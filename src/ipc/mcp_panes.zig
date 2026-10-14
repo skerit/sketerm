@@ -468,6 +468,13 @@ fn listHeadless(arena: std.mem.Allocator, family: Family) ![]const u8 {
         if (t.exited and t.exit_status_known) try w.print(",\"exit_status\":{d}", .{t.exit_status});
         if (t.hasPendingCommand()) try w.writeAll(",\"pending_command\":true");
         if (t.hasPendingExec()) try w.writeAll(",\"pending_exec\":true");
+        const busy = try mcp_term.busyInfo(arena, t, id);
+        if (busy) |b| {
+            try w.writeAll(",\"busy\":");
+            try std.json.Stringify.value(.{ .kind = b.kind, .command = b.command, .running_ms = b.running_ms }, .{ .emit_null_optional_fields = false }, w);
+        }
+        if (t.ssh_tty) try w.writeAll(",\"transport\":\"ssh\"");
+        if (!t.exited) try w.print(",\"fg_signal\":{}", .{t.conn.caps.fg_signal and !t.ssh_tty});
         const last = mcp_term.termLastLine(arena, t);
         if (last.len > 0) {
             try w.writeAll(",\"last_line\":");
@@ -488,6 +495,7 @@ fn listHeadless(arena: std.mem.Allocator, family: Family) ![]const u8 {
         if (t.remote_host) |rh| try res.textf("  host: {s} (sketerm-mux)", .{rh});
         if (t.hasPendingCommand()) try res.text("  pending_command: true");
         if (t.hasPendingExec()) try res.text("  pending_exec: true");
+        if (busy) |b| if (b.command) |cmd| try res.textf("  busy: {s} `{s}` for {d}s", .{ b.kind, cmd, @divTrunc(b.running_ms.?, 1000) }) else try res.textf("  busy: {s}", .{b.kind});
         if (last.len > 0) try res.textf("  last line: {s}", .{last});
         if (cast) |p| try res.textf("  recording: {s}", .{p});
     }
@@ -649,8 +657,11 @@ pub fn runCommand(arena: std.mem.Allocator, family: Family, backend: ?Backend, a
     if (target == .term) {
         const t = target.term.t;
         if (t.hasPendingCommand()) _ = t.waitPendingCommand(0);
-        if (t.hasPendingCommand())
-            return errRes(arena, .conflict, "a command-mode command is still being tracked; resolve it with term_wait_command before running another command, or its exit status would be misattributed");
+        // A tracked command's completion would be misattributed to the
+        // new one; the refusal says what runs and how to get past it.
+        if (t.hasPendingCommand() or t.hasPendingExec()) {
+            if (try mcp_term.busyRefusal(arena, t, target.term.id)) |refusal| return refusal;
+        }
     }
     const quiet_ms: i64 = argInt(args, "quiet_ms") orelse DEFAULT_QUIET_MS;
     const want_output_only = argBool(args, "output_only");

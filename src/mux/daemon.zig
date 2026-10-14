@@ -6855,6 +6855,49 @@ pub const Daemon = struct {
         });
     }
 
+    /// The attached session's foreground process group: reported, and
+    /// signalled when asked and when it is not the session's own child.
+    pub fn handleFgSignal(self: *Daemon, cl: *Client, payload: []const u8) void {
+        var parsed = std.json.parseFromSlice(wire.FgSignalReq, self.allocator, payload, .{ .ignore_unknown_fields = true }) catch {
+            cl.queueErr("bad fg_signal request");
+            return;
+        };
+        defer parsed.deinit();
+        var reply = wire.FgSignalReply{ .req = parsed.value.req };
+        var name_buf: [64]u8 = undefined;
+        reply.@"error" = fgSignal(cl, parsed.value.signal, &reply, &name_buf);
+        reply.ok = reply.@"error".len == 0;
+        cl.queueJson(.fg_signal_reply, reply);
+    }
+
+    /// `handleFgSignal`'s work; the failure sentence, or "".
+    fn fgSignal(cl: *Client, signal: []const u8, reply: *wire.FgSignalReply, name_buf: []u8) []const u8 {
+        const sig = std.meta.stringToEnum(wire.FgSignal, signal) orelse
+            return "unknown signal (query, int, quit, term or kill)";
+        if (sig != .query and !cl.drivesTerminal())
+            return "this attachment only watches the session; it cannot signal it";
+        const s = cl.attached orelse return "not attached to a session";
+        const pty = s.ptyPtr() orelse return "this session runs no process (a cast playback)";
+        if (pty.child_pid <= 0) return "this session has no local child process";
+        reply.shell_pid = pty.child_pid;
+        const pgrp = c.tcgetpgrp(pty.master_fd);
+        if (pgrp <= 0) return "the terminal reports no foreground process group";
+        reply.fg_pgrp = pgrp;
+        reply.fg_program = platform.foregroundProgram(pty.master_fd, name_buf) orelse "";
+        reply.shell_in_foreground = pgrp == pty.child_pid;
+        if (sig == .query or reply.shell_in_foreground) return "";
+        const signo: c_int = switch (sig) {
+            .query => unreachable,
+            .int => c.SIGINT,
+            .quit => c.SIGQUIT,
+            .term => c.SIGTERM,
+            .kill => c.SIGKILL,
+        };
+        if (c.kill(-pgrp, signo) != 0) return "the foreground process group could not be signalled";
+        reply.signalled = true;
+        return "";
+    }
+
     /// Broker: the end of a session that attach and list no longer see
     /// (killed, `dead`) but whose worker record is not retired yet, so its
     /// tombstone is not written: a client reconnecting in that window must

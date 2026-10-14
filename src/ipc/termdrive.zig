@@ -85,6 +85,73 @@ pub const CommandToken = struct {
     completion_seq: u64,
 };
 
+/// A daemon's `fg_signal_reply`, copied out of the frame.
+pub const FgState = struct {
+    ok: bool,
+    shell_pid: i32,
+    fg_pgrp: i32,
+    shell_in_foreground: bool,
+    signalled: bool,
+    program: [64]u8 = undefined,
+    program_len: u8 = 0,
+    err: [160]u8 = undefined,
+    err_len: u8 = 0,
+
+    pub fn programName(self: *const FgState) []const u8 {
+        return self.program[0..self.program_len];
+    }
+
+    pub fn errText(self: *const FgState) []const u8 {
+        return self.err[0..self.err_len];
+    }
+};
+
+/// `Term.fgSignal`: the daemon cannot be asked (`fg_signal` not
+/// advertised), did not answer in time (an adopted older worker, a
+/// lost link), or answered.
+pub const FgResult = union(enum) { unsupported, no_answer, state: FgState };
+
+/// Where an exec's output starts. `markers`: just past the begin
+/// marker. `echo`: the begin marker was gone, so just past the last
+/// line carrying the exec's nonce (the typed command's own echo).
+/// `watermark`: no such line either, so the first line born after the
+/// command was sent, never earlier than the top of the screen; at most
+/// a screen of older text, never the session's history.
+pub const Boundary = enum { markers, echo, watermark };
+
+/// What a terminal is busy with, for a refusal that has to say so: the
+/// start of the command this client sent and when.
+pub const Busy = struct {
+    started_ms: i64 = 0,
+    buf: [PREVIEW_MAX]u8 = undefined,
+    len: u8 = 0,
+
+    pub const PREVIEW_MAX = 120;
+
+    /// The first line of `command`, control bytes as spaces, cut with
+    /// "..." on a UTF-8 boundary.
+    pub fn of(command: []const u8) Busy {
+        var b = Busy{ .started_ms = nowMs() };
+        const first = std.mem.trim(u8, command[0 .. std.mem.indexOfScalar(u8, command, '\n') orelse command.len], " \t\r");
+        var n = @min(first.len, PREVIEW_MAX);
+        if (n < first.len) {
+            n = PREVIEW_MAX - 3;
+            while (n > 0 and (first[n] & 0xC0) == 0x80) n -= 1;
+        }
+        for (first[0..n], 0..) |ch, i| b.buf[i] = if (ch < 0x20 or ch == 0x7f) ' ' else ch;
+        if (n < first.len) {
+            @memcpy(b.buf[n..][0..3], "...");
+            n += 3;
+        }
+        b.len = @intCast(n);
+        return b;
+    }
+
+    pub fn preview(self: *const Busy) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
 /// Result of a sentinel-based exec (term_exec): structured completion
 /// for commands run inside an EXISTING interactive shell, including
 /// remote SSH sessions where OSC 133 integration cannot reach.
@@ -97,9 +164,11 @@ pub const ExecOutcome = struct {
     /// FAR (empty if the begin marker isn't visible, e.g. behind an
     /// alt-screen UI). Allocator-owned by the caller.
     output: []u8 = &.{},
-    /// The begin marker scrolled out of the mirror's scrollback: the
-    /// output is a TAIL, not the whole thing.
+    /// The begin marker was not found (scrolled out, erased by a clear
+    /// screen, overwritten by a redraw, or hidden behind the alternate
+    /// screen): `boundary` says where the output was started instead.
     truncated: bool = false,
+    boundary: Boundary = .markers,
     /// The terminal/shell itself died before the end marker.
     shell_died: bool = false,
     /// The command is still running and the tracker stays attached
@@ -149,6 +218,10 @@ test "looksInteractive" {
 
 const ExecPending = struct {
     nonce: [12]u8,
+    /// Line id of the cursor row when the command was typed: output
+    /// lines are born after it (`Boundary.watermark`).
+    watermark: u64 = 0,
+    busy: Busy = .{},
 };
 
 /// Where a sentinel scan landed in the rendered text.
@@ -198,9 +271,14 @@ pub fn buildExecLine(allocator: std.mem.Allocator, nonce: []const u8, command: [
             "";
         const interp = shell orelse "sh";
         const nl: []const u8 = if (command.len > 0 and command[command.len - 1] == '\n') "" else "\n";
+        // The wrapper TRAPS the terminal's interrupts (a trap with a
+        // handler is reset in the child, so ^C still stops the command):
+        // without it ^C killed the wrapper with the command, the end
+        // marker never printed and the exec stayed "still running"
+        // forever, refusing every later term_exec.
         const script = try std.fmt.allocPrint(
             allocator,
-            "cat > /tmp/.sk_{s}.c <<'SK_EOF_{s}'\n{s}{s}SK_EOF_{s}\nprintf '\\n%s\\n' SKB{s}\n{s}{s} /tmp/.sk_{s}.c\n__sk_s=$?\nprintf '\\n%s%d\\n' SKE{s}. \"$__sk_s\"\n",
+            "cat > /tmp/.sk_{s}.c <<'SK_EOF_{s}'\n{s}{s}SK_EOF_{s}\ntrap : INT QUIT TERM\nprintf '\\n%s\\n' SKB{s}\n{s}{s} /tmp/.sk_{s}.c\n__sk_s=$?\nprintf '\\n%s%d\\n' SKE{s}. \"$__sk_s\"\n",
             .{ nonce, nonce, command, nl, nonce, nonce, env, interp, nonce, nonce },
         );
         defer allocator.free(script);
@@ -250,6 +328,29 @@ pub fn findSentinel(text: []const u8, nonce: []const u8) SentinelParse {
         return .{ .done = .{ .status = status, .start = start, .end = endpos, .truncated = truncated } };
     }
     return .{ .pending = .{ .begin_after = begin_after } };
+}
+
+/// Just past the last line of `text` carrying `nonce`: the typed exec
+/// line's echo, when the begin marker itself is gone. Null without one.
+fn echoEnd(text: []const u8, nonce: []const u8) ?usize {
+    var found: ?usize = null;
+    var off: usize = 0;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        off += line.len + 1;
+        if (std.mem.indexOf(u8, line, nonce) != null) found = @min(off, text.len);
+    }
+    return found;
+}
+
+test "a lost begin marker starts the output after the command's echo" {
+    const nonce = "aabbccddeeff";
+    const text = "old history 1\nold history 2\n$ echo X | base64 -d > /tmp/.sk_aabbccddeeff && sh /tmp/.sk_aabbccddeeff\nprogress 100%\ndone\nSKEaabbccddeeff.0\n";
+    const d = findSentinel(text, nonce).done;
+    try std.testing.expect(d.truncated);
+    const e = echoEnd(text[0..d.end], nonce).?;
+    try std.testing.expectEqualStrings("progress 100%\ndone\n", text[e..d.end]);
+    try std.testing.expect(echoEnd("old history\nmore\n", nonce) == null);
 }
 
 /// Build the ssh forced-command that bootstraps OSC 133 shell
@@ -629,7 +730,16 @@ pub const Term = struct {
     /// Never blocks success — a mark that shows up later still wins.
     prompt_wait_exhausted: bool = false,
     pending_command: ?CommandToken = null,
+    /// What the tracked command-mode command is (`trackCommand`).
+    pending_command_busy: Busy = .{},
     pending_exec: ?ExecPending = null,
+    /// A plain `ssh -tt` session: the session's own child is ssh, so its
+    /// foreground group says nothing about the remote command and no
+    /// signal but the terminal's own interrupt characters reaches it.
+    ssh_tty: bool = false,
+    /// The last `fg_signal` request id and the answer that echoed it.
+    fg_req: u32 = 0,
+    fg_reply: ?FgState = null,
     /// Bumped by every snapshot that replaced the mirror (attach, resync,
     /// reattach): an observer of `screen` compares it to learn that the
     /// Screen it last read was swapped wholesale.
@@ -1083,6 +1193,7 @@ pub const Term = struct {
                 }
             },
             .gone => self.exited = true,
+            .fg_signal_reply => self.noteFgReply(payload),
             else => {},
         }
     }
@@ -1359,8 +1470,62 @@ pub const Term = struct {
         return screen.pending_output_start_id != 0 or screen.pending_output_awaits_nl;
     }
 
-    pub fn trackCommand(self: *Term, token: CommandToken) void {
+    pub fn trackCommand(self: *Term, token: CommandToken, command: []const u8) void {
         self.pending_command = token;
+        self.pending_command_busy = Busy.of(command);
+    }
+
+    /// What the pending term_exec is, when one is.
+    pub fn execBusy(self: *const Term) ?Busy {
+        const p = self.pending_exec orelse return null;
+        return p.busy;
+    }
+
+    /// Stop waiting for a pending exec's end marker: its wrapper is gone
+    /// (interrupted by a build that did not trap, or killed with its
+    /// group), so the marker will never print.
+    pub fn abandonExec(self: *Term) void {
+        self.pending_exec = null;
+    }
+
+    /// Stop tracking a command-mode command that will never complete.
+    pub fn abandonCommand(self: *Term) void {
+        self.pending_command = null;
+    }
+
+    /// Ask the session's daemon about, or signal, the terminal's
+    /// foreground process group (`wire.FgSignal`), pumping the mirror
+    /// while the answer is on its way.
+    pub fn fgSignal(self: *Term, sig: wire.FgSignal, timeout_ms: i64) FgResult {
+        if (!self.conn.caps.fg_signal) return .unsupported;
+        self.drain();
+        if (self.exited) return .no_answer;
+        self.fg_req +%= 1;
+        if (self.fg_req == 0) self.fg_req = 1;
+        self.fg_reply = null;
+        self.conn.sendJson(.fg_signal, wire.FgSignalReq{ .req = self.fg_req, .signal = @tagName(sig) }) catch return .no_answer;
+        const deadline = nowMs() + timeout_ms;
+        while (self.fg_reply == null and !self.exited and nowMs() < deadline) _ = self.pumpOnce(50);
+        return if (self.fg_reply) |r| .{ .state = r } else .no_answer;
+    }
+
+    fn noteFgReply(self: *Term, payload: []const u8) void {
+        const parsed = std.json.parseFromSlice(wire.FgSignalReply, self.allocator, payload, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        const r = parsed.value;
+        if (r.req != self.fg_req) return;
+        var st = FgState{
+            .ok = r.ok,
+            .shell_pid = r.shell_pid,
+            .fg_pgrp = r.fg_pgrp,
+            .shell_in_foreground = r.shell_in_foreground,
+            .signalled = r.signalled,
+        };
+        st.program_len = @intCast(@min(r.fg_program.len, st.program.len));
+        @memcpy(st.program[0..st.program_len], r.fg_program[0..st.program_len]);
+        st.err_len = @intCast(@min(r.@"error".len, st.err.len));
+        @memcpy(st.err[0..st.err_len], r.@"error"[0..st.err_len]);
+        self.fg_reply = st;
     }
 
     pub fn hasPendingCommand(self: *const Term) bool {
@@ -1443,6 +1608,8 @@ pub const Term = struct {
             pend.nonce[i * 2] = hex[b >> 4];
             pend.nonce[i * 2 + 1] = hex[b & 0xf];
         }
+        pend.watermark = if (self.screen) |sc| sc.cursorLineId() else 0;
+        pend.busy = Busy.of(command);
         const line = buildExecLine(self.allocator, &pend.nonce, command, subshell, noninteractive, shell) catch return Error.OutOfMemory;
         defer self.allocator.free(line);
         const with_cr = std.fmt.allocPrint(self.allocator, "{s}\r", .{line}) catch return Error.OutOfMemory;
@@ -1484,12 +1651,15 @@ pub const Term = struct {
                     .done => |d| {
                         defer self.allocator.free(t);
                         self.pending_exec = null;
-                        const out = self.allocator.dupe(u8, t[d.start..d.end]) catch &[_]u8{};
+                        const bounded = self.boundOutput(t, d, &pend);
+                        defer if (bounded.owned) |o| self.allocator.free(o);
+                        const out = self.allocator.dupe(u8, bounded.text) catch &[_]u8{};
                         return .{
                             .completed = true,
                             .exit_status = d.status,
                             .output = @constCast(out),
                             .truncated = d.truncated,
+                            .boundary = bounded.boundary,
                         };
                     },
                     .pending => |p| partial_from = p.begin_after,
@@ -1546,6 +1716,27 @@ pub const Term = struct {
                 if (self.exited) break;
             }
         }
+    }
+
+    const Bounded = struct { text: []const u8, boundary: Boundary, owned: ?[]u8 = null };
+
+    /// A finished exec's output. With its begin marker gone, scanning
+    /// from the top of the scrollback would hand back the session's
+    /// whole history as the command's output (a clear screen erased the
+    /// marker, a redraw overwrote it, or it sits on the main screen
+    /// behind the alternate one), so the start falls back to the
+    /// command's own echo, then to the send-time watermark.
+    fn boundOutput(self: *Term, t: []const u8, d: anytype, pend: *const ExecPending) Bounded {
+        if (!d.truncated) return .{ .text = t[d.start..d.end], .boundary = .markers };
+        if (echoEnd(t[0..d.end], &pend.nonce)) |e| return .{ .text = t[e..d.end], .boundary = .echo };
+        const sc = self.screen orelse return .{ .text = "", .boundary = .watermark };
+        var row = sc.firstRowFromLineId(pend.watermark);
+        if (row >= 0) row = 0;
+        const x = sc.extractScrollbackFrom(self.allocator, row) catch return .{ .text = "", .boundary = .watermark };
+        return switch (findSentinel(x, &pend.nonce)) {
+            .done => |d2| .{ .text = x[(if (d2.truncated) 0 else d2.start)..d2.end], .boundary = .watermark, .owned = x },
+            .pending => .{ .text = "", .boundary = .watermark, .owned = x },
+        };
     }
 
     /// The mirror stopped following the event stream and could not be
@@ -1882,4 +2073,15 @@ test "Term local spawn rolls back every post-spawn allocation failure" {
 
 test "Term remote mux spawn rolls back every post-spawn allocation failure" {
     try testSpawnAllocationFailures(true);
+}
+
+test "Busy.of keeps the command's first line, flattened and cut on a character boundary" {
+    const b = Busy.of("  docker logs -f web\nsecond line");
+    try std.testing.expectEqualStrings("docker logs -f web", b.preview());
+    const tab = Busy.of("a\tb");
+    try std.testing.expectEqualStrings("a b", tab.preview());
+    const long = Busy.of("x" ** 116 ++ "\u{00e9}\u{00e9}\u{00e9}");
+    try std.testing.expect(std.mem.endsWith(u8, long.preview(), "..."));
+    try std.testing.expect(long.preview().len <= Busy.PREVIEW_MAX);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(long.preview()));
 }

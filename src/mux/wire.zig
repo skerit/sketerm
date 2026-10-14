@@ -271,6 +271,12 @@ pub const FrameType = enum(u8) {
     /// record. Answered by `tombstone_reply`. Only sent to daemons whose
     /// welcome advertises `tombstones:true`.
     tombstone_get = 36,
+    /// Query, or signal, the foreground process group of the attached
+    /// session's terminal (`FgSignalReq`). Attach-scoped; a view-only
+    /// attachment may query but never signal. Answered by
+    /// `fg_signal_reply`. Only sent to daemons whose welcome advertises
+    /// `fg_signal:true`.
+    fg_signal = 37,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -414,6 +420,8 @@ pub const FrameType = enum(u8) {
     /// `found` false = no ended session of that name or lifetime is
     /// remembered here (never ended, or longer ago than the daemon keeps).
     tombstone_reply = 99,
+    /// Answer to `fg_signal`, ALWAYS echoing `req` (`FgSignalReply`).
+    fg_signal_reply = 100,
     _,
 };
 
@@ -1400,6 +1408,32 @@ pub const KillReq = struct {
     /// replacement when either expected value no longer matches.
     expected_pid: i32 = 0,
     expected_wl_display: []const u8 = "",
+};
+
+/// What `fg_signal` does: `query` reports the foreground group only.
+pub const FgSignal = enum { query, int, quit, term, kill };
+
+/// `fg_signal` request; `signal` is an `FgSignal` tag name.
+pub const FgSignalReq = struct {
+    req: u32 = 0,
+    signal: []const u8 = "query",
+};
+
+/// `fg_signal_reply`. The session's child leads its own process group,
+/// so a foreground group equal to `shell_pid` means nothing but that
+/// child is in the foreground, and nothing is signalled then: the
+/// child is the session itself (killing it is `kill`), and a child
+/// without job control (`ssh`, `sh -c`) is always in front of whatever
+/// it runs, which this frame cannot tell apart from an idle shell.
+pub const FgSignalReply = struct {
+    req: u32 = 0,
+    ok: bool = false,
+    @"error": []const u8 = "",
+    shell_pid: i32 = 0,
+    fg_pgrp: i32 = 0,
+    fg_program: []const u8 = "",
+    shell_in_foreground: bool = false,
+    signalled: bool = false,
 };
 
 /// `control_req` payload. Unknown ops are ignored (append-only).

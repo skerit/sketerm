@@ -2397,6 +2397,33 @@ pub const Screen = struct {
     /// logical line. Useful for "share my whole terminal session"
     /// flows (Ctrl+Shift+End-style copy-all). Caller frees.
     pub fn extractScrollback(self: *const Screen, allocator: std.mem.Allocator) ![]u8 {
+        return self.extractScrollbackFrom(allocator, -@as(i32, @intCast(self.scrollbackCount())));
+    }
+
+    /// Id of the line under the cursor (0 when it has none).
+    pub fn cursorLineId(self: *const Screen) u64 {
+        const l = self.lineAt(@intCast(self.row)) orelse return 0;
+        return l.id;
+    }
+
+    /// The first display row (scrollback rows negative) whose line was
+    /// born at or after `id`, or `rows` when none was. Ids follow birth
+    /// order, so this is where text written after a `cursorLineId`
+    /// reading begins, give or take a scroll region's reshuffle. An
+    /// erase keeps a line's id, so a cleared screen still reads as old.
+    pub fn firstRowFromLineId(self: *const Screen, id: u64) i32 {
+        const rows_i: i32 = @intCast(self.rows);
+        var r: i32 = -@as(i32, @intCast(self.scrollbackCount()));
+        while (r < rows_i) : (r += 1) {
+            const l = self.lineAt(r) orelse continue;
+            if (l.id >= id) return r;
+        }
+        return rows_i;
+    }
+
+    /// `extractScrollback` starting at display row `first_row`
+    /// (negative = scrollback, clamped to the oldest line held).
+    pub fn extractScrollbackFrom(self: *const Screen, allocator: std.mem.Allocator, first_row: i32) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
         var run: TextRun = .{ .screen = self, .allocator = allocator, .out = &out };
@@ -2404,7 +2431,7 @@ pub const Screen = struct {
         const sb_count: i32 = @intCast(self.scrollbackCount());
         const rows_i: i32 = @intCast(self.rows);
 
-        var r: i32 = -sb_count;
+        var r: i32 = @max(first_row, -sb_count);
         while (r < rows_i) : (r += 1) {
             if (self.lineCellsAt(r)) |line_cells| {
                 try run.emitRow(r, line_cells, 0, trimBlankTail(line_cells, line_cells.len), true);

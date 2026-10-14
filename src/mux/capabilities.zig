@@ -118,6 +118,12 @@ pub const Flag = enum {
     /// by `tombstone_reply`: expired, exited with status or signal,
     /// closed). Absent = never ask; a gone session's reason is unknown.
     tombstones,
+    /// The attached session's foreground process group can be queried
+    /// and signalled (`fg_signal`, answered by `fg_signal_reply`). Absent
+    /// = never ask; only the terminal's own interrupt characters (^C,
+    /// ^\) reach a running command. A worker adopted from an older
+    /// build may still leave it unanswered, so a client bounds the wait.
+    fg_signal,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

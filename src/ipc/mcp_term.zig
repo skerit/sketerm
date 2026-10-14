@@ -72,7 +72,10 @@ pub fn termLastLine(arena: std.mem.Allocator, t: *termdrive.Term) []const u8 {
     while (it.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \r\t");
         if (trimmed.len == 0) continue;
-        const cap = @min(trimmed.len, 160);
+        // Cut on a character start: half a UTF-8 sequence made the
+        // whole term_list reply invalid JSON text for the client.
+        var cap = @min(trimmed.len, 160);
+        while (cap < trimmed.len and cap > 0 and (trimmed[cap] & 0xC0) == 0x80) cap -= 1;
         return arena.dupe(u8, trimmed[0..cap]) catch "";
     }
     return "";
@@ -84,7 +87,7 @@ pub fn termLastLine(arena: std.mem.Allocator, t: *termdrive.Term) []const u8 {
 /// alt-screen flag, output idleness, an interactive-prompt hint and
 /// the tracker id. `output_file` (optional, absolute, local) receives
 /// the FULL untruncated output; the inline payload then keeps a tail.
-pub fn execResultJson(arena: std.mem.Allocator, r: termdrive.ExecOutcome, t: *termdrive.Term, output_file: ?[]const u8) ![]const u8 {
+pub fn execResultJson(arena: std.mem.Allocator, r: termdrive.ExecOutcome, t: *termdrive.Term, opts: ExecReply) ![]const u8 {
     // The live rendered screen: an interactive dialog (apt's
     // needrestart, a password ask) must be VISIBLE in the reply, never
     // hidden behind a bare timeout.
@@ -95,17 +98,71 @@ pub fn execResultJson(arena: std.mem.Allocator, r: termdrive.ExecOutcome, t: *te
             screen_tail = try arena.dupe(u8, tailLines(screen_text, 20));
         } else |_| {}
     }
-    return execResult(arena, r, screen_tail, output_file);
+    return execResult(arena, r, screen_tail, opts);
+}
+
+/// How an exec outcome is reported. `earlier`: it is the result of the
+/// PREVIOUS exec, found finished when a new one was asked for, and the
+/// new command was not sent.
+pub const ExecReply = struct {
+    output_file: ?[]const u8 = null,
+    max_chars: usize = EXEC_INLINE_DEFAULT,
+    earlier: bool = false,
+
+    fn of(args: std.json.Value) ExecReply {
+        return .{ .output_file = argStr(args, "output_file"), .max_chars = execMaxChars(args) };
+    }
+};
+
+/// The default inline output of term_exec/term_exec_wait: the TAIL is
+/// kept, the cut is a fact, and `max_chars` or `output_file` gets more.
+pub const EXEC_INLINE_DEFAULT: usize = 20_000;
+pub const EXEC_INLINE_MAX: usize = 200_000;
+
+/// `max_chars` on the exec tools, clamped to [1000, EXEC_INLINE_MAX].
+fn execMaxChars(args: std.json.Value) usize {
+    const v = argInt(args, "max_chars") orelse return EXEC_INLINE_DEFAULT;
+    if (v <= 0) return EXEC_INLINE_DEFAULT;
+    return std.math.clamp(@as(usize, @intCast(v)), 1000, EXEC_INLINE_MAX);
+}
+
+/// The last `cap` bytes of `text`, moved forward to a character start
+/// so a cut never splits a UTF-8 sequence.
+fn utf8Tail(text: []const u8, cap: usize) []const u8 {
+    if (text.len <= cap) return text;
+    var from = text.len - cap;
+    while (from < text.len and (text[from] & 0xC0) == 0x80) from += 1;
+    return text[from..];
+}
+
+test "utf8Tail never starts inside a character" {
+    const s = "ab\u{00e9}cd";
+    try std.testing.expectEqualStrings("cd", utf8Tail(s, 3));
+    try std.testing.expectEqualStrings("\u{00e9}cd", utf8Tail(s, 4));
+    try std.testing.expectEqualStrings(s, utf8Tail(s, 99));
 }
 
 /// The terminal-free half of execResultJson: everything the reply says
 /// about an outcome, given the screen tail already read.
-pub fn execResult(arena: std.mem.Allocator, r: termdrive.ExecOutcome, screen_tail: ?[]const u8, output_file: ?[]const u8) ![]const u8 {
+pub fn execResult(arena: std.mem.Allocator, r: termdrive.ExecOutcome, screen_tail: ?[]const u8, opts: ExecReply) ![]const u8 {
+    const output_file = opts.output_file;
     var res = mcp.Res.init(arena);
+    if (opts.earlier) {
+        try res.fact("earlier_exec", true);
+        try res.text("NOT SENT: the previous term_exec in this terminal had finished meanwhile, and this is ITS result; call term_exec again to run the new command");
+    }
     try res.fact("completed", r.completed);
     try res.fact("exit_status", r.exit_status);
     try res.fact("timed_out", r.timed_out);
     try res.fact("truncated", r.truncated);
+    if (r.completed) {
+        try res.fact("output_boundary", @tagName(r.boundary));
+        switch (r.boundary) {
+            .markers => {},
+            .echo => try res.text("the begin marker was gone (a clear screen or a redraw erased it): the output starts after the command's own echo"),
+            .watermark => try res.text("the begin marker and the command's echo were gone (a clear screen, a redraw or the alternate screen): the output starts at the first line written after the command was sent, or the top of the screen, and may include up to a screen of earlier text"),
+        }
+    }
     try res.fact("shell_died", r.shell_died);
     try res.fact("pending", r.pending);
     if (r.completed) {
@@ -135,7 +192,7 @@ pub fn execResult(arena: std.mem.Allocator, r: termdrive.ExecOutcome, screen_tai
     }
     var file_note: ?[]const u8 = null;
     var inline_out: []const u8 = r.output;
-    var inline_cap: usize = 200_000;
+    var inline_cap: usize = opts.max_chars;
     if (output_file) |path| {
         if (path.len == 0 or path[0] != '/') {
             file_note = "output_file must be an absolute local path - ignored, full output inline";
@@ -143,15 +200,17 @@ pub fn execResult(arena: std.mem.Allocator, r: termdrive.ExecOutcome, screen_tai
             try res.fact("output_file", path);
             try res.fact("output_bytes", r.output.len);
             try res.textf("output_file: {s} ({d} bytes)", .{ path, r.output.len });
-            inline_cap = 2_000;
+            inline_cap = @min(inline_cap, 2_000);
         } else {
             file_note = "output_file could not be written (dir missing / not writable?) - full output inline";
         }
     }
     if (inline_out.len > inline_cap) {
-        try res.fact("output_dropped_chars", inline_out.len - inline_cap);
-        try res.textf("(dropped {d} leading chars)", .{inline_out.len - inline_cap});
-        inline_out = inline_out[inline_out.len - inline_cap ..];
+        const kept = utf8Tail(inline_out, inline_cap);
+        try res.fact("output_dropped_chars", inline_out.len - kept.len);
+        try res.fact("output_total_chars", inline_out.len);
+        try res.textf("(dropped {d} leading chars of {d}; max_chars raises the inline budget up to {d}, output_file keeps everything)", .{ inline_out.len - kept.len, inline_out.len, EXEC_INLINE_MAX });
+        inline_out = kept;
     }
     try res.fact("output", inline_out);
     if (file_note) |n| {
@@ -253,6 +312,7 @@ pub fn termTool(arena: std.mem.Allocator, tool: Tool, args: std.json.Value) ![]c
         .term_read => mcp_panes.readScreen(arena, .term, null, args),
         .term_exec => withTerm(arena, args, termExec),
         .term_exec_wait => withTerm(arena, args, termExecWait),
+        .term_interrupt => withTerm(arena, args, termInterrupt),
         .term_wait_exit => withTerm(arena, args, termWaitExit),
         .term_run => mcp_panes.runCommand(arena, .term, null, args),
         .term_wait_command => withTerm(arena, args, termWaitCommand),
@@ -406,6 +466,7 @@ fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     // real prompt mark before trusting it, so an unsupported
     // remote shell degrades to an honest not-ready refusal.
     if (remote_integration) t.integration = true;
+    t.ssh_tty = host != null and !via_mux;
     if (host != null) t.setRemoteShellPending(remote_integration);
     // Let the shell print its first prompt.
     _ = t.waitIdle(250, 3_000);
@@ -493,20 +554,88 @@ fn termExec(arena: std.mem.Allocator, args: std.json.Value, t: *termdrive.Term, 
             return mcp.errRes(arena, .invalid_args, "invalid 'shell' (a command name or absolute path: letters, digits, . _ - / only)");
     }
     if (t.hasPendingExec()) {
-        // A previously timed-out exec may have finished since;
-        // resolve it silently so the new send is accepted.
-        if (t.waitExecResult(0)) |r0| term_state.allocator.free(r0.output);
-        if (t.hasPendingExec())
-            return mcp.errRes(arena, .conflict, "a previous term_exec is still running in this terminal; continue it with term_exec_wait (or interrupt with term_send_keys ctrl+c)");
+        // A previously timed-out exec may have finished since: its
+        // result would be lost if it were resolved silently, so it is
+        // handed back instead and nothing new is sent.
+        if (t.waitExecResult(0)) |r0| {
+            defer term_state.allocator.free(r0.output);
+            if (!r0.pending) {
+                var opts = ExecReply.of(args);
+                opts.earlier = true;
+                return execResultJson(arena, r0, t, opts);
+            }
+        }
     }
-    if (t.hasPendingCommand())
-        return mcp.errRes(arena, .conflict, "a term_run wait_for=command command is still tracked; resolve it with term_wait_command first");
+    if (try busyRefusal(arena, t, termIdOf(t))) |refusal| return refusal;
     const r = t.execCommand(cmd, subshell, noninteractive, shell, timeout_ms) catch |err| return switch (err) {
         termdrive.Error.NotConnected => mcp.errRes(arena, .conflict, "terminal exited"),
         else => appErr(arena, "exec failed"),
     };
     defer term_state.allocator.free(r.output);
-    return execResultJson(arena, r, t, argStr(args, "output_file"));
+    return execResultJson(arena, r, t, ExecReply.of(args));
+}
+
+/// What a terminal is busy with, for a refusal: what runs, since when
+/// and the three ways on (wait for it, interrupt it, open a sibling
+/// terminal). Null when it is free.
+pub const BusyInfo = struct {
+    msg: []const u8,
+    kind: []const u8,
+    command: ?[]const u8,
+    running_ms: ?i64,
+    wait_with: []const u8,
+};
+
+pub fn busyInfo(arena: std.mem.Allocator, t: *termdrive.Term, term_id: u32) !?BusyInfo {
+    // `execBusy` hands back a COPY: its preview is copied out before the
+    // copy goes out of scope.
+    var b: BusyInfo = if (t.execBusy()) |e| .{
+        .msg = "",
+        .kind = "term_exec",
+        .command = try arena.dupe(u8, e.preview()),
+        .running_ms = nowMs() - e.started_ms,
+        .wait_with = "term_exec_wait",
+    } else if (t.hasPendingCommand()) .{
+        .msg = "",
+        .kind = "term_run wait_for=command",
+        .command = try arena.dupe(u8, t.pending_command_busy.preview()),
+        .running_ms = nowMs() - t.pending_command_busy.started_ms,
+        .wait_with = "term_wait_command",
+    } else if (t.integration and t.foregroundRunning()) .{
+        .msg = "",
+        .kind = "foreground command",
+        .command = null,
+        .running_ms = null,
+        .wait_with = "term_wait_idle",
+    } else return null;
+    const sibling = if (t.remote_host) |h|
+        try std.fmt.allocPrint(arena, "term_open host:\"{s}\"", .{h})
+    else
+        "term_open (with the same host, if this terminal is an ssh session)";
+    const what = if (b.command) |cmd|
+        try std.fmt.allocPrint(arena, "the {s} `{s}` this MCP server sent {d}s ago is still running", .{ b.kind, cmd, @divTrunc(b.running_ms.?, 1000) })
+    else
+        "a foreground command typed outside term_exec/term_run is still running (shell integration shows its zone open)";
+    b.msg = try std.fmt.allocPrint(
+        arena,
+        "terminal {d} is busy: {s}; a new command would be typed into it. Wait for it with {s}, stop it with term_interrupt, or run elsewhere with {s}",
+        .{ term_id, what, b.wait_with, sibling },
+    );
+    return b;
+}
+
+/// `busyInfo` as a `conflict` refusal whose details repeat the facts.
+pub fn busyRefusal(arena: std.mem.Allocator, t: *termdrive.Term, term_id: u32) !?[]const u8 {
+    const b = (try busyInfo(arena, t, term_id)) orelse return null;
+    const Details = struct { term: u32, busy: []const u8, command: ?[]const u8, running_ms: ?i64, wait_with: []const u8, interrupt_with: []const u8 };
+    return try mcp.errResDetails(arena, .conflict, b.msg, @as(?Details, .{
+        .term = term_id,
+        .busy = b.kind,
+        .command = b.command,
+        .running_ms = b.running_ms,
+        .wait_with = b.wait_with,
+        .interrupt_with = "term_interrupt",
+    }));
 }
 
 fn termExecWait(arena: std.mem.Allocator, args: std.json.Value, t: *termdrive.Term, _: u32) ![]const u8 {
@@ -514,7 +643,214 @@ fn termExecWait(arena: std.mem.Allocator, args: std.json.Value, t: *termdrive.Te
     const r = t.waitExecResult(timeout_ms) orelse
         return mcp.errRes(arena, .not_found, "no pending term_exec in this terminal");
     defer term_state.allocator.free(r.output);
-    return execResultJson(arena, r, t, argStr(args, "output_file"));
+    return execResultJson(arena, r, t, ExecReply.of(args));
+}
+
+/// One rung of term_interrupt's ladder.
+const InterruptStep = enum {
+    tty_int,
+    tty_quit,
+    sigterm,
+    sigkill,
+
+    fn signal(self: InterruptStep) ?@import("../mux/wire.zig").FgSignal {
+        return switch (self) {
+            .tty_int, .tty_quit => null,
+            .sigterm => .term,
+            .sigkill => .kill,
+        };
+    }
+
+    fn ttyByte(self: InterruptStep) []const u8 {
+        return switch (self) {
+            .tty_int => "\x03",
+            .tty_quit => "\x1c",
+            .sigterm, .sigkill => "",
+        };
+    }
+};
+
+/// What term_interrupt watches to tell that the command stopped.
+const StopWatch = struct {
+    t: *termdrive.Term,
+    had_exec: bool,
+    had_cmd: bool,
+    /// The daemon can report the foreground group (local or sketerm-mux).
+    fg: bool,
+    exec_status: ?i32 = null,
+    exec_tail: ?[]const u8 = null,
+    tracker_abandoned: bool = false,
+    /// When the shell was first seen back in front with a tracker left.
+    shell_front_since: ?i64 = null,
+
+    /// Grace for a tracked command's end marker or completion mark once
+    /// the shell is back in front: past it the tracker is dead.
+    const ORPHAN_GRACE_MS = 1_000;
+
+    /// Whether the command has stopped: null = nothing can tell.
+    fn check(self: *StopWatch, arena: std.mem.Allocator) !?bool {
+        const t = self.t;
+        if (t.exited) return true;
+        if (self.had_exec and t.hasPendingExec()) {
+            if (t.waitExecResult(0)) |r| {
+                defer term_state.allocator.free(r.output);
+                if (!r.pending) {
+                    self.exec_status = r.exit_status;
+                    self.exec_tail = try arena.dupe(u8, utf8Tail(r.output, 2_000));
+                }
+            }
+        }
+        if (self.had_cmd and t.hasPendingCommand()) _ = t.waitPendingCommand(0);
+        const tracking = (self.had_exec and t.hasPendingExec()) or (self.had_cmd and t.hasPendingCommand());
+        if ((self.had_exec or self.had_cmd) and !tracking) return true;
+        if (self.fg) {
+            switch (t.fgSignal(.query, 1_500)) {
+                .state => |st| if (st.ok and st.shell_in_foreground) {
+                    if (!tracking) return true;
+                    const since = self.shell_front_since orelse nowMs();
+                    self.shell_front_since = since;
+                    if (nowMs() - since < ORPHAN_GRACE_MS) return false;
+                    t.abandonExec();
+                    t.abandonCommand();
+                    self.tracker_abandoned = true;
+                    return true;
+                } else {
+                    self.shell_front_since = null;
+                    return false;
+                },
+                .unsupported, .no_answer => {},
+            }
+        }
+        if (tracking) return false;
+        if (t.integration) return !t.foregroundRunning();
+        return null;
+    }
+};
+
+/// term_interrupt: stop the running command, escalating, and report
+/// which step did it.
+fn termInterrupt(arena: std.mem.Allocator, args: std.json.Value, t: *termdrive.Term, term_id: u32) ![]const u8 {
+    const step_ms: i64 = std.math.clamp(argInt(args, "step_ms") orelse 2_000, 200, 10_000);
+    const escalate = if (args == .object) blk: {
+        const v = args.object.get("escalate") orelse break :blk true;
+        break :blk !(v == .bool and !v.bool);
+    } else true;
+    if (t.exited) return mcp.errRes(arena, .conflict, "terminal exited; nothing runs in it (term_close releases it)");
+    t.drain();
+    const busy = try busyInfo(arena, t, term_id);
+    var watch = StopWatch{
+        .t = t,
+        .had_exec = t.hasPendingExec(),
+        .had_cmd = t.hasPendingCommand(),
+        .fg = !t.ssh_tty and t.conn.caps.fg_signal,
+    };
+    // Signals reach the process group only where the daemon can name it;
+    // over plain ssh the daemon's child IS ssh.
+    if (watch.fg) switch (t.fgSignal(.query, 1_500)) {
+        .state => |st| if (!st.ok) {
+            watch.fg = false;
+        } else if (st.shell_in_foreground and !watch.had_exec and !watch.had_cmd) {
+            // The daemon's answer outranks the OSC 133 zone, which stays
+            // open for a moment after a killed job until the shell's next
+            // prompt marks it complete.
+            return interruptResult(arena, term_id, .nothing_running, null, &.{}, null, &watch, st.programName(), "process_group");
+        },
+        .unsupported, .no_answer => watch.fg = false,
+    };
+    const signals: []const u8 = if (watch.fg) "process_group" else "tty_only";
+    const ladder: []const InterruptStep = if (!escalate)
+        &.{.tty_int}
+    else if (watch.fg)
+        &.{ .tty_int, .sigterm, .sigkill }
+    else
+        &.{ .tty_int, .tty_quit };
+
+    var steps: std.ArrayList(StepReport) = .empty;
+    var verdict: InterruptVerdict = .no;
+    var stopped_by: ?InterruptStep = null;
+    for (ladder) |step| {
+        var report = StepReport{ .step = @tagName(step), .sent = false, .stopped = false, .waited_ms = 0 };
+        if (step.signal()) |sig| {
+            switch (t.fgSignal(sig, 2_000)) {
+                .state => |st| {
+                    if (!st.ok) report.@"error" = try arena.dupe(u8, st.errText());
+                    report.sent = st.signalled;
+                    // Already back at the shell: nothing left to signal.
+                    if (st.ok and st.shell_in_foreground) report.sent = false;
+                },
+                .unsupported, .no_answer => report.@"error" = "the daemon did not answer the signal request",
+            }
+        } else {
+            t.sendText(step.ttyByte()) catch {
+                report.@"error" = "the terminal could not be written to";
+            };
+            report.sent = report.@"error" == null;
+        }
+        const started = nowMs();
+        var known: ?bool = null;
+        while (true) {
+            known = try watch.check(arena);
+            if (known == true) break;
+            if (nowMs() - started >= step_ms) break;
+            _ = t.pumpOnce(100);
+        }
+        report.waited_ms = nowMs() - started;
+        report.stopped = known == true;
+        try steps.append(arena, report);
+        if (known == true) {
+            verdict = .yes;
+            stopped_by = step;
+            break;
+        }
+        if (known == null) verdict = .unverified;
+    }
+    var fg_name: []const u8 = "";
+    if (watch.fg and !t.exited) switch (t.fgSignal(.query, 1_500)) {
+        .state => |st| fg_name = try arena.dupe(u8, st.programName()),
+        .unsupported, .no_answer => {},
+    };
+    return interruptResult(arena, term_id, verdict, stopped_by, steps.items, busy, &watch, fg_name, signals);
+}
+
+const InterruptVerdict = enum { yes, no, nothing_running, unverified };
+
+/// One step of term_interrupt as its reply lists it.
+const StepReport = struct { step: []const u8, sent: bool, stopped: bool, waited_ms: i64, @"error": ?[]const u8 = null };
+
+fn interruptResult(
+    arena: std.mem.Allocator,
+    term_id: u32,
+    verdict: InterruptVerdict,
+    stopped_by: ?InterruptStep,
+    steps: []const StepReport,
+    busy: ?BusyInfo,
+    watch: *const StopWatch,
+    foreground: []const u8,
+    signals: []const u8,
+) ![]const u8 {
+    var res = mcp.Res.init(arena);
+    try res.fact("term", term_id);
+    try res.fact("stopped", @tagName(verdict));
+    try res.fact("signals", signals);
+    if (stopped_by) |s| try res.fact("stopped_by", @tagName(s));
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(steps, .{ .emit_null_optional_fields = false }, &aw.writer);
+    try res.raw("steps", aw.written());
+    if (busy) |b| if (b.command) |cmd| try res.fact("was_running", cmd);
+    if (watch.exec_tail) |tail| {
+        try res.fact("exec_exit_status", watch.exec_status);
+        try res.fact("exec_output_tail", tail);
+    }
+    if (watch.tracker_abandoned) try res.fact("tracker_abandoned", true);
+    if (foreground.len > 0) try res.fact("foreground", foreground);
+    switch (verdict) {
+        .nothing_running => try res.textf("terminal {d}: nothing but the shell is in the foreground; nothing was sent", .{term_id}),
+        .yes => try res.textf("terminal {d}: stopped after {s}", .{ term_id, @tagName(stopped_by.?) }),
+        .unverified => try res.textf("terminal {d}: interrupts sent, but nothing here can tell whether the command stopped (plain ssh without shell integration); check with term_read", .{term_id}),
+        .no => try res.textf("terminal {d}: the command did NOT stop; close the terminal with term_close (it kills the session) or open a sibling with term_open", .{term_id}),
+    }
+    if (watch.tracker_abandoned) try res.text("the tracked command never reported completing; its tracker was dropped, so the terminal takes commands again");
+    return res.finish();
 }
 
 fn termWaitExit(arena: std.mem.Allocator, args: std.json.Value, t: *termdrive.Term, term_id: u32) ![]const u8 {
@@ -552,8 +888,9 @@ pub fn runCommandMode(arena: std.mem.Allocator, t: *termdrive.Term, cmd: []const
     // A tracked command may have completed since its timeout: one short
     // drain clears it so the new send is accepted.
     if (t.hasPendingCommand()) _ = t.waitPendingCommand(0);
-    if (t.hasPendingCommand()) {
-        return commandCompletionResult(arena, .{ .state = .running }, false, null, null, "a previously timed-out command is still running; use term_wait_command instead of resending");
+    if (t.hasPendingCommand() or t.hasPendingExec()) {
+        const b = (try busyInfo(arena, t, termIdOf(t))).?;
+        return commandCompletionResult(arena, .{ .state = .running }, false, null, null, b.msg);
     }
     // The token wait spends from the same budget as the completion wait,
     // so the call never outlives timeout_ms.
@@ -567,7 +904,7 @@ pub fn runCommandMode(arena: std.mem.Allocator, t: *termdrive.Term, cmd: []const
     };
     const line = try std.fmt.allocPrint(arena, "{s}\r", .{cmd});
     t.sendText(line) catch return mcp.errRes(arena, .conflict, "send failed (terminal exited?)");
-    t.trackCommand(token);
+    t.trackCommand(token, cmd);
     const result = t.waitCommand(token, @max(0, timeout_ms - (nowMs() - started)));
     return completionReply(arena, t, result, output_only);
 }
@@ -1906,7 +2243,7 @@ test "term_exec result: exec facts structured, exit header + output in the text 
         .completed = true,
         .exit_status = 1,
         .output = @constCast("EXEC-STRUCT\n"),
-    }, null, null);
+    }, null, .{});
     const parsed = try mcp.expectToolResultShape(arena, "term_exec", out);
     const sc = parsed.object.get("structuredContent").?.object;
     try t.expect(sc.get("completed").?.bool);
@@ -1930,7 +2267,7 @@ test "term_exec_wait result: a pending command shows tracker, screen and reason 
         .interactive_hint = true,
         .idle_ms = 900,
         .output = @constCast("Continue? [y/N] "),
-    }, "Continue? [y/N] ", null);
+    }, "Continue? [y/N] ", .{});
     const parsed = try mcp.expectToolResultShape(arena, "term_exec_wait", out);
     const sc = parsed.object.get("structuredContent").?.object;
     try t.expect(sc.get("pending").?.bool);
@@ -1965,7 +2302,7 @@ test "term_exec result: output_file writes the full output and reports it" {
         .completed = true,
         .exit_status = 0,
         .output = @constCast("payload"),
-    }, null, path);
+    }, null, .{ .output_file = path });
     const parsed = try mcp.expectToolResultShape(arena, "term_exec", out);
     const sc = parsed.object.get("structuredContent").?.object;
     try t.expectEqualStrings(path, sc.get("output_file").?.string);
@@ -1976,7 +2313,7 @@ test "term_exec result: output_file writes the full output and reports it" {
         .completed = true,
         .exit_status = 0,
         .output = @constCast("payload"),
-    }, null, "relative.txt");
+    }, null, .{ .output_file = "relative.txt" });
     const rparsed = try mcp.expectToolResultShape(arena, "term_exec", rel);
     try t.expect(rparsed.object.get("structuredContent").?.object.get("output_file") == null);
     try t.expect(std.mem.indexOf(

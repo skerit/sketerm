@@ -380,6 +380,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
         .web_helper_connect => self.handleWebHelperConnect(cl, frame.payload),
         // NOT attach-scoped: the broker keeps the tombstones.
         .tombstone_get => self.handleTombstoneGet(cl, frame.payload),
+        .fg_signal => self.handleFgSignal(cl, frame.payload),
         .rec_stop => {
             const s = cl.attached orelse {
                 cl.queueErr("not attached");

@@ -160,6 +160,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 - `term_close`: Close a headless terminal (kills its shell).
 - `term_exec`: Run one command inside a LIVE interactive shell (including a persistent SSH session from term_open host) and get STRUCTURED results: exact exit_status and the exact output between sentinel markers, independent of shell integration.
 - `term_exec_wait`: Continue waiting for a pending term_exec without resending — always attachable, including after a client-side tool timeout or abort.
+- `term_interrupt`: Stop what a headless terminal is running and say what worked: first the terminal's own interrupt (^C, SIGINT through the tty - it reaches a remote command over ssh too), then, with escalate (default true), SIGTERM and SIGKILL to the terminal's foreground process group (local and sketerm-mux terminals; fg_signal in term_list) or ctrl+backslash (SIGQUIT through the tty) on a plain ssh terminal, where no other signal can reach the remote command.
 - `term_wait_exit` (read-only): Wait until a headless terminal's child PROCESS exits (distinct from output idleness — a silent scp can be running while output is idle, and an exited one can leave a stale progress frame).
 
 ### `files`
