@@ -22,6 +22,7 @@ const xdg = @import("../util/xdg.zig");
 const pathz = @import("../util/pathz.zig");
 const readfile = @import("../util/readfile.zig");
 const atomicwrite = @import("../util/atomicwrite.zig");
+const idgen = @import("../util/ids.zig");
 
 /// The directory under the state dir.
 pub const DIR_NAME = "agents";
@@ -32,8 +33,8 @@ pub const DESCRIPTOR_MAX_BYTES = 4 * 1024 * 1024;
 pub const MAX_NAME = 64;
 /// Random characters after `<app>-` in an id.
 pub const ID_CHARS = 4;
-/// Lowercase Crockford base32: no i, l, o or u to misread.
-const ID_ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz";
+/// The id alphabet (`util/ids.zig`, shared with peer message ids).
+const ID_ALPHABET = idgen.ALPHABET;
 
 /// Everything needed to pick a running agent up again. Fields added
 /// later default so an older descriptor still reads.
@@ -183,10 +184,8 @@ pub fn taken(arena: std.mem.Allocator, index_dir: []const u8, key: []const u8) !
 pub fn mint(arena: std.mem.Allocator, index_dir: ?[]const u8, app: []const u8, inUse: *const fn ([]const u8) bool) ![]const u8 {
     var tries: usize = 0;
     while (tries < 64) : (tries += 1) {
-        var raw: [ID_CHARS]u8 = undefined;
-        if (c.getentropy(&raw, raw.len) != 0) return error.NoEntropy;
         var tail: [ID_CHARS]u8 = undefined;
-        for (raw, &tail) |b, *o| o.* = ID_ALPHABET[b % ID_ALPHABET.len];
+        try idgen.fill(&tail);
         const id = try std.fmt.allocPrint(arena, "{s}-{s}", .{ app, &tail });
         if (inUse(id)) continue;
         if (index_dir) |d| if (try taken(arena, d, id)) continue;

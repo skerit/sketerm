@@ -61,6 +61,68 @@ pub const Attention = enum {
     }
 };
 
+/// How a peer (one MCP client session) is doing, as its own hooks and
+/// statusline report it; never read off its screen.
+pub const PeerState = enum {
+    starting,
+    working,
+    idle,
+    waiting_user,
+    /// The peer reports no presence (no hooks installed); never guessed.
+    unknown,
+    /// Its server is gone (a durable address with no live server).
+    gone,
+
+    /// @return null for `unknown`: there is nothing to rank.
+    pub fn attention(self: PeerState) ?Attention {
+        return switch (self) {
+            .starting, .working => .working,
+            .idle => .idle,
+            .waiting_user => .needs_input,
+            .gone => .lost,
+            .unknown => null,
+        };
+    }
+};
+
+/// What became of one peer message; `peer_send` answers with one and
+/// every later `peer_event` reuses it.
+pub const PeerOutcome = enum {
+    /// Handed to the recipient's live server.
+    delivered,
+    /// Waiting in a durable address's mailbox for its next server.
+    queued,
+    /// Not accepted; `RefuseReason` says why.
+    refused,
+    /// Its time-to-live passed while it waited (expiry IS the bounce).
+    expired,
+};
+
+/// Why a peer message was refused, or (`not_durable_gone`) why a queued
+/// one ended unread.
+pub const RefuseReason = enum {
+    unknown_address,
+    not_durable_gone,
+    too_large,
+    mailbox_full,
+    self,
+    federation_unavailable,
+    name_taken_ambiguous,
+
+    /// The sentence a sender reads.
+    pub fn describe(self: RefuseReason) []const u8 {
+        return switch (self) {
+            .unknown_address => "no peer of that address is known on this host",
+            .not_durable_gone => "that peer's address was not durable and its server is gone",
+            .too_large => "the text is larger than 64 KiB",
+            .mailbox_full => "the recipient's mailbox is full",
+            .self => "a peer cannot message itself",
+            .federation_unavailable => "host/name addresses need federation, which this daemon does not offer",
+            .name_taken_ambiguous => "that name's owner is offline while another live server claims it",
+        };
+    }
+};
+
 pub const State = enum {
     starting,
     working,
@@ -362,6 +424,16 @@ test "attention: every state classified, urgency follows declaration order" {
         try t.expect(!ranks.isSet(a.summaryRank()));
         ranks.set(a.summaryRank());
     }
+}
+
+test "peer vocabulary: every state ranked except unknown, every reason described" {
+    const t = std.testing;
+    try t.expectEqual(@as(?Attention, .needs_input), PeerState.waiting_user.attention());
+    try t.expectEqual(@as(?Attention, .lost), PeerState.gone.attention());
+    try t.expectEqual(@as(?Attention, null), PeerState.unknown.attention());
+    for (std.enums.values(RefuseReason)) |r| try t.expect(r.describe().len > 0);
+    try t.expectEqualStrings("waiting_user", names(PeerState)[3]);
+    try t.expectEqual(@as(usize, 4), names(PeerOutcome).len);
 }
 
 test "a wait outcome never shares a name with an event kind" {

@@ -332,6 +332,7 @@ comptime {
     _ = @import("util/marks.zig");
     _ = @import("util/mounts.zig");
     _ = @import("util/xdg.zig");
+    _ = @import("util/ids.zig");
     _ = @import("util/dirsweep.zig");
     _ = @import("util/ocr.zig");
     _ = @import("util/pathz.zig");
@@ -366,6 +367,7 @@ comptime {
     _ = @import("ipc/agentglance.zig");
     _ = @import("ipc/agentpush.zig");
     _ = @import("ipc/agentindex.zig");
+    _ = @import("ipc/peeraddr.zig");
     _ = @import("util/headers.zig");
     _ = @import("util/percent.zig");
     _ = @import("util/suggest.zig");
