@@ -375,21 +375,43 @@ test "detail is per-request and never sticks" {
 /// to fail as a whole, taking the act's own confirmation with it.
 const TREE_INLINE_CHARS: usize = 32_000;
 
+/// The default inline budget of an action's follow-up delta (web_act,
+/// web_key): an act is answered after every step of a walk, so its
+/// reply has to stay small unless the caller asks for more.
+const ACT_DELTA_CHARS: usize = 8_000;
+
+/// The smallest `max_chars` honoured; below it a reply is all header.
+const MIN_TREE_CHARS: usize = 500;
+
+/// `max_chars`, clamped to [MIN_TREE_CHARS, TREE_INLINE_CHARS].
+fn maxCharsArg(args: std.json.Value, default: usize) usize {
+    const v = mcp.argInt(args, "max_chars") orelse return default;
+    if (v <= 0) return default;
+    return std.math.clamp(@as(usize, @intCast(v)), MIN_TREE_CHARS, TREE_INLINE_CHARS);
+}
+
 /// Emit a tree payload as fact + text section, bounded.
 fn treeSection(res: *mcp.Res, arena: std.mem.Allocator, name: []const u8, text: []const u8) !void {
+    return treeSectionMax(res, arena, name, text, TREE_INLINE_CHARS);
+}
+
+/// `treeSection` with a caller-chosen budget. The base has already
+/// advanced past what is cut, so the note names the reads that restate
+/// it rather than suggesting the same call again.
+fn treeSectionMax(res: *mcp.Res, arena: std.mem.Allocator, name: []const u8, text: []const u8, limit: usize) !void {
     const total_lines = std.mem.count(u8, std.mem.trimEnd(u8, text, "\n"), "\n") + 1;
-    if (text.len <= TREE_INLINE_CHARS) {
+    if (text.len <= limit) {
         try res.fact(name, text);
         try section(res, name, text);
         return;
     }
-    var cut = TREE_INLINE_CHARS;
+    var cut = limit;
     if (std.mem.lastIndexOfScalar(u8, text[0..cut], '\n')) |nl| cut = nl + 1;
     const kept_lines = std.mem.count(u8, text[0..cut], "\n");
     const note = try std.fmt.allocPrint(
         arena,
-        "... truncated: {d} of {d} lines shown ({d} chars total). Narrow it: web_snapshot scope:<id> for one subtree, web_query subtree/find_text, or web_act scope:<id> to bound the next act's delta.\n",
-        .{ kept_lines, total_lines, text.len },
+        "... truncated: {d} of {d} lines shown ({d} chars total; max_chars raises the budget up to {d}). The rest counts as seen: restate it with web_snapshot scope:<id> (one subtree) or mode:\"full\", or search it with web_query.\n",
+        .{ kept_lines, total_lines, text.len, TREE_INLINE_CHARS },
     );
     const bounded = try std.mem.concat(arena, u8, &.{ text[0..cut], note });
     try res.fact(name, bounded);
@@ -3101,6 +3123,7 @@ fn snapshotResult(
     s: Snap,
     detail: ?u32,
     unchanged: bool,
+    max_chars: usize,
 ) ![]const u8 {
     var res = mcp.Res.init(arena);
     try head(&res, arena, mode, v);
@@ -3119,7 +3142,7 @@ fn snapshotResult(
         try res.fact("unchanged", true);
         try res.text("nothing changed since your last snapshot; pass mode full for the whole tree");
     }
-    try treeSection(&res, arena, "snapshot", s.tree);
+    try treeSectionMax(&res, arena, "snapshot", s.tree, max_chars);
     try res.text(TRUST_LINE);
     return res.finish();
 }
@@ -3135,12 +3158,58 @@ const ActAfter = struct {
     note: ?[]const u8 = null,
     /// The subtree the follow-up was bounded to (`scope` on the call).
     scope: ?u32 = null,
+    /// What became of that subtree's root, read off the helper's scope
+    /// line; null with no scope or a helper that writes none.
+    scope_line: ?semantic.ScopeLine = null,
+    follow: FollowUp = .{},
 };
+
+/// What an action's follow-up returns: `snapshot` and `max_chars` on
+/// web_act/web_key, read BEFORE the action so a bad value refuses the
+/// call instead of acting first.
+const FollowUp = struct {
+    what: enum { none, delta, full } = .delta,
+    max_chars: usize = ACT_DELTA_CHARS,
+};
+
+fn followUpArgs(args: std.json.Value) ?FollowUp {
+    var f = FollowUp{ .max_chars = maxCharsArg(args, ACT_DELTA_CHARS) };
+    if (mcp.argStr(args, "snapshot")) |s| {
+        f.what = std.meta.stringToEnum(@TypeOf(f.what), s) orelse return null;
+    }
+    return f;
+}
+
+const FOLLOW_UP_REFUSAL = "'snapshot' is none (no tree: the act's echo and navigation facts only), delta (the default: what changed, bounded by 'scope' when given) or full (the whole tree, or the whole scope subtree)";
 
 /// `scope` on web_act/web_key: bound the follow-up tree to one subtree.
 fn scopeArg(args: std.json.Value) ?u32 {
     const s = boundedU32(mcp.argInt(args, "scope") orelse return null) orelse return null;
     return if (s > 0) s else null;
+}
+
+/// Whether a scoped answer's header line names `root` as its scope.
+fn headerNamesScope(payload: []const u8, root: u32) bool {
+    const nl = std.mem.indexOfScalar(u8, payload, '\n') orelse payload.len;
+    var buf: [32]u8 = undefined;
+    const want = std.fmt.bufPrint(&buf, "scope [{d}]", .{root}) catch return false;
+    return std.mem.indexOf(u8, payload[0..nl], want) != null;
+}
+
+/// The scope line a scoped answer carries as its second line, if any.
+fn scopeLineOf(payload: []const u8, root: u32) ?semantic.ScopeLine {
+    var it = std.mem.splitScalar(u8, payload, '\n');
+    _ = it.next() orelse return null;
+    return semantic.parseScopeLine(it.next() orelse return null, root);
+}
+
+test "scopeLineOf reads only the line after the header" {
+    try std.testing.expectEqual(
+        semantic.ScopeLine{ .state = .ancestor, .sid = 12 },
+        scopeLineOf("delta rev 3->4\nscope [1478] gone, ancestor [12]; it was alertdialog \"x\"\n- [1478] alertdialog\n", 1478).?,
+    );
+    try std.testing.expect(scopeLineOf("delta scope [4] rev 9\n+ [7] cell \"scope [4] gone\"\n", 4) == null);
+    try std.testing.expect(scopeLineOf("scope [4] gone", 4) == null);
 }
 
 /// What CHANGED after an input: give the caller the delta rather than
@@ -3152,8 +3221,8 @@ fn scopeArg(args: std.json.Value) ?u32 {
 /// gets a longer grace for the new route's content to render, plus an
 /// explicit warning it may still be arriving. Shared by web_act and
 /// web_key - a keystroke can navigate exactly like a click.
-fn settleAndDelta(drv: Driver, arena: std.mem.Allocator, view: View, args: std.json.Value) !ActAfter {
-    var after = ActAfter{ .scope = scopeArg(args) };
+fn settleAndDelta(drv: Driver, arena: std.mem.Allocator, view: View, args: std.json.Value, follow: FollowUp) !ActAfter {
+    var after = ActAfter{ .scope = scopeArg(args), .follow = follow };
     const pre_url = view.url;
     const pre_seq = view.load_seq;
     var nav_hard = false;
@@ -3206,12 +3275,15 @@ fn settleAndDelta(drv: Driver, arena: std.mem.Allocator, view: View, args: std.j
         drv.sleep(900);
         after.note = "the url changed without a page load (client-side route); the delta below is what had rendered ~1s after the act - if it looks incomplete, the route's data was still arriving: call web_snapshot again";
     }
-    // A scoped follow-up is that subtree in full (advancing the base
-    // for it only), so a click on a row menu can never return more
-    // than the menu.
-    switch (try runOp(drv, arena, view.pane, .{
+    // A scoped follow-up is what changed under that subtree (advancing
+    // the base for it only), so a click on a row menu can never return
+    // more than the menu; a scope the act removed is answered with
+    // where it went, never by widening to the whole tree.
+    if (follow.what == .none) {
+        after.delta_kind = "none";
+    } else switch (try runOp(drv, arena, view.pane, .{
         .op = "snapshot",
-        .mode = "auto",
+        .mode = if (follow.what == .full) "full" else "auto",
         .detail = 1,
         .node = after.scope,
     }, 5000)) {
@@ -3222,6 +3294,7 @@ fn settleAndDelta(drv: Driver, arena: std.mem.Allocator, view: View, args: std.j
             } else {
                 after.delta_kind = d.snapshot_kind;
                 after.delta = d.payload;
+                if (after.scope) |sc| after.scope_line = scopeLineOf(d.payload, sc);
             }
         },
     }
@@ -3285,10 +3358,22 @@ fn renderAfter(res: *mcp.Res, arena: std.mem.Allocator, after: ActAfter) !void {
         try res.fact("delta_error", e);
         try res.textf("delta_error: {s}", .{e});
     }
+    if (after.follow.what == .none) try res.fact("delta_kind", "none");
     if (after.delta) |d| {
         try res.fact("delta_kind", after.delta_kind orelse "");
-        if (after.scope) |sc| try res.fact("scope", sc);
-        try treeSection(res, arena, "delta", d);
+        if (after.scope) |sc| {
+            try res.fact("scope", sc);
+            // No scope line means a live root only when the header names
+            // it: an older helper widened a vanished scope to the whole
+            // page silently, and that must not read as "live".
+            const sl: ?semantic.ScopeLine = after.scope_line orelse
+                if (headerNamesScope(d, sc)) .{ .state = .live, .sid = sc } else null;
+            if (sl) |s| {
+                try res.fact("scope_state", @tagName(s.state));
+                if (s.state == .replaced or s.state == .ancestor) try res.fact("scope_resolved", s.sid);
+            }
+        }
+        try treeSectionMax(res, arena, "delta", d, after.follow.max_chars);
         try res.text(TRUST_LINE);
     }
 }
@@ -4744,16 +4829,18 @@ pub fn webTool(
         // `history: true` is sugar for mode "history" — the per-revision
         // replay of everything since the last snapshot, for debugging
         // pages whose changes appear and vanish between calls.
-        const mode = if (mcp.argBool(args, "history"))
-            "history"
-        else
-            mcp.argStr(args, "mode") orelse "auto";
         const detail: u32 = detailFor(args);
         const scope: ?u32 = switch (try argU32(arena, args, "scope")) {
             .absent => null,
             .err => |f| return failRes(arena, f),
             .value => |v| if (v > 0) v else null,
         };
+        // A scoped read is the subtree IN FULL unless the caller asks
+        // for its delta: "auto" on a scope answers what changed there.
+        const mode = if (mcp.argBool(args, "history"))
+            "history"
+        else
+            mcp.argStr(args, "mode") orelse if (scope != null) "full" else "auto";
         switch (try runOp(drv, arena, view.pane, .{
             .op = "snapshot",
             .mode = mode,
@@ -4767,6 +4854,23 @@ pub fn webTool(
                     .timeout,
                     "the page did not answer a snapshot in time (a wedged renderer, or a document still parsing)",
                 );
+                // An explicit scoped read never widens itself: a root that
+                // left the page is an error naming where to look instead.
+                if (scope) |sc| if (std.mem.eql(u8, r.snapshot_kind, "full")) {
+                    if (scopeLineOf(r.payload, sc)) |sl| switch (sl.state) {
+                        .live, .replaced => {},
+                        .ancestor => return mcp.errRes(arena, .not_found, try std.fmt.allocPrint(
+                            arena,
+                            "node [{d}] is no longer on the page (the page removed or re-rendered it since you saw it); its nearest surviving ancestor is [{d}]: snapshot scope:{d}, or snapshot without scope for what changed",
+                            .{ sc, sl.sid, sl.sid },
+                        )),
+                        .gone => return mcp.errRes(arena, .not_found, try std.fmt.allocPrint(
+                            arena,
+                            "node [{d}] is not on the page and none of its ancestors survived; snapshot without scope for what changed",
+                            .{sc},
+                        )),
+                    };
+                };
                 return snapshotResult(
                     arena,
                     drv.mode(),
@@ -4776,6 +4880,7 @@ pub fn webTool(
                     if (mcp.argInt(args, "detail") != null) detail else null,
                     std.mem.eql(u8, r.snapshot_kind, "delta") and
                         std.mem.count(u8, std.mem.trimEnd(u8, r.payload, "\n"), "\n") == 0,
+                    maxCharsArg(args, TREE_INLINE_CHARS),
                 );
             },
         }
@@ -4783,6 +4888,8 @@ pub fn webTool(
 
     if (eql(u8, name, "web_act")) {
         if (try policyGate(arena, view)) |f| return failRes(arena, f);
+        const follow = followUpArgs(args) orelse
+            return mcp.errRes(arena, .invalid_args, FOLLOW_UP_REFUSAL);
         var id: ?i64 = switch (try argU32(arena, args, "id")) {
             .absent => null,
             .err => |f| return failRes(arena, f),
@@ -4945,7 +5052,7 @@ pub fn webTool(
                 else
                     "the page refused the action");
 
-                const after = try settleAndDelta(drv, arena, view, args);
+                const after = try settleAndDelta(drv, arena, view, args, follow);
                 return actResult(arena, drv.mode(), view, id_v, action, r.payload, r.motion_ms, after);
             },
         }
@@ -6765,6 +6872,8 @@ fn keyTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: Vi
     if (try policyGate(arena, view)) |f| return failRes(arena, f);
     const keys = mcp.argStr(args, "keys") orelse
         return mcp.errRes(arena, .invalid_args, "web_key needs 'keys': space-separated chords, e.g. \"Tab Tab Enter\", \"Escape\", \"ctrl+a\"");
+    const follow = followUpArgs(args) orelse
+        return mcp.errRes(arena, .invalid_args, FOLLOW_UP_REFUSAL);
     const e = switch (drv) {
         .gui => return mcp.errRes(arena, .unavailable, GUI_ONLY_HEADLESS),
         .headless => |e| e,
@@ -6782,7 +6891,7 @@ fn keyTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: Vi
         // A human-ish gap so pages polling between events see each key.
         drv.sleep(30);
     }
-    const after = try settleAndDelta(drv, arena, view, args);
+    const after = try settleAndDelta(drv, arena, view, args, follow);
     var res = mcp.Res.init(arena);
     try head(&res, arena, drv.mode(), view);
     try res.fact("keys", keys);
@@ -8407,7 +8516,7 @@ test "web_snapshot: kind/document/revision structured, unchanged said once" {
         .document = 2,
         .revision = 9,
         .tree = "[1] document",
-    }, null, false);
+    }, null, false, TREE_INLINE_CHARS);
     const fsc = (try mcp.expectToolResultShape(arena, "web_snapshot", full)).object.get("structuredContent").?.object;
     try t.expectEqualStrings("full", fsc.get("kind").?.string);
     try t.expectEqual(@as(i64, 2), fsc.get("document").?.integer);
@@ -8419,7 +8528,7 @@ test "web_snapshot: kind/document/revision structured, unchanged said once" {
         .document = 2,
         .revision = 10,
         .tree = "rev 10",
-    }, 2, true);
+    }, 2, true, TREE_INLINE_CHARS);
     const dp = try mcp.expectToolResultShape(arena, "web_snapshot", delta);
     const dsc = dp.object.get("structuredContent").?.object;
     try t.expect(dsc.get("unchanged").?.bool);
@@ -10505,7 +10614,7 @@ test "an exhausted view refuses new traffic while its reads stay loud" {
     try t.expect((try policyGate(arena, EXAMPLE)) == null);
 
     // A read result still answers, carrying the facts and one line.
-    const shot = try snapshotResult(arena, .headless, v, "full", .{ .document = 1, .revision = 2, .tree = "[1] document" }, null, false);
+    const shot = try snapshotResult(arena, .headless, v, "full", .{ .document = 1, .revision = 2, .tree = "[1] document" }, null, false, TREE_INLINE_CHARS);
     const parsed = try mcp.expectToolResultShape(arena, "web_snapshot", shot);
     const sc = parsed.object.get("structuredContent").?.object;
     try t.expect(sc.get("policy_exhausted").?.bool);

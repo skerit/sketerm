@@ -177,7 +177,12 @@ pub fn autoTake(self: *WebFace, token: u32) ?AutoResult {
 }
 
 pub fn autoSnapshot(self: *WebFace, mode: u8, detail: u8, scope: u32) ?u32 {
-    const token = self.autoBegin(.snapshot, mode == @intFromEnum(proto.SnapMode.full) or scope != 0) orelse return null;
+    // A scoped `auto` request is answered with a delta of that subtree
+    // (`semantic.View.consumeScopedDelta`); only a helper that cannot
+    // correlate replies still needs the guard against a stray delta.
+    const want_full = mode == @intFromEnum(proto.SnapMode.full) or
+        (scope != 0 and !self.cl.has(.semantic_request_ids));
+    const token = self.autoBegin(.snapshot, want_full) orelse return null;
     self.postSemantic(token, proto.SemSnapshotReq{
         .view = self.view,
         .mode = mode,

@@ -2233,6 +2233,27 @@ only the trainer records; live use never is.
     `web_act`/`web_key` take `scope` for the follow-up delta and
     `web_act` takes `within` to bound a name lookup; both exist so a
     click on a row menu can never return more than the menu.
+  - **A scope never widens to the whole page.** `consumeScoped` used to
+    answer an unknown root with `consume(.full)`, and an act scoped to
+    the dialog it closed (or to a region the server re-rendered) came
+    back as the entire document: measured 20-25 KB per act, on every
+    one of 770 scoped acts in one field session, the useful toast as
+    the last line. A lost root is now resolved (`resolveScope`): a
+    UNIQUE never-seen node with the same role and non-empty name is
+    its replacement, else the nearest live ancestor on the BASE's
+    parent chain, else gone; a scope line (`SCOPE_*_FMT`, read back
+    only by `parseScopeLine`, whose fixed prefix precedes any page
+    text) says which. `scope + SnapMode.auto` is the act follow-up,
+    `consumeScopedDelta`: a coalesced delta bounded to the subtree
+    (`renderCoalesced(bound)`, full subtree only when not shorter), the
+    page's own delta when the ancestor is a document root. An explicit
+    `scope + full` (web_snapshot) shows a replacement but otherwise
+    answers the scope line alone and consumes nothing. Every coalesced
+    delta, scoped or not, leads with one `live:` line per outermost
+    `LIVE_ROLES` region whose subtree changed and still has text
+    (`writeLiveRegions`), and a bounded commit advances those regions
+    too, so a toast is read once. The GUI face accepts a delta reply to
+    a scoped `auto` request (`autoSnapshot`'s `want_full`).
   - **`set_value`'s commit carries `want`, the typed text.** The keys
     are queued trusted input and the commit is a renderer IPC, so the
     commit script can run before the keys land; `commitValue` waits

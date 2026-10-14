@@ -4127,8 +4127,13 @@ pub const Engine = struct {
         const request = if (self.has(.semantic_request_ids)) self.nextSemanticRequest() else 0;
         v.waiting[ki] = true;
         v.waiting_request[ki] = request;
+        // A scoped `auto` request is answered with a delta of that subtree
+        // (`semantic.View.consumeScopedDelta`); only a helper that cannot
+        // correlate replies still needs the guard against a stray delta.
+        // Mirrors `webface.autoSnapshot`.
         if (req.kind == .snapshot)
-            v.want_full = req.mode == @intFromEnum(proto.SnapMode.full) or req.scope != 0;
+            v.want_full = req.mode == @intFromEnum(proto.SnapMode.full) or
+                (req.scope != 0 and !self.has(.semantic_request_ids));
         var timed_out = false;
         defer self.finishWait(view_id, ki, request, timed_out);
 

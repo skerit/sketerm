@@ -182,6 +182,150 @@ const BaseNode = struct {
 /// oldest are dropped; past this a restored node reads as added.
 const ABSENT_CAP = 20_000;
 
+/// How a live node compares with the client's copy of it.
+const Cls = enum { add, same, mod, restored, restored_mod };
+
+/// A subtree a coalesced delta is bounded to, as the live index range
+/// of `root_sid` (`View.subtreeOf`).
+const Bound = struct { root_sid: u32, lo: usize, hi: usize };
+
+/// Where a scope id stands when a scoped answer is rendered; the scope
+/// line (`writeScopeLine`) names it, and `mcp_web.zig` parses it back.
+pub const ScopeState = enum { live, replaced, ancestor, gone };
+
+/// A scoped follow-up: `sid` is the subtree the text describes (the
+/// root, its replacement or its ancestor), 0 for the whole page.
+pub const ScopedUpdate = struct {
+    kind: Kind,
+    state: ScopeState,
+    sid: u32,
+    text: []u8,
+};
+
+/// Roles whose text is an announcement (ARIA live regions): what
+/// heads every delta when it changed, wherever it sits on the page.
+pub const LIVE_ROLES = [_][]const u8{ "alert", "status", "log" };
+
+/// Bytes of one live region's text on its `live:` line.
+const LIVE_TEXT_MAX = 300;
+
+pub fn isLiveRole(role: []const u8) bool {
+    for (LIVE_ROLES) |r| {
+        if (std.mem.eql(u8, r, role)) return true;
+    }
+    return false;
+}
+
+/// A live region's text: the names in its subtree, in document order,
+/// joined by " / " and skipping one its predecessors already contain
+/// (a text role's name IS its content, so a parent repeats its
+/// children). Cut on a UTF-8 boundary with "..." when it overflows.
+fn liveText(buf: *[LIVE_TEXT_MAX]u8, nodes: []const Node) []const u8 {
+    const ellipsis = "...";
+    const cap = buf.len - ellipsis.len;
+    var len: usize = 0;
+    for (nodes) |nd| {
+        if (nd.name.len == 0 or std.mem.indexOf(u8, buf[0..len], nd.name) != null) continue;
+        const sep: []const u8 = if (len == 0) "" else " / ";
+        for ([_][]const u8{ sep, nd.name }) |part| {
+            if (len + part.len <= cap) {
+                @memcpy(buf[len..][0..part.len], part);
+                len += part.len;
+                continue;
+            }
+            var keep = cap - len;
+            while (keep > 0 and (part[keep] & 0xC0) == 0x80) keep -= 1;
+            @memcpy(buf[len..][0..keep], part[0..keep]);
+            len += keep;
+            @memcpy(buf[len..][0..ellipsis.len], ellipsis);
+            return buf[0 .. len + ellipsis.len];
+        }
+    }
+    return buf[0..len];
+}
+
+/// The machine prefixes of a scope line; `mcp_web.zig` parses exactly
+/// these (anything after them is page text and never read back).
+pub const SCOPE_REPLACED_FMT = "scope [{d}] replaced by [{d}]";
+pub const SCOPE_ANCESTOR_FMT = "scope [{d}] gone, ancestor [{d}]";
+pub const SCOPE_GONE_FMT = "scope [{d}] gone";
+
+/// The second line of a scoped answer whose root did not survive: what
+/// happened to it, what the client last saw there and what follows.
+/// Nothing for a live root. `delta`: the answer goes on to show what
+/// changed (an action's follow-up) rather than nothing (an explicit
+/// scoped snapshot, which never widens itself).
+fn writeScopeLine(w: *std.Io.Writer, root_sid: u32, res: View.Resolved, delta: bool) !void {
+    switch (res.state) {
+        .live => return,
+        .replaced => try w.print(SCOPE_REPLACED_FMT, .{ root_sid, res.sid }),
+        .ancestor => try w.print(SCOPE_ANCESTOR_FMT, .{ root_sid, res.sid }),
+        .gone => try w.print(SCOPE_GONE_FMT, .{root_sid}),
+    }
+    if (res.was_role.len != 0) {
+        try w.print("; it was {s}", .{res.was_role});
+        if (res.was_name.len != 0) try w.print(" \"{s}\"", .{res.was_name});
+    }
+    switch (res.state) {
+        .live => unreachable,
+        .replaced => try w.writeAll("; showing the replacement\n"),
+        .ancestor => if (delta)
+            try w.writeAll("; showing what changed under the ancestor\n")
+        else
+            try w.print("; nothing shown: snapshot scope [{d}] or the whole page\n", .{res.sid}),
+        .gone => try w.writeAll(if (delta)
+            "; showing what changed on the page\n"
+        else
+            "; nothing shown: snapshot the whole page\n"),
+    }
+}
+
+pub const ScopeLine = struct { state: ScopeState, sid: u32 };
+
+/// Read a scope line back: what became of `root_sid` and the node the
+/// answer shows (0 when gone). Null when `line` is not a scope line
+/// about that root. Only the fixed prefix is read; page text follows.
+pub fn parseScopeLine(line: []const u8, root_sid: u32) ?ScopeLine {
+    var buf: [32]u8 = undefined;
+    const head = std.fmt.bufPrint(&buf, "scope [{d}] ", .{root_sid}) catch return null;
+    if (!std.mem.startsWith(u8, line, head)) return null;
+    const rest = line[head.len..];
+    const Prefix = struct { text: []const u8, state: ScopeState };
+    for ([_]Prefix{
+        .{ .text = "replaced by [", .state = .replaced },
+        .{ .text = "gone, ancestor [", .state = .ancestor },
+    }) |p| {
+        if (!std.mem.startsWith(u8, rest, p.text)) continue;
+        const tail = rest[p.text.len..];
+        const end = std.mem.indexOfScalar(u8, tail, ']') orelse return null;
+        const sid = std.fmt.parseInt(u32, tail[0..end], 10) catch return null;
+        return .{ .state = p.state, .sid = sid };
+    }
+    if (std.mem.startsWith(u8, rest, "gone")) return .{ .state = .gone, .sid = 0 };
+    return null;
+}
+
+test "parseScopeLine reads back every scope line format" {
+    var buf: [96]u8 = undefined;
+    const rep = try std.fmt.bufPrint(&buf, SCOPE_REPLACED_FMT ++ "; it was region \"x ] y\"", .{ 4, 312 });
+    try std.testing.expectEqual(ScopeLine{ .state = .replaced, .sid = 312 }, parseScopeLine(rep, 4).?);
+    const anc = try std.fmt.bufPrint(&buf, SCOPE_ANCESTOR_FMT, .{ 1478, 12 });
+    try std.testing.expectEqual(ScopeLine{ .state = .ancestor, .sid = 12 }, parseScopeLine(anc, 1478).?);
+    const gone = try std.fmt.bufPrint(&buf, SCOPE_GONE_FMT ++ "; showing", .{9});
+    try std.testing.expectEqual(ScopeLine{ .state = .gone, .sid = 0 }, parseScopeLine(gone, 9).?);
+    // Another root's line, or a page's text, is not a scope line.
+    try std.testing.expect(parseScopeLine(anc, 147) == null);
+    try std.testing.expect(parseScopeLine("[5] cell \"scope [4] gone\"", 4) == null);
+}
+
+/// `text` with the delta-flavoured scope line after its header line.
+fn spliceScopeLine(w: *std.Io.Writer, text: []const u8, root_sid: u32, res: View.Resolved) !void {
+    const nl = if (std.mem.indexOfScalar(u8, text, '\n')) |i| i + 1 else text.len;
+    try w.writeAll(text[0..nl]);
+    try writeScopeLine(w, root_sid, res, true);
+    try w.writeAll(text[nl..]);
+}
+
 /// Parse a walk emitted by the injected script.
 pub fn parseTree(gpa: std.mem.Allocator, json: []const u8) !std.json.Parsed(InTree) {
     return std.json.parseFromSlice(InTree, gpa, json, .{ .ignore_unknown_fields = true });
@@ -548,7 +692,8 @@ pub const View = struct {
                     changes = 0;
                 },
                 else => {
-                    const co = try self.renderCoalesced();
+                    const co = try self.renderCoalesced(null);
+                    self.gpa.free(co.live);
                     changes = co.changes;
                     carried = co.carried;
                     if (!co.full) {
@@ -653,55 +798,195 @@ pub const View = struct {
     /// A scoped snapshot: the subtree under `root_sid` rendered in
     /// full, and the base advanced for THAT subtree only — the caller
     /// saw those nodes, not the rest of the page, so a later delta
-    /// still reports everything outside it. Unknown root: the whole
-    /// tree, consumed.
+    /// still reports everything outside it. A root that left the tree
+    /// is resolved (`resolveScope`): a unique replacement is rendered
+    /// instead, anything else answers the header and the scope line
+    /// only and consumes nothing — never the whole page.
     pub fn consumeScoped(self: *View, root_sid: u32) ![]u8 {
-        const root = self.findSid(root_sid) orelse {
-            const up = try self.consume(.full);
-            return up.text;
-        };
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
+        const res = try self.resolveScope(arena, root_sid);
         var out: std.Io.Writer.Allocating = .init(self.gpa);
         defer out.deinit();
         const w = &out.writer;
-        try w.print("doc {d} rev {d} url {s} scope [{d}]\n", .{ self.doc_gen, self.rev, self.url, root_sid });
-        var in_scope = std.AutoHashMap(u32, void).init(arena);
-        for (self.nodes.items) |nd| {
-            if (nd.sid != root_sid and !self.descends(nd, root_sid)) continue;
-            try in_scope.put(nd.sid, {});
-            try w.splatByteAll(' ', @as(usize, nd.depth -| root.depth) * 2);
-            try writeNodeLine(w, nd);
-            try w.writeByte('\n');
-        }
-        // Base nodes that sat under the root (by the base's own parent
-        // chain) and are no longer live in the subtree are absent now.
-        var base_by_sid = try self.baseIndex(arena);
-        for (self.base.items) |*b| {
-            if (!b.present or in_scope.contains(b.sid)) continue;
-            var cur = b.parent_sid;
-            var guard: usize = 0;
-            while (cur != 0 and guard < 512) : (guard += 1) {
-                if (cur == root_sid) {
-                    b.present = false;
-                    break;
-                }
-                const bi = base_by_sid.get(cur) orelse break;
-                cur = self.base.items[bi].parent_sid;
-            }
-        }
-        for (self.nodes.items) |nd| {
-            if (in_scope.contains(nd.sid)) try self.upsertBase(&base_by_sid, nd);
-        }
+        const shown = if (res.state == .live or res.state == .replaced) res.sid else root_sid;
+        try w.print("doc {d} rev {d} url {s} scope [{d}]\n", .{ self.doc_gen, self.rev, self.url, shown });
+        try writeScopeLine(w, root_sid, res, false);
+        if (res.state != .live and res.state != .replaced) return self.gpa.dupe(u8, out.written());
+
+        const b = self.subtreeOf(res.sid).?;
+        try self.writeSubtree(w, b);
+        try self.commitSubtree(b, &.{});
+        if (res.state == .replaced) try self.markAbsentUnder(root_sid);
         // `base_ok` is left alone: a first-ever consume that is scoped
         // has not shown the rest of the page, and the next unscoped
         // snapshot restates it in full through that gate.
         return self.gpa.dupe(u8, out.written());
     }
 
-    const Coalesced = struct { text: []u8, changes: usize, carried: usize, full: bool };
+    /// The scoped follow-up of an action: what changed under `root_sid`
+    /// since the caller last saw it, as a coalesced delta (or the
+    /// subtree in full when the delta would not be shorter), headed by
+    /// every live region (`LIVE_ROLES`) that changed ANYWHERE on the
+    /// page — a toast outside the scope is usually the action's answer.
+    /// A root that left the tree is resolved rather than dropped: a
+    /// unique replacement is diffed instead, else the nearest surviving
+    /// ancestor, else (or when that is the document) the whole page's
+    /// ordinary delta. The scope line says which.
+    pub fn consumeScopedDelta(self: *View, root_sid: u32) !ScopedUpdate {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const res = try self.resolveScope(arena, root_sid);
+        const bound: ?Bound = if (res.sid != 0) self.subtreeOf(res.sid) else null;
+        // An ancestor that is a document root bounds nothing: the page's
+        // own delta handles a document change, which a bounded one cannot.
+        const whole = bound == null or (res.state == .ancestor and self.nodes.items[bound.?.lo].depth == 0);
+        var out: std.Io.Writer.Allocating = .init(self.gpa);
+        defer out.deinit();
+        if (whole) {
+            const up = try self.consume(.auto);
+            defer self.gpa.free(up.text);
+            try spliceScopeLine(&out.writer, up.text, root_sid, res);
+            return .{ .kind = up.kind, .state = res.state, .sid = res.sid, .text = try self.gpa.dupe(u8, out.written()) };
+        }
+        const co = try self.renderCoalesced(bound.?);
+        defer self.gpa.free(co.live);
+        defer self.gpa.free(co.text);
+        try spliceScopeLine(&out.writer, co.text, root_sid, res);
+        const text = try self.gpa.dupe(u8, out.written());
+        errdefer self.gpa.free(text);
+        try self.commitSubtree(bound.?, co.live);
+        if (res.state == .replaced) try self.markAbsentUnder(root_sid);
+        return .{ .kind = if (co.full) .full else .delta, .state = res.state, .sid = res.sid, .text = text };
+    }
+
+    const Resolved = struct {
+        state: ScopeState,
+        /// The node the answer is about: the root itself, its
+        /// replacement or its ancestor; 0 when nothing survived.
+        sid: u32,
+        /// What the client last saw at the lost root, when it saw it.
+        was_role: []const u8 = "",
+        was_name: []const u8 = "",
+    };
+
+    /// Where a scope id stands in the live tree. A lost root's
+    /// REPLACEMENT is a live node the client has never seen with the
+    /// same role and non-empty name, and only a unique one counts — a
+    /// server re-render of a region mints fresh ids for identical-role
+    /// content, and two candidates would be a guess.
+    fn resolveScope(self: *const View, arena: std.mem.Allocator, root_sid: u32) !Resolved {
+        if (self.findSid(root_sid) != null) return .{ .state = .live, .sid = root_sid };
+        const base_by_sid = try self.baseIndex(arena);
+        const bi = base_by_sid.get(root_sid) orelse return .{ .state = .gone, .sid = 0 };
+        const was = self.base.items[bi];
+        var res = Resolved{ .state = .gone, .sid = 0, .was_role = was.role, .was_name = was.name };
+        if (was.name.len != 0) {
+            var match: u32 = 0;
+            var matches: usize = 0;
+            for (self.nodes.items) |nd| {
+                if (!std.mem.eql(u8, nd.role, was.role) or !std.mem.eql(u8, nd.name, was.name)) continue;
+                if (base_by_sid.get(nd.sid)) |j| {
+                    if (self.base.items[j].present) continue;
+                }
+                match = nd.sid;
+                matches += 1;
+            }
+            if (matches == 1) {
+                res.state = .replaced;
+                res.sid = match;
+                return res;
+            }
+        }
+        var cur = was.parent_sid;
+        var guard: usize = 0;
+        while (cur != 0 and guard < 512) : (guard += 1) {
+            if (self.findSid(cur) != null) {
+                res.state = .ancestor;
+                res.sid = cur;
+                return res;
+            }
+            const pi = base_by_sid.get(cur) orelse break;
+            cur = self.base.items[pi].parent_sid;
+        }
+        return res;
+    }
+
+    /// The live index range of `sid`'s subtree: the walk is a preorder,
+    /// so a subtree is the node plus every following deeper node.
+    fn subtreeOf(self: *const View, sid: u32) ?Bound {
+        for (self.nodes.items, 0..) |nd, i| {
+            if (nd.sid != sid) continue;
+            var hi = i + 1;
+            while (hi < self.nodes.items.len and self.nodes.items[hi].depth > nd.depth) hi += 1;
+            return .{ .root_sid = sid, .lo = i, .hi = hi };
+        }
+        return null;
+    }
+
+    fn writeSubtree(self: *const View, w: *std.Io.Writer, b: Bound) !void {
+        const top = self.nodes.items[b.lo].depth;
+        for (self.nodes.items[b.lo..b.hi]) |nd| {
+            try w.splatByteAll(' ', @as(usize, nd.depth -| top) * 2);
+            try writeNodeLine(w, nd);
+            try w.writeByte('\n');
+        }
+    }
+
+    /// Whether a base entry sat under `root_sid` by the base's own
+    /// parent chain (the client's view of the tree, not the live one).
+    fn baseUnder(self: *const View, index: *const std.AutoHashMap(u32, usize), b: BaseNode, root_sid: u32) bool {
+        var cur = b.parent_sid;
+        var guard: usize = 0;
+        while (cur != 0 and guard < 512) : (guard += 1) {
+            if (cur == root_sid) return true;
+            const bi = index.get(cur) orelse return false;
+            cur = self.base.items[bi].parent_sid;
+        }
+        return false;
+    }
+
+    /// Advance the base for one subtree, plus the live regions a delta
+    /// listed outside it: the client saw those and nothing else.
+    fn commitSubtree(self: *View, b: Bound, live: []const u32) !void {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var in_scope = std.AutoHashMap(u32, void).init(arena);
+        for (self.nodes.items[b.lo..b.hi]) |nd| try in_scope.put(nd.sid, {});
+        var base_by_sid = try self.baseIndex(arena);
+        // Base nodes that sat under the root and are no longer live in
+        // the subtree are absent now.
+        for (self.base.items) |*bn| {
+            if (!bn.present or in_scope.contains(bn.sid)) continue;
+            if (self.baseUnder(&base_by_sid, bn.*, b.root_sid)) bn.present = false;
+        }
+        for (self.nodes.items[b.lo..b.hi]) |nd| try self.upsertBase(&base_by_sid, nd);
+        for (live) |sid| {
+            const lb = self.subtreeOf(sid) orelse continue;
+            if (lb.lo >= b.lo and lb.hi <= b.hi) continue;
+            for (self.nodes.items[lb.lo..lb.hi]) |nd| try self.upsertBase(&base_by_sid, nd);
+        }
+    }
+
+    /// The client was told `root_sid` is gone: its whole base subtree
+    /// is absent, so the next delta does not report it again.
+    fn markAbsentUnder(self: *View, root_sid: u32) !void {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const index = try self.baseIndex(arena_state.allocator());
+        for (self.base.items) |*bn| {
+            if (bn.sid == root_sid or self.baseUnder(&index, bn.*, root_sid)) bn.present = false;
+        }
+    }
+
+    /// `live` holds the live-region roots the delta listed (gpa-owned),
+    /// so a bounded commit can advance them too.
+    const Coalesced = struct { text: []u8, changes: usize, carried: usize, full: bool, live: []u32 };
 
     /// Whether the client's copy of a node still describes the live one.
     fn sameContent(b: BaseNode, nd: Node) bool {
@@ -720,7 +1005,12 @@ pub const View = struct {
     /// Removals are folded to subtree roots with a descendant count,
     /// and a superseded document's nodes to a single count — the
     /// client is never handed a page it has already left.
-    fn renderCoalesced(self: *View) !Coalesced {
+    ///
+    /// With a `bound` only that subtree is diffed (removals by the
+    /// base's own parent chain), and the full fallback is the subtree.
+    /// Either way, once the client holds a base, every live region that
+    /// changed anywhere on the page heads the text as a `live:` line.
+    fn renderCoalesced(self: *View, bound: ?Bound) !Coalesced {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -730,8 +1020,9 @@ pub const View = struct {
         var live_by_sid = std.AutoHashMap(u32, usize).init(arena);
         for (self.nodes.items, 0..) |nd, i| try live_by_sid.put(nd.sid, i);
 
-        const Cls = enum { add, same, mod, restored, restored_mod };
         const n = self.nodes.items.len;
+        const lo = if (bound) |b| b.lo else 0;
+        const hi = if (bound) |b| b.hi else n;
         const cls = try arena.alloc(Cls, n);
         var adds: usize = 0;
         var mods: usize = 0;
@@ -739,14 +1030,12 @@ pub const View = struct {
         var carry_lo: u32 = 0;
         var carry_hi: u32 = 0;
         for (self.nodes.items, 0..) |nd, i| {
+            const counted = i >= lo and i < hi;
             const bi = base_by_sid.get(nd.sid) orelse {
                 cls[i] = .add;
-                adds += 1;
+                if (counted) adds += 1;
                 continue;
             };
-            shared += 1;
-            if (carry_lo == 0 or nd.sid < carry_lo) carry_lo = nd.sid;
-            if (nd.sid > carry_hi) carry_hi = nd.sid;
             const b = self.base.items[bi];
             const same = sameContent(b, nd);
             if (b.present) {
@@ -754,15 +1043,32 @@ pub const View = struct {
             } else {
                 cls[i] = if (same) .restored else .restored_mod;
             }
+            if (!counted) continue;
+            shared += 1;
+            if (carry_lo == 0 or nd.sid < carry_lo) carry_lo = nd.sid;
+            if (nd.sid > carry_hi) carry_hi = nd.sid;
             if (!same) mods += 1;
         }
 
         // Removals: base nodes that were present and are not live,
-        // folded to the roots of removed subtrees.
+        // folded to the roots of removed subtrees. `all_gone` is the
+        // page-wide set the live-region check reads.
+        var all_gone = std.AutoHashMap(u32, void).init(arena);
         var gone_set = std.AutoHashMap(u32, void).init(arena);
         for (self.base.items) |b| {
-            if (b.present and !live_by_sid.contains(b.sid)) try gone_set.put(b.sid, {});
+            if (!b.present or live_by_sid.contains(b.sid)) continue;
+            try all_gone.put(b.sid, {});
+            if (bound) |bd| {
+                if (!self.baseUnder(&base_by_sid, b, bd.root_sid)) continue;
+            }
+            try gone_set.put(b.sid, {});
         }
+
+        var live_out: std.Io.Writer.Allocating = .init(arena);
+        var live: std.ArrayList(u32) = .empty;
+        defer live.deinit(self.gpa);
+        if (self.base_ok) try self.writeLiveRegions(&live_out.writer, &live, cls, &all_gone, &base_by_sid);
+        const live_text = live_out.written();
         var gone_desc = std.AutoHashMap(u32, usize).init(arena); // root sid -> descendants
         var gone_total: usize = 0;
         for (self.base.items) |b| {
@@ -785,14 +1091,14 @@ pub const View = struct {
         // Restored-unchanged subtrees, rooted where the live parent is
         // not itself restored unchanged.
         var restored_desc = std.AutoHashMap(u32, usize).init(arena);
-        for (self.nodes.items, 0..) |nd, i| {
+        for (self.nodes.items[lo..hi], lo..) |nd, i| {
             if (cls[i] != .restored) continue;
             var root = nd.sid;
             var cur = nd.parent_sid;
             var guard: usize = 0;
             while (cur != 0 and guard < 512) : (guard += 1) {
                 const pi = live_by_sid.get(cur) orelse break;
-                if (cls[pi] != .restored) break;
+                if (cls[pi] != .restored or pi < lo or pi >= hi) break;
                 root = cur;
                 cur = self.nodes.items[pi].parent_sid;
             }
@@ -805,19 +1111,47 @@ pub const View = struct {
         // Full only when the delta would not be SHORTER than the tree.
         // There is deliberately no carry-ratio rule here any more: a new
         // document that carried only its chrome still saves every one
-        // of those lines, and a delta never re-sends a carried node.
-        const doc_moved = self.doc_gen != self.base_doc_gen;
+        // of those lines, and a delta never re-sends a carried node. A
+        // bounded delta never speaks for the document as a whole.
+        const doc_moved = bound == null and self.doc_gen != self.base_doc_gen;
         const changes = adds + mods + gone_roots;
         var delta_lines = adds + mods;
         delta_lines += if (doc_moved) @intFromBool(gone_total != 0) else gone_roots;
         delta_lines += @intFromBool(restored_roots != 0);
-        if (n != 0 and delta_lines >= n)
-            return .{ .text = try self.renderFull(), .changes = changes, .carried = shared, .full = true };
+        const span = hi - lo;
+        if (span != 0 and delta_lines >= span) {
+            var full: std.Io.Writer.Allocating = .init(self.gpa);
+            defer full.deinit();
+            if (bound) |bd| {
+                try full.writer.print("doc {d} rev {d} url {s} scope [{d}]\n", .{ self.doc_gen, self.rev, self.url, bd.root_sid });
+                try full.writer.writeAll(live_text);
+                try self.writeSubtree(&full.writer, bd);
+            } else {
+                const whole = try self.renderFull();
+                defer self.gpa.free(whole);
+                const nl = std.mem.indexOfScalar(u8, whole, '\n').? + 1;
+                try full.writer.writeAll(whole[0..nl]);
+                try full.writer.writeAll(live_text);
+                try full.writer.writeAll(whole[nl..]);
+            }
+            return .{
+                .text = try self.gpa.dupe(u8, full.written()),
+                .changes = changes,
+                .carried = shared,
+                .full = true,
+                .live = try live.toOwnedSlice(self.gpa),
+            };
+        }
 
         var out: std.Io.Writer.Allocating = .init(self.gpa);
         defer out.deinit();
         const w = &out.writer;
-        try w.print("delta rev {d}->{d}\n", .{ self.base_rev, self.rev });
+        if (bound) |bd| {
+            try w.print("delta scope [{d}] rev {d}\n", .{ bd.root_sid, self.rev });
+        } else {
+            try w.print("delta rev {d}->{d}\n", .{ self.base_rev, self.rev });
+        }
+        try w.writeAll(live_text);
         if (doc_moved and shared != 0) {
             try w.print("carried [{d}..{d}] {d} nodes\n", .{ carry_lo, carry_hi, shared });
         }
@@ -842,7 +1176,7 @@ pub const View = struct {
         // already has, once per run of siblings.
         var last_parent: u32 = 0;
         var add_indent = std.AutoHashMap(u32, usize).init(arena);
-        for (self.nodes.items, 0..) |nd, i| {
+        for (self.nodes.items[lo..hi], lo..) |nd, i| {
             if (cls[i] != .add) continue;
             var indent: usize = 0;
             const parent_added = if (live_by_sid.get(nd.parent_sid)) |pi| cls[pi] == .add else false;
@@ -869,7 +1203,7 @@ pub const View = struct {
                 try w.writeByte('\n');
             }
         }
-        for (self.nodes.items, 0..) |nd, i| {
+        for (self.nodes.items[lo..hi], lo..) |nd, i| {
             if (cls[i] != .mod and cls[i] != .restored_mod) continue;
             const b = self.base.items[base_by_sid.get(nd.sid).?];
             const d_role = !std.mem.eql(u8, b.role, nd.role);
@@ -889,7 +1223,54 @@ pub const View = struct {
             .changes = changes,
             .carried = shared,
             .full = false,
+            .live = try live.toOwnedSlice(self.gpa),
         };
+    }
+
+    /// One `live:` line per outermost live region whose subtree the
+    /// client has not seen in this form (a node added, changed, back
+    /// from absence, or removed under it) and which still has text: a
+    /// toast saying what an action did. Each listed root goes to `live`.
+    fn writeLiveRegions(
+        self: *const View,
+        w: *std.Io.Writer,
+        live: *std.ArrayList(u32),
+        cls: []const Cls,
+        all_gone: *const std.AutoHashMap(u32, void),
+        base_by_sid: *const std.AutoHashMap(u32, usize),
+    ) !void {
+        const nodes = self.nodes.items;
+        var i: usize = 0;
+        while (i < nodes.len) {
+            const nd = nodes[i];
+            if (!isLiveRole(nd.role)) {
+                i += 1;
+                continue;
+            }
+            var end = i + 1;
+            while (end < nodes.len and nodes[end].depth > nd.depth) end += 1;
+            defer i = end;
+            var changed = false;
+            for (cls[i..end]) |c| {
+                if (c != .same) changed = true;
+            }
+            if (!changed) {
+                var it = all_gone.keyIterator();
+                while (it.next()) |sid| {
+                    const b = self.base.items[base_by_sid.get(sid.*).?];
+                    if (self.baseUnder(base_by_sid, b, nd.sid)) {
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            if (!changed) continue;
+            var buf: [LIVE_TEXT_MAX]u8 = undefined;
+            const text = liveText(&buf, nodes[i..end]);
+            if (text.len == 0) continue;
+            try w.print("live: [{d}] {s} \"{s}\"\n", .{ nd.sid, nd.role, text });
+            try live.append(self.gpa, nd.sid);
+        }
     }
 
     fn findSid(self: *const View, sid: u32) ?Node {
@@ -2563,4 +2944,206 @@ test "scoped consumes alone never make an unscoped delta claim unchanged" {
     defer gpa.free(up.text);
     try std.testing.expectEqual(Kind.full, up.kind);
     try std.testing.expect(std.mem.indexOf(u8, up.text, "Sign in") != null);
+}
+
+/// The field case behind scoped deltas: a confirm button clicked with
+/// the follow-up scoped to its alertdialog, which the click closes.
+const confirm_page = [_]InNode{
+    .{ .id = 1, .parent = 0, .role = "document", .name = "Admin" },
+    .{ .id = 2, .parent = 1, .role = "navigation", .name = "Sidebar" },
+    .{ .id = 3, .parent = 2, .role = "link", .name = "Servers" },
+    .{ .id = 4, .parent = 2, .role = "link", .name = "Settings" },
+    .{ .id = 5, .parent = 1, .role = "main", .name = "" },
+    .{ .id = 6, .parent = 5, .role = "heading", .name = "daystrom-incus" },
+    .{ .id = 7, .parent = 5, .role = "cell", .name = "certificate: unconfirmed" },
+    .{ .id = 8, .parent = 1, .role = "alertdialog", .name = "Confirm certificate fingerprint" },
+    .{ .id = 9, .parent = 8, .role = "button", .name = "Confirm" },
+    .{ .id = 10, .parent = 8, .role = "button", .name = "Cancel" },
+    .{ .id = 11, .parent = 1, .role = "status", .name = "" },
+};
+
+const confirmed_page = [_]InNode{
+    .{ .id = 1, .parent = 0, .role = "document", .name = "Admin" },
+    .{ .id = 2, .parent = 1, .role = "navigation", .name = "Sidebar" },
+    .{ .id = 3, .parent = 2, .role = "link", .name = "Servers" },
+    .{ .id = 4, .parent = 2, .role = "link", .name = "Settings" },
+    .{ .id = 5, .parent = 1, .role = "main", .name = "" },
+    .{ .id = 6, .parent = 5, .role = "heading", .name = "daystrom-incus" },
+    .{ .id = 7, .parent = 5, .role = "cell", .name = "certificate: confirmed" },
+    .{ .id = 11, .parent = 1, .role = "status", .name = "" },
+    .{ .id = 12, .parent = 11, .role = "paragraph", .name = "Server certificate of daystrom-incus confirmed." },
+};
+
+test "a scoped follow-up whose dialog closed names it and leads with the toast" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    const up = try applyConsume(&v, tree(7, "http://x/", &confirm_page), .auto);
+    gpa.free(up.text);
+    const dialog = v.sidFor(8);
+    const status = v.sidFor(11);
+    try v.apply(tree(7, "http://x/", &confirmed_page));
+
+    const su = try v.consumeScopedDelta(dialog);
+    defer gpa.free(su.text);
+    try std.testing.expectEqual(ScopeState.ancestor, su.state);
+    try std.testing.expectEqual(Kind.delta, su.kind);
+    var lines = std.mem.splitScalar(u8, su.text, '\n');
+    _ = lines.next();
+    var buf: [256]u8 = undefined;
+    const scope_line = lines.next().?;
+    try std.testing.expect(std.mem.startsWith(u8, scope_line, try std.fmt.bufPrint(&buf, SCOPE_ANCESTOR_FMT, .{ dialog, v.sidFor(1) })));
+    try std.testing.expect(std.mem.indexOf(u8, scope_line, "alertdialog \"Confirm certificate fingerprint\"") != null);
+    const live_line = lines.next().?;
+    try std.testing.expectEqualStrings(
+        try std.fmt.bufPrint(&buf, "live: [{d}] status \"Server certificate of daystrom-incus confirmed.\"", .{status}),
+        live_line,
+    );
+    // What changed, never the unchanged chrome.
+    try std.testing.expect(std.mem.indexOf(u8, su.text, "certificate: confirmed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, su.text, "Servers") == null);
+    try std.testing.expect(std.mem.indexOf(u8, su.text, "Sidebar") == null);
+    // The whole page was consumed: nothing is owed afterwards.
+    const after = try v.consume(.auto);
+    defer gpa.free(after.text);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, std.mem.trimEnd(u8, after.text, "\n"), "\n"));
+}
+
+test "a scoped follow-up re-resolves a region the server replaced" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    const page = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Overview" },
+        .{ .id = 2, .parent = 1, .role = "navigation", .name = "Sidebar" },
+        .{ .id = 3, .parent = 2, .role = "link", .name = "Servers" },
+        .{ .id = 4, .parent = 1, .role = "main", .name = "" },
+        .{ .id = 5, .parent = 4, .role = "region", .name = "Checks" },
+        .{ .id = 6, .parent = 5, .role = "cell", .name = "posture: failing" },
+        .{ .id = 7, .parent = 5, .role = "button", .name = "Check again" },
+    };
+    const up = try applyConsume(&v, tree(7, "http://x/", &page), .auto);
+    gpa.free(up.text);
+    const old_region = v.sidFor(5);
+    // Live-replaced: fresh elements, different content, same region.
+    const replaced = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Overview" },
+        .{ .id = 2, .parent = 1, .role = "navigation", .name = "Sidebar" },
+        .{ .id = 3, .parent = 2, .role = "link", .name = "Servers" },
+        .{ .id = 4, .parent = 1, .role = "main", .name = "" },
+        .{ .id = 20, .parent = 4, .role = "region", .name = "Checks" },
+        .{ .id = 21, .parent = 20, .role = "cell", .name = "posture: passing" },
+        .{ .id = 22, .parent = 20, .role = "button", .name = "Check again" },
+    };
+    try v.apply(tree(7, "http://x/", &replaced));
+    const new_region = v.sidFor(20);
+    try std.testing.expect(new_region != old_region);
+
+    const su = try v.consumeScopedDelta(old_region);
+    defer gpa.free(su.text);
+    try std.testing.expectEqual(ScopeState.replaced, su.state);
+    try std.testing.expectEqual(new_region, su.sid);
+    var buf: [64]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, su.text, try std.fmt.bufPrint(&buf, SCOPE_REPLACED_FMT, .{ old_region, new_region })) != null);
+    try std.testing.expect(std.mem.indexOf(u8, su.text, "posture: passing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, su.text, "Servers") == null);
+    // Neither the old region's removal nor the new one is owed again.
+    const after = try v.consume(.auto);
+    defer gpa.free(after.text);
+    try std.testing.expect(std.mem.indexOf(u8, after.text, "Checks") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after.text, "posture") == null);
+}
+
+test "a surviving scope answers its own delta plus live regions from outside it" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    const page = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "region", .name = "left" },
+        .{ .id = 3, .parent = 2, .role = "button", .name = "L1" },
+        .{ .id = 4, .parent = 1, .role = "region", .name = "right" },
+        .{ .id = 5, .parent = 4, .role = "button", .name = "R1" },
+        .{ .id = 6, .parent = 1, .role = "status", .name = "" },
+    };
+    var up = try applyConsume(&v, tree(7, "http://x/", &page), .auto);
+    gpa.free(up.text);
+    const left = v.sidFor(2);
+    const grown = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "region", .name = "left" },
+        .{ .id = 3, .parent = 2, .role = "button", .name = "L1" },
+        .{ .id = 7, .parent = 2, .role = "button", .name = "L2" },
+        .{ .id = 4, .parent = 1, .role = "region", .name = "right" },
+        .{ .id = 5, .parent = 4, .role = "button", .name = "R1" },
+        .{ .id = 8, .parent = 4, .role = "button", .name = "R2" },
+        .{ .id = 6, .parent = 1, .role = "status", .name = "" },
+        .{ .id = 9, .parent = 6, .role = "text", .name = "Saved" },
+    };
+    try v.apply(tree(7, "http://x/", &grown));
+    const su = try v.consumeScopedDelta(left);
+    defer gpa.free(su.text);
+    try std.testing.expectEqual(ScopeState.live, su.state);
+    try std.testing.expectEqual(Kind.delta, su.kind);
+    var buf: [128]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, su.text, try std.fmt.bufPrint(&buf, "delta scope [{d}] rev ", .{left})));
+    try std.testing.expect(std.mem.indexOf(u8, su.text, "\"L2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, su.text, "\"L1\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, su.text, "R2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, su.text, "live: [") != null);
+    try std.testing.expect(std.mem.indexOf(u8, su.text, "\"Saved\"") != null);
+    // Outside the scope only R2 is still owed: L2 and the toast were seen.
+    up = try v.consume(.auto);
+    defer gpa.free(up.text);
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "R2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "L2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "Saved") == null);
+}
+
+test "an explicit scoped snapshot of a vanished root says so and consumes nothing" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    const up = try applyConsume(&v, tree(7, "http://x/", &confirm_page), .auto);
+    gpa.free(up.text);
+    const dialog = v.sidFor(8);
+    try v.apply(tree(7, "http://x/", &confirmed_page));
+    const scoped = try v.consumeScoped(dialog);
+    defer gpa.free(scoped);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, scoped, "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, scoped, "nothing shown") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scoped, "Servers") == null);
+    // The page's changes are still owed to the next delta.
+    const after = try v.consume(.auto);
+    defer gpa.free(after.text);
+    try std.testing.expect(std.mem.indexOf(u8, after.text, "certificate: confirmed") != null);
+}
+
+test "an unscoped delta leads with a changed live region too" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    var up = try applyConsume(&v, tree(7, "http://x/", &confirm_page), .auto);
+    gpa.free(up.text);
+    up = try applyConsume(&v, tree(7, "http://x/", &confirmed_page), .auto);
+    defer gpa.free(up.text);
+    try std.testing.expectEqual(Kind.delta, up.kind);
+    var lines = std.mem.splitScalar(u8, up.text, '\n');
+    _ = lines.next();
+    try std.testing.expect(std.mem.startsWith(u8, lines.next().?, "live: ["));
+}
+
+test "liveText joins distinct names and cuts on a character boundary" {
+    var nodes = [_]Node{undefined} ** 3;
+    const names = [_][]const u8{ "Saved", "Saved", "x" ** 290 ++ "\u{00e9}\u{00e9}\u{00e9}" };
+    for (&nodes, names) |*nd, nm| {
+        nd.* = std.mem.zeroes(Node);
+        nd.name = @constCast(nm);
+    }
+    var buf: [LIVE_TEXT_MAX]u8 = undefined;
+    const t = liveText(&buf, &nodes);
+    try std.testing.expect(std.mem.startsWith(u8, t, "Saved / xxx"));
+    try std.testing.expect(std.mem.endsWith(u8, t, "..."));
+    try std.testing.expect(t.len <= LIVE_TEXT_MAX);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(t));
 }

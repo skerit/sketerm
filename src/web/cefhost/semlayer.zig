@@ -1095,6 +1095,20 @@ pub fn onTree(self: *Host, v: *View, rid: u32, json: []const u8) void {
         return;
     }
 
+    if (p.scope != 0 and p.mode == @intFromEnum(proto.SnapMode.auto)) {
+        // An action's scoped follow-up: what changed under the scope
+        // (or where its root went), headed by changed live regions.
+        const up = v.sem.consumeScopedDelta(p.scope) catch return;
+        defer self.gpa.free(up.text);
+        self.post(proto.SemSnapshot{
+            .view = v.id,
+            .doc_gen = v.sem.doc_gen,
+            .rev = v.sem.rev,
+            .kind = @intFromEnum(up.kind),
+            .payload = .{ .s = up.text },
+        });
+        return;
+    }
     if (p.scope != 0) {
         // A scoped snapshot is one subtree rendered in full; it
         // advances the base for THAT subtree only (the caller did
