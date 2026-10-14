@@ -468,9 +468,16 @@ pub const CAP_MOTION_DRIFT = "motion-drift";
 /// The helper accepts `view_screen`: the REAL monitor, toplevel and view
 /// position a client reports, served to pages as `screen.*`,
 /// `outerWidth`/`outerHeight`, `screenX`/`screenY` and the view's screen
-/// origin. Without the frame (an older client, or the headless MCP
-/// lane) a page keeps seeing its view as the whole screen, at the origin.
+/// origin. Without the frame (an older client) a page keeps seeing its
+/// view as the whole screen, at the origin. The headless MCP lane sends
+/// synthesized geometry (`screengeom.headless`).
 pub const CAP_VIEW_SCREEN = "view-screen";
+/// The helper HOLDS a `view_screen` that names a view it has not created
+/// yet and applies it when that view is created, so the view's first
+/// document is laid out on it. Without it a report sent before
+/// `view_create*` is dropped, and a client sends it after the create
+/// instead (where the first navigation can race it).
+pub const CAP_VIEW_SCREEN_EARLY = "view-screen-early";
 pub const MAX_VIEW_FPS: u16 = 240;
 pub const DEFAULT_HEADLESS_FPS: u16 = 60;
 
@@ -551,6 +558,7 @@ pub const Cap = enum {
     motion_replay,
     view_screen,
     motion_drift,
+    view_screen_early,
 
     /// The wire name `hello_ack` carries.
     pub fn name(self: Cap) []const u8 {
@@ -7322,6 +7330,7 @@ test "new refusal counters append to legacy policy accounting" {
 test "view_screen is a fresh owner-only block and validates its rects" {
     try std.testing.expectEqual(@as(u8, 0xFC), @intFromEnum(Tag.view_screen));
     try std.testing.expectEqualStrings("view-screen", Cap.view_screen.name());
+    try std.testing.expectEqualStrings("view-screen-early", Cap.view_screen_early.name());
     const r = ViewScreen{ .view = 3, .screen_x = -1920, .screen_w = 1920, .screen_h = 1080, .avail_x = -1920, .avail_w = 1920, .avail_h = 1080, .window_x = -1920, .window_w = 1280, .window_h = 900, .view_y = 46 };
     try roundTrip(ViewScreen, r);
     try std.testing.expect(r.valid());

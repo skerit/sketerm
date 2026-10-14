@@ -42,6 +42,7 @@ const webdrive = @import("webdrive.zig");
 const navfault = @import("../web/navfault.zig");
 const web_proto = @import("../web/protocol.zig");
 const ozone = @import("../web/ozone.zig");
+const screengeom = @import("../web/screengeom.zig");
 const motion_pack = @import("../motion/pack.zig");
 const motion_replay = @import("../motion/replay.zig");
 const motion_store = @import("../motion/store.zig");
@@ -144,6 +145,26 @@ var g_webgl_policy: ozone.WebglPolicy = .auto;
 pub fn configureWebgl(policy: ozone.WebglPolicy) void {
     g_webgl_policy = policy;
 }
+
+/// `web_screen` from `[mcp]` or the selected profile and where it came
+/// from: the screen every headless view this server opens reports.
+var g_web_screen: screengeom.Size = screengeom.headless_screen_default;
+var g_web_screen_source: MotionSource = .built_in;
+
+pub fn configureScreen(size: screengeom.Size, source: MotionSource) void {
+    g_web_screen = size;
+    g_web_screen_source = source;
+}
+
+/// The `web_screen` facts: the configured screen, or null when pages
+/// will not see it (the GUI drives web tools and reports its real
+/// monitor, or the running helper predates `view-screen`).
+pub fn screenCapability() struct { screen: ?screengeom.Size, source: MotionSource } {
+    const off = guiDrivesWeb() or g_headless_alloc == null;
+    const old_helper = if (currentEngine()) |e| e.state == .ready and !e.has(.view_screen) else false;
+    return .{ .screen = if (off or old_helper) null else g_web_screen, .source = g_web_screen_source };
+}
+
 var g_headless_dir: ?[]const u8 = null;
 var g_headless_instance: ?[]const u8 = null;
 /// The instance directory is removed when the server exits (`mcp-tmp-<pid>`).
@@ -920,6 +941,7 @@ fn headlessEngineForMode(spec: webroute.Spec, untrusted: bool) ?*webdrive.Engine
     re.engine.untrusted = untrusted;
     re.engine.default_max_fps = g_default_max_fps;
     re.engine.webgl_policy = g_webgl_policy;
+    re.engine.screen = g_web_screen;
     if (g_motion.pack) |bytes| re.engine.setMotionPack(g_motion.pack_name, bytes) catch {};
     @memcpy(re.slug[0..slug.len], slug);
     re.slug_len = slug.len;

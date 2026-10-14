@@ -370,6 +370,10 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("web_stream_popups", stream.popups);
         try res.fact("web_software_webgl", @import("mcp_web.zig").webglCapability(.software_webgl));
         try res.fact("web_webgl", if (@import("mcp_web.zig").webglMode()) |m| @tagName(m) else null);
+        const scr = @import("mcp_web.zig").screenCapability();
+        var scr_buf: [16]u8 = undefined;
+        try res.fact("web_screen", if (scr.screen) |s| std.fmt.bufPrint(&scr_buf, "{f}", .{s}) catch null else null);
+        try res.fact("web_screen_source", @tagName(scr.source));
         const mo = @import("mcp_web.zig").motionCapability();
         if (mo.setup.summary) |s| {
             try res.fact("web_motion", .{ .pack = mo.setup.pack_name, .device = @tagName(s.device), .rate_hz = s.rate_hz, .reaches = s.reaches, .keys = s.keys, .scroll = s.scroll, .idle = s.idle, .drift = s.drift });

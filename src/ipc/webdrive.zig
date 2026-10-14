@@ -80,6 +80,7 @@ const fsserve = @import("../mux/fsserve.zig");
 const display = @import("../mux/display.zig");
 const ozone = @import("../web/ozone.zig");
 const proto = @import("../web/protocol.zig");
+const screengeom = @import("../web/screengeom.zig");
 const untrusted_env = @import("../web/untrusted_env.zig");
 comptime {
     // untrusted_env spells the presenter switch itself to stay import-free.
@@ -403,6 +404,9 @@ pub const View = struct {
     /// Where a download this view's page starts lands, instead of the
     /// user's download directory. Owned.
     download_dir: ?[]u8 = null,
+    /// The last `view_screen` sent for this view (capability
+    /// "view-screen"); a report equal to it is not sent again.
+    sent_screen: ?proto.ViewScreen = null,
 
     fn deinit(self: *View, gpa: std.mem.Allocator) void {
         for (self.console.items) |line| gpa.free(line.text);
@@ -1091,6 +1095,9 @@ pub const Engine = struct {
     /// `[mcp] web_webgl`: handed to every helper this engine launches
     /// (`SKETERM_WEB_WEBGL`, or the broker's `engine_open.webgl`).
     webgl_policy: ozone.WebglPolicy = .auto,
+    /// `[mcp] web_screen`: the screen every view reports
+    /// (`screengeom.headless`), to a helper with `view-screen` only.
+    screen: screengeom.Size = screengeom.headless_screen_default,
     gpa: std.mem.Allocator,
     /// Directory holding the helper socket and its cache; owned.
     dir: []u8,
@@ -2576,6 +2583,10 @@ pub const Engine = struct {
             self.next_capture_serial += 1;
             self.send(captureInstallFrame(new_id, v.cap_serial, f)) catch return error.Unavailable;
         }
+        // A helper that holds an early report gets it BEFORE the create,
+        // which is the only order where the first document (navigated
+        // inside `view_create_url`) cannot race it.
+        if (self.has(.view_screen_early)) self.syncScreen(v) catch return error.Unavailable;
         if (url.len > 0 and self.has(.view_create_url)) {
             self.send(proto.ViewCreateUrl{
                 .view = v.id,
@@ -2600,6 +2611,9 @@ pub const Engine = struct {
                 .max_fps = v.max_fps orelse 0,
             }) catch return error.Unavailable;
         }
+        // Otherwise right after it, before view_show and any navigate
+        // (a no-op when the early report went out).
+        self.syncScreen(v) catch return error.Unavailable;
         // A hidden view is never painted; headless views are always
         // "shown" — nothing else would ever show them.
         self.send(proto.ViewShow{ .view = v.id }) catch return error.Unavailable;
@@ -2608,6 +2622,17 @@ pub const Engine = struct {
         }
         if (bg == null) self.current = v.id;
         return v;
+    }
+
+    /// Report the synthesized screen, window and view offset for `v`
+    /// when they changed. A helper without `view-screen` gets nothing
+    /// and keeps screen == window == viewport, as it always has.
+    fn syncScreen(self: *Engine, v: *View) !void {
+        if (!self.has(.view_screen)) return;
+        const report = screengeom.headless(v.id, self.screen, v.w, v.h);
+        if (v.sent_screen) |s| if (std.meta.eql(s, report)) return;
+        try self.send(report);
+        v.sent_screen = report;
     }
 
     /// Drop a half-built view, whether or not it reached `views`.
@@ -3503,6 +3528,7 @@ pub const Engine = struct {
         self.send(proto.ViewResize{ .view = id, .w = w, .h = h, .scale_x1000 = v.emulation.scale() }) catch return error.Unavailable;
         v.w = w;
         v.h = h;
+        self.syncScreen(v) catch return error.Unavailable;
     }
 
     /// The full text of the last eval result on `id`, if any.
@@ -4513,6 +4539,8 @@ pub const Engine = struct {
                         self.send(proto.ViewDestroy{ .view = ev.popup_view }) catch {};
                         return;
                     };
+                    // Each popup is a window of its own, sized by its page.
+                    if (self.findView(ev.popup_view)) |pv| self.syncScreen(pv) catch {};
                     self.send(proto.ViewShow{ .view = ev.popup_view }) catch {};
                 } else if (self.findView(ev.popup_view)) |v| {
                     self.abandonView(v);
@@ -6889,6 +6917,71 @@ test "emulation capability refuses before publication and precedes the first doc
     var reader = proto.Reader.init(pair.drain(&buf));
     const resized = try proto.decode(proto.ViewResize, (try reader.next()).?.payload);
     try std.testing.expectEqual(@as(u16, 1500), resized.scale_x1000);
+}
+
+test "view_screen goes to a view-screen helper after the create, before the show, and again only when it changes" {
+    const t = std.testing;
+    var pair = try Pair.init(t.allocator);
+    defer pair.deinit();
+    var buf: [16384]u8 = undefined;
+    var tags: [8]proto.Tag = undefined;
+    // A helper without the capability gets nothing: skew keeps the old view == screen.
+    const old = try pair.eng.openView("https://site.example/", 800, 600);
+    try t.expectEqualSlices(proto.Tag, &.{ .view_create_url, .view_show }, tagsOf(pair.drain(&buf), &tags));
+    try pair.eng.resize(old.id, 900, 700);
+    try t.expectEqualSlices(proto.Tag, &.{.view_resize}, tagsOf(pair.drain(&buf), &tags));
+
+    pair.eng.caps.insert(.view_screen);
+    pair.eng.screen = .{ .w = 1366, .h = 768 };
+    const v = try pair.eng.openView("https://site.example/", 800, 600);
+    var bytes = pair.drain(&buf);
+    try t.expectEqualSlices(proto.Tag, &.{ .view_create_url, .view_screen, .view_show }, tagsOf(bytes, &tags));
+    const first = frameOf(proto.ViewScreen, bytes).?;
+    try t.expectEqual(screengeom.headless(v.id, .{ .w = 1366, .h = 768 }, 800, 600), first);
+    try t.expectEqual(@as(u16, 832), first.window_w);
+    try t.expectEqual(@as(u16, 1366), first.screen_w);
+
+    // Same size: the report did not change, so it is not resent.
+    try pair.eng.resize(v.id, 800, 600);
+    try t.expectEqualSlices(proto.Tag, &.{.view_resize}, tagsOf(pair.drain(&buf), &tags));
+    // A window that outgrows 1366x768 moves the screen up the ladder.
+    try pair.eng.resize(v.id, 1400, 600);
+    bytes = pair.drain(&buf);
+    try t.expectEqualSlices(proto.Tag, &.{ .view_resize, .view_screen }, tagsOf(bytes, &tags));
+    const grown = frameOf(proto.ViewScreen, bytes).?;
+    try t.expectEqual(@as(u16, 1432), grown.window_w);
+    try t.expectEqual(@as(u16, 2560), grown.screen_w);
+
+    // An adopted popup is a window of its own, reported before its claim.
+    const popup_id: u32 = proto.ENGINE_VIEW_BASE + 7;
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(t.allocator);
+    try proto.encodePayload(t.allocator, &payload, proto.EvPagePopup{
+        .owner_view = v.id,
+        .popup_view = popup_id,
+        .state = proto.page_popup_opened,
+        .disposition = 0,
+        .user_gesture = 1,
+        .chromeless = 1,
+        .w = 500,
+        .h = 600,
+        .url = "https://accounts.test/signin",
+        .frame_name = "",
+    });
+    pair.eng.dispatch(.{ .tag = .ev_page_popup, .payload = payload.items });
+    bytes = pair.drain(&buf);
+    try t.expectEqualSlices(proto.Tag, &.{ .view_screen, .view_show }, tagsOf(bytes, &tags));
+    const pop = frameOf(proto.ViewScreen, bytes).?;
+    try t.expectEqual(popup_id, pop.view);
+    try t.expectEqual(@as(u16, 532), pop.window_w);
+    try t.expectEqual(@as(u16, 729), pop.window_h);
+
+    // A helper that holds early reports gets it BEFORE the create, once.
+    pair.eng.caps.insert(.view_screen_early);
+    const early = try pair.eng.openView("https://site.example/", 800, 600);
+    bytes = pair.drain(&buf);
+    try t.expectEqualSlices(proto.Tag, &.{ .view_screen, .view_create_url, .view_show }, tagsOf(bytes, &tags));
+    try t.expectEqual(early.id, frameOf(proto.ViewScreen, bytes).?.view);
 }
 
 test "untrusted opens never switch an ordinary helper or loosen a live policy" {

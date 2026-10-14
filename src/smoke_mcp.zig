@@ -739,6 +739,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         webMotionStage(allocator, exe, rt);
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBSCREEN_ONLY") != null) {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine missing for the screen stage");
+        _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+        webScreenStage(allocator, exe, rt);
+        return 0;
+    }
     // The headful audit alone, in the product's default MCP lane.
     if (c.getenv("SKETERM_SMOKE_MCP_HEADFUL_ONLY") != null) {
         var bin_buf: [4096:0]u8 = undefined;
@@ -4261,6 +4269,134 @@ fn webglPolicyStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []cons
     say("smoke-mcp: web_webgl off and hardware give pages exactly the WebGL the policy names, and the fact reports it");
 }
 
+/// What the open page reports, comma-joined: screen w,h, avail w,h,
+/// avail left,top, outer w,h, inner w,h, screenX,Y.
+const SCREEN_PROBE = "{\"code\":\"[screen.width,screen.height,screen.availWidth,screen.availHeight,screen.availLeft,screen.availTop,outerWidth,outerHeight,innerWidth,innerHeight,screenX,screenY].join(',')\"}";
+
+/// Poll the page's geometry until it reads `want` (a resize reaches the
+/// renderer asynchronously), failing with both values after 10s.
+fn expectScreen(m: *Mcp, arena: std.mem.Allocator, want: []const u8, comptime what: []const u8) void {
+    const deadline = nowMs() + 10_000;
+    while (true) {
+        const got = capSc(arena, m.callTool("web_eval", SCREEN_PROBE), "screen probe", false).get("value").?.object.get("value").?.string;
+        if (std.mem.eql(u8, got, want)) return;
+        if (nowMs() > deadline) {
+            std.debug.print("smoke-mcp: {s}: page reports {s}, want {s}\n", .{ what, got, want });
+            fail("a headless page does not report the synthesized screen and window: " ++ what);
+        }
+        _ = c.usleep(100_000);
+    }
+}
+
+/// What the FIRST document saw while it parsed (screen w,h, outer -
+/// inner w,h, screenX,Y): the report must precede the page, not follow it.
+fn expectFirstDocument(m: *Mcp, arena: std.mem.Allocator, want: []const u8, comptime what: []const u8) void {
+    const got = capSc(arena, m.callTool("web_eval", "{\"code\":\"window.first\"}"), "first document probe", false).get("value").?.object.get("value").?.string;
+    if (!std.mem.eql(u8, got, want)) {
+        std.debug.print("smoke-mcp: {s}: the first document saw {s}, want {s}\n", .{ what, got, want });
+        fail("the first document did not see the synthesized screen: " ++ what);
+    }
+}
+
+/// Click the page's Probe button (real engine input) and read what its
+/// click event said: `screenX - clientX`, `screenY - clientY`.
+fn expectMouseOffset(m: *Mcp, arena: std.mem.Allocator, want: []const u8, comptime what: []const u8) void {
+    _ = capSc(arena, m.callToolTimeout("web_act", "{\"name\":\"Probe\"}", 30_000), "screen stage probe click", false);
+    const got = capSc(arena, m.callTool("web_eval", "{\"code\":\"String(window.off)\"}"), "mouse offset probe", false).get("value").?.object.get("value").?.string;
+    if (!std.mem.eql(u8, got, want)) {
+        std.debug.print("smoke-mcp: {s}: a click's screen - client offset is {s}, want {s}\n", .{ what, got, want });
+        fail("a mouse event does not carry the view's screen origin: " ++ what);
+    }
+}
+
+/// `capabilities.web_screen` (null = JSON null) and its source.
+fn expectScreenFacts(m: *Mcp, arena: std.mem.Allocator, screen: ?[]const u8, source: []const u8, comptime what: []const u8) void {
+    const caps = capSc(arena, m.callTool("capabilities", "{}"), "web_screen facts", false);
+    const fact = caps.get("web_screen").?;
+    const ok_screen = if (screen) |s| fact == .string and std.mem.eql(u8, fact.string, s) else fact == .null;
+    if (!ok_screen or !std.mem.eql(u8, caps.get("web_screen_source").?.string, source)) {
+        std.debug.print("smoke-mcp: {s}: web_screen {f}, source {s}; want {s} from {s}\n", .{ what, std.json.fmt(fact, .{}), caps.get("web_screen_source").?.string, screen orelse "null", source });
+        fail("capabilities.web_screen does not report the screen in force: " ++ what);
+    }
+}
+
+/// A headless page reports a believable screen and window
+/// (`screengeom.headless` over `view_screen`): the configured screen, a
+/// window 32x129 larger than the viewport at 10,10 pulled back onto the
+/// screen, a window that follows `web_resize` up the size ladder, the
+/// `web_screen` facts for every source, and the old view == screen with
+/// a helper that looks old (`SKETERM_WEB_DISABLE_VIEW_SCREEN`).
+fn webScreenStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const page = "data:text/html,<title>geo</title><script>window.first=[screen.width,screen.height,outerWidth-innerWidth,outerHeight-innerHeight,screenX,screenY].join(',')</script><button onclick='window.off=[event.screenX-event.clientX,event.screenY-event.clientY].join()'>Probe</button>";
+    const open_800 = "{\"url\":\"" ++ page ++ "\",\"ephemeral\":true,\"width\":800,\"height\":600,\"snapshot\":\"none\"}";
+
+    // Built-in 1920x1080, and a window that follows web_resize.
+    {
+        removeSmokeConfig(rt);
+        var m = Mcp.spawn(allocator, exe, &.{});
+        defer m.closeStdinWait();
+        m.initialize();
+        expectScreenFacts(&m, arena, "1920x1080", "built_in", "default, before the engine starts");
+        m.sendTool("web_open", open_800);
+        _ = capSc(arena, m.recvLine(60_000), "screen stage default open", false);
+        expectFirstDocument(&m, arena, "1920,1080,32,129,10,10", "default 800x600");
+        expectScreen(&m, arena, "1920,1080,1920,1080,0,0,832,729,800,600,10,10", "default 800x600");
+        expectMouseOffset(&m, arena, "26,107", "default 800x600");
+        _ = capSc(arena, m.callTool("web_resize", "{\"width\":1000,\"height\":700}"), "screen stage resize", false);
+        expectScreen(&m, arena, "1920,1080,1920,1080,0,0,1032,829,1000,700,10,10", "default resized to 1000x700");
+        expectScreenFacts(&m, arena, "1920x1080", "built_in", "default, engine running");
+    }
+
+    // [mcp] web_screen, the pull-back toward 0, the ladder, a profile.
+    writeSmokeConfig(rt, "[mcp]\nweb_screen = 1366x768\n\n[mcp.wide]\nweb_screen = 2560x1440\n");
+    defer removeSmokeConfig(rt);
+    {
+        var m = Mcp.spawn(allocator, exe, &.{});
+        defer m.closeStdinWait();
+        m.initialize();
+        m.sendTool("web_open", "{\"url\":\"" ++ page ++ "\",\"ephemeral\":true,\"width\":1330,\"height\":600,\"snapshot\":\"none\"}");
+        _ = capSc(arena, m.recvLine(60_000), "screen stage configured open", false);
+        // 1330+32 = 1362 leaves 4 px of the 1366 screen: screenX 4.
+        expectFirstDocument(&m, arena, "1366,768,32,129,4,10", "web_screen 1366x768, 1330x600");
+        expectScreen(&m, arena, "1366,768,1366,768,0,0,1362,729,1330,600,4,10", "web_screen 1366x768, 1330x600");
+        expectScreenFacts(&m, arena, "1366x768", "config", "[mcp] web_screen");
+        // 1400+32 no longer fits 1366: the next common size holds it.
+        _ = capSc(arena, m.callTool("web_resize", "{\"width\":1400,\"height\":600}"), "screen stage ladder resize", false);
+        expectScreen(&m, arena, "2560,1440,2560,1440,0,0,1432,729,1400,600,10,10", "web_screen 1366x768, resized past it");
+    }
+    {
+        var m = Mcp.spawn(allocator, exe, &.{ "--profile", "wide" });
+        defer m.closeStdinWait();
+        m.initialize();
+        m.sendTool("web_open", open_800);
+        _ = capSc(arena, m.recvLine(60_000), "screen stage profile open", false);
+        expectScreen(&m, arena, "2560,1440,2560,1440,0,0,832,729,800,600,10,10", "[mcp.wide] web_screen 2560x1440");
+        expectScreenFacts(&m, arena, "2560x1440", "profile", "[mcp.wide] web_screen");
+    }
+
+    // A helper that looks old gets nothing and keeps view == screen.
+    {
+        removeSmokeConfig(rt);
+        _ = c.setenv("SKETERM_WEB_DISABLE_VIEW_SCREEN", "1", 1);
+        defer _ = unsetEnv("SKETERM_WEB_DISABLE_VIEW_SCREEN");
+        var m = Mcp.spawn(allocator, exe, &.{});
+        defer m.closeStdinWait();
+        m.initialize();
+        m.sendTool("web_open", open_800);
+        _ = capSc(arena, m.recvLine(60_000), "screen stage old-helper open", false);
+        expectFirstDocument(&m, arena, "800,600,0,0,0,0", "helper without view-screen");
+        expectScreen(&m, arena, "800,600,800,600,0,0,800,600,800,600,0,0", "helper without view-screen");
+        expectMouseOffset(&m, arena, "0,0", "helper without view-screen");
+        _ = capSc(arena, m.callTool("web_resize", "{\"width\":1000,\"height\":700}"), "screen stage old-helper resize", false);
+        expectScreen(&m, arena, "1000,700,1000,700,0,0,1000,700,1000,700,0,0", "helper without view-screen, resized");
+        expectScreenFacts(&m, arena, null, "built_in", "helper without view-screen");
+    }
+    say("smoke-mcp: headless pages report the configured screen, a 32x129 window at 10,10 pulled onto it, resize and ladder, profile and config facts; an old helper keeps view == screen");
+}
+
 /// Recorded-motion replay through MCP: `capabilities.web_motion*`
 /// before and after `sketerm motion install`, `web_act motion:"replay"`
 /// reporting `motion:"replayed"` with a duration, the configured
@@ -5681,6 +5817,7 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     webHandStage(&m, rt);
     webStreamStage(allocator, exe, rt);
     if (@import("builtin").os.tag == .linux) webglPolicyStage(allocator, exe, rt);
+    webScreenStage(allocator, exe, rt);
 
     // ── named profiles against REAL CEF ─────────────────────────────
     //

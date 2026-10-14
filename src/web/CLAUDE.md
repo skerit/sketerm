@@ -1079,18 +1079,21 @@ to the page with a NORMALISED value, classify it in `TABLE` (a non-
 Unset `HTTPS_PROXY`/`SSL_CERT_FILE` first (the proxy note above).
 
 Measured 2026-10-12 (CEF 151 helper vs Chromium 152, this GPU-less host),
-identical in both configs. The `must_match` failures still open, which keep
+identical in both configs, re-measured 2026-10-14 after the headless lane
+got synthesized geometry. The `must_match` failures still open, which keep
 the full smoke-mcp red until they are fixed:
 
-- `geo.screen_is_viewport` / `geo.outer_exceeds_inner`: `screen` is the
-  1280x800 MCP view and `outer*` equals `inner*`; Chromium reports the 1920x1080
-  output and a window 32x129 px larger than its viewport. GUI views now
-  report real geometry (`view_screen`, below); the headless MCP lane is
-  waiting on the architecture decision and still says view == screen.
 - `kbd.layout_map`: `navigator.keyboard.getLayoutMap()` is empty (48
   entries in Chromium, from the Wayland keymap). See "Keyboard layout map
   and EyeDropper" below.
 - `win.features`: no `window.EyeDropper` (Chromium has it). Same section.
+
+Fixed 2026-10-14: `geo.screen_is_viewport` / `geo.outer_exceeds_inner`
+(the MCP view WAS the screen and `outer*` equalled `inner*`), and the two
+rows that were `host` until the headless lane copied the reference's
+window, `geo.window_at_origin` and `input.screen_offset` (`[0,0]`, now
+`[26,107]` like Chromium), are `must_match` now. See "The MCP headless
+lane: synthesized geometry" below.
 
 Fixed: `ctx.hdr_order_worker` (2026-10-12). A dedicated Worker's script
 request sent `User-Agent` right after `Accept`; Chromium sends it after
@@ -1118,7 +1121,7 @@ Reported, not gated: `gfx.webgl*` (SwiftShader under `auto`, none under
 in CEF's distribution), `input.moves_before_down` / `input.hold` for the
 direct click (one move, zero hold: documented; the replayed click holds
 and matches), and the host rows (`focus.has_focus` was false in Chromium
-until the first click, the window position, audio devices, voices).
+until the first click, audio devices, voices).
 Everything else matched, including every automation marker, the
 `toString` scan in both realms, worker/iframe facts, devtools-detector's
 tricks, permissions, client hints, ClearKey and the storage quota.
@@ -1126,13 +1129,19 @@ tricks, permissions, client hints, ClearKey and the storage quota.
 ## Real geometry for GUI views (`view_screen`, capability "view-screen")
 
 A windowless browser knows no screen: CEF asks the client for the view
-rect (`get_view_rect`, its origin is the view's screen position and so
-`MouseEvent.screenX - clientX`), the screen (`get_screen_info` `rect` /
-`available_rect`: `screen.*`) and the root window (`get_root_screen_rect`:
-`outerWidth/Height`, `screenX/Y`; unanswered, the engine uses the view
-rect). Until 2026-10-12 every answer was the view itself at the origin,
-so a page in a GUI tab saw a screen the size of its viewport and no
-window chrome.
+rect (`get_view_rect`, its origin is the view's screen position), the
+screen (`get_screen_info` `rect` / `available_rect`: `screen.*`), the
+root window (`get_root_screen_rect`: `outerWidth/Height`, `screenX/Y`;
+unanswered, the engine uses the view rect) and, per mouse event, the
+screen point of a view point (`get_screen_point`: `MouseEvent.screenX/Y`,
+device px on Linux; unanswered, CEF uses the VIEW point, so the view
+rect's origin never reaches an event). Until 2026-10-12 every answer was
+the view itself at the origin, so a page in a GUI tab saw a screen the
+size of its viewport and no window chrome; until 2026-10-14
+`get_screen_point` was not installed, so `screenX - clientX` stayed 0
+even with a report (the headful audit's `input.screen_offset` showed
+it). It answers only for a view with a report (`screengeom.screenPoint`),
+so a client that never sends one keeps CEF's own answer.
 
 The GUI face now reports what it really knows (`ui/webface/screen.zig`):
 the GdkMonitor the window is on (logical px, its layout origin), the
@@ -1144,8 +1153,9 @@ position nor a work area, so the window sits at its monitor's origin and
 on a 1920x1080 sketerm display: `screen` and `avail` 1920x1080 at 0,0,
 `outer` 945x1060 = the compositor's window size, `inner` 913x931, and
 `screenX/Y` 10,10, which is Chrome's own default placement (WindowSizer),
-not something Wayland told it; we report the monitor origin instead (the
-audit classes that row `host`). Sent after `view_create`, on resize,
+not something Wayland told it; the GUI reports the monitor origin
+instead (the audit runs the MCP lane only, which copies Chrome's 10,10).
+Sent after `view_create`, on resize,
 realize, `enter-monitor`, a scale change and the surface's `layout`
 (toplevel resize), only when it changed; the helper (`Host.setScreen`)
 answers a change with `notify_screen_info_changed` (which also re-sends
@@ -1157,13 +1167,51 @@ headless ozone here).
 
 Skew: the GUI sends the frame only to a helper that advertises the
 capability, and a helper keeps view == screen for a client that never
-sends it, which is the MCP headless lane today (its geometry waits on the
-headless architecture decision). `SKETERM_WEB_DISABLE_VIEW_SCREEN` makes
-a new helper look old. smoke-e2e `webScreenStage`
-(`SKETERM_SMOKE_E2E_WEB_SCREEN_ONLY=1`) asserts the real values on
-sketerm's own display, and with that variable set asserts the old ones.
-A monitor's own geometry changing under a window that stays on it (a
-mode change) is not watched.
+sends it. `SKETERM_WEB_DISABLE_VIEW_SCREEN` makes a new helper look old.
+smoke-e2e `webScreenStage` (`SKETERM_SMOKE_E2E_WEB_SCREEN_ONLY=1`)
+asserts the real values on sketerm's own display, and with that
+variable set asserts the old ones. A monitor's own geometry changing
+under a window that stays on it (a mode change) is not watched.
+
+### The MCP headless lane: synthesized geometry (decided 2026-10-14)
+
+A headless view has no monitor and no window, so `webdrive.Engine`
+reports SYNTHESIZED geometry through the same frame, computed in ONE
+place, `screengeom.headless` (pure, both test roots): `screen` and
+`avail` are `[mcp] web_screen` (`[mcp.<name>]` overrides; default
+1920x1080) at 0,0; the window is the viewport + 32 x 129 px (headful
+Chromium's 945x1060 around 913x931); it sits at 10,10 (Chrome's
+WindowSizer default), pulled back toward 0 when it would leave the
+screen; the view sits at 16,97 inside it. That offset is MEASURED, not
+assumed: the committed reference's `input.screen_offset` is [26,107] at
+window 10,10, so the bottom border (32) is not the side border (16). A
+window that does not fit the configured screen moves to 2560x1440, then
+3840x2160, then a screen of the window's own size. Everything is logical
+px; device-scale emulation does not change the report (the lever
+mapping above does).
+
+ORDER is what makes the first document see it, and it was measured: a
+report sent right after `view_create_url` lost to that create's own
+first navigation (the page parsed with the new `screen` but `outer ==
+inner` and `screenX` 0, the root rect not yet re-sent). So the helper
+now HOLDS a report naming a view that does not exist yet
+(`Host.pending_screen`, beside `pending_media`, taken by
+`registerViewWith`, dropped with the id or the connection by
+`dropPending`) and advertises that as `view-screen-early`; the engine
+sends the report BEFORE `view_create*` to such a helper, else right
+after the create (a helper with `view-screen` only: best effort, it can
+race). A report for a view another client owns is ignored, never held;
+a full table (`MAX_POLICY_VIEWS`) refuses. It is resent on
+`Engine.resize` and for every adopted popup (its own window, already
+created by the engine, so after the fact), each time only when it
+differs from the view's `sent_screen`. A helper without `view-screen`
+gets nothing (`capabilities.web_screen` is then null);
+`web_screen_source` says built_in/config/profile. A mouse event's
+screen position needed `get_screen_point` (above), or the click offset
+stayed `[0,0]` behind a believable window. smoke-mcp `webScreenStage`
+(`SKETERM_SMOKE_MCP_WEBSCREEN_ONLY=1`) proves the values the FIRST
+document parses with, a real click's `screenX - clientX`, the resize,
+the ladder, the pull-back, both config sources and the old-helper path.
 
 ## Keyboard layout map and EyeDropper (investigated 2026-10-12, unchanged)
 

@@ -1141,6 +1141,11 @@ pub const Host = struct {
     /// carries it (`Policy.proxy_decides_addresses`).
     proxy_decides_addresses: bool = false,
     pending_media: [proto.MAX_POLICY_VIEWS]proto.ViewEmulation = @splat(.{ .view = 0 }),
+    /// `view_screen` reports that named a view before it existed
+    /// (capability "view-screen-early"); `registerViewWith` takes one
+    /// into its view, so the first document is laid out on it. A slot
+    /// with view 0 is free.
+    pending_screen: [proto.MAX_POLICY_VIEWS]proto.ViewScreen = @splat(std.mem.zeroes(proto.ViewScreen)),
     next_media_generation: u64 = 0,
     /// Why this ROUTED instance serves nothing (empty while it serves):
     /// the engine refused the route's proxy, or the WebRTC policy that
@@ -1735,10 +1740,15 @@ pub const Host = struct {
     /// `view_screen`: the real geometry the page reads as `screen.*`,
     /// `outer*` and `screenX/Y`. A change reaches the engine as a screen
     /// info change (which also re-sends the window rect to the renderer)
-    /// plus a resize, since the view's own origin may have moved.
-    pub fn setScreen(self: *Host, req: proto.ViewScreen) !void {
+    /// plus a resize, since the view's own origin may have moved. With
+    /// `hold_early`, a report naming a view that does not exist yet is
+    /// held until it is created; a view another client owns is ignored.
+    pub fn setScreen(self: *Host, req: proto.ViewScreen, hold_early: bool) !void {
         if (!req.valid()) return error.InvalidScreen;
-        const v = self.find(req.view) orelse return;
+        const v = self.find(req.view) orelse {
+            if (hold_early and req.view != 0 and self.findAny(req.view) == null) try self.holdScreen(req);
+            return;
+        };
         if (v.screen) |s| if (std.meta.eql(s, req)) return;
         v.screen = req;
         if (v.discarded) return;
@@ -1748,6 +1758,29 @@ pub const Host = struct {
                 if (host.was_resized) |wr| wr(host);
             }
         }.f);
+    }
+
+    fn holdScreen(self: *Host, req: proto.ViewScreen) !void {
+        for (&self.pending_screen) |*slot| if (slot.view == req.view) {
+            slot.* = req;
+            return;
+        };
+        for (&self.pending_screen) |*slot| if (slot.view == 0) {
+            slot.* = req;
+            return;
+        };
+        return error.TooManyPendingScreens;
+    }
+
+    /// Drop every pre-create record (`pending_media`, `pending_screen`)
+    /// naming a view id in `lo..hi`, inclusive.
+    fn dropPending(self: *Host, lo: u32, hi: u32) void {
+        for (&self.pending_media) |*slot| if (slot.view != 0 and slot.view >= lo and slot.view <= hi) {
+            slot.* = .{ .view = 0 };
+        };
+        for (&self.pending_screen) |*slot| if (slot.view != 0 and slot.view >= lo and slot.view <= hi) {
+            slot.view = 0;
+        };
     }
 
     pub fn setEmulation(self: *Host, req: proto.ViewEmulation) !void {
@@ -1951,6 +1984,11 @@ pub const Host = struct {
                 break;
             }
         }
+        for (&self.pending_screen) |*slot| if (slot.view == req.view) {
+            v.screen = slot.*;
+            slot.view = 0;
+            break;
+        };
         errdefer v.sem.deinit();
         try self.views.append(self.gpa, v);
         return v;
@@ -2218,9 +2256,7 @@ pub const Host = struct {
 
     /// Retire every view-owned resource without re-closing a browser already in its close callback.
     pub fn retireView(self: *Host, id: u32, opts: Retirement) void {
-        for (&self.pending_media) |*slot| if (slot.view == id) {
-            slot.* = .{ .view = 0 };
-        };
+        self.dropPending(id, id);
         self.abandonViewWaiters(id);
         // Its stream ends while the record exists, so the stream
         // client's held keys and buttons are released into the page.
@@ -2416,9 +2452,7 @@ pub const Host = struct {
         // opened would pin slots from the shared MAX_POLICY_VIEWS pool
         // until engine exit.
         const base = conn_id *| proto.CONN_ID_WINDOW;
-        for (&self.pending_media) |*slot| {
-            if (slot.view >= base and slot.view < base + proto.CONN_ID_WINDOW) slot.* = .{ .view = 0 };
-        }
+        self.dropPending(base, base +| (proto.CONN_ID_WINDOW - 1));
         var slot_ids: [proto.MAX_POLICY_VIEWS]u32 = undefined;
         var n: usize = 0;
         {
@@ -4505,6 +4539,32 @@ const MediaTest = struct {
         try std.testing.expectEqual(@as(usize, 1), count);
     }
 };
+
+test "a view_screen naming a view not created yet is held, taken at registration and dropped with its id" {
+    const t = std.testing;
+    var out = proto.Outbox.init(t.allocator);
+    defer out.deinit();
+    var host = Host.init(t.allocator, &out);
+    defer host.deinit();
+    const def = screengeom.headless_screen_default;
+    // Without the hold (a helper withholding view-screen-early) it is dropped.
+    try host.setScreen(screengeom.headless(81, def, 800, 600), false);
+    for (host.pending_screen) |s| try t.expectEqual(@as(u32, 0), s.view);
+    try host.setScreen(screengeom.headless(81, def, 800, 600), true);
+    // A later report for the same id replaces the held one.
+    const later = screengeom.headless(81, def, 1000, 700);
+    try host.setScreen(later, true);
+    const v = try host.registerView(ViewConstructionTest.req(81, 0));
+    try t.expectEqual(later, v.screen.?);
+    for (host.pending_screen) |s| try t.expectEqual(@as(u32, 0), s.view);
+    // A report for a view that never arrives goes with its id.
+    try host.setScreen(screengeom.headless(82, def, 800, 600), true);
+    host.destroyView(82);
+    for (host.pending_screen) |s| try t.expectEqual(@as(u32, 0), s.view);
+    // A full table refuses rather than evicting another view's report.
+    for (0..proto.MAX_POLICY_VIEWS) |i| try host.setScreen(screengeom.headless(100 + @as(u32, @intCast(i)), def, 800, 600), true);
+    try t.expectError(error.TooManyPendingScreens, host.setScreen(screengeom.headless(99, def, 800, 600), true));
+}
 
 test "media initial navigation waits for execution success and hides bootstrap blank completion" {
     try std.testing.expect(apiHash());
@@ -6721,6 +6781,7 @@ fn installHandlers() void {
     render_handler.get_view_rect = onGetViewRect;
     render_handler.get_screen_info = onGetScreenInfo;
     render_handler.get_root_screen_rect = onGetRootScreenRect;
+    render_handler.get_screen_point = onGetScreenPoint;
     render_handler.on_paint = onPaint;
     // BOTH are installed, always. Which one Chromium calls is its own
     // decision per frame: with shared textures off it is `on_paint`, and
@@ -6972,6 +7033,25 @@ fn onGetRootScreenRect(
     const v = viewOf(browser) orelse return 0;
     const root = engineGeometry(v).root orelse return 0;
     rect.* = cefRect(root);
+    return 1;
+}
+
+/// A view point on the screen (`screengeom.screenPoint`): what a mouse
+/// event's `screenX`/`screenY` are. 0 without a client report, so CEF
+/// keeps the view point as before.
+fn onGetScreenPoint(
+    _: [*c]cef.cef_render_handler_t,
+    browser: [*c]cef.cef_browser_t,
+    view_x: c_int,
+    view_y: c_int,
+    screen_x: [*c]c_int,
+    screen_y: [*c]c_int,
+) callconv(.c) c_int {
+    defer releaseArg(browser);
+    const v = viewOf(browser) orelse return 0;
+    const p = screengeom.screenPoint(scale_lever, v.scale_x1000, engineGeometry(v), view_x, view_y) orelse return 0;
+    screen_x.* = p.x;
+    screen_y.* = p.y;
     return 1;
 }
 

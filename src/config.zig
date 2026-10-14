@@ -735,10 +735,13 @@ pub const McpProfile = struct {
     /// Whether a headless web_open that does not say turns recorded idle
     /// drift on for its view; null leaves it off.
     web_motion_idle_drift: ?bool = null,
+    /// The screen a headless view reports (`web/screengeom.zig`
+    /// `headless`); null leaves 1920x1080.
+    web_screen: ?@import("web/screengeom.zig").Size = null,
 
     /// Whether serializing this record writes anything.
     pub fn isEmpty(self: *const McpProfile) bool {
-        return self.tools.len == 0 and self.web_gui == null and self.web_max_fps == null and self.web_idle_close_secs == null and self.web_fetch_max_tabs == null and self.web_webgl == null and self.web_motion_default == null and self.web_motion_pack.len == 0 and self.web_motion_idle_drift == null;
+        return self.tools.len == 0 and self.web_gui == null and self.web_max_fps == null and self.web_idle_close_secs == null and self.web_fetch_max_tabs == null and self.web_webgl == null and self.web_motion_default == null and self.web_motion_pack.len == 0 and self.web_motion_idle_drift == null and self.web_screen == null;
     }
 
     pub fn cloneInto(self: *const McpProfile, arena: std.mem.Allocator) error{OutOfMemory}!McpProfile {
@@ -2326,6 +2329,8 @@ fn applyMcpKv(prof: *McpProfile, arena: std.mem.Allocator, key: []const u8, valu
         prof.web_motion_pack = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "web_motion_idle_drift")) {
         prof.web_motion_idle_drift = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "web_screen")) {
+        prof.web_screen = @import("web/screengeom.zig").Size.parse(value) orelse return error.BadValue;
     } else return error.UnknownKey;
 }
 
@@ -2341,6 +2346,7 @@ fn serialiseMcpKeys(prof: *const McpProfile, w: *std.Io.Writer) !void {
     if (prof.web_motion_default) |v| try w.print("web_motion_default = {s}\n", .{@tagName(v)});
     if (prof.web_motion_pack.len > 0) try w.print("web_motion_pack = {s}\n", .{prof.web_motion_pack});
     if (prof.web_motion_idle_drift) |v| try w.print("web_motion_idle_drift = {s}\n", .{if (v) "true" else "false"});
+    if (prof.web_screen) |v| try w.print("web_screen = {f}\n", .{v});
 }
 
 fn applyDomainKv(dom: *Domain, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
@@ -4497,6 +4503,7 @@ test "config: bare [mcp] defaults and web_gui parse and round-trip" {
         \\web_motion_default = replay
         \\web_motion_pack = my-mouse
         \\web_motion_idle_drift = true
+        \\web_screen = 2560x1440
         \\
         \\[mcp.locked]
         \\tools = files:ro
@@ -4506,6 +4513,7 @@ test "config: bare [mcp] defaults and web_gui parse and round-trip" {
         \\web_motion_default = direct
         \\web_motion_idle_drift = off
         \\web_idle_close_secs = 0
+        \\web_screen = 1366x768
         \\
         \\[mcp.quiet]
         \\tools = app
@@ -4547,9 +4555,16 @@ test "config: bare [mcp] defaults and web_gui parse and round-trip" {
     try std.testing.expectEqual(true, cfg2.mcp.web_motion_idle_drift.?);
     try std.testing.expectEqual(false, cfg2.mcpProfile("locked").?.web_motion_idle_drift.?);
     try std.testing.expect(cfg2.mcpProfile("quiet").?.web_motion_idle_drift == null);
+    // The profile's screen overrides the bare one; a profile that does
+    // not say leaves it unstated, so the bare value applies.
+    try std.testing.expectEqual(@import("web/screengeom.zig").Size{ .w = 2560, .h = 1440 }, cfg2.mcp.web_screen.?);
+    try std.testing.expectEqual(@import("web/screengeom.zig").Size{ .w = 1366, .h = 768 }, cfg2.mcpProfile("locked").?.web_screen.?);
+    try std.testing.expect(cfg2.mcpProfile("quiet").?.web_screen == null);
     var scratch: McpProfile = .{ .name = "scratch" };
     try std.testing.expectError(error.BadValue, applyMcpKv(&scratch, std.testing.allocator, "web_motion_default", "sometimes"));
     try std.testing.expectError(error.BadValue, applyMcpKv(&scratch, std.testing.allocator, "web_motion_pack", "../x"));
+    for ([_][]const u8{ "1920", "0x1080", "1920*1080", "wide" }) |bad|
+        try std.testing.expectError(error.BadValue, applyMcpKv(&scratch, std.testing.allocator, "web_screen", bad));
     try std.testing.expect(cfg2.mcpProfile("locked").?.web_fetch_max_tabs == null);
     try std.testing.expectEqual(false, cfg2.mcpProfile("locked").?.web_gui.?);
     try std.testing.expect(cfg2.mcpProfile("quiet").?.web_gui == null);

@@ -847,6 +847,28 @@ headless routes use local helpers and do not relay remote stream sockets.
 Launchers should pass their existing per-instance runtime/state directory
 explicitly instead of relying on that fallback.
 
+**Screen and window geometry.** A headless page reports a believable
+screen and window instead of screen = window = viewport at 0,0 (an
+obvious automation tell). The geometry is synthesized, since there is no
+monitor, from headful Chromium 152 on a sketerm display
+(`src/web/screengeom.zig` `headless`, the one home): `screen.*` and
+`screen.avail*` are `[mcp] web_screen` (default 1920x1080, see
+docs/config.md) at 0,0; `outerWidth`/`outerHeight` are the viewport plus
+32 x 129 px; `screenX`/`screenY` are 10,10 (Chrome's default placement),
+pulled back toward 0 when the window would leave the screen; the
+viewport sits 16,97 inside the window, so `MouseEvent.screenX - clientX`
+is 26,107 as in the reference capture. A window that does not fit the
+configured screen moves to 2560x1440, then 3840x2160, then a screen of
+the window's own size. The report is sent BEFORE the view is created to
+a helper that holds it (`view-screen-early`), so the first document
+parses with it, else right after the create; again on `web_resize`, and
+for every adopted popup (its own window), each time only when it
+changed; it is in logical px, so `device_scale_factor` leaves it alone.
+Only a helper advertising `view-screen` gets it: an older one keeps the
+old geometry, and `capabilities.web_screen` is then null (also null for
+the GUI's browser, which reports its real monitor). `web_screen_source`
+says where the value came from (`built_in`, `config`, `profile`).
+
 The helper's continuous CEF loop owns the stream, including its input and
 audio processing. MCP creates no pump thread and sends no unsolicited
 pixels on stdio. A binary peer can drive and watch the view while an MCP

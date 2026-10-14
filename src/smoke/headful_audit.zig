@@ -83,7 +83,9 @@ pub const TABLE = [_]Entry{
     .{ .id = "geo.outer_exceeds_inner", .class = M },
     .{ .id = "geo.window_fits_screen", .class = M },
     .{ .id = "geo.avail_within_screen", .class = M },
-    .{ .id = "geo.window_at_origin", .class = H, .why = "window placement; Wayland gives a client no position, so Chrome's value is its own guess" },
+    // The MCP lane synthesizes its window at Chrome's own 10,10
+    // (`screengeom.headless`), so the position is a fact, not the host's.
+    .{ .id = "geo.window_at_origin", .class = M },
     .{ .id = "geo.dpr", .class = H, .why = "the output's scale" },
     .{ .id = "geo.color_depth", .class = M },
     .{ .id = "geo.orientation", .class = M },
@@ -173,7 +175,9 @@ pub const TABLE = [_]Entry{
     .{ .id = "input.timestamps_monotonic", .class = M },
     .{ .id = "input.pointer_props", .class = M },
     .{ .id = "input.click_props", .class = M },
-    .{ .id = "input.screen_offset", .class = H, .why = "where the window and its toolbar sit on the screen" },
+    // Synthesized from this reference: window 10,10 plus the viewport's
+    // 16,97 inside it (`screengeom.headless_view_offset`).
+    .{ .id = "input.screen_offset", .class = M },
 };
 
 pub fn classOf(id: []const u8) ?Entry {

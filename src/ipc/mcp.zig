@@ -844,6 +844,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     var motion_pack_source: MotionSource = if (motion_pack.len > 0) .config else .built_in;
     var idle_drift: bool = cfg.mcp.web_motion_idle_drift orelse false;
     var idle_drift_source: MotionSource = if (cfg.mcp.web_motion_idle_drift != null) .config else .built_in;
+    var web_screen = cfg.mcp.web_screen orelse @import("../web/screengeom.zig").headless_screen_default;
+    var web_screen_source: MotionSource = if (cfg.mcp.web_screen != null) .config else .built_in;
     if (opts.profile) |name| {
         const prof = mcpProfileRecord(&cfg, name) catch return 2;
         if (prof.web_max_fps) |fps| web_max_fps = fps;
@@ -862,6 +864,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             idle_drift = on;
             idle_drift_source = .profile;
         }
+        if (prof.web_screen) |s| {
+            web_screen = s;
+            web_screen_source = .profile;
+        }
     }
     if (opts.web_motion_default) |m| {
         motion_default = m;
@@ -875,6 +881,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     @import("mcp_web.zig").configureMotion(allocator, motion_default, motion_default_source, idle_drift, idle_drift_source, allocator.dupe(u8, motion_pack) catch "", motion_pack_source);
     @import("mcp_web.zig").configureIdleClose(web_idle_close_secs);
     @import("mcp_web.zig").configureWebgl(web_webgl orelse .auto);
+    @import("mcp_web.zig").configureScreen(web_screen, web_screen_source);
     mcp_webfetch.configure(web_fetch_max_tabs);
 
     if (opts.log_dir) |ld| {
