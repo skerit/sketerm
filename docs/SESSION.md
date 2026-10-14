@@ -22833,3 +22833,38 @@ entries for `vendor/aro_shims` (which only C sources would see, and none
 includes GTK) are gone. `vendor/aro_shims/cef/uchar.h` is unchanged.
 `addHostTool` is now the one recipe for host helpers (`lint-errdefer`
 uses it too).
+
+## 2026-10-14: bounded act replies, and terminals that say why they are busy
+
+Field feedback from agents walking an admin UI and driving remote hosts.
+Every claim was checked against the code first, and all five held.
+
+Web. A `web_act` scoped to a node the act removed (an alertdialog the
+click closed, a region the server live-replaced) fell back to the whole
+document, 20-25 KB per act. A scoped act was also always a full
+subtree, never a diff. Now a scoped follow-up is a coalesced delta of
+the subtree (`semantic.View.consumeScopedDelta`). A lost scope is
+re-resolved: a unique replacement with the same role and name, else the
+nearest surviving ancestor, else the page's delta. The reply says which
+in `scope_state` and `scope_resolved`. Changed live regions
+(status/alert/log, i.e. toasts) lead every delta as `live:` lines.
+`web_act`/`web_key` take `snapshot: none|delta|full` and `max_chars`
+(default 8000). An explicit `web_snapshot scope:` of a vanished node is
+`not_found` and names the ancestor. The GUI face accepts a delta reply
+to a scoped auto request.
+
+Terminals:
+- The `term_exec` wrapper traps INT/QUIT/TERM. ^C used to kill it
+  before the end marker printed, which left the exec pending forever.
+- A finished exec whose begin marker vanished (a clear screen, a
+  redraw, the alternate screen) returned the whole scrollback. It now
+  starts after the command's echo, or after a send-time line watermark,
+  and reports `output_boundary`.
+- Exec output is capped inline at 20000 characters by default
+  (`max_chars`), keeping the tail.
+- Busy refusals name the command, how long it has run, and the three
+  ways on.
+- New tool `term_interrupt`. It escalates ^C, then SIGTERM, then
+  SIGKILL to the foreground process group through a new daemon frame,
+  `fg_signal` (37/100, capability `fg_signal`). On plain ssh it sends
+  ^C, then ^\. It reports which step worked.
