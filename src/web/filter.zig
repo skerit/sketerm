@@ -42,27 +42,9 @@
 const std = @import("std");
 const urlhost = @import("urlhost.zig");
 
-/// Engine-agnostic resource classes, aligned with the wire's
-/// `NetResource` byte in protocol.zig.
-pub const RType = enum(u8) {
-    other = 0,
-    document = 1,
-    subdocument = 2,
-    stylesheet = 3,
-    script = 4,
-    image = 5,
-    font = 6,
-    xhr = 7,
-    media = 8,
-    websocket = 9,
-    ping = 10,
+pub const RType = @import("resource.zig").Resource;
 
-    pub fn bit(self: RType) u16 {
-        return @as(u16, 1) << @as(u4, @intCast(@intFromEnum(self)));
-    }
-};
-
-const ALL_TYPES: u16 = 0x7ff;
+const ALL_TYPES: u16 = RType.all_mask;
 /// Default applicability: everything but a top-level document.
 const DEFAULT_TYPES: u16 = ALL_TYPES & ~RType.document.bit();
 

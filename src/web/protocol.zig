@@ -3073,22 +3073,8 @@ pub const SemEvalResult = struct {
 
 // -- request interception (0x80 block, capability "intercept") --------
 
-/// Resource classes as the wire names them; mirrors `filter.RType`
-/// (engine-agnostic — a Servo helper maps its own enum onto these).
-pub const NetResource = enum(u8) {
-    other = 0,
-    document = 1,
-    subdocument = 2,
-    stylesheet = 3,
-    script = 4,
-    image = 5,
-    font = 6,
-    xhr = 7,
-    media = 8,
-    websocket = 9,
-    ping = 10,
-    _,
-};
+/// The `rtype` byte's classes; decoders read it via `NetResource.fromWire`.
+pub const NetResource = @import("resource.zig").Resource;
 
 /// Enable/disable blocking. `view` 0 is the process-wide default; a
 /// nonzero view carries the per-view (per-site, as the client sees it)
@@ -3393,11 +3379,7 @@ pub fn netLogJson2(gpa: std.mem.Allocator, log: NetLog) ![]u8 {
 }
 
 fn writeNetEntryJson(w: *std.Io.Writer, e: NetEntry, reason: NetReason, detail: ?NetDetail) !void {
-    const rt: NetResource = @enumFromInt(e.rtype);
-    const rt_name = switch (rt) {
-        .other, .document, .subdocument, .stylesheet, .script, .image, .font, .xhr, .media, .websocket, .ping => @tagName(rt),
-        _ => "other",
-    };
+    const rt_name = @tagName(NetResource.fromWire(e.rtype));
     try w.print("{{\"seq\":{d},\"blocked\":{s},\"type\":\"{s}\",\"method\":", .{
         e.seq,
         if (e.blocked != 0) "true" else "false",

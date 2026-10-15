@@ -270,6 +270,7 @@ comptime {
     _ = @import("smoke/headful_audit.zig");
     _ = @import("util/jsonnum.zig");
     _ = @import("util/jsonstr.zig");
+    _ = @import("web/resource.zig");
     _ = @import("util/spinlock.zig");
     // browser helper protocol + keymap: pure std, no CEF — the helper
     // itself is opt-in (`zig build web`) but its wire format and key

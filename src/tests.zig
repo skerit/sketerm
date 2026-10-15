@@ -66,6 +66,7 @@ comptime {
     _ = @import("smoke/headful_audit.zig");
     _ = @import("util/jsonnum.zig");
     _ = @import("util/jsonstr.zig");
+    _ = @import("web/resource.zig");
     _ = @import("util/spinlock.zig");
     _ = @import("util/fdcancel.zig");
     // browser helper protocol + keymap: pure std, no CEF — the helper

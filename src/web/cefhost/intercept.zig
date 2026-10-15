@@ -518,7 +518,7 @@ test "destroy before browser creation releases installed and rejected policy slo
 
 fn validPolicySet(req: proto.NetPolicySet) bool {
     const schemes: u16 = (1 << std.meta.fields(netpolicy.Scheme).len) - 1;
-    const types: u16 = (1 << std.meta.fields(filter.RType).len) - 1;
+    const types: u16 = filter.RType.all_mask;
     if (req.flags & ~(proto.NetPolicySet.flag_allow_private | proto.NetPolicySet.flag_untrusted) != 0 or
         req.allow_schemes & ~schemes != 0 or req.block_types & ~types != 0 or
         req.allow_top.len > netpolicy.MAX_HOSTS or req.allow_sub.len > netpolicy.MAX_HOSTS) return false;
