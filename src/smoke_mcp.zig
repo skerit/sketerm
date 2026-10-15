@@ -795,13 +795,27 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             std.mem.indexOf(u8, open, "term-1.cast") == null)
             fail("term_open did not announce its auto asciicast recording");
 
-        // Private daemon socket exists; shared one does NOT.
+        // The terminal lives on the private daemon. The per-user daemon
+        // (under this run's isolated runtime dir) exists only as the peer
+        // link's broker: it must hold no session of this server's.
         var priv_buf: [512]u8 = undefined;
         const priv = std.fmt.bufPrint(&priv_buf, "{s}/sketerm/mcp-tmp-{d}/mux.sock", .{ rt, m.pid }) catch unreachable;
         if (!fileExists(priv)) fail("private daemon socket not created");
         var shared_buf: [512]u8 = undefined;
         const shared = std.fmt.bufPrint(&shared_buf, "{s}/sketerm/mux.sock", .{rt}) catch unreachable;
-        if (fileExists(shared)) fail("shared mux.sock was created (isolation breach)");
+        if (!fileExists(shared)) fail("the peer link did not reach the per-user daemon");
+        {
+            var sc = muxclient.Conn.connect(allocator, shared) catch fail("per-user daemon connect");
+            defer sc.deinit();
+            sc = muxclient.Conn.probe(allocator, sc) catch fail("per-user daemon probe");
+            sc.sendFrame(.list, "") catch fail("per-user daemon list send");
+            const lf = sc.recvExpectFor(&.{.welcome}, 10_000) catch fail("per-user daemon list reply");
+            defer lf.deinit(allocator);
+            const Listing = struct { sessions: []struct { name: []const u8 = "" } = &.{} };
+            const parsed = std.json.parseFromSlice(Listing, allocator, lf.payload, .{ .ignore_unknown_fields = true }) catch fail("per-user daemon list parse");
+            defer parsed.deinit();
+            if (parsed.value.sessions.len != 0) fail("a session reached the per-user daemon (isolation breach)");
+        }
 
         const after_mux = doctorOutput(exe, &doctor_buf);
         if (std.mem.indexOf(u8, after_mux, pid_text) == null or
@@ -1314,12 +1328,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             }
         }
 
-        // The live half: no origin daemon or GUI socket, so a described
-        // refusal naming the missing transport -- never a hang.
+        // The live half: no GUI socket, and the per-user daemon (running for
+        // the peer links) holds no such session, so a described refusal
+        // naming the missing session -- never a hang.
         const no_gui = m.callTool("ui_show", "{\"name\":\"p\",\"session\":\"smoke ui\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"hi\"}}}}");
         if (std.mem.indexOf(u8, no_gui, "isError") == null or
-            std.mem.indexOf(u8, no_gui, "origin mux daemon") == null)
+            std.mem.indexOf(u8, no_gui, "origin session smoke ui is no longer present on its exact daemon") == null)
+        {
+            say(no_gui);
             fail("ui_show without a panel origin did not explain the missing transport");
+        }
         const no_session = m.callTool("ui_show", "{\"name\":\"anon-live\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"hi\"}}}}");
         if (std.mem.indexOf(u8, no_session, "isError") == null or
             std.mem.indexOf(u8, no_session, "no live panel transport") == null)
@@ -1356,8 +1374,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const panels = m.callTool("ui_panels", "{\"session\":\"smoke ui\"}");
         if (std.mem.indexOf(u8, panels, "Epoch 41") == null or
             std.mem.indexOf(u8, panels, "\"live\":null") == null or
-            std.mem.indexOf(u8, panels, "origin mux daemon") == null)
+            std.mem.indexOf(u8, panels, "origin session smoke ui is no longer present on its exact daemon") == null)
+        {
+            say(panels);
             fail("ui_panels did not separate the saved list from the unavailable live list");
+        }
         const other = m.callTool("ui_panels", "{\"session\":\"someone-else\"}");
         if (std.mem.indexOf(u8, other, "Epoch 41") != null)
             fail("a saved panel leaked into another session's list");
