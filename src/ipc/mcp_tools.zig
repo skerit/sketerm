@@ -1,9 +1,12 @@
 //! THE tool vocabulary: one table declaring every MCP tool this server
 //! advertises, its exposure group, whether it mutates anything, and its
 //! schemas. `TOOLS_JSON` (what tools/list serves) and `mcpfilter`'s
-//! policy classification are both DERIVED from it at comptime, so a new
-//! tool is one entry here and can never be advertised-but-ungrouped or
-//! grouped-but-unadvertised.
+//! policy classification are both DERIVED from it, so a new tool is one
+//! entry here and can never be advertised-but-ungrouped or
+//! grouped-but-unadvertised. The classification is comptime; the JSON is
+//! rendered by `writeToolJson` at BUILD time (`src/mcp_tools_gen.zig`),
+//! because the same rendering as comptime code dominated the analysis of
+//! every MCP-bearing root.
 //!
 //! GTK-free on purpose: both test roots import it.
 //!
@@ -109,11 +112,12 @@ const ERROR_OUTPUT =
     \\{"type":"object","properties":{"error":{"type":"object","properties":{"code":{"type":"string"},"message":{"type":"string"},"retryable":{"type":"boolean"}},"required":["code","message","retryable"],"additionalProperties":true}},"required":["error"],"additionalProperties":true}
 ;
 
-fn resultSchema(comptime success: []const u8) []const u8 {
+fn writeResultSchema(w: *std.Io.Writer, success: []const u8) std.Io.Writer.Error!void {
     // An optional-only success schema must not also match an error, including
     // a malformed one. isError lives outside structuredContent, not here.
-    return "{\"type\":\"object\",\"oneOf\":[" ++ success[0 .. success.len - 1] ++
-        ",\"not\":{\"required\":[\"error\"]}}," ++ ERROR_OUTPUT ++ "]}";
+    try w.writeAll("{\"type\":\"object\",\"oneOf\":[");
+    try w.writeAll(success[0 .. success.len - 1]);
+    try w.writeAll(",\"not\":{\"required\":[\"error\"]}}," ++ ERROR_OUTPUT ++ "]}");
 }
 
 /// The app-state facts `mcp.appFacts` writes, declared ONCE: every app
@@ -2572,86 +2576,46 @@ fn schemaReplace(comptime schema: []const u8, comptime needle: []const u8, compt
 
 // ── generated tools/list JSON ─────────────────────────────────────
 
-/// Each tool's tools/list object, key order `name`, `description`,
-/// `inputSchema`, then `outputSchema` when the tool declares one.
+/// Rendered from `TOOLS` by `src/mcp_tools_gen.zig` at build time; only
+/// the roots that reach `TOOL_JSON`/`TOOLS_JSON` need the module.
+const generated = @import("mcp_tools_json");
+
+/// Each tool's tools/list object, as `writeToolJson` renders it.
 /// Newline-free: MCP stdio framing is one JSON object per line.
 pub const TOOL_JSON: [TOOLS.len][]const u8 = blk: {
-    @setEvalBranchQuota(4_000_000);
+    if (generated.TOOL_SPANS.len != TOOLS.len)
+        @compileError("mcp_tools_json was generated from a different tool table");
     var arr: [TOOLS.len][]const u8 = undefined;
-    for (TOOLS, 0..) |t, i| arr[i] = toolJson(t);
+    for (generated.TOOL_SPANS, 0..) |span, i| arr[i] = TOOLS_JSON[span[0]..span[1]];
     break :blk arr;
 };
 
 /// The whole advertised array, unfiltered. `mcpfilter.filterToolsJson`
 /// rebuilds a narrower one from `TOOL_JSON` when a policy applies.
-pub const TOOLS_JSON: []const u8 = blk: {
-    @setEvalBranchQuota(4_000_000);
-    var total: usize = 2 + TOOLS.len - 1;
-    for (TOOL_JSON) |j| total += j.len;
-    var buf: [total]u8 = undefined;
-    var at: usize = 0;
-    writeRaw(&buf, &at, "[");
-    for (TOOL_JSON, 0..) |j, i| {
-        if (i > 0) writeRaw(&buf, &at, ",");
-        writeRaw(&buf, &at, j);
+pub const TOOLS_JSON: []const u8 = generated.TOOLS_JSON;
+
+/// Writes `t`'s tools/list object, key order `name`, `description`,
+/// `inputSchema`, then `outputSchema` when the tool declares one.
+/// Only `"` and `\` ever need escaping: the table's descriptions are
+/// hand-written prose.
+/// @return error.ControlByte for a control byte in the description,
+/// which would produce a document no client can parse.
+pub fn writeToolJson(w: *std.Io.Writer, t: ToolDef) (std.Io.Writer.Error || error{ControlByte})!void {
+    try w.writeAll("{\"name\":\"");
+    try w.writeAll(t.name);
+    try w.writeAll("\",\"description\":\"");
+    for (t.description) |ch| {
+        if (ch < 0x20) return error.ControlByte;
+        if (ch == '"' or ch == '\\') try w.writeByte('\\');
+        try w.writeByte(ch);
     }
-    writeRaw(&buf, &at, "]");
-    const frozen = buf;
-    break :blk &frozen;
-};
-
-fn toolJson(comptime t: ToolDef) []const u8 {
-    comptime {
-        var buf: [toolJsonLen(t)]u8 = undefined;
-        var at: usize = 0;
-        writeRaw(&buf, &at, "{\"name\":\"");
-        writeRaw(&buf, &at, t.name);
-        writeRaw(&buf, &at, "\",\"description\":\"");
-        writeEscaped(&buf, &at, t.description);
-        writeRaw(&buf, &at, "\",\"inputSchema\":");
-        writeRaw(&buf, &at, t.input_schema);
-        if (t.output_schema) |os| {
-            writeRaw(&buf, &at, ",\"outputSchema\":");
-            writeRaw(&buf, &at, resultSchema(os));
-        }
-        writeRaw(&buf, &at, "}");
-        const frozen = buf;
-        return &frozen;
+    try w.writeAll("\",\"inputSchema\":");
+    try w.writeAll(t.input_schema);
+    if (t.output_schema) |os| {
+        try w.writeAll(",\"outputSchema\":");
+        try writeResultSchema(w, os);
     }
-}
-
-fn toolJsonLen(comptime t: ToolDef) usize {
-    var n: usize = "{\"name\":\"".len + t.name.len +
-        "\",\"description\":\"".len + escapedLen(t.description) +
-        "\",\"inputSchema\":".len + t.input_schema.len + "}".len;
-    if (t.output_schema) |os| n += ",\"outputSchema\":".len + resultSchema(os).len;
-    return n;
-}
-
-/// Only `"` and `\` ever need escaping here: a control byte in a
-/// description is refused at comptime rather than emitted raw (it would
-/// produce a JSON document no client can parse).
-fn escapedLen(s: []const u8) usize {
-    var n: usize = 0;
-    for (s) |ch| n += if (ch == '"' or ch == '\\') @as(usize, 2) else 1;
-    return n;
-}
-
-fn writeEscaped(buf: []u8, at: *usize, s: []const u8) void {
-    for (s) |ch| {
-        if (ch < 0x20) @compileError("control byte in a tool description");
-        if (ch == '"' or ch == '\\') {
-            buf[at.*] = '\\';
-            at.* += 1;
-        }
-        buf[at.*] = ch;
-        at.* += 1;
-    }
-}
-
-fn writeRaw(buf: []u8, at: *usize, s: []const u8) void {
-    @memcpy(buf[at.*..][0..s.len], s);
-    at.* += s.len;
+    try w.writeAll("}");
 }
 
 // A duplicate tool name silently shadows in every MCP client, and a
@@ -2977,15 +2941,38 @@ test "a declared output schema is emitted last" {
         .input_schema = "{\"type\":\"object\",\"properties\":{}}",
         .output_schema = "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}}}",
     };
-    const json = comptime toolJson(t);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeToolJson(&aw.writer, t);
+    const json = aw.written();
     try testing.expectEqualStrings(
         "{\"name\":\"demo\",\"description\":\"quote \\\" and backslash \\\\ survive\"," ++
             "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}," ++
-            "\"outputSchema\":" ++ comptime resultSchema(t.output_schema.?) ++ "}",
+            "\"outputSchema\":{\"type\":\"object\",\"oneOf\":[{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}}," ++
+            "\"not\":{\"required\":[\"error\"]}}," ++ ERROR_OUTPUT ++ "]}}",
         json,
     );
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), json, .{});
     try testing.expectEqualStrings("quote \" and backslash \\ survive", parsed.object.get("description").?.string);
+    // A control byte is refused rather than emitted raw.
+    aw.clearRetainingCapacity();
+    var bad = t;
+    bad.description = "a raw\nnewline";
+    try testing.expectError(error.ControlByte, writeToolJson(&aw.writer, bad));
+}
+
+test "the build-time tool list is the table rendered now, and each tool's span is its own object" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try aw.writer.writeByte('[');
+    for (TOOLS, TOOL_JSON, 0..) |t, json, i| {
+        if (i > 0) try aw.writer.writeByte(',');
+        const start = aw.written().len;
+        try writeToolJson(&aw.writer, t);
+        try testing.expectEqualStrings(aw.written()[start..], json);
+    }
+    try aw.writer.writeByte(']');
+    try testing.expectEqualStrings(aw.written(), TOOLS_JSON);
 }

@@ -165,6 +165,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("build_options", glib_opts_mod);
     addVideo(b, exe_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     addAgentAdapters(b, exe_mod); // `sketerm mcp`'s agent_* tools
+    addMcpToolsJson(b, exe_mod);
     // NSAccessibility bridge (live on macOS: GTK4 has no NSAccessibility
     // backend, so every pane hangs an element on the window's content
     // view through a11y/nsax.zig). main.zig force-includes nsax.zig on
@@ -250,6 +251,7 @@ pub fn build(b: *std.Build) void {
     mcp_mod.addImport("build_options", noglib_opts_mod);
     addVideo(b, mcp_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     addAgentAdapters(b, mcp_mod); // the agent_* tools load the shipped adapters
+    addMcpToolsJson(b, mcp_mod);
     const mcp_exe = b.addExecutable(.{
         .name = "sketerm-mcp",
         .root_module = mcp_mod,
@@ -609,6 +611,7 @@ pub fn build(b: *std.Build) void {
     replay_mod.addImport("build_options", glib_opts_mod);
     addVideo(b, replay_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     addAgentAdapters(b, replay_mod); // `replay --agent` runs a shipped adapter
+    addMcpToolsJson(b, replay_mod);
     const replay = b.addExecutable(.{
         .name = "sketerm-replay",
         .root_module = replay_mod,
@@ -1104,6 +1107,7 @@ pub fn build(b: *std.Build) void {
     tests_mod.addAnonymousImport("docs_config_md", .{ .root_source_file = b.path("docs/config.md") });
     tests_mod.addAnonymousImport("docs_mcp_md", .{ .root_source_file = b.path("docs/mcp.md") });
     addAgentAdapters(b, tests_mod);
+    addMcpToolsJson(b, tests_mod);
     const tests = b.addTest(.{
         .root_module = tests_mod,
         .use_llvm = test_llvm,
@@ -1182,6 +1186,7 @@ pub fn build(b: *std.Build) void {
     // config.zig's drift test embeds docs/config.md, as in tests_mod.
     coretests_mod.addAnonymousImport("docs_config_md", .{ .root_source_file = b.path("docs/config.md") });
     addAgentAdapters(b, coretests_mod);
+    addMcpToolsJson(b, coretests_mod);
     const coretests = b.addTest(.{
         .root_module = coretests_mod,
         .use_llvm = test_llvm,
@@ -2327,6 +2332,23 @@ fn agentAdaptersSource(b: *std.Build) std.Build.LazyPath {
     src.appendSlice(b.allocator, "};\npub const facts_json = @embedFile(\"" ++ FACTS_FILE ++ "\");\n") catch @panic("OOM");
     const p = wf.add("agent_adapters.zig", src.items);
     agent_adapters_src = p;
+    return p;
+}
+
+/// Give a module the `mcp_tools_json` import `src/ipc/mcp_tools.zig` serves
+/// tools/list from: `src/mcp_tools_gen.zig` renders it from the tool table
+/// at build time. Every module that reaches `TOOLS_JSON` needs this call.
+fn addMcpToolsJson(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addAnonymousImport("mcp_tools_json", .{ .root_source_file = mcpToolsJsonSource(b) });
+}
+
+var mcp_tools_json_src: ?std.Build.LazyPath = null;
+
+fn mcpToolsJsonSource(b: *std.Build) std.Build.LazyPath {
+    if (mcp_tools_json_src) |p| return p;
+    const gen = b.addRunArtifact(addHostTool(b, "sketerm-mcp-tools-gen", "src/mcp_tools_gen.zig"));
+    const p = gen.addOutputFileArg("mcp_tools_json.zig");
+    mcp_tools_json_src = p;
     return p;
 }
 

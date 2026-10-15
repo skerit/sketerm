@@ -165,6 +165,11 @@ verbatim. `mcpfilter.filterToolsJson(arena, policy)` rebuilds the
 narrowed array from `TOOL_JSON`; `renderedToolsJson` filters first, then
 substitutes the `%..._DEF%` tokens. Generation was proven byte-identical
 to the deleted literal before the literal went away.
+2026-10-15: the JSON rendering moved from comptime to build time
+(`mcp_tools.writeToolJson`, run by `src/mcp_tools_gen.zig` into the
+`mcp_tools_json` module), which took the analysis of every MCP-bearing
+root from about 17 minutes to seconds; the control-byte refusal moved
+with it, and the served bytes were proven identical before and after.
 
 A tool's structured result is DECLARED on its entry:
 `.output_schema = \\{"type":"object","properties":{...}}` (a multiline
