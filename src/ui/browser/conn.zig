@@ -31,6 +31,8 @@ const DeferredDeltas = @import("../../mux/fs_boundary.zig").Deferred;
 const errorPhrase = @import("../../filebrowser/format.zig").errorPhrase;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const cast = @import("../../util/cast.zig");
+const Backoff = @import("../../util/backoff.zig").Backoff;
+const clock = @import("../../util/clock.zig");
 const hostlink = @import("../hostlink.zig");
 
 /// The live (ready or connecting) connection for `host`, creating
@@ -305,7 +307,8 @@ fn rebindTab(self: *BrowserView, tab: *BTab, hc: *HostConn) void {
 pub const Reconnect = struct {
     view: *BrowserView,
     host: []u8,
-    attempts: u32 = 0,
+    /// Its `attempts` count the dials made.
+    backoff: Backoff = RECONNECT,
     source: c.guint = 0,
 
     pub fn destroy(self: *Reconnect, allocator: std.mem.Allocator) void {
@@ -313,12 +316,17 @@ pub const Reconnect = struct {
         allocator.free(self.host);
         allocator.destroy(self);
     }
+
+    /// Re-arm the tick after the wait the dials so far impose.
+    fn arm(self: *Reconnect) void {
+        self.source = c.g_timeout_add(@intCast(self.backoff.next()), @ptrCast(&onReconnectTick), @ptrCast(self));
+    }
 };
 
-/// Re-dial delays; after three attempts the host stays dead until the
-/// user refreshes or navigates (every attempt may spawn a real ssh). The first is
-/// never earlier than the transfer retry floor.
-const RECONNECT_DELAYS_MS = [_]c.guint{ 5_000, 10_000, 20_000 };
+/// Re-dial delays (5 s, 10 s, then 20 s); after three dials the host stays
+/// dead until the user refreshes or navigates (every dial may spawn a real
+/// ssh). The first is never earlier than the transfer retry floor.
+const RECONNECT = Backoff{ .min_ms = 5_000, .max_ms = 20_000, .limit = 3 };
 
 /// A connection dropped while tabs were on it: retry by timer so a
 /// rebooted host comes back without the user re-navigating.
@@ -339,7 +347,7 @@ pub fn scheduleReconnect(self: *BrowserView, host: []const u8) void {
         self.allocator.destroy(r);
         return;
     };
-    r.source = c.g_timeout_add(RECONNECT_DELAYS_MS[0], @ptrCast(&onReconnectTick), @ptrCast(r));
+    r.arm();
 }
 
 pub fn clearReconnect(self: *BrowserView, host: ?[]const u8) void {
@@ -367,8 +375,7 @@ fn onReconnectTick(user: ?*anyopaque) callconv(.c) c.gboolean {
             return 0;
         }
         if (hc.state == .connecting) {
-            const next = RECONNECT_DELAYS_MS[@min(r.attempts, RECONNECT_DELAYS_MS.len - 1)];
-            r.source = c.g_timeout_add(next, @ptrCast(&onReconnectTick), @ptrCast(r));
+            r.arm();
             return 0;
         }
     }
@@ -389,19 +396,18 @@ fn onReconnectTick(user: ?*anyopaque) callconv(.c) c.gboolean {
         self.clearReconnect(r.host);
         return 0;
     }
-    r.attempts += 1;
-    if (r.attempts > RECONNECT_DELAYS_MS.len) {
+    if (r.backoff.exhausted()) {
         self.setStatusFmt("gave up reconnecting to {s} -- refresh to retry", .{r.host});
         self.clearReconnect(r.host);
         return 0;
     }
-    self.setStatusFmt("reconnecting to {s} (attempt {d})…", .{ r.host, r.attempts });
+    _ = r.backoff.fail(clock.nowMs());
+    self.setStatusFmt("reconnecting to {s} (attempt {d})…", .{ r.host, r.backoff.attempts });
     var host_buf: [512]u8 = undefined;
     const n = @min(r.host.len, host_buf.len);
     @memcpy(host_buf[0..n], r.host[0..n]);
     _ = self.hostConnFor(host_buf[0..n]);
-    const next = RECONNECT_DELAYS_MS[@min(r.attempts, RECONNECT_DELAYS_MS.len - 1)];
-    r.source = c.g_timeout_add(next, @ptrCast(&onReconnectTick), @ptrCast(r));
+    r.arm();
     return 0;
 }
 

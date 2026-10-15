@@ -56,6 +56,7 @@ const stall_mod = @import("../agent/stall.zig");
 const statusline = @import("../agent/statusline.zig");
 const clock = @import("../util/clock.zig");
 const platform = @import("../util/platform.zig");
+const Backoff = @import("../util/backoff.zig").Backoff;
 const transport_mod = @import("transport.zig");
 const mcp_registry = @import("mcp_registry.zig");
 const agentindex = @import("agentindex.zig");
@@ -141,8 +142,7 @@ pub const DEFAULT_ROWS: u16 = 40;
 pub const WAITER_SOCKET = "agents.sock";
 /// Background reconnection of a lost remote link: the first retry, doubled
 /// after each failure up to the cap, forever while the agent is here.
-pub const RECONNECT_MIN_MS: i64 = 2_000;
-pub const RECONNECT_MAX_MS: i64 = 60_000;
+pub const RECONNECT = Backoff{ .min_ms = 2_000, .max_ms = 60_000 };
 
 /// Server `instructions` (the MCP initialize result) while the agent tools
 /// are offered: MCP clients put them in the assistant's system prompt.
@@ -183,8 +183,8 @@ pub const Entry = struct {
     claim: ?agentindex.Claim = null,
     /// Its descriptor is in the index (a borrowed terminal's never is).
     indexed: bool = false,
-    /// Wait before the next background reconnect of a lost link.
-    reconnect_delay_ms: i64 = RECONNECT_MIN_MS,
+    /// Waits between background reconnects of a lost link.
+    reconnect_backoff: Backoff = RECONNECT,
     loaded: *const adapter.Loaded,
     agent: *agent_mod.Agent,
     /// The terminal the user watches: the app itself (screen sources) or

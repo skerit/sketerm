@@ -31,6 +31,10 @@ const pathz = @import("../util/pathz.zig");
 const cast = @import("../util/cast.zig");
 const nowMs = @import("../util/clock.zig").nowMs;
 const wallMs = @import("../util/clock.zig").wallMs;
+const Backoff = @import("../util/backoff.zig").Backoff;
+
+/// Redials of the local daemon: 1 s doubling to 30 s.
+const DAEMON_RETRY = Backoff{ .min_ms = 1000, .max_ms = 30_000 };
 
 pub const NotifyFn = *const fn (ctx: *anyopaque, text: []const u8) void;
 const Subscriber = struct { ctx: *anyopaque, callback: NotifyFn };
@@ -414,7 +418,7 @@ pub const Service = struct {
     drivers: std.ArrayList(Driver) = .empty,
     shutting_down: bool = false,
     refs: usize = 1,
-    retry_delay_ms: c.guint = 1000,
+    daemon_retry: Backoff = DAEMON_RETRY,
     durability_error: bool = false,
     disconnect_after_drain: bool = false,
     in_fd_callback: bool = false,
@@ -982,14 +986,14 @@ pub const Service = struct {
         }
         conn.setNonBlocking();
         self.conn = conn;
-        self.retry_delay_ms = 1000;
+        self.daemon_retry.reset();
         self.fd_watch = c.g_unix_fd_add(conn.fd, c.G_IO_IN | c.G_IO_HUP | c.G_IO_ERR, @ptrCast(&onFd), @ptrCast(self));
     }
 
     fn scheduleRetry(self: *Service) void {
+        const wait: c.guint = @intCast(self.daemon_retry.fail(nowMs()));
         if (self.retry_source == 0 and !self.shutting_down)
-            self.retry_source = c.g_timeout_add(self.retry_delay_ms, @ptrCast(&onRetry), @ptrCast(self));
-        self.retry_delay_ms = @min(@as(c.guint, 30_000), self.retry_delay_ms * 2);
+            self.retry_source = c.g_timeout_add(wait, @ptrCast(&onRetry), @ptrCast(self));
     }
 
     fn scheduleTransferRetry(self: *Service, it: *Intent) void {

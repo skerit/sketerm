@@ -70,6 +70,7 @@ const wallMs = @import("../util/clock.zig").wallMs;
 /// (never as a client-vs-daemon timestamp diff) so a remote client whose
 /// clock differs still sees the right age.
 const nowMs = @import("../util/clock.zig").nowMs;
+const Backoff = @import("../util/backoff.zig").Backoff;
 
 /// The working directory of a session's child via `/proc/<pid>/cwd`. The
 /// daemon owns the PID, so this is authoritative even when the shell never
@@ -862,14 +863,8 @@ pub const Client = struct {
     /// failure to clear, short enough that a permanently unserializable
     /// screen does not sit unreported.
     pub const MAX_RESYNC_ATTEMPTS: u8 = 10;
-    const RESYNC_RETRY_BASE_MS: i64 = 50;
-    const RESYNC_RETRY_MAX_MS: i64 = 1000;
-
-    /// Exponential backoff for attempt `n` (1-based), capped.
-    fn resyncBackoffMs(attempt: u8) i64 {
-        const shift: u6 = @intCast(@min(attempt -| 1, 5));
-        return @min(RESYNC_RETRY_BASE_MS << shift, RESYNC_RETRY_MAX_MS);
-    }
+    /// Waits between those attempts: 50 ms doubling to 1 s.
+    const RESYNC_RETRY = Backoff{ .min_ms = 50, .max_ms = 1000 };
 
     /// Whether this client may do more to its session than watch it: kill
     /// or rename it, drive cast playback, query the app's accessibility
@@ -5988,7 +5983,7 @@ pub const Daemon = struct {
             cl.queueErr("snapshot resync failed repeatedly; reconnect for a fresh screen");
             return;
         }
-        const delay = Client.resyncBackoffMs(cl.resync_attempts);
+        const delay = Client.RESYNC_RETRY.waitAt(cl.resync_attempts);
         cl.resync_retry_at_ms = nowMs() + delay;
         // Only the first failure is a warning: warnings also hit stderr,
         // and a per-tick warn on a shared log is how this used to become

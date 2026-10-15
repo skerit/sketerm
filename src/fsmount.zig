@@ -22,6 +22,7 @@ const fdio = @import("util/fdio.zig");
 const muxclient = @import("mux/client.zig");
 const fsdrive = @import("ipc/fsdrive.zig");
 const platform = @import("util/platform.zig");
+const Backoff = @import("util/backoff.zig").Backoff;
 const fscache = @import("filebrowser/cache.zig");
 
 const is_linux = builtin.os.tag == .linux;
@@ -84,10 +85,12 @@ const DirH = struct {
     }
 };
 
+/// Retries of a pin that failed: 1 s doubling to 60 s.
+const PIN_RETRY = Backoff{ .min_ms = 1000, .max_ms = 60_000 };
+
 const PendingPin = struct {
     path: []u8,
-    retry_at_ms: i64 = 0,
-    retry_delay_ms: i64 = 1000,
+    retry: Backoff = PIN_RETRY,
 };
 
 pub const Mount = struct {
@@ -340,8 +343,7 @@ pub const Mount = struct {
     fn queuePin(self: *Mount, path: []const u8) void {
         for (self.pin_queue.items) |*queued| {
             if (std.mem.eql(u8, queued.path, path)) {
-                queued.retry_at_ms = 0;
-                queued.retry_delay_ms = 1000;
+                queued.retry.reset();
                 return;
             }
         }
@@ -356,8 +358,7 @@ pub const Mount = struct {
 
     fn retryQueuedPin(self: *Mount, index: usize) void {
         const pin = &self.pin_queue.items[index];
-        pin.retry_at_ms = nowMs() + pin.retry_delay_ms;
-        pin.retry_delay_ms = @min(pin.retry_delay_ms * 2, 60_000);
+        _ = pin.retry.fail(nowMs());
     }
 
     fn renameQueuedPins(self: *Mount, old: []const u8, new: []const u8) void {
@@ -368,8 +369,7 @@ pub const Mount = struct {
             const replacement = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ new, pin.path[old.len..] }) catch continue;
             self.allocator.free(pin.path);
             pin.path = replacement;
-            pin.retry_at_ms = 0;
-            pin.retry_delay_ms = 1000;
+            pin.retry.reset();
         }
     }
 
@@ -667,7 +667,7 @@ fn servicePinnedCache(m: *Mount) void {
     const now = nowMs();
     var index: ?usize = null;
     for (m.pin_queue.items, 0..) |pin, i| {
-        if (pin.retry_at_ms <= now) {
+        if (pin.retry.due(now)) {
             index = i;
             break;
         }
@@ -714,7 +714,7 @@ fn pinPollTimeout(m: *const Mount) c_int {
     if (m.pin_queue.items.len == 0) return -1;
     const now = nowMs();
     var delay: i64 = std.math.maxInt(c_int);
-    for (m.pin_queue.items) |pin| delay = @min(delay, @max(pin.retry_at_ms - now, 0));
+    for (m.pin_queue.items) |pin| delay = @min(delay, @max(pin.retry.retry_at_ms - now, 0));
     return @intCast(delay);
 }
 

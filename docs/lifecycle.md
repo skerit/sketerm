@@ -365,7 +365,7 @@ channels), bumps the panel generation, and starts a reconnect: a
 DETACHED `std.Thread` running `reconnectThreadMain`, which does the
 blocking connect+attach and hands back through `g_idle_add`
 (`reconnectHandback` -> `reconnectDone`). Backoff doubles from 1 s and
-caps at 30 s (`nextReconnectDelay`, unit-tested).
+caps at 30 s (`RECONNECT`, a `util/backoff.zig` `Backoff`, unit-tested).
 
 Three fences make that safe, and all three are needed:
 

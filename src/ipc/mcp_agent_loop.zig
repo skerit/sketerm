@@ -30,8 +30,6 @@ const mcp_agent_act = @import("mcp_agent_act.zig");
 
 const STEP_WAIT_MS = mcp_agent.STEP_WAIT_MS;
 const DELIVERY_CONFIRM_MS = mcp_agent.DELIVERY_CONFIRM_MS;
-const RECONNECT_MIN_MS = mcp_agent.RECONNECT_MIN_MS;
-const RECONNECT_MAX_MS = mcp_agent.RECONNECT_MAX_MS;
 const Entry = mcp_agent.Entry;
 const GoneFacts = mcp_agent.GoneFacts;
 const hold = mcp_agent.hold;
@@ -355,7 +353,7 @@ pub fn serviceReconnects(now_ms: i64) void {
             if (j.conn) |conn| {
                 t.adoptReattached(conn, j.snapshot.?);
                 j.conn = null;
-                if (entryOfTerm(t)) |e| e.reconnect_delay_ms = RECONNECT_MIN_MS;
+                if (entryOfTerm(t)) |e| e.reconnect_backoff.reset();
             } else if (j.gone) |g| goneOnReconnect(t, g, j.host, now_ms);
         }
         j.free();
@@ -395,7 +393,7 @@ pub fn goneDetail(g: GoneFacts) []const u8 {
 }
 
 /// Start a background reconnect for each of `e`'s lost links that is due,
-/// backing off 2 s doubling to 60 s.
+/// backing off as `mcp_agent.RECONNECT` says.
 fn kickReconnects(e: *Entry, now_ms: i64) void {
     if (e.relaunching or now_ms < e.reconnect_ms) return;
     var started = false;
@@ -406,8 +404,7 @@ fn kickReconnects(e: *Entry, now_ms: i64) void {
         started = true;
     }
     if (!started) return;
-    e.reconnect_ms = now_ms + e.reconnect_delay_ms;
-    e.reconnect_delay_ms = @min(e.reconnect_delay_ms * 2, RECONNECT_MAX_MS);
+    e.reconnect_ms = now_ms + e.reconnect_backoff.fail(now_ms);
 }
 
 fn startReconnect(t: *termdrive.Term) void {
@@ -549,7 +546,7 @@ pub fn spawnForward(arena: std.mem.Allocator, id: []const u8, host: []const u8, 
 /// background; the call does not wait for it) and restarts the backoff.
 pub fn reconnectIfLost(e: *Entry) void {
     e.reconnect_ms = 0;
-    e.reconnect_delay_ms = RECONNECT_MIN_MS;
+    e.reconnect_backoff.reset();
     kickReconnects(e, clock.nowMs());
 }
 

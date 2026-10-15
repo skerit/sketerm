@@ -15,6 +15,7 @@
 const std = @import("std");
 const vocab = @import("vocab.zig");
 const events = @import("events.zig");
+const Backoff = @import("../util/backoff.zig").Backoff;
 
 /// Most retries one job may take.
 pub const MAX_RETRIES: u32 = 10;
@@ -32,11 +33,8 @@ pub const Policy = struct {
 
 /// The wait before retry `attempt` (1-based).
 pub fn delayMs(p: Policy, attempt: u32) i64 {
-    var s: u64 = @min(p.backoff_s, BACKOFF_CAP_S);
-    var i: u32 = 1;
-    while (i < attempt and s < BACKOFF_CAP_S) : (i += 1) s *= 2;
-    const capped: u64 = @min(s, BACKOFF_CAP_S);
-    return @intCast(capped * 1000);
+    const b = Backoff{ .min_ms = @as(i64, p.backoff_s) * 1000, .max_ms = @as(i64, BACKOFF_CAP_S) * 1000 };
+    return b.waitAt(attempt);
 }
 
 /// Why a retry episode ended without recovering.

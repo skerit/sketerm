@@ -36,6 +36,8 @@ const emitCopyDone = fsjob.emitCopyDone;
 const stampEntry = fsjob.stampEntry;
 const cancelRequested = fsjob.cancelRequested;
 const sleepMs = fsjob.sleepMs;
+const Backoff = @import("../util/backoff.zig").Backoff;
+const nowMs = @import("../util/clock.zig").nowMs;
 
 fn connectHostFs(allocator: std.mem.Allocator, host: []const u8) !fsdrive.Fs {
     const conn = if (host.len == 0)
@@ -77,7 +79,8 @@ pub fn durableCancelRequested(journal_dir: []const u8, job_id: u64) bool {
     return fsjob.durable_state.cancel_requested;
 }
 
-const CLEANUP_RECONNECT_BACKOFF_MS = [_]u32{ 5_000, 10_000, 20_000 };
+/// Redials of a cancellation's cleanup: three, 5 s then 10 s apart.
+const CLEANUP_RECONNECT = Backoff{ .min_ms = 5_000, .max_ms = 20_000, .limit = 3 };
 
 /// Reconnect budget for ONE cross-host copy attempt. A multi-GB
 /// transfer over a home link legitimately outlives several drops, so
@@ -87,7 +90,8 @@ const CLEANUP_RECONNECT_BACKOFF_MS = [_]u32{ 5_000, 10_000, 20_000 };
 /// policy still applies on top.
 const RECONNECT_ATTEMPTS: u32 = 6;
 const RECONNECT_BUDGET: u32 = 200;
-const RECONNECT_BACKOFF_MS = [_]u32{ 1_000, 2_000, 4_000, 8_000, 15_000, 30_000 };
+/// Waits between those attempts: 1 s doubling to 30 s.
+const RECONNECT = Backoff{ .min_ms = 1_000, .max_ms = 30_000, .limit = RECONNECT_ATTEMPTS };
 
 const Side = enum {
     src,
@@ -337,17 +341,17 @@ const CrossCopy = struct {
             });
             return false;
         }
-        var attempt: u32 = 0;
-        while (attempt < RECONNECT_ATTEMPTS) : (attempt += 1) {
+        var backoff = RECONNECT;
+        while (!backoff.exhausted()) {
             // A cancel request must not wait out up to a minute of
             // backoff; the retryable failure routes it to recovery.
             if (self.canceled()) break;
             self.reconnects += 1;
-            const wait_ms = RECONNECT_BACKOFF_MS[@min(attempt, RECONNECT_BACKOFF_MS.len - 1)];
+            const wait_ms = backoff.fail(nowMs());
             self.notice("{s} {s} unreachable -- reconnecting in {d}s (attempt {d}/{d})", .{
-                side.label(), self.hostLabel(side), wait_ms / 1000, attempt + 1, RECONNECT_ATTEMPTS,
+                side.label(), self.hostLabel(side), @divTrunc(wait_ms, 1000), backoff.attempts, backoff.limit,
             });
-            sleepMs(wait_ms);
+            sleepMs(@intCast(wait_ms));
             const fresh = connectHostFs(self.allocator, self.hostOf(side)) catch continue;
             const fs = self.fsOf(side);
             fs.deinit();
@@ -1554,20 +1558,20 @@ fn delayForTest(name: [*:0]const u8) void {
 /// unreachable peer fails in seconds). No sleep follows the final
 /// failed attempt — the caller reports it immediately.
 fn connectHostFsRetrying(allocator: std.mem.Allocator, host: []const u8, side: Side, max_tries: u32, spec: Spec, allow_canceled: bool) ?fsdrive.Fs {
-    const tries = if (max_tries == 0) RECONNECT_ATTEMPTS else @min(max_tries, RECONNECT_ATTEMPTS);
-    var attempt: u32 = 0;
-    while (attempt < tries) : (attempt += 1) {
+    var backoff = RECONNECT;
+    if (max_tries != 0) backoff.limit = @min(max_tries, RECONNECT_ATTEMPTS);
+    while (true) {
         if (!allow_canceled and cancelRequested(spec)) return null;
         if (connectHostFs(allocator, host)) |fs| return fs else |_| {}
-        if (attempt + 1 >= tries) break;
-        const wait_ms = RECONNECT_BACKOFF_MS[@min(attempt, RECONNECT_BACKOFF_MS.len - 1)];
+        const wait_ms = backoff.fail(nowMs());
+        if (backoff.exhausted()) break;
         var buf: [160]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
         w.print("{s} host {s} unreachable -- retrying in {d}s", .{
-            side.label(), if (host.len == 0) "local" else host, wait_ms / 1000,
+            side.label(), if (host.len == 0) "local" else host, @divTrunc(wait_ms, 1000),
         }) catch {};
         emit(.{ .ev = "progress", .message = w.buffered() });
-        sleepMs(wait_ms);
+        sleepMs(@intCast(wait_ms));
     }
     return null;
 }
@@ -1661,10 +1665,12 @@ fn cancelOutcome(cc: *const CrossCopy, retry_msg: []const u8, permanent_msg: []c
 }
 
 fn connectCancellationHost(allocator: std.mem.Allocator, host: []const u8) ?fsdrive.Fs {
-    var attempt: usize = 0;
-    while (attempt < 3) : (attempt += 1) {
+    var backoff = CLEANUP_RECONNECT;
+    while (true) {
         if (connectHostFs(allocator, host)) |fs| return fs else |_| {}
-        if (attempt + 1 < 3) sleepMs(CLEANUP_RECONNECT_BACKOFF_MS[attempt]);
+        const wait_ms = backoff.fail(nowMs());
+        if (backoff.exhausted()) break;
+        sleepMs(@intCast(wait_ms));
     }
     return null;
 }

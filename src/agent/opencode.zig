@@ -25,6 +25,7 @@ const http = @import("http.zig");
 const dialect = @import("opencode_dialect.zig");
 const c = @import("../c.zig").c;
 const clock = @import("../util/clock.zig");
+const Backoff = @import("../util/backoff.zig").Backoff;
 
 pub const Record = output.Record;
 pub const Interaction = output.Interaction;
@@ -1311,8 +1312,8 @@ const PROMPT_TIMEOUT_ENV = "SKETERM_TEST_AGENT_PROMPT_TIMEOUT_MS";
 pub const HEALTH_PROBE_MS: i64 = 1000;
 /// How many of a session's newest messages a resume or a resync reads.
 pub const RESUME_MESSAGES: u32 = 50;
-const RECONNECT_MIN_MS: i64 = 500;
-const RECONNECT_MAX_MS: i64 = 10_000;
+/// Redials of a dropped event stream: 0.5 s doubling to 10 s.
+const RECONNECT = Backoff{ .min_ms = 500, .max_ms = 10_000 };
 
 pub const ModelInfo = struct {
     provider: []const u8,
@@ -1389,7 +1390,7 @@ pub const Api = struct {
     stream: http.EventStream,
     inbox: std.ArrayList(http.SseEvent) = .empty,
     reconnect_at_ms: ?i64 = null,
-    backoff_ms: i64 = RECONNECT_MIN_MS,
+    backoff: Backoff = RECONNECT,
     catalog: ?Catalog = null,
     /// `factsDocument` could not load the catalog: it does not ask again.
     catalog_failed: bool = false,
@@ -1604,8 +1605,8 @@ pub const Api = struct {
             try self.drainInbox(now_ms);
             if (!alive) {
                 try self.source.noteDisconnected(now_ms, "event stream closed");
-                self.backoff_ms = RECONNECT_MIN_MS;
-                self.reconnect_at_ms = now_ms + self.backoff_ms;
+                self.backoff.reset();
+                self.reconnect_at_ms = now_ms + self.backoff.fail(now_ms);
             }
         } else if (self.reconnect_at_ms) |at| {
             if (now_ms >= at) self.reconnect(now_ms);
@@ -1648,12 +1649,11 @@ pub const Api = struct {
     fn reconnect(self: *Api, now_ms: i64) void {
         const g = self.gen orelse return;
         self.openStream(g, now_ms) catch {
-            self.backoff_ms = @min(self.backoff_ms * 2, RECONNECT_MAX_MS);
-            self.reconnect_at_ms = now_ms + self.backoff_ms;
+            self.reconnect_at_ms = now_ms + self.backoff.fail(now_ms);
             return;
         };
         self.reconnect_at_ms = null;
-        self.backoff_ms = RECONNECT_MIN_MS;
+        self.backoff.reset();
         self.resync(now_ms) catch |err| self.noteResyncFailed("session statuses and pending requests", err);
         if (self.source.root) |root| {
             if (self.recentMessages(root)) |msgs_const| {

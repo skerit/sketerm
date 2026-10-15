@@ -24,13 +24,13 @@ const cell_mod = @import("grid/cell.zig");
 const profile_util = @import("util/profile.zig");
 const clock = @import("util/clock.zig");
 const diag = @import("util/diag.zig");
+const Backoff = @import("util/backoff.zig").Backoff;
 
 /// An unanswered `requestHostList` is given up after this long.
 const HOST_LIST_TIMEOUT_MS: i64 = 15_000;
 
-fn nextReconnectDelay(delay_ms: u32) u32 {
-    return @min(delay_ms * 2, 30_000);
-}
+/// Redials of a dropped mux session: 1 s doubling to 30 s.
+const RECONNECT = Backoff{ .min_ms = 1000, .max_ms = 30_000 };
 
 /// Stable trampoline target for `g_main_context_invoke` callbacks.
 /// Lives independently of Terminal so a callback that fires AFTER
@@ -350,7 +350,7 @@ pub const Terminal = struct {
         /// Bumped only when the attached connection is lost. Deferred panel
         /// work captures this value so a later reconnect cannot revive it.
         panel_generation: u64 = 1,
-        retry_delay_ms: u32 = 1000,
+        reconnect_backoff: Backoff = RECONNECT,
         pending_rows: u16 = 0,
         pending_cols: u16 = 0,
         /// Session ended (daemon EXIT/GONE or protocol error) — terminal
@@ -1192,7 +1192,7 @@ pub const Terminal = struct {
             return 0;
         };
         remote.connected = true;
-        remote.retry_delay_ms = 1000;
+        remote.reconnect_backoff.reset();
         if (!self.installReattachedConn(remote, job)) return 0;
         self.notifyConnectionState(.connected, 0);
         diag.print("sketerm: mux session '{s}': reattached over {s}\n", .{ remote.session, @tagName(remote.conn.transport) });
@@ -1278,8 +1278,7 @@ pub const Terminal = struct {
     fn scheduleReconnect(self: *Terminal) void {
         const remote = self.remote orelse return;
         if (!remote.awaitingReconnect() or remote.reconnect_timer != 0) return;
-        const delay = remote.retry_delay_ms;
-        remote.retry_delay_ms = nextReconnectDelay(delay);
+        const delay: u32 = @intCast(remote.reconnect_backoff.fail(clock.nowMs()));
         self.notifyConnectionState(.retry_wait, @max(1, delay / 1000));
         remote.reconnect_timer = c.g_timeout_add(delay, @ptrCast(&reconnectTimer), @ptrCast(self.drain));
     }
@@ -3440,12 +3439,9 @@ pub const Terminal = struct {
 };
 
 test "reconnect backoff doubles and caps at thirty seconds" {
-    var delay: u32 = 1000;
-    const expected = [_]u32{ 2000, 4000, 8000, 16_000, 30_000, 30_000 };
-    for (expected) |want| {
-        delay = nextReconnectDelay(delay);
-        try std.testing.expectEqual(want, delay);
-    }
+    var b = RECONNECT;
+    const expected = [_]i64{ 1000, 2000, 4000, 8000, 16_000, 30_000, 30_000 };
+    for (expected) |want| try std.testing.expectEqual(want, b.fail(0));
 }
 
 test "nappOpen appends before firing on_app_view (empty-list deref regression)" {
