@@ -2507,13 +2507,45 @@ fn sidebarChipPoint(app: *appdrive.App, win_id: u32) ?struct { x: f64, y: f64 } 
     };
 }
 
+/// The active-row chip once one shows off `prev`'s row (any row when
+/// `prev` is null), or whatever chip shows at the deadline. Wall clock
+/// and live head, as in `waitSidebarVisible`: a sidebar repaint can land
+/// well after the action that caused it.
+fn waitChipOff(app: *appdrive.App, win_id: u32, prev: ?ChipBounds, timeout_ms: i64) ?ChipBounds {
+    const deadline = clock.nowMs() + timeout_ms;
+    while (true) {
+        _ = app.drainLive(500);
+        const cur = sidebarChipBounds(app, win_id);
+        if (cur) |b| if (prev == null or b.min_y != prev.?.min_y) return b;
+        if (clock.nowMs() >= deadline) return cur;
+        pumpFor(app, 100);
+    }
+}
+
+/// Focus a pane and wait for the chip to leave `prev`'s row (a pane that
+/// was already current never moves it, so the deadline read stands).
+fn chipAfterFocus(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    sock_path: [:0]const u8,
+    win_id: u32,
+    pane: u32,
+    prev: ?ChipBounds,
+    timeout_ms: i64,
+) ?ChipBounds {
+    var buf: [96]u8 = undefined;
+    const req = std.fmt.bufPrint(&buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{pane}) catch return null;
+    if (roundtrip(allocator, sock_path, req)) |r| allocator.free(r) else return null;
+    return waitChipOff(app, win_id, prev, timeout_ms);
+}
+
 /// The two sidebar rows a drag needs, learned by focusing each pane in
-/// turn and reading the active-row chip. A single chip read after
-/// waitIdle races the COMMITTED frame under load (the focus applies,
-/// the repaint lands frames later), so a stale read hands the drag the
-/// wrong rectangle; requiring the two reads to land on DIFFERENT rows
-/// makes the pair self-healing — a stale second read equals the first
-/// and the loop re-reads until a fresh frame arrives.
+/// turn and reading the active-row chip. Each read waits for the chip to
+/// move off the row it showed before that focus: the repaint can land
+/// after any quiet window (on the dev profile it missed a 200 ms one on
+/// every pass), and a read that does not wait for the move sees the
+/// PREVIOUS focus, so every pair came back reversed. The pair
+/// must still land on different, same-indent rows, else it is re-learned.
 fn learnDragRowPair(
     allocator: std.mem.Allocator,
     app: *appdrive.App,
@@ -2523,22 +2555,29 @@ fn learnDragRowPair(
     require_below: bool,
     timeout_ms: u32,
 ) ?struct { first: ChipBounds, drag: ChipBounds } {
-    var focus_buf: [96]u8 = undefined;
-    const focus_drag = std.fmt.bufPrint(&focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{drag_pane}) catch return null;
-    var waited: u32 = 0;
-    while (waited <= timeout_ms) : (waited += 400) {
-        if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else return null;
-        _ = app.waitIdle(200, 4_000);
-        const first = sidebarChipBounds(app, win_id);
-        if (roundtrip(allocator, sock_path, focus_drag)) |r| allocator.free(r) else return null;
-        _ = app.waitIdle(200, 4_000);
-        const drag = sidebarChipBounds(app, win_id);
+    var first: ?ChipBounds = null;
+    var drag: ?ChipBounds = null;
+    _ = app.drainLive(500);
+    var shown = sidebarChipBounds(app, win_id);
+    const deadline = clock.nowMs() + timeout_ms;
+    while (clock.nowMs() < deadline) {
+        first = chipAfterFocus(allocator, app, sock_path, win_id, 1, shown, 3_000);
+        drag = chipAfterFocus(allocator, app, sock_path, win_id, drag_pane, first, 6_000);
+        shown = drag;
         if (first != null and drag != null and drag.?.min_y != first.?.min_y and
             first.?.min_x == drag.?.min_x and
             (!require_below or drag.?.min_y > first.?.min_y))
             return .{ .first = first.?, .drag = drag.? };
-        pumpFor(app, 400);
+        pumpFor(app, 200);
     }
+    const none: ChipBounds = .{ .min_x = 0, .max_x = 0, .min_y = 0, .max_y = 0 };
+    const f = first orelse none;
+    const d = drag orelse none;
+    _ = c.fprintf(platform.stderr(), "smoke-e2e: last chip reads: pane 1 x=%zu y=%zu, pane %u x=%zu y=%zu (zig-out/smoke-e2e-sidebar-rows.png)\n", f.min_x, f.min_y, drag_pane, d.min_x, d.min_y);
+    if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng("zig-out/smoke-e2e-sidebar-rows.png", shot.png);
+    } else |_| {}
     return null;
 }
 
@@ -3315,7 +3354,7 @@ fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     _ = app.waitIdle(300, 6_000);
     if (waitTreeParent(allocator, app, sock_path, extra[1], null, 6_000) == null)
         return "dropping a sidebar row on the empty list did not return it to the root level";
-    if (sidebarChipBounds(app, win_id) == null)
+    if (waitChipOff(app, win_id, null, 6_000) == null)
         return "the unnested sidebar row disappeared";
 
     // 3. Drop on the TOP of the first row -> reorder above it, still a
