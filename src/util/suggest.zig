@@ -438,7 +438,9 @@ pub fn searchUrl(buf: []u8, template: []const u8, q: []const u8) ?[]const u8 {
     const suffix = template[at + 3 ..];
     if (prefix.len > buf.len) return null;
     @memcpy(buf[0..prefix.len], prefix);
-    const encoded = percent.encodeQueryInto(buf[prefix.len..], q) orelse return null;
+    var qw = std.Io.Writer.fixed(buf[prefix.len..]);
+    percent.encode(&qw, .query, q) catch return null;
+    const encoded = qw.buffered();
     const w = prefix.len + encoded.len;
     if (w + suffix.len > buf.len) return null;
     @memcpy(buf[w .. w + suffix.len], suffix);

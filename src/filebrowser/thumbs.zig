@@ -28,22 +28,11 @@ fn tierName(tier: Tier) []const u8 {
     };
 }
 
-const isUriSafe = percent.isFileUriByte;
-
-/// Write the file:// URI for an absolute POSIX path.
+/// Write the file:// URI for an absolute POSIX path; its bytes are the thumbnail cache key's input.
 pub fn fileUri(path: []const u8, buf: []u8) ?[]const u8 {
     var w = std.Io.Writer.fixed(buf);
     w.writeAll("file://") catch return null;
-    const hex = "0123456789ABCDEF";
-    for (path) |ch| {
-        if (isUriSafe(ch)) {
-            w.writeByte(ch) catch return null;
-        } else {
-            w.writeByte('%') catch return null;
-            w.writeByte(hex[ch >> 4]) catch return null;
-            w.writeByte(hex[ch & 15]) catch return null;
-        }
-    }
+    percent.encode(&w, .file_uri, path) catch return null;
     return w.buffered();
 }
 
@@ -223,6 +212,31 @@ test "thumbKey matches the canonical spec example" {
     // file:///home/jens/photos/me.png hashes to this key.
     const key = thumbKey("/home/jens/photos/me.png").?;
     try std.testing.expectEqualStrings("c6ee772d9e49320e97ec29a7eb5b1697", &key);
+}
+
+test "fileUri and thumbKey stay byte-identical to the pre-percent.encode output" {
+    // Expected values were produced by the f9a2a99b fileUri/thumbKey, run verbatim:
+    // a changed byte here re-keys every cached thumbnail.
+    const Case = struct { path: []const u8, uri: []const u8, key: []const u8 };
+    const cases = [_]Case{
+        .{ .path = "/home/u/plain.png", .uri = "file:///home/u/plain.png", .key = "977b7ae9dd9d8975b860ff94ee8505d4" },
+        .{ .path = "/tmp/a b#c?.txt", .uri = "file:///tmp/a%20b%23c%3F.txt", .key = "5fbb3479a8e51e993ff97aaff04ccf95" },
+        .{ .path = "/tmp/100%.jpg", .uri = "file:///tmp/100%25.jpg", .key = "2ba70347a30cce2a84756396bb7c6be1" },
+        .{ .path = "/tmp/\xc3\xa9\xe4\xb8\xad.png", .uri = "file:///tmp/%C3%A9%E4%B8%AD.png", .key = "162e576064a189cbdfc6b0752d43a839" },
+        .{ .path = "/tmp/!$&'()*+,;=:@.png", .uri = "file:///tmp/%21%24%26%27%28%29%2A%2B%2C%3B%3D%3A%40.png", .key = "cac2ef1fe7c5b00ee97a5baa727f193f" },
+        .{ .path = "/tmp/tab\there\n.png", .uri = "file:///tmp/tab%09here%0A.png", .key = "b9ffc3e8a4c9afb338c1f81f3e7e5580" },
+        .{ .path = "/tmp/~user/-._x", .uri = "file:///tmp/~user/-._x", .key = "a21a8be827dbebda584b9bc1e7703213" },
+        .{ .path = "/tmp/\x01\x7f\xff", .uri = "file:///tmp/%01%7F%FF", .key = "d313dad5921486bd40b49987891af0f0" },
+        .{ .path = "/", .uri = "file:///", .key = "03f0716f0d219f8b767d0e5ac6c3da37" },
+    };
+    var buf: [256]u8 = undefined;
+    for (cases) |cs| {
+        try std.testing.expectEqualStrings(cs.uri, fileUri(cs.path, &buf).?);
+        try std.testing.expectEqualStrings(cs.key, &thumbKey(cs.path).?);
+    }
+    // Too small a buffer is still null, never a truncated key input.
+    var tiny: [9]u8 = undefined;
+    try std.testing.expect(fileUri("/tmp/a b", &tiny) == null);
 }
 
 test "thumbPath composes cache dir, tier, and key" {

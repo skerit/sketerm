@@ -2181,19 +2181,6 @@ fn ensureTrashDirs(root: []const u8) bool {
     return c.mkdir(iz, 0o700) == 0 or std.posix.errno(@as(c_int, -1)) == .EXIST;
 }
 
-fn appendUrlEscaped(w: *std.Io.Writer, path: []const u8) !void {
-    const hex = "0123456789ABCDEF";
-    for (path) |ch| {
-        if (std.ascii.isAlphanumeric(ch) or ch == '/' or ch == '-' or ch == '_' or ch == '.' or ch == '~') {
-            try w.writeByte(ch);
-        } else {
-            try w.writeByte('%');
-            try w.writeByte(hex[ch >> 4]);
-            try w.writeByte(hex[ch & 15]);
-        }
-    }
-}
-
 fn deletionStamp(buf: *[32]u8) []const u8 {
     var now: c.time_t = c.time(null);
     var tm: c.struct_tm = undefined;
@@ -2255,7 +2242,7 @@ fn trashInto(src: []const u8, root: []const u8) TrashResult {
     var text: [8192]u8 = undefined;
     var w = std.Io.Writer.fixed(&text);
     w.writeAll("[Trash Info]\nPath=") catch return .fail;
-    appendUrlEscaped(&w, src) catch return .fail;
+    @import("../util/percent.zig").encode(&w, .file_uri, src) catch return .fail;
     var stamp_buf: [32]u8 = undefined;
     w.print("\nDeletionDate={s}\n", .{deletionStamp(&stamp_buf)}) catch return .fail;
     var iz: [4096]u8 = undefined;

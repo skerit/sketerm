@@ -192,25 +192,15 @@ pub fn localPath(spec: []const u8) ?[]const u8 {
 
 // -- file:// URI encoding ----------------------------------------
 
-const uriByteOk = percent.isFileUriByte;
-
 /// Percent-encode an absolute local path as a file:// URI (RFC 3986
 /// unreserved + '/' kept literal; everything else, UTF-8 bytes
 /// included, is %XX-escaped).
 pub fn fileUriAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "file://");
-    for (path) |b| {
-        if (uriByteOk(b)) {
-            try out.append(allocator, b);
-        } else {
-            var esc: [3]u8 = undefined;
-            _ = std.fmt.bufPrint(&esc, "%{X:0>2}", .{b}) catch unreachable;
-            try out.appendSlice(allocator, &esc);
-        }
-    }
-    return out.toOwnedSlice(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    out.writer.writeAll("file://") catch return error.OutOfMemory;
+    percent.encode(&out.writer, .file_uri, path) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
 }
 
 /// SaveFiles: the chosen directory + one requested leaf name as a

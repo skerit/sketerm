@@ -6,6 +6,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const paths = @import("paths.zig");
+const percent = @import("../util/percent.zig");
 
 /// Where `sketerm files` puts the browser face.
 pub const Mode = enum {
@@ -96,15 +97,6 @@ pub fn startSpec(buf: []u8, host: ?[]const u8, cwd: ?[]const u8) ?[]const u8 {
     return paths.formatSpec(buf, host, p);
 }
 
-/// Decode one percent-escape; null when `s` does not start with a
-/// well-formed one.
-fn pctByte(s: []const u8) ?u8 {
-    if (s.len < 3 or s[0] != '%') return null;
-    const hi = std.fmt.charToDigit(s[1], 16) catch return null;
-    const lo = std.fmt.charToDigit(s[2], 16) catch return null;
-    return hi * 16 + lo;
-}
-
 /// Turn a command-line location argument into a spec `paths.parseSpec`
 /// understands. A `file://` URI is percent-decoded (the desktop entry
 /// hands us URIs via %U); a non-empty, non-localhost authority becomes
@@ -122,20 +114,7 @@ pub fn normalizeArg(buf: []u8, arg: []const u8) []const u8 {
     const raw_path = rest[slash..];
 
     var decoded: [4096]u8 = undefined;
-    var w: usize = 0;
-    var i: usize = 0;
-    while (i < raw_path.len and w < decoded.len) {
-        if (pctByte(raw_path[i..])) |b| {
-            decoded[w] = b;
-            w += 1;
-            i += 3;
-        } else {
-            decoded[w] = raw_path[i];
-            w += 1;
-            i += 1;
-        }
-    }
-    const path = decoded[0..w];
+    const path = percent.decodeInto(&decoded, raw_path);
     if (authority.len == 0 or std.ascii.eqlIgnoreCase(authority, "localhost"))
         return paths.formatSpec(buf, null, path);
     return paths.formatSpec(buf, authority, path);
@@ -151,21 +130,8 @@ pub fn normalizeArgAlloc(allocator: std.mem.Allocator, arg: []const u8) ![]u8 {
     const raw_path = rest[slash..];
     const decoded = try allocator.alloc(u8, raw_path.len);
     defer allocator.free(decoded);
-    var w: usize = 0;
-    var i: usize = 0;
-    while (i < raw_path.len) {
-        if (pctByte(raw_path[i..])) |b| {
-            decoded[w] = b;
-            w += 1;
-            i += 3;
-        } else {
-            decoded[w] = raw_path[i];
-            w += 1;
-            i += 1;
-        }
-    }
     const host: ?[]const u8 = if (authority.len == 0 or std.ascii.eqlIgnoreCase(authority, "localhost")) null else authority;
-    return paths.formatSpecAlloc(allocator, host, decoded[0..w]);
+    return paths.formatSpecAlloc(allocator, host, percent.decodeInto(decoded, raw_path));
 }
 
 /// A command-line resource as an owned spec; a relative current-host path resolves against `cwd` (null reads as ".").

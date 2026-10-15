@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const languages = @import("../editor/languages.zig");
+const percent = @import("../util/percent.zig");
 
 /// One configured (or built-in) language server.
 ///
@@ -127,28 +128,16 @@ pub fn findRoot(dir: []const u8, root_files: []const u8, exists: ExistsFn, ctx: 
     return dir;
 }
 
-/// Percent-encode a filesystem path into a `file://` URI. Only the
-/// characters that actually break parsers are escaped (space, `#`,
-/// `?`, `%`, control bytes) — over-escaping makes URIs that some
-/// servers fail to match against their own.
+/// Percent-encode a filesystem path into a `file://` URI, keeping every
+/// RFC 3986 path character literal (`percent.SafeSet.uri_path`):
+/// over-escaping makes URIs that some servers fail to match against
+/// their own.
 pub fn pathToUri(alloc: std.mem.Allocator, path: []const u8) std.mem.Allocator.Error![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, "file://");
-    for (path) |ch| {
-        const safe = switch (ch) {
-            'a'...'z', 'A'...'Z', '0'...'9', '/', '-', '_', '.', '~', '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=', '@', ':' => true,
-            else => false,
-        };
-        if (safe) {
-            try out.append(alloc, ch);
-        } else {
-            var buf: [3]u8 = undefined;
-            const s = std.fmt.bufPrint(&buf, "%{X:0>2}", .{ch}) catch unreachable;
-            try out.appendSlice(alloc, s);
-        }
-    }
-    return out.toOwnedSlice(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    out.writer.writeAll("file://") catch return error.OutOfMemory;
+    percent.encode(&out.writer, .uri_path, path) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
 }
 
 /// Inverse of `pathToUri`. Returns null for a non-`file:` URI (a
@@ -162,29 +151,7 @@ pub fn uriToPath(alloc: std.mem.Allocator, uri: []const u8) std.mem.Allocator.Er
         const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
         rest = rest[slash..];
     }
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(alloc);
-    var i: usize = 0;
-    while (i < rest.len) {
-        if (rest[i] == '%' and i + 2 < rest.len) {
-            const hi = std.fmt.charToDigit(rest[i + 1], 16) catch {
-                try out.append(alloc, rest[i]);
-                i += 1;
-                continue;
-            };
-            const lo = std.fmt.charToDigit(rest[i + 2], 16) catch {
-                try out.append(alloc, rest[i]);
-                i += 1;
-                continue;
-            };
-            try out.append(alloc, @intCast(hi * 16 + lo));
-            i += 3;
-            continue;
-        }
-        try out.append(alloc, rest[i]);
-        i += 1;
-    }
-    return try out.toOwnedSlice(alloc);
+    return try percent.decode(alloc, rest);
 }
 
 // ======================================================================
