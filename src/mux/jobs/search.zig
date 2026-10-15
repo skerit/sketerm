@@ -637,7 +637,7 @@ fn grepFile(path: []const u8, state: *SearchState) void {
             const tail = chunk[start..nl];
             if (matchLine(state, path, line_no, carry[0..carry_len], tail)) {
                 file_matches += 1;
-                if (file_matches >= MAX_MATCHES_PER_FILE or state.matches >= MAX_MATCHES) return;
+                if (file_matches >= MAX_MATCHES_PER_FILE or state.matches >= state.max_matches) return;
             }
             carry_len = 0;
             line_no += 1;
@@ -690,4 +690,28 @@ test "nameMatches: substring default, glob with wildcards, ci" {
     try t.expect(!nameMatches("a?c", "abbc"));
     try t.expect(nameMatches("*b*b*", "abxbx"));
     try t.expect(!nameMatches("*b*b*", "abxx"));
+}
+
+test "grep stops at the job's own match cap, not the default one" {
+    const t = std.testing;
+    const td = pathz.TempDir.make("fsjob-grepcap") orelse return error.SkipZigTest;
+    defer td.remove();
+    var pb: [4096]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pb, "{s}/hits.txt", .{td.path()});
+    var z: [4096]u8 = undefined;
+    const f = c.fopen(try pathz.pathZ(&z, path), "wb") orelse return error.SkipZigTest;
+    for (0..50) |_| _ = c.fwrite("hit\n", 1, 4, f);
+    _ = c.fclose(f);
+    const job = Job{ .allocator = t.allocator, .spec = .{} };
+    var pat = "hit".*;
+
+    // 1. A raised cap: past the default, every matching line of the file still counts.
+    var raised = SearchState{ .job = &job, .lower_pat = &pat, .matches = MAX_MATCHES, .max_matches = MAX_MATCHES + 100 };
+    grepFile(path, &raised);
+    try t.expectEqual(MAX_MATCHES + 50, raised.matches);
+
+    // 2. A lowered cap: the scan stops inside the file, exactly at the cap.
+    var lowered = SearchState{ .job = &job, .lower_pat = &pat, .max_matches = 10 };
+    grepFile(path, &lowered);
+    try t.expectEqual(@as(usize, 10), lowered.matches);
 }
