@@ -8838,6 +8838,20 @@ fn ocrCount(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, needl
     return ocrCountScaled(allocator, app, win_id, needle, 1);
 }
 
+/// Poll `ocrCountScaled` (2x) until the count lands in `min..max`: an
+/// app redraw reaches the replica a frame or more after the input that
+/// caused it, and one read after a fixed wait raced that frame.
+/// @return false at the deadline, or when tesseract is absent.
+fn waitOcrCountIn(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, needle: []const u8, min: usize, max: usize, timeout_ms: i64) bool {
+    const deadline = clock.nowMs() + timeout_ms;
+    while (true) {
+        const n = ocrCountScaled(allocator, app, win_id, needle, 2) orelse return false;
+        if (n >= min and n <= max) return true;
+        if (clock.nowMs() >= deadline) return false;
+        pumpRenameFor(app, 300);
+    }
+}
+
 /// `ocrCount` over native scale and, with `max_scale` 2, a 2x upscale
 /// too (the best read wins): the information panel's small dim labels
 /// (its "Permissions" row, its name head) only read upscaled, and a
@@ -9923,9 +9937,7 @@ fn filesTransfersStage(
         // The popover grows when the two stat replies fill its detail
         // rows ("modified ..." under each side), which moves the
         // buttons: aim only once both are in and the frame is still.
-        const filled_deadline = clock.nowMs() + 8_000;
-        while (clock.nowMs() < filled_deadline and
-            (ocrCountScaled(allocator, app, pop, "modified", 2) orelse 0) < 2) pumpRenameFor(app, 300);
+        _ = waitOcrCountIn(allocator, app, pop, "modified", 2, std.math.maxInt(usize), 8_000);
         _ = app.waitVisualSettle(pop, 600, 8_000, 0.002, null);
         const about_skip = (ocrCountScaled(allocator, app, pop, "SKIPME", 2) orelse 0) > 0;
         const about_pay = (ocrCountScaled(allocator, app, pop, "PAYLOAD", 2) orelse 0) > 0;
@@ -10360,26 +10372,21 @@ fn filesBrowserBugsStage(
     app.clickEx(child.win, w - 37 - 120, 138, 1, 80, 1) catch return "files bugs: info toggle click failed";
     // The panel carries its own "Permissions" row under the column
     // header of the same name: two reads once it is up.
-    pumpRenameFor(app, 1_000);
-    if ((ocrCountScaled(allocator, app, child.win, "Permissions", 2) orelse 0) < 2) {
+    if (!waitOcrCountIn(allocator, app, child.win, "Permissions", 2, std.math.maxInt(usize), 15_000)) {
         viewerShot(allocator, app, child.win, "files-bugs-infotoggle");
         return "files bugs: the Information toggle opened no panel";
     }
     const aaa_row = ocrRowCenter(allocator, app, child.win, "AAAROW", 10_000) orelse return "files bugs: AAAROW row not found";
     app.clickEx(child.win, aaa_row.x, aaa_row.y, 1, 60, 1) catch return "files bugs: selecting AAAROW failed";
-    pumpRenameFor(app, 1_000);
     // The panel names the selected entry: AAAROW now reads three
     // times (the two rows + the panel head).
-    const before = ocrCountScaled(allocator, app, child.win, "AAAROW", 2) orelse 0;
-    if (before < 3) {
+    if (!waitOcrCountIn(allocator, app, child.win, "AAAROW", 3, std.math.maxInt(usize), 15_000)) {
         viewerShot(allocator, app, child.win, "files-bugs-panel");
         return "files bugs: the information panel did not show the selected entry";
     }
     app.pressKey(child.win, "alt+Up") catch return "files bugs: alt+Up failed";
     if (!viewerWaitOcr(allocator, app, child.win, "fbug", 20_000)) return "files bugs: the parent never rendered";
-    pumpRenameFor(app, 1_500);
-    const after = ocrCountScaled(allocator, app, child.win, "AAAROW", 2) orelse 0;
-    if (after != 0) {
+    if (!waitOcrCountIn(allocator, app, child.win, "AAAROW", 0, 0, 15_000)) {
         viewerShot(allocator, app, child.win, "files-bugs-panel-stale");
         return "files bugs: the information panel kept the entry selected in the folder just left";
     }
