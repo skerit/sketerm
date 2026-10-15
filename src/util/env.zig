@@ -27,6 +27,13 @@ pub fn nonEmpty(name: [*:0]const u8) ?[]const u8 {
     return if (v.len == 0) null else v;
 }
 
+/// `nonEmpty` for a name that is not NUL-terminated (null when it is too long).
+pub fn nonEmptyName(name: []const u8) ?[]const u8 {
+    var buf: [256]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&buf, "{s}", .{name}) catch return null;
+    return nonEmpty(z.ptr);
+}
+
 var detached: std.atomic.Value(bool) = .init(false);
 
 /// Point libc's `environ` at a heap copy of its pointer array, once, so libc never edits the startup array again.

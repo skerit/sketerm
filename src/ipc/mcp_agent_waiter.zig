@@ -309,18 +309,24 @@ fn setNonBlocking(fd: c_int) void {
 }
 
 fn serviceSub(a: std.mem.Allocator, s: *Sub, now_ms: i64) void {
-    // Read the subscription, or notice the client leaving.
+    // Read the subscription, or notice the client leaving. A client that
+    // writes its one line and closes (a presence post) still has it read.
     var tmp: [1024]u8 = undefined;
+    var eof = false;
     while (true) {
         const n = c.read(s.fd, &tmp, tmp.len);
         if (n == 0) {
-            s.done = true;
-            return;
+            eof = true;
+            break;
         }
         if (n < 0) break;
         if (s.subscribed) continue;
         s.inbuf.appendSlice(a, tmp[0..@intCast(n)]) catch return endSub(s, "out of memory");
         if (s.inbuf.items.len > agentwait.MAX_SUBSCRIBE) return endSub(s, "subscribe line too long");
+    }
+    if (eof and (s.subscribed or std.mem.indexOfScalar(u8, s.inbuf.items, '\n') == null)) {
+        s.done = true;
+        return;
     }
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
@@ -328,7 +334,19 @@ fn serviceSub(a: std.mem.Allocator, s: *Sub, now_ms: i64) void {
     if (!s.subscribed) {
         const nl = std.mem.indexOfScalar(u8, s.inbuf.items, '\n') orelse return;
         s.subscribed = true;
-        const sub = std.json.parseFromSliceLeaky(agentwait.Subscribe, arena, s.inbuf.items[0..nl], .{ .ignore_unknown_fields = true }) catch
+        const first = s.inbuf.items[0..nl];
+        if (agentwait.isPresence(arena, first)) {
+            const p = std.json.parseFromSliceLeaky(agentwait.Presence, arena, first, .{ .ignore_unknown_fields = true }) catch
+                return endSub(s, "bad presence line");
+            @import("mcp_peer.zig").applyPresence(p);
+            return endSub(s, "presence taken");
+        }
+        // The client left right after subscribing: nobody to wake.
+        if (eof) {
+            s.done = true;
+            return;
+        }
+        const sub = std.json.parseFromSliceLeaky(agentwait.Subscribe, arena, first, .{ .ignore_unknown_fields = true }) catch
             return endSub(s, "bad subscribe line");
         const names = sub.names();
         if (names.len == 0 and !sub.server) return endSub(s, "no agent named");

@@ -250,6 +250,19 @@ pub fn toJson(arena: std.mem.Allocator, vocab: *const Vocab, values: Values) !st
     return .{ .object = obj };
 }
 
+/// The inverse of `toJson`: each vocabulary fact's number in `doc` (a
+/// value of the wrong kind for its type is unknown, names it does not
+/// declare are ignored).
+pub fn fromJson(arena: std.mem.Allocator, vocab: *const Vocab, doc: std.json.Value) !Values {
+    const out = try arena.alloc(?f64, vocab.names.len);
+    @memset(out, null);
+    if (doc != .object) return out;
+    for (vocab.names, vocab.decls, out) |n, d, *o| {
+        o.* = fit(d.type, number(doc.object.get(n) orelse continue));
+    }
+    return out;
+}
+
 /// The known facts that carry a `compact` label, as `label 14%, label 98%`
 /// in vocabulary order; null when none is known.
 pub fn compactLine(arena: std.mem.Allocator, vocab: *const Vocab, values: Values) !?[]const u8 {

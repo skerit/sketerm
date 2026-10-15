@@ -44,6 +44,8 @@ const mcp_agent = @import("mcp_agent.zig");
 const mcp_webfetch = @import("mcp_webfetch.zig");
 const agentwait = @import("agentwait.zig");
 const agentsline = @import("agentsline.zig");
+const mcp_hook = @import("mcp_hook.zig");
+const peer_cli = @import("peer_cli.zig");
 const agentpush = @import("agentpush.zig");
 const mcp_testkit = @import("mcp_testkit.zig");
 const FakeBackend = mcp_testkit.FakeBackend;
@@ -61,6 +63,9 @@ const MCP_HELP =
     \\                   [--follow] [--timeout SECONDS] [--since SEQ] AGENT
     \\       sketerm mcp agents [--format line|compact|json] [--parent PID]
     \\                   [--hosts] [--no-color]
+    \\       sketerm mcp hook [--parent PID] | --print-settings
+    \\       sketerm mcp statusline [--parent PID] [--user-command CMD]
+    \\       sketerm mcp peer list|send|read ...   (= sketerm peer)
     \\
     \\Runs a Model Context Protocol server on stdio. Register it in an
     \\MCP client (Claude Code, etc.) as command "sketerm" with args
@@ -136,7 +141,10 @@ const MCP_HELP =
     \\the agent next needs attention (the tools return the exact command as
     \\watch_command); see `sketerm mcp agent-wait --help`. `sketerm mcp
     \\agents` summarizes the agents your process tree's servers run, for a
-    \\status line; see `sketerm mcp agents --help`.
+    \\status line; see `sketerm mcp agents --help`. `sketerm mcp hook` and
+    \\`sketerm mcp statusline` report a Claude Code session's presence
+    \\(working, idle, waiting, context use) to its server from its own hooks
+    \\and status line, for peer_list (`sketerm mcp hook --print-settings`).
     \\
     \\Pushed agent events: in a Claude Code session started with
     \\`--dangerously-load-development-channels server:sketerm` (or
@@ -806,6 +814,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     if (args.len > 0 and std.mem.eql(u8, args[0], agentwait.SUBCOMMAND)) return agentwait.cli(allocator, args[1..]);
     // Likewise a reader of the registry files: a status line's segment.
     if (args.len > 0 and std.mem.eql(u8, args[0], agentsline.SUBCOMMAND)) return agentsline.cli(allocator, args[1..]);
+    // Presence from the client's hooks and status line, posted to its server.
+    if (args.len > 0 and std.mem.eql(u8, args[0], mcp_hook.HOOK_SUBCOMMAND)) return mcp_hook.hookCli(allocator, args[1..]);
+    if (args.len > 0 and std.mem.eql(u8, args[0], mcp_hook.STATUSLINE_SUBCOMMAND)) return mcp_hook.statuslineCli(allocator, args[1..]);
+    // A non-MCP peer: `sketerm-mcp peer ...` answers like `sketerm peer ...`.
+    if (args.len > 0 and std.mem.eql(u8, args[0], peer_cli.SUBCOMMAND)) return peer_cli.cli(allocator, args[1..]);
     const opts = Opts.parse(args) catch |err| {
         const msg = switch (err) {
             error.UnknownFlag => "sketerm mcp: unknown flag (see --help)\n",

@@ -642,9 +642,7 @@ pub fn localHost() launch.Host {
 /// This process's non-empty value of a variable: the host environment a
 /// local start's settings lookup sees (`statusline.localPaths`).
 pub fn envValue(name: []const u8) ?[]const u8 {
-    var buf: [256]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{name}) catch return null;
-    return @import("../util/env.zig").nonEmpty(z.ptr);
+    return @import("../util/env.zig").nonEmptyName(name);
 }
 
 /// The adapter's status command (a screen app's facts source), if any.

@@ -30,7 +30,7 @@ pub const SUBCOMMAND = "agents";
 pub const COMPACT_BELOW_COLUMNS = 100;
 
 /// Ancestors walked at most (a cycle or a runaway chain ends the walk).
-const MAX_ANCESTRY = 64;
+pub const MAX_ANCESTRY = 64;
 
 pub const Format = enum { line, compact, json };
 

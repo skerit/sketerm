@@ -98,9 +98,6 @@ const SECRET_WAIT_MS: i64 = 30_000;
 const REMOTE_PORT_MIN: u16 = 20_000;
 const REMOTE_PORT_SPAN: u16 = 40_000;
 
-/// Largest settings file read for the user's own status command.
-const SETTINGS_MAX_BYTES: usize = 1 << 20;
-
 // ── launch values agent_open and agent_set share ─────────────────
 
 /// agent_open's / agent_set's `retry_on_overload`: an object (`max`,
@@ -664,10 +661,7 @@ pub fn startAgent(arena: std.mem.Allocator, loaded: *const adapter.Loaded, o: *O
         };
         facts.version = try localVersion(arena, loaded.spec.launch, found);
         if (wants_status) {
-            const paths = try statusline.localPaths(arena, status_cmd.?, o.cwd.?, localHost().home, o.extra, loaded.spec.launch.unset_env, envValue);
-            const contents = try arena.alloc(?[]const u8, paths.len);
-            for (paths, contents) |p, *ct| ct.* = if (p) |path| readfile.capped(arena, path, SETTINGS_MAX_BYTES) else null;
-            o.status = .{ .run_dir = platform.runtimeDir(), .user = try statusline.userJson(arena, status_cmd.?, contents) };
+            o.status = .{ .run_dir = platform.runtimeDir(), .user = try statusline.localUserJson(arena, status_cmd.?, o.cwd.?, localHost().home, o.extra, loaded.spec.launch.unset_env, envValue) };
         }
         break :blk found;
     };

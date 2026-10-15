@@ -23,6 +23,9 @@ const peerclient = @import("../mux/peerclient.zig");
 const peermail = peerclient.peermail;
 const vocab = @import("../agent/vocab.zig");
 const clock = @import("../util/clock.zig");
+const agentwait = @import("agentwait.zig");
+const mcp_hook = @import("mcp_hook.zig");
+const peer_cli = @import("peer_cli.zig");
 const Res = mcp.Res;
 const errRes = mcp.errRes;
 
@@ -237,6 +240,15 @@ pub const Link = struct {
     ttl_hours: u32 = 0,
     mailbox: ?Mailbox = null,
     lease: ?*mcp_registry.Lease = null,
+    /// What its client's hooks and status line reported (`applyPresence`).
+    state: vocab.PeerState = .unknown,
+    /// A presence line arrived at least once.
+    presence: bool = false,
+    /// Owned; "" = none. The facts as JSON text, the model, the latest
+    /// notification type.
+    facts_json: []u8 = &.{},
+    model: []u8 = &.{},
+    last_notification: []u8 = &.{},
 };
 
 pub var link: Link = .{};
@@ -282,6 +294,9 @@ pub fn shutdown() void {
     a.free(link.app);
     a.free(link.cwd);
     a.free(link.address);
+    a.free(link.facts_json);
+    a.free(link.model);
+    a.free(link.last_notification);
     if (link.mailbox) |*m| m.deinit();
     link = .{};
 }
@@ -309,14 +324,66 @@ fn connect() void {
 
 fn register() void {
     const p = if (link.peer) |*pp| pp else return;
+    var arena_state = std.heap.ArenaAllocator.init(link.allocator);
+    defer arena_state.deinit();
     p.register(.{
         .address = link.name.address,
         .durable = link.name.durable,
         .app = link.app,
         .cwd = link.cwd,
         .pid = @intCast(c.getpid()),
-        .state = .unknown,
+        .state = link.state,
+        .facts = factsValue(arena_state.allocator()),
+        .model = link.model,
+        .last_notification = link.last_notification,
     }) catch lost();
+}
+
+fn factsValue(arena: std.mem.Allocator) ?std.json.Value {
+    if (link.facts_json.len == 0) return null;
+    return std.json.parseFromSliceLeaky(std.json.Value, arena, link.facts_json, .{}) catch null;
+}
+
+/// Publish this server's peer facts on its registry record.
+fn publish() void {
+    const lease = link.lease orelse return;
+    if (link.address.len == 0) return;
+    var arena_state = std.heap.ArenaAllocator.init(link.allocator);
+    defer arena_state.deinit();
+    lease.publishPeer(.{
+        .address = link.address,
+        .durable = link.durable,
+        .state = @tagName(link.state),
+        .name_taken = link.name_taken,
+        .facts = factsValue(arena_state.allocator()),
+        .model = if (link.model.len > 0) link.model else null,
+        .last_notification = if (link.last_notification.len > 0) link.last_notification else null,
+    }) catch {};
+}
+
+/// A presence line from the client's hooks or status line
+/// (`mcp_hook.zig`, through the waiter socket): the state it means, its
+/// facts, model and notification replace what was reported, the record
+/// is rewritten and the broker hears it with a re-registration.
+pub fn applyPresence(p: agentwait.Presence) void {
+    if (!link.configured) return;
+    link.presence = true;
+    if (mcp_hook.stateFor(p)) |st| link.state = st;
+    if (mcp_hook.notificationOf(p)) |n| replaceOwned(&link.last_notification, n);
+    if (p.model) |m| replaceOwned(&link.model, m);
+    if (p.facts) |f| if (f == .object) {
+        const text = std.json.Stringify.valueAlloc(link.allocator, f, .{}) catch return;
+        link.allocator.free(link.facts_json);
+        link.facts_json = text;
+    };
+    publish();
+    if (link.status == .up) register();
+}
+
+fn replaceOwned(slot: *[]u8, value: []const u8) void {
+    const owned = link.allocator.dupe(u8, value) catch return;
+    link.allocator.free(slot.*);
+    slot.* = owned;
 }
 
 fn closeConn() void {
@@ -417,12 +484,7 @@ fn take(push: peerclient.Push) void {
             link.name_taken = s.name_taken;
             link.ttl_hours = s.ttl_hours;
             for (s.expired_while_away) |x| _ = m.add(.{ .expired_away = x }) catch {};
-            if (link.lease) |lease| lease.publishPeer(.{
-                .address = link.address,
-                .durable = link.durable,
-                .state = @tagName(vocab.PeerState.unknown),
-                .name_taken = link.name_taken,
-            }) catch {};
+            publish();
         },
     }
 }
@@ -483,21 +545,7 @@ pub fn peerTool(arena: std.mem.Allocator, tool: Tool, args: std.json.Value) ![]c
 
 const SelfFacts = struct { address: []const u8, durable: bool, name_taken: bool, ttl_hours: u32 };
 
-const ListLine = struct {
-    address: []const u8,
-    host: ?[]const u8 = null,
-    app: ?[]const u8 = null,
-    state: []const u8,
-    attention: ?[]const u8 = null,
-    live: bool,
-    pending: u32,
-    self: ?bool = null,
-    cwd: ?[]const u8 = null,
-    pid: ?i32 = null,
-    durable: ?bool = null,
-    last_seen_ms: ?i64 = null,
-    name_taken: ?bool = null,
-};
+const ListLine = peer_cli.ListLine;
 
 fn jsonOf(arena: std.mem.Allocator, v: anytype) ![]const u8 {
     return std.json.Stringify.valueAlloc(arena, v, .{ .emit_null_optional_fields = false });
@@ -522,32 +570,10 @@ fn peerList(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     try res.textf("{d} peer(s); this session is {s}{s}", .{ lines.len, if (link.address.len > 0) link.address else "(not registered yet)", if (link.name_taken) " (the name it asked for is taken)" else "" });
     for (reply.value.peers, lines) |pi, *l| {
         const is_self = std.mem.eql(u8, pi.address, link.address);
-        l.* = .{
-            .address = pi.address,
-            .host = nonEmpty(pi.host),
-            .app = nonEmpty(pi.app),
-            .state = @tagName(pi.state),
-            .attention = if (pi.state.attention()) |at| @tagName(at) else null,
-            .live = pi.live,
-            .pending = pi.pending,
-            .self = if (is_self) true else null,
-        };
-        if (detail) {
-            l.cwd = pi.cwd;
-            l.pid = pi.pid;
-            l.durable = pi.durable;
-            l.last_seen_ms = pi.last_seen_ms;
-            l.name_taken = pi.name_taken;
-        }
-        try res.textf("{s}{s} {s} on {s}, {s}{s}, pending {d}", .{
-            pi.address,
-            if (is_self) " (you)" else "",
-            if (pi.app.len > 0) pi.app else "unknown app",
-            if (pi.host.len > 0) pi.host else "this host",
-            @tagName(pi.state),
-            if (pi.live) "" else ", offline",
-            pi.pending,
-        });
+        l.* = peer_cli.listLine(pi, is_self, detail);
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        try peer_cli.writeListText(&aw.writer, arena, pi, is_self);
+        try res.textf("{s}", .{aw.written()});
     }
     try res.raw("peers", try jsonOf(arena, lines));
     return res.finish();
@@ -653,6 +679,8 @@ pub const CapFact = struct {
     durable: bool,
     name_taken: bool,
     channel_armed: bool,
+    /// A presence line from this session's hooks or status line arrived.
+    presence: bool,
 };
 
 /// `capabilities.peers`.
@@ -666,6 +694,7 @@ pub fn capability() CapFact {
         .durable = link.durable,
         .name_taken = link.name_taken,
         .channel_armed = link.configured and mcp_agent.state.push == .channel,
+        .presence = link.presence,
     };
 }
 

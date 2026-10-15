@@ -10,11 +10,14 @@ const std = @import("std");
 const adapter = @import("adapter.zig");
 const launch = @import("launch.zig");
 const shellquote = @import("../util/shellquote.zig");
+const readfile = @import("../util/readfile.zig");
 
 /// The facts file the command writes (an absolute path on the agent's host).
 pub const FILE_ENV = "SKETERM_AGENT_FACTS";
 /// The user's own status command, absent when they have none.
 pub const USER_ENV = "SKETERM_AGENT_STATUS";
+/// A settings file larger than this is not read.
+pub const SETTINGS_MAX_BYTES: usize = 1 << 20;
 
 /// POSIX sh: the JSON on stdin goes to `$FILE_ENV` through a temp file and
 /// a rename, then to the user's command, whose output is the only output.
@@ -164,6 +167,21 @@ pub fn userCommand(sc: adapter.StatusCommand, user: ?std.json.ObjectMap) ?[]cons
     const o = user orelse return null;
     const cmd = o.get(sc.command_key) orelse return null;
     return if (cmd == .string and cmd.string.len > 0) cmd.string else null;
+}
+
+/// The user's own status object on this machine: `localPaths` read (each
+/// file capped at `SETTINGS_MAX_BYTES`), then `userObject`.
+pub fn localUserObject(arena: std.mem.Allocator, sc: adapter.StatusCommand, cwd: []const u8, home: ?[]const u8, x: launch.Extra, unset: []const []const u8, host_env: *const fn ([]const u8) ?[]const u8) !?std.json.ObjectMap {
+    const paths = try localPaths(arena, sc, cwd, home, x, unset, host_env);
+    const contents = try arena.alloc(?[]const u8, paths.len);
+    for (paths, contents) |p, *ct| ct.* = if (p) |path| readfile.capped(arena, path, SETTINGS_MAX_BYTES) else null;
+    return userObject(arena, sc, contents);
+}
+
+/// `localUserObject` as JSON text (what a start keeps), null for none.
+pub fn localUserJson(arena: std.mem.Allocator, sc: adapter.StatusCommand, cwd: []const u8, home: ?[]const u8, x: launch.Extra, unset: []const []const u8, host_env: *const fn ([]const u8) ?[]const u8) !?[]const u8 {
+    const u = try localUserObject(arena, sc, cwd, home, x, unset, host_env) orelse return null;
+    return try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = u }, .{});
 }
 
 /// What a start puts in the settings document and the app's environment:

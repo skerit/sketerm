@@ -219,6 +219,10 @@ const HELP_TEXT =
     \\                         press keys, run commands). Register in an
     \\                         MCP client as command "sketerm", args
     \\                         ["mcp"]. `sketerm mcp --help` for details.
+    \\  sketerm peer list|send|read [--follow] [--json] --name NAME
+    \\                         take part in peer messaging between
+    \\                         assistants' sessions from any program.
+    \\                         `sketerm peer --help` for details.
     \\
     \\Durable sessions (sketerm-mux):
     \\  sketerm mux [host]     TUI picker: attach / spawn / kill
@@ -447,6 +451,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer allocator.free(mcp_args);
         for (argv[2..], 0..) |a, n| mcp_args[n] = std.mem.span(a);
         return @import("ipc/mcp.zig").run(allocator, mcp_args);
+    }
+
+    // `sketerm peer ...` — a non-MCP program as a peer (socket-only).
+    if (argv.len >= 2 and std.mem.eql(u8, std.mem.span(argv[1]), "peer")) {
+        const peer_args = allocator.alloc([]const u8, argv.len - 2) catch return 1;
+        defer allocator.free(peer_args);
+        for (argv[2..], 0..) |a, n| peer_args[n] = std.mem.span(a);
+        return @import("ipc/peer_cli.zig").cli(allocator, peer_args);
     }
 
     // `sketerm app <host> <command...>` — run a remote GUI app with
