@@ -7,6 +7,9 @@
 const std = @import("std");
 const keychord = @import("../util/keychord.zig");
 
+/// `meta` is Super: the seat has a real Super key (pc105 Mod4).
+pub const dialect: keychord.Dialect = .{ .meta = .super };
+
 /// xkb modifier mask bits under the pc105 keymaps.
 pub const Mods = struct {
     shift: bool = false,
@@ -147,7 +150,7 @@ pub const Chord = struct {
 /// "ctrl+shift+t", "alt+F4", "enter", "ctrl+c" → mods + evdev key, per util/keychord.zig's grammar.
 /// Only a US-QWERTY ASCII character is a character key here.
 pub fn parseChord(spec: []const u8) ?Chord {
-    const parsed = keychord.parse(spec) catch return null;
+    const parsed = keychord.parse(spec, dialect) catch return null;
     var mods = Mods{};
     var it = parsed.mods.iterator();
     while (it.next()) |m| switch (m) {

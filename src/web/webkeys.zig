@@ -2,7 +2,7 @@
 //! keys by NAME (the MCP `web_key` tool) rather than from a real GTK
 //! event. std + protocol only, usable from every target.
 //!
-//! Names and grammar are util/keychord.zig's (`meta` is Super). The
+//! Names and grammar are util/keychord.zig's (`meta` is Super, `dialect`). The
 //! wire carries the XKB keysym exactly as the GUI would: Latin-1
 //! characters are their own keysym, anything else is
 //! `0x01000000 | codepoint`.
@@ -27,6 +27,9 @@ pub const Chord = struct {
 
 pub const Error = keychord.Error;
 
+/// `meta` is Super, as the DOM's metaKey and the web_key/web_input tool docs read it.
+pub const dialect: keychord.Dialect = .{ .meta = .super };
+
 fn bitFor(m: keychord.Mod) u32 {
     return switch (m) {
         .ctrl => proto.mod_ctrl,
@@ -38,7 +41,7 @@ fn bitFor(m: keychord.Mod) u32 {
 
 /// The `proto.mod_*` bit a modifier name stands for, any case.
 pub fn modBit(name: []const u8) ?u32 {
-    return bitFor(keychord.modFor(name) orelse return null);
+    return bitFor(keychord.modFor(name, dialect) orelse return null);
 }
 
 /// The keysym of a named key; every one is in the helper's keymap table (web/keymap.zig), which has no Menu.
@@ -84,7 +87,7 @@ fn namedKeysym(n: keychord.Named) ?u32 {
 /// bare-shift chord over a printable produces that character's text
 /// (the caller writes the character they mean, "?" not "shift+/").
 pub fn parseChord(spec: []const u8) Error!Chord {
-    const parsed = try keychord.parse(spec);
+    const parsed = try keychord.parse(spec, dialect);
     var mods: u32 = 0;
     var it = parsed.mods.iterator();
     while (it.next()) |m| mods |= bitFor(m);

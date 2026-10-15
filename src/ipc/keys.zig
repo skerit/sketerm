@@ -3,15 +3,27 @@
 //! sequences; kitty-keyboard-protocol apps still see the legacy
 //! encoding (fine for driving CLIs/TUIs remotely).
 //!
-//! Names and grammar are util/keychord.zig's. Super (`meta`, `cmd`)
-//! rides only the CSI forms (modifier bit 8, as xterm and kitty
-//! number it); a chord the legacy encoding has no bytes for is
-//! refused with UnsupportedModifier rather than sent without it.
+//! Names and grammar are util/keychord.zig's. `meta` is Alt here, as
+//! terminals and readline read it (`dialect`): an ESC prefix on legacy
+//! bytes, modifier bit 2 in the CSI forms. Super (`super`, `cmd`,
+//! `win`) rides only the CSI forms (modifier bit 8, as xterm and kitty
+//! number it); a chord the legacy encoding has no bytes for is refused
+//! with UnsupportedModifier rather than sent without it.
 
 const std = @import("std");
 const keychord = @import("../util/keychord.zig");
 
 pub const Error = keychord.Error || error{ UnsupportedModifier, OutOfMemory };
+
+/// The terminal convention: `meta` is Alt, never Super.
+pub const dialect: keychord.Dialect = .{ .meta = .alt };
+
+/// The keys Super can ride, for a refusal or a tool description to name.
+pub const super_reach = "super (cmd, win) rides only arrows, home/end, insert/delete, page keys and F-keys";
+
+/// The modifier rule as the send-keys tool descriptions state it.
+pub const modifiers_doc = "Modifiers: ctrl (control), shift, alt (option); meta is Alt, as terminals read it " ++
+    "(an ESC prefix); " ++ super_reach ++ ", and a chord the terminal has no bytes for is refused.";
 
 /// xterm modifier parameter: 1 + shift(1) + alt(2) + ctrl(4) + super(8).
 fn modParam(mods: keychord.Mods) u8 {
@@ -89,7 +101,7 @@ fn literal(out: *std.ArrayList(u8), allocator: std.mem.Allocator, mods: keychord
 
 /// Encode one chord ("ctrl+c", "enter", "shift+tab") into `out`.
 pub fn encodeChord(out: *std.ArrayList(u8), allocator: std.mem.Allocator, chord: []const u8, app_cursor: bool) Error!void {
-    const parsed = try keychord.parse(chord);
+    const parsed = try keychord.parse(chord, dialect);
     const mods = parsed.mods;
     const name = switch (parsed.key) {
         .char => |text| return literal(out, allocator, mods, text),
@@ -188,16 +200,31 @@ test "alt prefixes and literals" {
     try expectEnc("ctrl+c up up enter", false, "\x03\x1b[A\x1b[A\r");
 }
 
-test "meta is Super: CSI forms carry modifier bit 8, legacy bytes refuse it" {
-    try expectEnc("meta+up", false, "\x1b[1;9A");
-    try expectEnc("super+shift+delete", false, "\x1b[3;10~");
-    try expectEnc("cmd+f1", false, "\x1b[1;9P");
+test "meta is Alt: an ESC prefix on bytes, modifier bit 2 in the CSI forms" {
+    try expectEnc("meta+x", false, "\x1bx");
+    try expectEnc("Meta+Up", false, "\x1b[1;3A");
+    try expectEnc("meta+enter", false, "\x1b\r");
+    try expectEnc("ctrl+meta+delete", false, "\x1b[3;7~");
+    // A bare `meta` is the held Alt key, which has no bytes.
     const a = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
-    try std.testing.expectError(Error.UnsupportedModifier, encode(&out, a, "meta+x", false));
-    try std.testing.expectError(Error.UnsupportedModifier, encode(&out, a, "meta+enter", false));
-    try std.testing.expectError(Error.UnsupportedModifier, encode(&out, a, "meta+shift+tab", false));
+    try std.testing.expectError(Error.UnknownKey, encode(&out, a, "meta", false));
+}
+
+test "super, cmd and win: CSI forms carry modifier bit 8, legacy bytes refuse it" {
+    try expectEnc("super+up", false, "\x1b[1;9A");
+    try expectEnc("super+shift+delete", false, "\x1b[3;10~");
+    try expectEnc("cmd+f1", false, "\x1b[1;9P");
+    try expectEnc("win+meta+up", false, "\x1b[1;11A");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try std.testing.expectError(Error.UnsupportedModifier, encode(&out, a, "super+x", false));
+    try std.testing.expectError(Error.UnsupportedModifier, encode(&out, a, "cmd+enter", false));
+    try std.testing.expectError(Error.UnsupportedModifier, encode(&out, a, "win+shift+tab", false));
+    // A refused chord sends nothing.
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
 test "unknown keys rejected" {

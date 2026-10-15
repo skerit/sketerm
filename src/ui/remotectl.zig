@@ -10,6 +10,7 @@ const atomicwrite = @import("../util/atomicwrite.zig");
 const crashlog = @import("../util/crashlog.zig");
 const clipboard = @import("clipboard.zig");
 const ipc_protocol = @import("../ipc/protocol.zig");
+const keys = @import("../ipc/keys.zig");
 const Screen = @import("../grid/screen.zig").Screen;
 const Pane = @import("pane.zig").Pane;
 const winmod = @import("window.zig");
@@ -589,9 +590,9 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         }
         var bytes: std.ArrayList(u8) = .empty;
         defer bytes.deinit(allocator);
-        @import("../ipc/keys.zig").encode(&bytes, allocator, data, pane.terminal.screen.app_cursor_keys) catch |err| switch (err) {
+        keys.encode(&bytes, allocator, data, pane.terminal.screen.app_cursor_keys) catch |err| switch (err) {
             error.UnknownKey, error.UnknownModifier, error.EmptyChord => return ipc_protocol.writeErr(out, allocator, .invalid_request, "unknown key chord"),
-            error.UnsupportedModifier => return ipc_protocol.writeErr(out, allocator, .invalid_request, "the terminal has no encoding for that modifier on that key (super/meta rides only arrows, home/end, insert/delete, page keys and F-keys)"),
+            error.UnsupportedModifier => return ipc_protocol.writeErr(out, allocator, .invalid_request, "the terminal has no encoding for that modifier on that key (" ++ keys.super_reach ++ ")"),
             error.OutOfMemory => return err,
         };
         pane.terminal.writeUserInput(bytes.items);

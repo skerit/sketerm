@@ -24,6 +24,7 @@ const adapter = @import("../agent/adapter.zig");
 const retry = @import("../agent/retry.zig");
 const stall = @import("../agent/stall.zig");
 const transport = @import("transport.zig");
+const keys = @import("keys.zig");
 const sshmaster = @import("../mux/sshmaster.zig");
 const web_proto = @import("../web/protocol.zig");
 const webtabs = @import("webtabs.zig");
@@ -537,7 +538,7 @@ const TOOL_DECLS = [_]ToolDef{
         .mutates = true,
         .description =
         \\Press named keys in a pane: space-separated chords like 'ctrl+c', 'enter', 'up', 'escape', 'f5', 'alt+x', 'shift+tab', 'pagedown'. Single characters are typed literally. Without a GUI socket, `pane` addresses the headless terminals this server opened (the ids term_* tools take; new_tab opens one).
-        ,
+        ++ " " ++ keys.modifiers_doc,
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}
         ,
@@ -1158,7 +1159,7 @@ const TOOL_DECLS = [_]ToolDef{
         .mutates = true,
         .description =
         \\Press named key chords in a headless terminal: 'ctrl+c', 'enter', 'up', 'tab', space-separated.
-        ,
+        ++ " " ++ keys.modifiers_doc,
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":["integer","string"],"description":"Terminal id, or the name term_open gave it"},"keys":{"type":"string"}},"required":["keys"]}
         ,
