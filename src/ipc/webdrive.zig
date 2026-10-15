@@ -73,6 +73,7 @@ const std = @import("std");
 const diagnostic = @import("../web/diagnostic.zig");
 const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
+const scmrights = @import("../util/scmrights.zig");
 const pathz = @import("../util/pathz.zig");
 const strz = @import("../util/strz.zig");
 const muxclient = @import("../mux/client.zig");
@@ -4317,59 +4318,12 @@ pub const Engine = struct {
     /// False = the connection is gone (state already updated).
     fn readAvailable(self: *Engine) bool {
         if (self.fd < 0) return false;
-        var buf: [64 * 1024]u8 = undefined;
-        // Byte budget per call so a flooding peer cannot starve the
-        // caller-side deadline (the appdrive fillAvailable rule).
-        var budget: usize = 4 * 1024 * 1024;
-        while (budget > 0) {
-            var iov = c.struct_iovec{ .iov_base = &buf, .iov_len = buf.len };
-            var cbuf: [64]u8 align(@alignOf(c.struct_cmsghdr)) = std.mem.zeroes([64]u8);
-            var mh = std.mem.zeroes(c.struct_msghdr);
-            mh.msg_iov = @ptrCast(&iov);
-            mh.msg_iovlen = 1;
-            mh.msg_control = &cbuf;
-            mh.msg_controllen = cbuf.len;
-            const n = c.recvmsg(self.fd, &mh, if (platform.is_linux) c.MSG_CMSG_CLOEXEC else 0);
-            if (n == 0) {
+        switch (scmrights.drain(self.fd, self.gpa, &self.in, &self.rx_fds)) {
+            .open => {},
+            .eof, .failed => {
                 self.lost();
                 return false;
-            }
-            if (n < 0) {
-                const e = std.c._errno().*;
-                if (e == c.EAGAIN or e == c.EWOULDBLOCK) break;
-                if (e == c.EINTR) continue;
-                self.lost();
-                return false;
-            }
-            const hdr_size: usize = @sizeOf(c.struct_cmsghdr);
-            if (@as(usize, @intCast(mh.msg_controllen)) >= hdr_size) {
-                const hdr: *const c.struct_cmsghdr = @ptrCast(@alignCast(&cbuf));
-                if (hdr.cmsg_level == c.SOL_SOCKET and hdr.cmsg_type == c.SCM_RIGHTS and
-                    @as(usize, @intCast(hdr.cmsg_len)) >= hdr_size + @sizeOf(c_int))
-                {
-                    // One control message can carry several descriptors;
-                    // reading only the first would leak the rest.
-                    const bytes = @as(usize, @intCast(hdr.cmsg_len)) - hdr_size;
-                    var off: usize = 0;
-                    while (off + @sizeOf(c_int) <= bytes and hdr_size + off + @sizeOf(c_int) <= cbuf.len) : (off += @sizeOf(c_int)) {
-                        var passed: c_int = undefined;
-                        @memcpy(std.mem.asBytes(&passed), cbuf[hdr_size + off ..][0..@sizeOf(c_int)]);
-                        if (!platform.is_linux and c.fcntl(passed, c.F_SETFD, c.FD_CLOEXEC) < 0) {
-                            _ = c.close(passed);
-                            continue;
-                        }
-                        self.rx_fds.append(self.gpa, passed) catch {
-                            _ = c.close(passed);
-                        };
-                    }
-                }
-            }
-            self.in.appendSlice(self.gpa, buf[0..@intCast(n)]) catch {
-                self.lost();
-                return false;
-            };
-            budget -|= @intCast(n);
-            if (@as(usize, @intCast(n)) < buf.len) break;
+            },
         }
 
         var reader = proto.Reader.init(self.in.items);

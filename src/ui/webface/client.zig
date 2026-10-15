@@ -9,6 +9,7 @@ const cast = @import("../../util/cast.zig");
 const findbin = @import("../../web/findbin.zig");
 const mux_cli = @import("../../ipc/mux_cli.zig");
 const platform = @import("../../util/platform.zig");
+const scmrights = @import("../../util/scmrights.zig");
 const proto = @import("../../web/protocol.zig");
 const socksbridge = @import("../../ipc/socksbridge.zig");
 const webext = @import("../webext.zig");
@@ -825,46 +826,9 @@ pub const Client = struct {
     /// Drain the socket into `in`, collecting passed descriptors, then
     /// dispatch every complete frame. False = the connection is done.
     fn readIn(self: *Client) bool {
-        var buf: [64 * 1024]u8 = undefined;
-        while (true) {
-            var iov = c.struct_iovec{ .iov_base = &buf, .iov_len = buf.len };
-            var cbuf: [64]u8 align(@alignOf(c.struct_cmsghdr)) = std.mem.zeroes([64]u8);
-            var mh = std.mem.zeroes(c.struct_msghdr);
-            mh.msg_iov = @ptrCast(&iov);
-            mh.msg_iovlen = 1;
-            mh.msg_control = &cbuf;
-            mh.msg_controllen = cbuf.len;
-            const n = c.recvmsg(self.fd, &mh, 0);
-            if (n == 0) return false;
-            if (n < 0) {
-                const e = std.c._errno().*;
-                if (e == c.EAGAIN or e == c.EWOULDBLOCK) break;
-                if (e == c.EINTR) continue;
-                return false;
-            }
-            const hdr_size: usize = @sizeOf(c.struct_cmsghdr);
-            if (@as(usize, @intCast(mh.msg_controllen)) >= hdr_size) {
-                const hdr: *const c.struct_cmsghdr = @ptrCast(@alignCast(&cbuf));
-                if (hdr.cmsg_level == c.SOL_SOCKET and hdr.cmsg_type == c.SCM_RIGHTS and
-                    @as(usize, @intCast(hdr.cmsg_len)) >= hdr_size + @sizeOf(c_int))
-                {
-                    // ONE control message can carry several descriptors:
-                    // a memfd frame attaches one, a dma-buf frame one
-                    // per plane. Reading only the first would leak the
-                    // rest into this process forever.
-                    const bytes = @as(usize, @intCast(hdr.cmsg_len)) - hdr_size;
-                    var off: usize = 0;
-                    while (off + @sizeOf(c_int) <= bytes and hdr_size + off + @sizeOf(c_int) <= cbuf.len) : (off += @sizeOf(c_int)) {
-                        var passed: c_int = undefined;
-                        @memcpy(std.mem.asBytes(&passed), cbuf[hdr_size + off ..][0..@sizeOf(c_int)]);
-                        self.fds.append(self.gpa, passed) catch {
-                            _ = c.close(passed);
-                        };
-                    }
-                }
-            }
-            self.in.appendSlice(self.gpa, buf[0..@intCast(n)]) catch return false;
-            if (@as(usize, @intCast(n)) < buf.len) break;
+        switch (scmrights.drain(self.fd, self.gpa, &self.in, &self.fds)) {
+            .open => {},
+            .eof, .failed => return false,
         }
 
         var reader = proto.Reader.init(self.in.items);
