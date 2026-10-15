@@ -205,8 +205,9 @@ pub const PEER_AGE_SHOWN_MS: i64 = 60_000;
 
 /// Compose the push for one peer item: the same `Push` the agent wake-ups
 /// use, so both routes and `peer_read` carry this text and nothing else.
-/// The sender's presence is its `PeerState`: `gone` when its server is not
-/// live, else `unknown` until presence (hooks) reports more.
+/// The sender's presence is its `PeerState` as the broker reported it at
+/// delivery; a broker that predates `sender_state`: `gone` when the
+/// sender's server is not live, else `unknown`.
 pub fn composePeer(arena: std.mem.Allocator, item: PeerItem) !Push {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
@@ -216,7 +217,7 @@ pub fn composePeer(arena: std.mem.Allocator, item: PeerItem) !Push {
             try w.writeAll(if (m.from.app.len > 0) m.from.app else "unknown app");
             if (m.from.host.len > 0) try w.print(" on {s}", .{m.from.host});
             if (m.from.cwd.len > 0) try w.print(", {s}", .{m.from.cwd});
-            const presence: vocab.PeerState = if (m.sender_live) .unknown else .gone;
+            const presence = senderState(m);
             try w.print(", {s})", .{@tagName(presence)});
             const aged = m.age_ms >= PEER_AGE_SHOWN_MS;
             if (aged or m.queued) try w.writeAll(", sent");
@@ -262,6 +263,7 @@ fn peerMeta(arena: std.mem.Allocator, item: PeerItem) !agentwait.Meta {
             .reply_to = m.reply_to,
             .queued = if (m.queued) "true" else "false",
             .age_s = try std.fmt.allocPrint(arena, "{d}", .{@divTrunc(@max(m.age_ms, 0), 1000)}),
+            .sender_state = @tagName(senderState(m)),
             .at = try wallAt(arena, m.sent_ms),
         },
         .event => |e| .{
@@ -275,6 +277,10 @@ fn peerMeta(arena: std.mem.Allocator, item: PeerItem) !agentwait.Meta {
             .at = try wallAt(arena, x.sent_ms),
         },
     };
+}
+
+fn senderState(m: peermail.Deliver) vocab.PeerState {
+    return m.sender_state orelse if (m.sender_live) .unknown else .gone;
 }
 
 fn nonEmpty(s: []const u8) ?[]const u8 {
@@ -420,6 +426,11 @@ test "a peer message reads as the plan's sentence: age from a minute on, offline
     try t.expectEqualStrings("false", fresh.meta.queued.?);
     try t.expectEqualStrings("4", fresh.meta.age_s.?);
     try t.expect(fresh.meta.agent == null and fresh.meta.seq == null);
+    try t.expectEqualStrings("unknown", fresh.meta.sender_state.?);
+    // The broker's sender_state wins (hooks report presence).
+    const busy = try composePeer(a, .{ .message = .{ .id = "m-9", .from = from, .text = "x", .sender_live = true, .sender_state = .working } });
+    try t.expect(std.mem.startsWith(u8, busy.content, "Peer message from Zenit (claude-code on hohenheim, /home/u/zenit-workspace, working). id m-9."));
+    try t.expectEqualStrings("working", busy.meta.sender_state.?);
 
     // Aged but delivered live: the age alone.
     const aged = try composePeer(a, .{ .message = .{ .id = "m-1", .from = from, .text = "x", .age_ms = 5 * 60_000 + 10, .sender_live = true } });

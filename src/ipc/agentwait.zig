@@ -26,6 +26,10 @@
 //! for `--all`, and a final `{"type":"end","reason":"..."}` before it
 //! closes. A server that predates `all` reads the line as `--any`.
 //!
+//! A first line `{"kind":"presence",...}` (`Presence`) is no subscription:
+//! `sketerm mcp hook` / `statusline` report the session's presence to the
+//! server its client started, then close without reading a reply.
+//!
 //! A waiter shares the agent's ONE delivery state with the agent_* tools
 //! (`events.Cursor`): what it prints is delivered, so no result repeats
 //! it, and a second waiter on the same agent does not wake for it.
@@ -134,7 +138,55 @@ pub const Meta = struct {
     queued: ?[]const u8 = null,
     /// Peer: seconds between sending and delivery.
     age_s: ?[]const u8 = null,
+    /// Peer: the sender's `vocab.PeerState` at delivery.
+    sender_state: ?[]const u8 = null,
 };
+
+/// `Presence.kind`: the first line is a presence post, not a subscription.
+pub const PRESENCE_KIND = "presence";
+/// `Presence.event` of a statusline post (the others are hook event names).
+pub const STATUSLINE_EVENT = "statusline";
+
+/// One presence post: what a hook or the statusline saw. The server maps
+/// `event` (+ `notification`) to a `vocab.PeerState` (`mcp_hook.stateFor`);
+/// `state` names one directly (a client that knows it, e.g. a plugin).
+pub const Presence = struct {
+    kind: []const u8 = PRESENCE_KIND,
+    event: []const u8 = "",
+    /// A Notification hook's `notification_type`.
+    notification: ?[]const u8 = null,
+    state: ?[]const u8 = null,
+    /// Known facts as `facts.toJson` writes them (`data/agents/facts.json` names).
+    facts: ?std.json.Value = null,
+    model: ?[]const u8 = null,
+};
+
+/// Whether the line is a presence post.
+pub fn isPresence(arena: std.mem.Allocator, line: []const u8) bool {
+    const k = std.json.parseFromSliceLeaky(struct { kind: ?[]const u8 = null }, arena, line, .{ .ignore_unknown_fields = true }) catch return false;
+    return if (k.kind) |v| std.mem.eql(u8, v, PRESENCE_KIND) else false;
+}
+
+pub fn encodePresence(arena: std.mem.Allocator, p: Presence) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{f}\n", .{std.json.fmt(p, .{ .emit_null_optional_fields = false })});
+}
+
+/// Post one presence line to the waiter socket at `socket` and close,
+/// never blocking: a non-blocking connect and send (a full backlog or
+/// buffer is a failed post, not a wait).
+/// @return whether the whole line was sent.
+pub fn postPresence(socket: []const u8, line: []const u8) bool {
+    const fd = platform.socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    defer _ = c.close(fd);
+    const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
+    _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
+    var addr: c.struct_sockaddr_un = undefined;
+    @import("../mux/sockpath.zig").fillSockaddrUn(&addr, socket) catch return false;
+    if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) return false;
+    const n = c.send(fd, line.ptr, line.len, c.MSG_NOSIGNAL | c.MSG_DONTWAIT);
+    return n == @as(isize, @intCast(line.len));
+}
 
 /// What a `server` subscription's wake carries besides the events.
 pub const Pushed = struct { content: []const u8, meta: Meta };

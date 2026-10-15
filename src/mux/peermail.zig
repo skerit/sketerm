@@ -46,6 +46,10 @@ pub const ID_LEN = ID_PREFIX.len + ID_CHARS;
 pub const FILE_MAX: usize = 16 * 1024 * 1024;
 /// Mailbox files are named `<address>` plus this.
 pub const FILE_EXT = ".jsonl";
+/// A registration's facts document longer than this (as JSON) is dropped.
+pub const FACTS_MAX: usize = 4096;
+/// Longest `model` / `last_notification` kept from a registration.
+pub const PRESENCE_TEXT_MAX: usize = 128;
 
 // ---------------------------------------------------------------- wire
 
@@ -67,6 +71,14 @@ pub const RegisterReq = struct {
     cwd: []const u8 = "",
     pid: i32 = 0,
     state: PeerState = .unknown,
+    /// The session's known facts (`data/agents/facts.json` names to
+    /// numbers), from its statusline; null = none reported. Not an object,
+    /// or above `FACTS_MAX`, is dropped.
+    facts: ?std.json.Value = null,
+    /// The model the session reports (its statusline), empty = unknown.
+    model: []const u8 = "",
+    /// The latest notification type its hooks reported, empty = none.
+    last_notification: []const u8 = "",
 };
 
 /// `peer_list_req` body.
@@ -109,6 +121,10 @@ pub const PeerInfo = struct {
     last_seen_ms: i64 = 0,
     pending: u32 = 0,
     name_taken: bool = false,
+    /// What the peer's registration reported (`RegisterReq`).
+    facts: ?std.json.Value = null,
+    model: []const u8 = "",
+    last_notification: []const u8 = "",
 };
 
 /// `peer_list` body. `req` echoes `peer_list_req`; 0 = the answer to a
@@ -152,6 +168,9 @@ pub const Deliver = struct {
     /// Broker wall clock at delivery minus `sent_ms`.
     age_ms: i64 = 0,
     sender_live: bool = false,
+    /// The sender's presence at delivery: its registration's state, `gone`
+    /// when its server is not live. Null from a broker that predates it.
+    sender_state: ?PeerState = null,
     /// The recipient had no live server when it was sent.
     queued: bool = false,
 };
@@ -279,6 +298,10 @@ const Peer = struct {
     cwd: []const u8,
     pid: i32,
     state: PeerState,
+    /// Owned; "" = none (`RegisterReq.facts` re-serialized).
+    facts_json: []const u8,
+    model: []const u8,
+    last_notification: []const u8,
     last_seen_ms: i64,
 };
 
@@ -395,6 +418,9 @@ pub const Store = struct {
             .asked_durable = req.durable,
             .app = &.{},
             .cwd = &.{},
+            .facts_json = &.{},
+            .model = &.{},
+            .last_notification = &.{},
             .pid = req.pid,
             .state = req.state,
             .last_seen_ms = now,
@@ -406,6 +432,12 @@ pub const Store = struct {
         errdefer self.allocator.free(p.app);
         p.cwd = try self.allocator.dupe(u8, req.cwd);
         errdefer self.allocator.free(p.cwd);
+        try self.setPresence(p, req);
+        errdefer {
+            self.allocator.free(p.facts_json);
+            self.allocator.free(p.model);
+            self.allocator.free(p.last_notification);
+        }
         try self.peers.append(self.allocator, p);
     }
 
@@ -569,6 +601,9 @@ pub const Store = struct {
                 .last_seen_ms = p.last_seen_ms,
                 .pending = if (box) |b| @intCast(b.items.items.len) else 0,
                 .name_taken = p.name_taken,
+                .facts = if (p.facts_json.len > 0) std.json.parseFromSliceLeaky(std.json.Value, arena, p.facts_json, .{}) catch null else null,
+                .model = p.model,
+                .last_notification = p.last_notification,
             });
         }
         for (self.boxes.items) |b| {
@@ -751,6 +786,7 @@ pub const Store = struct {
                 .reply_to = it.reply_to,
                 .age_ms = now - it.sent_ms,
                 .sender_live = self.livePeer(it.from.address) != null,
+                .sender_state = if (self.livePeer(it.from.address)) |sp| sp.state else .gone,
                 .queued = it.queued,
             } }),
             .event => self.emit.call(conn, .{ .event = .{
@@ -832,6 +868,31 @@ pub const Store = struct {
         p.pid = req.pid;
         p.state = req.state;
         p.last_seen_ms = now;
+        try self.setPresence(p, req);
+    }
+
+    /// Replace `p`'s presence facts with `req`'s; a facts document that is
+    /// not an object or is too large is dropped, never refused.
+    fn setPresence(self: *Store, p: *Peer, req: RegisterReq) error{OutOfMemory}!void {
+        const facts: []u8 = if (req.facts) |f| blk: {
+            if (f != .object) break :blk try self.allocator.alloc(u8, 0);
+            const text = try std.json.Stringify.valueAlloc(self.allocator, f, .{});
+            if (text.len > FACTS_MAX) {
+                self.allocator.free(text);
+                break :blk try self.allocator.alloc(u8, 0);
+            }
+            break :blk text;
+        } else try self.allocator.alloc(u8, 0);
+        errdefer self.allocator.free(facts);
+        const model = try self.allocator.dupe(u8, req.model[0..@min(req.model.len, PRESENCE_TEXT_MAX)]);
+        errdefer self.allocator.free(model);
+        const note = try self.allocator.dupe(u8, req.last_notification[0..@min(req.last_notification.len, PRESENCE_TEXT_MAX)]);
+        self.allocator.free(p.facts_json);
+        self.allocator.free(p.model);
+        self.allocator.free(p.last_notification);
+        p.facts_json = facts;
+        p.model = model;
+        p.last_notification = note;
     }
 
     fn ensureBox(self: *Store, address: []const u8, durable: bool) error{OutOfMemory}!*Box {
@@ -909,6 +970,9 @@ pub const Store = struct {
         self.allocator.free(p.requested);
         self.allocator.free(p.app);
         self.allocator.free(p.cwd);
+        self.allocator.free(p.facts_json);
+        self.allocator.free(p.model);
+        self.allocator.free(p.last_notification);
         self.allocator.destroy(p);
     }
 
@@ -955,6 +1019,7 @@ const Rec = struct {
         age_ms: i64 = 0,
         text: []const u8 = "",
         from: []const u8 = "",
+        sender_state: ?PeerState = null,
     };
 
     fn init() Rec {
@@ -974,7 +1039,7 @@ const Rec = struct {
         const a = self.arena.allocator();
         for (self.dead.items) |d| if (d == conn) return false;
         const g: Got = switch (out) {
-            .deliver => |d| .{ .conn = conn, .kind = .deliver, .id = a.dupe(u8, d.id) catch "", .to = a.dupe(u8, d.to) catch "", .queued = d.queued, .age_ms = d.age_ms, .text = a.dupe(u8, d.text) catch "", .from = a.dupe(u8, d.from.address) catch "" },
+            .deliver => |d| .{ .conn = conn, .kind = .deliver, .id = a.dupe(u8, d.id) catch "", .to = a.dupe(u8, d.to) catch "", .queued = d.queued, .age_ms = d.age_ms, .text = a.dupe(u8, d.text) catch "", .from = a.dupe(u8, d.from.address) catch "", .sender_state = d.sender_state },
             .event => |e| .{ .conn = conn, .kind = .event, .id = a.dupe(u8, e.id) catch "", .outcome = e.outcome, .reason = e.reason, .to = a.dupe(u8, e.to) catch "" },
             .warn => |w| .{ .conn = conn, .kind = .warn, .text = a.dupe(u8, w) catch "" },
         };
@@ -1301,4 +1366,49 @@ test "the wire bodies round-trip their vocabulary by name" {
     const lback = try std.json.parseFromSlice(ListReply, t.allocator, lr, .{ .ignore_unknown_fields = true });
     defer lback.deinit();
     try t.expectEqualStrings("Zenit", lback.value.self.?.address);
+}
+
+test "presence: a re-registration's state, facts, model and notification reach peer_list and the sender's deliveries" {
+    var rec = Rec.init();
+    defer rec.deinit();
+    var s = try Store.init(t.allocator, .{ .host = "h", .emit = rec.emit() });
+    defer s.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // 1. Registered without presence: unknown, no facts.
+    try s.register(1, .{ .address = "alice", .durable = true, .app = "claude-code" }, 1000);
+    try s.register(2, reg("bob", true), 1000);
+    var list = try s.list(a);
+    try t.expectEqual(PeerState.unknown, list[0].state);
+    try t.expect(list[0].facts == null);
+    // 2. A presence update arrives as a re-registration with the same
+    // address: state, facts, model, notification and last_seen change.
+    const facts = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"context_used_percent\":42,\"cost_usd\":1.5}", .{});
+    try s.register(1, .{ .address = "alice", .durable = true, .app = "claude-code", .state = .working, .facts = facts, .model = "Opus", .last_notification = "permission_prompt" }, 2000);
+    list = try s.list(a);
+    try t.expectEqual(PeerState.working, list[0].state);
+    try t.expectEqual(@as(i64, 2000), list[0].last_seen_ms);
+    try t.expectEqualStrings("Opus", list[0].model);
+    try t.expectEqualStrings("permission_prompt", list[0].last_notification);
+    try t.expectEqual(@as(i64, 42), list[0].facts.?.object.get("context_used_percent").?.integer);
+    // 3. The list survives the wire (the broker stringifies, a client parses).
+    const wire_text = try std.json.Stringify.valueAlloc(a, ListReply{ .req = 3, .peers = list }, .{});
+    const back = try std.json.parseFromSliceLeaky(ListReply, a, wire_text, .{ .ignore_unknown_fields = true });
+    try t.expectEqual(PeerState.working, back.peers[0].state);
+    try t.expectEqual(@as(f64, 1.5), back.peers[0].facts.?.object.get("cost_usd").?.float);
+    // 4. A message alice sends carries her state; once she is gone, a
+    // queued one is delivered with `gone`.
+    var idb: [ID_LEN]u8 = undefined;
+    _ = try sendText(&s, 1, "bob", "hi", 2100, &idb);
+    try t.expectEqual(@as(?PeerState, .working), rec.last().sender_state);
+    s.deregister(2, 2200);
+    _ = try sendText(&s, 1, "bob", "later", 2300, &idb);
+    s.deregister(1, 2400);
+    try s.register(3, reg("bob", true), 2500);
+    s.flush(3, 2500);
+    try t.expectEqual(@as(?PeerState, .gone), rec.last().sender_state);
+    // 5. A facts document that is not an object is dropped, not refused.
+    try s.register(4, .{ .address = "carol", .facts = .{ .integer = 7 } }, 3000);
+    for (try s.list(a)) |p| if (std.mem.eql(u8, p.address, "carol")) try t.expect(p.facts == null);
 }

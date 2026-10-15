@@ -120,6 +120,11 @@ pub const PeerFacts = struct {
     state: []const u8 = "unknown",
     /// The name it asked for was held by another live server.
     name_taken: bool = false,
+    /// Presence its client's hooks and statusline reported
+    /// (`mcp_hook.zig`); absent until one did.
+    facts: ?std.json.Value = null,
+    model: ?[]const u8 = null,
+    last_notification: ?[]const u8 = null,
 };
 
 pub const Entry = struct {
@@ -242,6 +247,8 @@ pub const Lease = struct {
     /// the other's.
     agents: ?[]Agent = null,
     peer: ?PeerFacts = null,
+    /// Owns `peer`'s strings and facts document.
+    peer_arena: ?*std.heap.ArenaAllocator = null,
 
     /// Publish this MCP server and hold its ownership lock until deinit/process exit.
     pub fn acquire(allocator: std.mem.Allocator, registration: Registration) !Lease {
@@ -300,19 +307,37 @@ pub const Lease = struct {
     /// Rewrite the record with this server's peer facts; the agents last
     /// published stay.
     pub fn publishPeer(self: *Lease, peer: PeerFacts) !void {
-        const address = try self.allocator.dupe(u8, peer.address);
-        errdefer self.allocator.free(address);
-        const st = try self.allocator.dupe(u8, peer.state);
+        const arena = try self.allocator.create(std.heap.ArenaAllocator);
+        arena.* = .init(self.allocator);
+        const copy = copyPeer(arena.allocator(), peer) catch |e| {
+            arena.deinit();
+            self.allocator.destroy(arena);
+            return e;
+        };
         self.freePeer();
-        self.peer = .{ .address = address, .durable = peer.durable, .state = st, .name_taken = peer.name_taken };
+        self.peer_arena = arena;
+        self.peer = copy;
         try self.write();
     }
 
+    fn copyPeer(a: std.mem.Allocator, peer: PeerFacts) !PeerFacts {
+        return .{
+            .address = try a.dupe(u8, peer.address),
+            .durable = peer.durable,
+            .state = try a.dupe(u8, peer.state),
+            .name_taken = peer.name_taken,
+            .facts = if (peer.facts) |f| try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, f, .{}), .{}) else null,
+            .model = if (peer.model) |m| try a.dupe(u8, m) else null,
+            .last_notification = if (peer.last_notification) |n| try a.dupe(u8, n) else null,
+        };
+    }
+
     fn freePeer(self: *Lease) void {
-        if (self.peer) |p| {
-            self.allocator.free(p.address);
-            self.allocator.free(p.state);
+        if (self.peer_arena) |a| {
+            a.deinit();
+            self.allocator.destroy(a);
         }
+        self.peer_arena = null;
         self.peer = null;
     }
 
