@@ -38,6 +38,7 @@ const unsetEnv = @import("util/env.zig").unset;
 const platform = @import("util/platform.zig");
 const appdrive = @import("ipc/appdrive.zig");
 const ctlsock = @import("smoke/ctlsock.zig");
+const rigwin = @import("smoke/rigwin.zig");
 const A11yHub = @import("mux/a11yhub.zig").Hub;
 const a11ynode = @import("smoke/a11ynode.zig");
 
@@ -330,8 +331,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
         const app = drive.?;
         _ = app.drainLive(2_000);
-        if (app.windows.items.len == 0) return fail("display session lost its window");
-        const win = app.windows.items[0];
+        const win = rigwin.mainWindow(app) orelse return fail("display session lost its window");
         const w: f64 = @floatFromInt(win.w);
         const h: f64 = @floatFromInt(win.h);
         // A vertical drag through the pane's middle: spans several rows,
@@ -589,8 +589,7 @@ fn findMenuRow(allocator: std.mem.Allocator, label: []const u8, budget_ms: u32) 
 fn contextMenuStage(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?[]const u8 {
     const app = drive orelse return "the display session has no driver";
     _ = app.drainLive(2_000);
-    if (app.windows.items.len == 0) return "the display session lost its window";
-    const win = app.windows.items[0];
+    const win = rigwin.mainWindow(app) orelse return "the display session lost its window";
     const w: f64 = @floatFromInt(win.w);
     const h: f64 = @floatFromInt(win.h);
 
@@ -829,8 +828,7 @@ fn dumpTree(json: []const u8) void {
 fn rightClickAt(x: f64, y: f64, ms: u32) ?u32 {
     const app = drive orelse return null;
     _ = app.drainLive(500);
-    if (app.windows.items.len == 0) return null;
-    const win = app.windows.items[0];
+    const win = rigwin.mainWindow(app) orelse return null;
     app.clickEx(win.id, x, y, 3, 80, 1) catch return null;
     return waitTabPopup(app, true, ms);
 }
@@ -885,8 +883,7 @@ const STATE_SELECTED_BIT: u32 = 1 << 23;
 /// confirm anything.
 fn locateTabStrip(allocator: std.mem.Allocator, names: []const []const u8, tab_w: i32, tab_h: i32) ?Point {
     const app = drive orelse return null;
-    if (app.windows.items.len == 0) return null;
-    const win = app.windows.items[0];
+    const win = rigwin.mainWindow(app) orelse return null;
     // Client-side decorations: the driver's window box is bigger than
     // the toplevel the a11y tree measures, by an even margin.
     const margin: f64 = @max(0.0, (@as(f64, @floatFromInt(win.w)) - frame_w) / 2);
@@ -929,8 +926,7 @@ fn dismissPopup(app: *appdrive.App) ?[]const u8 {
         if (tabPopup(app) == null) return null;
         app.pressKey(null, "Escape") catch return "injecting Escape to dismiss a popup failed";
         if (waitTabPopup(app, false, 1_500) != null) return null;
-        if (app.windows.items.len == 0) return null;
-        const win = app.windows.items[0];
+        const win = rigwin.mainWindow(app) orelse return null;
         app.clickEx(win.id, @as(f64, @floatFromInt(win.w)) / 2, @as(f64, @floatFromInt(win.h)) - 60, 1, 60, 1) catch
             return "clicking the content to dismiss a popup failed";
         if (waitTabPopup(app, false, 1_500) != null) return null;
@@ -1046,7 +1042,7 @@ fn tabMenuStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:0]con
     // ── the keyboard path opens the SAME menu ───────────────────
     // Clicking a tab leaves focus on the notebook's tab gizmo, which
     // is where Menu / Shift+F10 is answered.
-    app.clickEx(app.windows.items[0].id, first.x, first.y, 1, 60, 1) catch return "clicking the tab failed";
+    app.clickEx(rigwin.mainWin(app).id, first.x, first.y, 1, 60, 1) catch return "clicking the tab failed";
     _ = app.waitIdle(200, 2_000);
     app.pressKey(null, "shift+F10") catch return "injecting Shift+F10 failed";
     if (waitTabPopup(app, true, 10_000) == null)
@@ -1275,8 +1271,8 @@ fn editorStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:0]cons
     {
         const app = drive orelse return "the display viewer went away";
         _ = app.drainLive(2_000);
-        if (app.windows.items.len == 0) return "display session lost its window";
-        app.pressKey(app.windows.items[0].id, "shift+home") catch return "injecting Shift+Home failed";
+        const win = rigwin.mainWindow(app) orelse return "display session lost its window";
+        app.pressKey(win.id, "shift+home") catch return "injecting Shift+Home failed";
     }
     var tries: u32 = 0;
     var sel_ok = false;
@@ -1505,8 +1501,7 @@ fn editorChromeStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:
     // PATH), and a status line that widened the window also moved the
     // gutter out from under the probes below.
     _ = app.drainLive(2_000);
-    if (app.windows.items.len == 0) return "the display session lost its window";
-    const w_before = app.windows.items[0].w;
+    const w_before = (rigwin.mainWindow(app) orelse return "the display session lost its window").w;
     var path_buf: [512]u8 = undefined;
     const efile = std.fmt.bufPrintZ(&path_buf, "{s}/chrome.zig", .{rt}) catch return "chrome path";
     {
@@ -1542,8 +1537,7 @@ fn editorChromeStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:
     say("editor chrome: status line readable over AT-SPI");
 
     _ = app.drainLive(2_000);
-    if (app.windows.items.len == 0) return "the display session lost its window";
-    const win = app.windows.items[0];
+    const win = rigwin.mainWindow(app) orelse return "the display session lost its window";
     if (win.w != w_before) {
         shotPopup(allocator, win.id, "/tmp/sketerm-atspi-editor-widened.png");
         _ = c.fprintf(platform.stderr(), "smoke-atspi: window width %d -> %d\n", @as(c_int, @intCast(w_before)), @as(c_int, @intCast(win.w)));
