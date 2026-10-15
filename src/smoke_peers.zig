@@ -713,6 +713,8 @@ const FED_TTL_MS: i64 = 8_000;
 const FED_TTL_TEXT = "8000";
 /// The hub's name for the member host.
 const FED_DOMAIN = "fedbox";
+/// The hub's name for the call-in member, which is also its own host name.
+const FED_CALLIN = "cin";
 
 /// One isolated daemon's directories.
 const FedHost = struct {
@@ -750,8 +752,9 @@ const FedHost = struct {
 };
 
 /// Exec `mux_bin --broker` under `h`'s directories (and `ssh`, the fake
-/// ssh, when set); wait for its socket. @return its pid.
-fn startFedDaemon(arena: std.mem.Allocator, h: *const FedHost, mux_bin: [*:0]const u8, ssh: ?[*:0]const u8) c.pid_t {
+/// ssh, when set; `host`, its peer host name, when set); wait for its
+/// socket. @return its pid.
+fn startFedDaemon(arena: std.mem.Allocator, h: *const FedHost, mux_bin: [*:0]const u8, ssh: ?[*:0]const u8, host: ?[*:0]const u8) c.pid_t {
     const sock = std.fmt.allocPrintSentinel(arena, "{s}/sketerm/mux.sock", .{h.rt}, 0) catch fail("oom");
     const pid = c.fork();
     if (pid < 0) fail("fork a federation daemon");
@@ -762,6 +765,7 @@ fn startFedDaemon(arena: std.mem.Allocator, h: *const FedHost, mux_bin: [*:0]con
         _ = c.setenv("XDG_CONFIG_HOME", h.cfg.ptr, 1);
         _ = c.setenv(daemon_peers.TTL_ENV, FED_TTL_TEXT, 1);
         if (ssh) |s| _ = c.setenv("SKETERM_SSH", s, 1) else _ = envutil.unset("SKETERM_SSH");
+        if (host) |s| _ = c.setenv(daemon_peers.HOST_ENV, s, 1) else _ = envutil.unset(daemon_peers.HOST_ENV);
         const argv = [_:null]?[*:0]const u8{ "sketerm-mux", "--broker", null };
         _ = c.execv(mux_bin, @ptrCast(@constCast(&argv)));
         c._exit(127);
@@ -792,6 +796,68 @@ fn writeFileOrFail(path: [:0]const u8, body: []const u8, mode: c_uint) void {
     if (c.chmod(path.ptr, mode) != 0) fail("chmod a federation file");
 }
 
+/// A fake ssh into `target`: refuses while `down` exists, else records
+/// its pid in `pid_file` and becomes `target`'s `sketerm-mux --proxy`.
+const FakeSsh = struct {
+    path: [:0]const u8,
+    down: [:0]const u8,
+    pid_file: []const u8,
+
+    fn make(arena: std.mem.Allocator, root: []const u8, name: []const u8, target: *const FedHost, mux_bin: [*:0]const u8) FakeSsh {
+        const f = FakeSsh{
+            .path = std.fmt.allocPrintSentinel(arena, "{s}/fake-{s}-ssh", .{ root, name }, 0) catch fail("oom"),
+            .down = std.fmt.allocPrintSentinel(arena, "{s}/{s}-down", .{ root, name }, 0) catch fail("oom"),
+            .pid_file = std.fmt.allocPrint(arena, "{s}/{s}.pid", .{ root, name }) catch fail("oom"),
+        };
+        writeFileOrFail(f.path, std.fmt.allocPrint(arena,
+            \\#!/bin/sh
+            \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
+            \\[ -e '{s}' ] && exit 255
+            \\echo $$ > '{s}.tmp' && mv '{s}.tmp' '{s}'
+            \\export XDG_RUNTIME_DIR='{s}' XDG_STATE_HOME='{s}' XDG_CONFIG_HOME='{s}'
+            \\exec '{s}' --proxy
+            \\
+        , .{ f.down, f.pid_file, f.pid_file, f.pid_file, target.rt, target.st, target.cfg, std.mem.span(mux_bin) }) catch fail("oom"), 0o700);
+        return f;
+    }
+};
+
+/// `from` mails `to` (at `to_addr` as `from` names it): delivered; `to`
+/// reads it from `from_addr` and replies there; `from` reads the reply.
+fn mailBothWays(from: *Mcp, to: *Mcp, arena: std.mem.Allocator, to_addr: []const u8, from_addr: []const u8, comptime tag: []const u8) void {
+    expectStr(send(from, arena, to_addr, "ping across", tag ++ " send"), "outcome", "delivered", tag ++ " outcome");
+    const it = readOne(to, arena, 10_000, tag ++ " peer_read");
+    expectStr(it, "from", from_addr, tag ++ " from");
+    expectStr(it, "text", "ping across", tag ++ " text");
+    contains(str(it, "content", tag), std.fmt.allocPrint(arena, "Reply with peer_send to \"{s}\"", .{from_addr}) catch fail("oom"), tag ++ " reply hint");
+    const args = std.fmt.allocPrint(arena, "{{\"to\":\"{s}\",\"text\":\"pong back\",\"reply_to\":\"{s}\"}}", .{ from_addr, str(it, "id", tag) }) catch fail("oom");
+    expectStr(call(to, arena, "peer_send", args, tag ++ " reply"), "outcome", "delivered", tag ++ " reply outcome");
+    const back = readOne(from, arena, 10_000, tag ++ " reply peer_read");
+    expectStr(back, "from", to_addr, tag ++ " reply from");
+    expectStr(back, "reply_to", str(it, "id", tag), tag ++ " reply_to");
+}
+
+/// The link through `ssh` is cut (its proxy, by its exact pid) and kept
+/// down: `far` stays listed on `hub` with link down; a send is queued
+/// host_unreachable; restored, it arrives once with its age.
+fn cutAndRestore(hub: *Mcp, far: *Mcp, arena: std.mem.Allocator, ssh: *const FakeSsh, far_addr: []const u8, hub_addr: []const u8, comptime tag: []const u8) void {
+    writeFileOrFail(ssh.down, "", 0o600);
+    const pid_text = readfile.capped(arena, ssh.pid_file, 64) orelse fail(tag ++ " the fake ssh left no pid");
+    const link_pid = std.fmt.parseInt(c.pid_t, std.mem.trim(u8, pid_text, " \n"), 10) catch fail(tag ++ " the fake ssh pid is not a number");
+    if (c.kill(link_pid, c.SIGTERM) != 0) fail(tag ++ " could not stop the link's proxy");
+    _ = awaitListed(hub, arena, far_addr, "down", 20_000, tag ++ " the hub lists the far peer down");
+    const r = send(hub, arena, far_addr, "sent while the link was down", tag ++ " send");
+    expectStr(r, "outcome", "queued", tag ++ " outcome");
+    expectStr(r, "reason", "host_unreachable", tag ++ " reason");
+    if (c.unlink(ssh.down.ptr) != 0) fail(tag ++ " could not restore the link");
+    const it = readOne(far, arena, 90_000, tag ++ " peer_read after the link is back");
+    expectStr(it, "text", "sent while the link was down", tag ++ " text");
+    expectStr(it, "from", hub_addr, tag ++ " from");
+    if (it.get("age_s") == null) fail(tag ++ " the delivery has no age");
+    expectNothing(far, arena, tag ++ " delivered once");
+    _ = awaitListed(hub, arena, far_addr, "up", 20_000, tag ++ " the hub lists the far peer up again");
+}
+
 /// Poll `m`'s peer_list until `address` is listed with `link` (null: any).
 fn awaitListed(m: *Mcp, arena: std.mem.Allocator, address: []const u8, link: ?[]const u8, budget_ms: i64, comptime what: []const u8) std.json.ObjectMap {
     const deadline = nowMs() + budget_ms;
@@ -812,6 +878,8 @@ fn awaitListed(m: *Mcp, arena: std.mem.Allocator, address: []const u8, link: ?[]
 /// member name that left) exercise presence, mail both ways with reply
 /// routing, a cut link with mail queued in between, far refusals and TTL
 /// expiry across the link, then the member's trust rule on its socket.
+/// Last a call-in member (`peer_hub_domain`) dials the hub's inbound
+/// `[domain.cin]` and gets the same presence, mail and cut-and-redial.
 pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
     if (!prepared) fail("prepare() must run before the federation stage");
     const started = nowMs();
@@ -827,25 +895,17 @@ pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
     const hub_host = std.mem.sliceTo(&host_buf, 0);
     if (std.mem.eql(u8, hub_host, FED_DOMAIN)) fail("this machine is called " ++ FED_DOMAIN ++ ", the stage's member domain");
 
-    // The fake ssh: refuses while `link-down` exists, else records its pid
-    // and becomes the member host's `sketerm-mux --proxy`.
-    const down = std.fmt.allocPrintSentinel(arena, "{s}/link-down", .{root}, 0) catch fail("oom");
-    const pid_file = std.fmt.allocPrint(arena, "{s}/link.pid", .{root}) catch fail("oom");
-    const ssh = std.fmt.allocPrintSentinel(arena, "{s}/fake-fed-ssh", .{root}, 0) catch fail("oom");
-    writeFileOrFail(ssh, std.fmt.allocPrint(arena,
-        \\#!/bin/sh
-        \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
-        \\[ -e '{s}' ] && exit 255
-        \\echo $$ > '{s}.tmp' && mv '{s}.tmp' '{s}'
-        \\export XDG_RUNTIME_DIR='{s}' XDG_STATE_HOME='{s}' XDG_CONFIG_HOME='{s}'
-        \\exec '{s}' --proxy
-        \\
-    , .{ down, pid_file, pid_file, pid_file, mem.rt, mem.st, mem.cfg, std.mem.span(mux_bin) }) catch fail("oom"), 0o700);
+    // The fake ssh into the member host; the call-in member's into the hub.
+    const ssh = FakeSsh.make(arena, root, "fed", &mem, mux_bin);
+    const cin = FedHost.make(arena, root, "fc");
+    const cin_ssh = FakeSsh.make(arena, root, "cin", &hub, mux_bin);
     writeFileOrFail(std.fmt.allocPrintSentinel(arena, "{s}/sketerm/config.conf", .{hub.cfg}, 0) catch fail("oom"),
-        "peer_hub = true\n\n[domain." ++ FED_DOMAIN ++ "]\nhost = " ++ FED_DOMAIN ++ "\ntransport = ssh\npeers = true\n", 0o600);
+        "peer_hub = true\n\n[domain." ++ FED_DOMAIN ++ "]\nhost = " ++ FED_DOMAIN ++ "\ntransport = ssh\npeers = true\n\n[domain." ++ FED_CALLIN ++ "]\npeers = true\npeer_link = inbound\n", 0o600);
+    writeFileOrFail(std.fmt.allocPrintSentinel(arena, "{s}/sketerm/config.conf", .{cin.cfg}, 0) catch fail("oom"),
+        "peer_hub_domain = fedhub\n\n[domain.fedhub]\nhost = fedhub\ntransport = ssh\n", 0o600);
 
-    const mem_pid = startFedDaemon(arena, &mem, mux_bin, null);
-    const hub_pid = startFedDaemon(arena, &hub, mux_bin, ssh.ptr);
+    const mem_pid = startFedDaemon(arena, &mem, mux_bin, null, null);
+    const hub_pid = startFedDaemon(arena, &hub, mux_bin, ssh.path.ptr, null);
     const zed_on_mem = std.fmt.allocPrint(arena, "{s}/zed", .{hub_host}) catch fail("oom");
     const mia_on_hub = FED_DOMAIN ++ "/mia";
 
@@ -876,40 +936,12 @@ pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
 
     // 3. mia -> zed: delivered; zed reads it from fedbox/mia and replies to
     //    that address; mia reads the reply from <hub>/zed.
-    {
-        expectStr(send(&mia, arena, zed_on_mem, "ping across", "f3. send"), "outcome", "delivered", "f3. outcome");
-        const it = readOne(&zed, arena, 10_000, "f3. zed peer_read");
-        expectStr(it, "from", mia_on_hub, "f3. from");
-        expectStr(it, "text", "ping across", "f3. text");
-        contains(str(it, "content", "f3."), "Reply with peer_send to \"" ++ mia_on_hub ++ "\"", "f3. reply hint");
-        const args = std.fmt.allocPrint(arena, "{{\"to\":\"{s}\",\"text\":\"pong back\",\"reply_to\":\"{s}\"}}", .{ mia_on_hub, str(it, "id", "f3.") }) catch fail("oom");
-        expectStr(call(&zed, arena, "peer_send", args, "f3. reply"), "outcome", "delivered", "f3. reply outcome");
-        const back = readOne(&mia, arena, 10_000, "f3. mia peer_read");
-        expectStr(back, "from", zed_on_mem, "f3. reply from");
-        expectStr(back, "reply_to", str(it, "id", "f3."), "f3. reply_to");
-    }
+    mailBothWays(&mia, &zed, arena, zed_on_mem, mia_on_hub, "f3.");
     std.debug.print("smoke: peers: federation mail both ways with reply routing ok\n", .{});
 
-    // 4. The link is cut (the fake ssh's proxy, by its exact pid) and kept
-    //    down: mia stays listed with link down; a send is queued
-    //    host_unreachable; restored, it arrives once.
-    {
-        writeFileOrFail(down, "", 0o600);
-        const pid_text = readfile.capped(arena, pid_file, 64) orelse fail("f4. the fake ssh left no pid");
-        const link_pid = std.fmt.parseInt(c.pid_t, std.mem.trim(u8, pid_text, " \n"), 10) catch fail("f4. the fake ssh pid is not a number");
-        if (c.kill(link_pid, c.SIGTERM) != 0) fail("f4. could not stop the link's proxy");
-        _ = awaitListed(&zed, arena, mia_on_hub, "down", 20_000, "f4. zed lists mia down");
-        const r = send(&zed, arena, mia_on_hub, "sent while the link was down", "f4. send");
-        expectStr(r, "outcome", "queued", "f4. outcome");
-        expectStr(r, "reason", "host_unreachable", "f4. reason");
-        if (c.unlink(down.ptr) != 0) fail("f4. could not restore the link");
-        const it = readOne(&mia, arena, 90_000, "f4. mia peer_read after the link is back");
-        expectStr(it, "text", "sent while the link was down", "f4. text");
-        expectStr(it, "from", zed_on_mem, "f4. from");
-        if (it.get("age_s") == null) fail("f4. the delivery has no age");
-        expectNothing(&mia, arena, "f4. delivered once");
-        _ = awaitListed(&zed, arena, mia_on_hub, "up", 20_000, "f4. zed lists mia up again");
-    }
+    // 4. The link is cut and kept down: queued host_unreachable on the
+    //    hub; restored, it arrives once.
+    cutAndRestore(&zed, &mia, arena, &ssh, mia_on_hub, zed_on_mem, "f4.");
     std.debug.print("smoke: peers: federation link cut, queued, restored, delivered once ok\n", .{});
 
     // 5. A name the member does not know: the far broker's refusal comes
@@ -961,8 +993,26 @@ pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
     }
     std.debug.print("smoke: peers: federation trusts a local hello and refuses a relay without one ok\n", .{});
 
+    // 8. A call-in member: its daemon dials the hub's inbound domain; both
+    //    sides list each other up; mail crosses both ways; its link is cut
+    //    by the exact pid of its dialed proxy and it redials on its own.
+    const cin_pid = startFedDaemon(arena, &cin, mux_bin, cin_ssh.path.ptr, FED_CALLIN);
+    {
+        var cid = cin.server(allocator, arena, exe, "cid");
+        cid.initialize();
+        _ = registered(&cid, arena, "f8. cid");
+        const cid_on_hub = FED_CALLIN ++ "/cid";
+        _ = awaitListed(&zed, arena, cid_on_hub, "up", 60_000, "f8. zed lists the call-in cid");
+        _ = awaitListed(&cid, arena, zed_on_mem, "up", 20_000, "f8. cid lists zed");
+        mailBothWays(&cid, &zed, arena, zed_on_mem, cid_on_hub, "f8.");
+        cutAndRestore(&zed, &cid, arena, &cin_ssh, cid_on_hub, zed_on_mem, "f8. cut");
+        cid.closeStdinWait();
+    }
+    std.debug.print("smoke: peers: federation call-in member presence, mail, cut and redial ok\n", .{});
+
     mia.closeStdinWait();
     zed.closeStdinWait();
+    stopFedDaemon(cin_pid);
     stopFedDaemon(hub_pid);
     stopFedDaemon(mem_pid);
     std.debug.print("smoke: peers federation stage ok ({d} ms)\n", .{nowMs() - started});
