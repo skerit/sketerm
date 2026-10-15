@@ -59,10 +59,6 @@ pub const Producer = union(enum) {
 pub const Handler = struct {
     output: Output,
     producer: Producer,
-
-    pub fn isHost(self: Handler) bool {
-        return self.producer == .host_command;
-    }
 };
 
 pub const Rule = struct {

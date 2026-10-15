@@ -877,40 +877,6 @@ fn replaceMoveSourceAfterQuarantine(ctx: *MoveReplacement) void {
     }
 }
 
-const CopyHelperKill = struct {
-    journal: []const u8,
-    part: []const u8,
-    min_bytes: u64 = 2 << 20,
-    killed: bool = false,
-};
-
-/// SIGKILL the copy helper once its staged partial has real bytes —
-/// the deterministic "attempt died mid-transfer" a retry must resume.
-fn killCopyHelperMidTransfer(ctx: *CopyHelperKill) void {
-    var waited: usize = 0;
-    while (waited < 20_000) : (waited += 1) {
-        var z: [4096]u8 = undefined;
-        var st: c.struct_stat = undefined;
-        if (c.stat(pathz.pathZ(&z, ctx.part) catch return, &st) == 0 and
-            st.st_size >= @as(c.off_t, @intCast(ctx.min_bytes)))
-        {
-            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            defer arena.deinit();
-            if (fsjournal.load(arena.allocator(), ctx.journal)) |parsed_value| {
-                var parsed = parsed_value;
-                defer parsed.deinit();
-                if (parsed.value.pid > 0 and
-                    c.kill(-@as(c.pid_t, @intCast(parsed.value.pid)), c.SIGKILL) == 0)
-                {
-                    ctx.killed = true;
-                    return;
-                }
-            } else |_| {}
-        }
-        _ = c.usleep(1_000);
-    }
-}
-
 const QuarantineBlock = struct {
     journal: []const u8,
     parent: []const u8,

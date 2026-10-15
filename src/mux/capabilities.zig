@@ -180,14 +180,6 @@ pub fn withFlags(base: anytype, flags: Set) WithFlags(@TypeOf(base)) {
     return out;
 }
 
-/// The flags of any struct that carries them by wire name (a parsed
-/// welcome), copied out into a `Set`.
-pub fn flagsOf(v: anytype) Set {
-    var s: Set = .{};
-    inline for (@typeInfo(Set).@"struct".fields) |f| @field(s, f.name) = @field(v, f.name);
-    return s;
-}
-
 /// Parse the flags out of a welcome payload. Unknown keys are
 /// skipped (a newer daemon), missing keys read false (an older one),
 /// and a malformed value costs every flag, never the rest of the

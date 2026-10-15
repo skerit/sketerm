@@ -2767,15 +2767,6 @@ pub fn dropValueIntoAction(self: *BrowserView, tab: *BTab, value: *c.GValue, dst
     return admitted;
 }
 
-/// Land a dragged entry spec in `dst_dir` on `tab`'s host. `.auto`
-/// keeps the topology default (same host = MOVE via undoable rename,
-/// cross-host = copy); modifiers override it. Shared by the listing,
-/// the breadcrumb segments and the tab labels.
-/// @return false when the spec is unusable or the drop is a no-op.
-pub fn dropSpecIntoAction(self: *BrowserView, tab: *BTab, spec: []const u8, dst_dir: []const u8, action: DropAction) bool {
-    return dropSpecIntoActionBatch(self, tab, spec, dst_dir, action, 0, 0, null, null);
-}
-
 fn dropSpecIntoActionBatch(self: *BrowserView, tab: *BTab, spec: []const u8, dst_dir: []const u8, action: DropAction, batch_id: u64, batch_total: usize, manifest_token: ?[]const u8, manifest_index: ?usize) bool {
     if (self.picker) |pk| if (pk.suppress_ops) return false;
     if (spec.len == 0) return false;

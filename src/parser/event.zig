@@ -94,12 +94,6 @@ pub const Event = union(enum) {
             return if (p == 0) default else p;
         }
 
-        /// Raw param without zero→default substitution.
-        pub fn paramRaw(self: *const Csi, idx: usize) u32 {
-            if (idx >= self.n_params) return 0;
-            return self.params[idx];
-        }
-
         pub fn isSub(self: *const Csi, idx: usize) bool {
             if (idx >= 16) return false;
             return (self.is_sub_bits >> @intCast(idx)) & 1 == 1;

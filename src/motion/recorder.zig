@@ -385,12 +385,6 @@ pub const Session = struct {
         try self.bursts.append(self.a(), .{ .smooth = b.smooth, .events = try self.a().dupe(pack_mod.Wheel, b.events) });
     }
 
-    /// Whether a burst is open whose last event is older than the gap.
-    pub fn burstStale(self: *const Session, now: f64) bool {
-        if (self.burst.items.len == 0) return false;
-        return now - (self.burst_t0 + self.burst.items[self.burst.items.len - 1].t) > BURST_GAP_MS;
-    }
-
     /// Start an idle-drift segment; it begins at the next motion sample.
     pub fn beginIdle(self: *Session) void {
         self.idle_cur = .{ .t0 = 0, .origin = .{ 0, 0 }, .samples = .empty };

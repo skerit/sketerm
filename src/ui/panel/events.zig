@@ -259,12 +259,6 @@ pub const Queue = struct {
         return self.count;
     }
 
-    pub fn isClosed(self: *Queue) bool {
-        self.acquire();
-        defer self.release();
-        return self.closed;
-    }
-
     /// Drop count since the last call, reset on read.
     pub fn takeDropped(self: *Queue) u64 {
         self.acquire();

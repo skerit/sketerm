@@ -127,10 +127,6 @@ pub fn setPreference(p: Preference) void {
     preference = p;
 }
 
-pub fn getPreference() Preference {
-    return preference;
-}
-
 /// Read the session's IM declarations. Impure half of the heuristic,
 /// kept apart from `strategyFor` so the logic stays unit-testable.
 pub fn readEnv() ImEnv {

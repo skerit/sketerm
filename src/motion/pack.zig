@@ -228,14 +228,6 @@ pub const Keys = struct {
         for (self.hold) |h| n += h.len;
         return n;
     }
-
-    pub fn flightCount(self: Keys) usize {
-        var n: usize = 0;
-        for (self.flight) |row| for (row) |f| {
-            n += f.len;
-        };
-        return n;
-    }
 };
 
 pub const Header = struct {

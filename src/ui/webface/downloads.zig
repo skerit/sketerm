@@ -260,16 +260,6 @@ pub fn webDownloadCancel(self: *WebFace, req: u32) bool {
     return false;
 }
 
-/// A request already answered as failed (canceled, or expired by
-/// the sweep) whose offer arrives late anyway.
-pub fn failedRequest(self: *WebFace, req: u32) bool {
-    if (req == 0) return false;
-    for (self.downloads.items) |d| {
-        if (d.req == req and d.id == 0 and d.state == .failed) return true;
-    }
-    return false;
-}
-
 pub fn takeAsked(self: *WebFace, req: u32) ?AskedDownload {
     for (self.dl_asked.items, 0..) |a, i| {
         if (a.req != req) continue;
