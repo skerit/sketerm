@@ -461,175 +461,94 @@ pub const Encoder = union(enum) {
     }
 };
 
-/// libx264 backend via vendor/x264_shim.c. Fixed tile geometry (one
-/// encoder per tile size); BGRA→I420 through yuv.zig, then low-latency
-/// H.264. Compiled only when build_options.video is set.
-const X264 = struct {
-    allocator: std.mem.Allocator,
-    handle: ?*anyopaque,
-    w: i32,
-    h: i32,
-    yp: []u8,
-    up: []u8,
-    vp: []u8,
-    out: std.ArrayList(u8) = .empty,
+/// A fixed-geometry encoder over a C shim taking I420 planes: BGRA→I420 through yuv.zig, then `Backend.encode`.
+/// `Backend` declares `open(w, h, fps) ?*anyopaque`, `encode(handle, y, u, v, force_kf, *out, *is_kf) c_int` (bytes
+/// written, never 0 for these low-delay shims) and `close(handle)`; its decls are referenced only by a compiled call.
+fn I420Encoder(comptime Backend: type) type {
+    return struct {
+        const Self = @This();
 
+        allocator: std.mem.Allocator,
+        handle: ?*anyopaque,
+        w: i32,
+        h: i32,
+        yp: []u8,
+        up: []u8,
+        vp: []u8,
+        out: std.ArrayList(u8) = .empty,
+
+        fn init(allocator: std.mem.Allocator, w: i32, h: i32, fps: i32) !Self {
+            if (w <= 0 or h <= 0 or @rem(w, 2) != 0 or @rem(h, 2) != 0) return Error.SizeMismatch;
+            const uw: u32 = @intCast(w);
+            const uh: u32 = @intCast(h);
+            const handle = Backend.open(w, h, fps) orelse return Error.X264;
+            errdefer Backend.close(handle);
+            const yp = try allocator.alloc(u8, yuv.ySize(uw, uh));
+            errdefer allocator.free(yp);
+            const up = try allocator.alloc(u8, yuv.chromaSize(uw, uh));
+            errdefer allocator.free(up);
+            const vp = try allocator.alloc(u8, yuv.chromaSize(uw, uh));
+            return .{ .allocator = allocator, .handle = handle, .w = w, .h = h, .yp = yp, .up = up, .vp = vp };
+        }
+
+        fn deinit(self: *Self) void {
+            Backend.close(self.handle);
+            self.allocator.free(self.yp);
+            self.allocator.free(self.up);
+            self.allocator.free(self.vp);
+            self.out.deinit(self.allocator);
+        }
+
+        fn encodeTile(self: *Self, w: i32, h: i32, pixels: []const u8, force_keyframe: bool) !EncodeResult {
+            if (w != self.w or h != self.h) return Error.SizeMismatch;
+            const uw: u32 = @intCast(w);
+            const uh: u32 = @intCast(h);
+            if (pixels.len != @as(usize, uw) * uh * 4) return Error.SizeMismatch;
+            yuv.bgraToI420(pixels, uw, uh, self.yp, self.up, self.vp);
+
+            var out_ptr: [*]const u8 = undefined;
+            var is_kf: c_int = 0;
+            const n = Backend.encode(self.handle, self.yp.ptr, self.up.ptr, self.vp.ptr, if (force_keyframe) 1 else 0, &out_ptr, &is_kf);
+            if (n <= 0) return Error.X264;
+            self.out.clearRetainingCapacity();
+            try self.out.appendSlice(self.allocator, out_ptr[0..@intCast(n)]);
+            return .{ .keyframe = is_kf != 0, .bytes = self.out.items };
+        }
+    };
+}
+
+/// libx264 backend via vendor/x264_shim.c, zerolatency. Compiled only when build_options.video is set.
+const X264 = I420Encoder(struct {
     extern fn sk_x264_open(width: c_int, height: c_int, fps: c_int) ?*anyopaque;
     extern fn sk_x264_encode(enc: ?*anyopaque, y: [*]const u8, u: [*]const u8, v: [*]const u8, force_kf: c_int, out: *[*]const u8, is_kf: *c_int) c_int;
     extern fn sk_x264_close(enc: ?*anyopaque) void;
+    const open = sk_x264_open;
+    const encode = sk_x264_encode;
+    const close = sk_x264_close;
+});
 
-    fn init(allocator: std.mem.Allocator, w: i32, h: i32, fps: i32) !X264 {
-        if (w <= 0 or h <= 0 or @rem(w, 2) != 0 or @rem(h, 2) != 0) return Error.SizeMismatch;
-        const uw: u32 = @intCast(w);
-        const uh: u32 = @intCast(h);
-        const handle = sk_x264_open(w, h, fps) orelse return Error.X264;
-        errdefer sk_x264_close(handle);
-        const yp = try allocator.alloc(u8, yuv.ySize(uw, uh));
-        errdefer allocator.free(yp);
-        const up = try allocator.alloc(u8, yuv.chromaSize(uw, uh));
-        errdefer allocator.free(up);
-        const vp = try allocator.alloc(u8, yuv.chromaSize(uw, uh));
-        return .{ .allocator = allocator, .handle = handle, .w = w, .h = h, .yp = yp, .up = up, .vp = vp };
-    }
-
-    fn deinit(self: *X264) void {
-        sk_x264_close(self.handle);
-        self.allocator.free(self.yp);
-        self.allocator.free(self.up);
-        self.allocator.free(self.vp);
-        self.out.deinit(self.allocator);
-    }
-
-    fn encodeTile(self: *X264, w: i32, h: i32, pixels: []const u8, force_keyframe: bool) !EncodeResult {
-        if (w != self.w or h != self.h) return Error.SizeMismatch;
-        const uw: u32 = @intCast(w);
-        const uh: u32 = @intCast(h);
-        if (pixels.len != @as(usize, uw) * uh * 4) return Error.SizeMismatch;
-        yuv.bgraToI420(pixels, uw, uh, self.yp, self.up, self.vp);
-
-        var out_ptr: [*]const u8 = undefined;
-        var is_kf: c_int = 0;
-        const n = sk_x264_encode(self.handle, self.yp.ptr, self.up.ptr, self.vp.ptr, if (force_keyframe) 1 else 0, &out_ptr, &is_kf);
-        if (n <= 0) return Error.X264; // zerolatency should never buffer
-        self.out.clearRetainingCapacity();
-        try self.out.appendSlice(self.allocator, out_ptr[0..@intCast(n)]);
-        return .{ .keyframe = is_kf != 0, .bytes = self.out.items };
-    }
-};
-
-/// VideoToolbox H.264 backend (vendor/vtenc_shim.c) — the macOS-native
-/// hardware encoder. Same shape as X264 (BGRA→I420 via yuv.zig, then
-/// encode), and emits the SAME Annex-B `.h264` stream the avdec decoder
-/// reads. Needs no libx264/libavcodec. Compiled only when
-/// build_options.vtenc is set (native macOS).
-const Vt = struct {
-    allocator: std.mem.Allocator,
-    handle: ?*anyopaque,
-    w: i32,
-    h: i32,
-    yp: []u8,
-    up: []u8,
-    vp: []u8,
-    out: std.ArrayList(u8) = .empty,
-
+/// VideoToolbox H.264 backend (vendor/vtenc_shim.c), the macOS-native hardware encoder, RealTime with
+/// CompleteFrames. Emits the SAME Annex-B `.h264` stream the avdec decoder reads and needs no
+/// libx264/libavcodec. Compiled only when build_options.vtenc is set (native macOS).
+const Vt = I420Encoder(struct {
     extern fn sk_vtenc_open(width: c_int, height: c_int, fps: c_int) ?*anyopaque;
     extern fn sk_vtenc_encode(enc: ?*anyopaque, y: [*]const u8, u: [*]const u8, v: [*]const u8, force_kf: c_int, out: *[*]const u8, is_kf: *c_int) c_int;
     extern fn sk_vtenc_close(enc: ?*anyopaque) void;
+    const open = sk_vtenc_open;
+    const encode = sk_vtenc_encode;
+    const close = sk_vtenc_close;
+});
 
-    fn init(allocator: std.mem.Allocator, w: i32, h: i32, fps: i32) !Vt {
-        if (w <= 0 or h <= 0 or @rem(w, 2) != 0 or @rem(h, 2) != 0) return Error.SizeMismatch;
-        const uw: u32 = @intCast(w);
-        const uh: u32 = @intCast(h);
-        const handle = sk_vtenc_open(w, h, fps) orelse return Error.X264;
-        errdefer sk_vtenc_close(handle);
-        const yp = try allocator.alloc(u8, yuv.ySize(uw, uh));
-        errdefer allocator.free(yp);
-        const up = try allocator.alloc(u8, yuv.chromaSize(uw, uh));
-        errdefer allocator.free(up);
-        const vp = try allocator.alloc(u8, yuv.chromaSize(uw, uh));
-        return .{ .allocator = allocator, .handle = handle, .w = w, .h = h, .yp = yp, .up = up, .vp = vp };
-    }
-
-    fn deinit(self: *Vt) void {
-        sk_vtenc_close(self.handle);
-        self.allocator.free(self.yp);
-        self.allocator.free(self.up);
-        self.allocator.free(self.vp);
-        self.out.deinit(self.allocator);
-    }
-
-    fn encodeTile(self: *Vt, w: i32, h: i32, pixels: []const u8, force_keyframe: bool) !EncodeResult {
-        if (w != self.w or h != self.h) return Error.SizeMismatch;
-        const uw: u32 = @intCast(w);
-        const uh: u32 = @intCast(h);
-        if (pixels.len != @as(usize, uw) * uh * 4) return Error.SizeMismatch;
-        yuv.bgraToI420(pixels, uw, uh, self.yp, self.up, self.vp);
-
-        var out_ptr: [*]const u8 = undefined;
-        var is_kf: c_int = 0;
-        const n = sk_vtenc_encode(self.handle, self.yp.ptr, self.up.ptr, self.vp.ptr, if (force_keyframe) 1 else 0, &out_ptr, &is_kf);
-        if (n <= 0) return Error.X264; // RealTime+CompleteFrames never buffers
-        self.out.clearRetainingCapacity();
-        try self.out.appendSlice(self.allocator, out_ptr[0..@intCast(n)]);
-        return .{ .keyframe = is_kf != 0, .bytes = self.out.items };
-    }
-};
-
-/// SVT-AV1 encoder backend (vendor/svtav1_shim.c), low-delay so a frame
-/// in is a packet out. Same shape as X264; BGRA→I420 then encode.
-/// Compiled only when build_options.video_av1enc is set.
-const Svt = struct {
-    allocator: std.mem.Allocator,
-    handle: ?*anyopaque,
-    w: i32,
-    h: i32,
-    yp: []u8,
-    up: []u8,
-    vp: []u8,
-    out: std.ArrayList(u8) = .empty,
-
+/// SVT-AV1 backend (vendor/svtav1_shim.c), low-delay so a frame in is a packet out. Compiled only when
+/// build_options.video_av1enc is set.
+const Svt = I420Encoder(struct {
     extern fn sk_svt_open(width: c_int, height: c_int, fps: c_int) ?*anyopaque;
     extern fn sk_svt_encode(enc: ?*anyopaque, y: [*]const u8, u: [*]const u8, v: [*]const u8, force_kf: c_int, out: *[*]const u8, is_kf: *c_int) c_int;
     extern fn sk_svt_close(enc: ?*anyopaque) void;
-
-    fn init(allocator: std.mem.Allocator, w: i32, h: i32, fps: i32) !Svt {
-        if (w <= 0 or h <= 0 or @rem(w, 2) != 0 or @rem(h, 2) != 0) return Error.SizeMismatch;
-        const uw: u32 = @intCast(w);
-        const uh: u32 = @intCast(h);
-        const handle = sk_svt_open(w, h, fps) orelse return Error.X264;
-        errdefer sk_svt_close(handle);
-        const yp = try allocator.alloc(u8, yuv.ySize(uw, uh));
-        errdefer allocator.free(yp);
-        const up = try allocator.alloc(u8, yuv.chromaSize(uw, uh));
-        errdefer allocator.free(up);
-        const vp = try allocator.alloc(u8, yuv.chromaSize(uw, uh));
-        return .{ .allocator = allocator, .handle = handle, .w = w, .h = h, .yp = yp, .up = up, .vp = vp };
-    }
-
-    fn deinit(self: *Svt) void {
-        sk_svt_close(self.handle);
-        self.allocator.free(self.yp);
-        self.allocator.free(self.up);
-        self.allocator.free(self.vp);
-        self.out.deinit(self.allocator);
-    }
-
-    fn encodeTile(self: *Svt, w: i32, h: i32, pixels: []const u8, force_keyframe: bool) !EncodeResult {
-        if (w != self.w or h != self.h) return Error.SizeMismatch;
-        const uw: u32 = @intCast(w);
-        const uh: u32 = @intCast(h);
-        if (pixels.len != @as(usize, uw) * uh * 4) return Error.SizeMismatch;
-        yuv.bgraToI420(pixels, uw, uh, self.yp, self.up, self.vp);
-
-        var out_ptr: [*]const u8 = undefined;
-        var is_kf: c_int = 0;
-        const n = sk_svt_encode(self.handle, self.yp.ptr, self.up.ptr, self.vp.ptr, if (force_keyframe) 1 else 0, &out_ptr, &is_kf);
-        if (n <= 0) return Error.X264; // 0 = no packet (low-delay get_packet blocks, so shouldn't happen)
-        self.out.clearRetainingCapacity();
-        try self.out.appendSlice(self.allocator, out_ptr[0..@intCast(n)]);
-        return .{ .keyframe = is_kf != 0, .bytes = self.out.items };
-    }
-};
+    const open = sk_svt_open;
+    const encode = sk_svt_encode;
+    const close = sk_svt_close;
+});
 
 /// Raw passthrough: payload IS the BGRA, every tile a keyframe. Exists
 /// so the transport/decode/composite pipeline is exercised end-to-end
@@ -1124,4 +1043,66 @@ test "offer applies the user's preference to what this viewer decodes" {
     try t.expectEqual(@as(u8, 0), offer(.lossless, both).len);
     // Preferring a codec this viewer cannot decode never offers it.
     try t.expectEqualSlices(Codec, &.{.h264}, offer(.av1, listOf(&.{.h264})).items());
+}
+
+test "I420Encoder validates geometry, forwards the keyframe request and copies the shim's packet" {
+    const Fake = struct {
+        var opened: usize = 0;
+        var buffered = false;
+        var closed: usize = 0;
+        var refuse_open = false;
+        var packet: [3]u8 = .{ 0, 0, 0 };
+        var last_y: u8 = 0;
+
+        fn open(w: c_int, h: c_int, fps: c_int) ?*anyopaque {
+            _ = .{ w, h, fps };
+            if (refuse_open) return null;
+            opened += 1;
+            return @ptrCast(&packet);
+        }
+        fn encode(enc: ?*anyopaque, y: [*]const u8, u: [*]const u8, v: [*]const u8, force_kf: c_int, out: *[*]const u8, is_kf: *c_int) c_int {
+            _ = .{ enc, u, v };
+            last_y = y[0];
+            if (buffered) return 0;
+            packet = .{ 'p', @intCast(force_kf), last_y };
+            out.* = &packet;
+            is_kf.* = force_kf;
+            return packet.len;
+        }
+        fn close(enc: ?*anyopaque) void {
+            _ = enc;
+            closed += 1;
+        }
+    };
+    const Enc = I420Encoder(Fake);
+
+    // 1. Odd or empty geometry is refused before the shim opens.
+    try t.expectError(Error.SizeMismatch, Enc.init(t.allocator, 3, 2, 30));
+    try t.expectError(Error.SizeMismatch, Enc.init(t.allocator, 0, 2, 30));
+    try t.expectEqual(@as(usize, 0), Fake.opened);
+    // 2. A shim that cannot open is Error.X264.
+    Fake.refuse_open = true;
+    try t.expectError(Error.X264, Enc.init(t.allocator, 2, 2, 30));
+    Fake.refuse_open = false;
+
+    var enc = try Enc.init(t.allocator, 2, 2, 30);
+    var white: [2 * 2 * 4]u8 = @splat(0xff);
+    // 3. A mismatched tile or buffer is refused.
+    try t.expectError(Error.SizeMismatch, enc.encodeTile(4, 2, &white, false));
+    try t.expectError(Error.SizeMismatch, enc.encodeTile(2, 2, white[0..8], false));
+    // 4. A keyframe request reaches the shim and the packet is copied out of shim memory.
+    const kf = try enc.encodeTile(2, 2, &white, true);
+    try t.expect(kf.keyframe);
+    try t.expectEqualSlices(u8, &.{ 'p', 1, Fake.last_y }, kf.bytes);
+    try t.expect(kf.bytes.ptr != @as([*]const u8, &Fake.packet));
+    try t.expect(Fake.last_y > 200); // white BGRA became a bright luma plane
+    const inter = try enc.encodeTile(2, 2, &white, false);
+    try t.expect(!inter.keyframe);
+    // 5. A shim that returns no packet is Error.X264, never an empty frame.
+    Fake.buffered = true;
+    try t.expectError(Error.X264, enc.encodeTile(2, 2, &white, false));
+    Fake.buffered = false;
+    enc.deinit();
+    // 6. Every open is closed once.
+    try t.expectEqual(Fake.opened, Fake.closed);
 }
