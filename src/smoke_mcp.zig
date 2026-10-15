@@ -10211,13 +10211,23 @@ fn agentFactsCheck(m: *Mcp, arena: std.mem.Allocator, rt: []const u8, place: []c
     const read = agentCall(m, arena, "agent_read", std.fmt.allocPrint(arena, "{{\"agent\":\"{s}\"}}", .{id}) catch fail("oom"), what ++ ": agent_read", false, 15_000);
     if (factNum(if (read.get("facts")) |f| f.object else null, "context_used_percent") != 14) fail(what ++ ": agent_read carries no facts");
 
-    // The user's own command ran on both documents, stdin intact.
-    const log = readfile.cappedAlloc(arena, fcPath(&out_buf, FC_STATUS_OUT), 1 << 16) catch fail(what ++ ": the status command never ran");
-    for ([_][]const u8{ facts.CLAUDE_SAMPLE_FRESH, facts.CLAUDE_SAMPLE }) |doc| {
-        if (std.mem.indexOf(u8, log, std.fmt.allocPrint(arena, "USER-STATUS {d}\n", .{doc.len}) catch fail("oom")) == null) {
+    // The user's own command ran on both documents, stdin intact. The
+    // fake appends its output only after the command exits, which can
+    // land after agent_list already shows the facts the wrapper parsed.
+    var log: []const u8 = "";
+    const log_deadline = nowMs() + 10_000;
+    while (true) {
+        log = readfile.cappedAlloc(arena, fcPath(&out_buf, FC_STATUS_OUT), 1 << 16) catch "";
+        const whole = for ([_][]const u8{ facts.CLAUDE_SAMPLE_FRESH, facts.CLAUDE_SAMPLE }) |doc| {
+            if (std.mem.indexOf(u8, log, std.fmt.allocPrint(arena, "USER-STATUS {d}\n", .{doc.len}) catch fail("oom")) == null) break false;
+        } else true;
+        if (whole) break;
+        if (nowMs() >= log_deadline) {
+            if (log.len == 0) fail(what ++ ": the status command never ran");
             say(log);
             fail(what ++ ": the user's status command did not get the whole document");
         }
+        _ = c.usleep(100_000);
     }
     const file = std.fmt.allocPrintSentinel(arena, "{s}/sketerm/agent-facts/{s}.json", .{ rt, id }, 0) catch fail("oom");
     if (local and c.access(file.ptr, c.F_OK) != 0) fail(what ++ ": no facts file under the runtime dir");
