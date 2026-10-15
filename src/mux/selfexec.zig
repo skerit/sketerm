@@ -62,16 +62,6 @@ pub const Mode = enum {
         const word = self.flag() orelse return false;
         return std.mem.eql(u8, arg, word);
     }
-
-    /// Whether this process is the far end of a link dialed INTO this
-    /// host (an SSH `--proxy` bridge or a UDP listener): what a peer hub's
-    /// connection must come through.
-    pub fn bridgesDialedLink(self: Mode) bool {
-        return switch (self) {
-            .proxy, .udp_listen => true,
-            .daemon, .job, .keep, .udp_connect, .socks5_connect, .display => false,
-        };
-    }
 };
 
 /// The mode of a full argv (argv[0] included): the first argument naming one, else `.daemon`.
@@ -132,13 +122,11 @@ test "modeOf skips leading options and defaults to the daemon" {
     try t.expectEqual(Mode.daemon, modeOf(&.{"--proxy"}));
 }
 
-test "an argv block splits into modes; only link bridges carry a hub" {
+test "an argv block splits on NUL; an empty block has no arguments" {
     var buf: [8][]const u8 = undefined;
     const args = splitArgv("sketerm-mux-0f3a\x00--proxy", &buf);
     try t.expectEqual(@as(usize, 2), args.len);
-    try t.expect(modeOf(args).bridgesDialedLink());
-    try t.expect(Mode.udp_listen.bridgesDialedLink());
-    try t.expect(!modeOf(splitArgv("sketerm-mux\x00--broker", &buf)).bridgesDialedLink());
+    try t.expectEqual(Mode.proxy, modeOf(args));
     try t.expectEqual(@as(usize, 0), splitArgv("", &buf).len);
 }
 

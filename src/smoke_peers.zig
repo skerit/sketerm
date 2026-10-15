@@ -11,12 +11,15 @@
 //! when it starts.
 //!
 //! `runFederation` is the phase 2 stage: two more isolated daemons, exec'd
-//! from the built sketerm-mux, one the hub, linked through a fake ssh.
+//! from the built sketerm-mux, one the hub, linked through a fake ssh; it
+//! ends with a bare local connection acting as a hub's link.
 
 const std = @import("std");
 const c = @import("c.zig").c;
 const mcpproc = @import("smoke/mcpproc.zig");
 const daemon_peers = @import("mux/daemon_peers.zig");
+const peermail = @import("mux/peermail.zig");
+const muxclient = @import("mux/client.zig");
 const nowMs = @import("util/clock.zig").nowMs;
 const atomicwrite = @import("util/atomicwrite.zig");
 const readfile = @import("util/readfile.zig");
@@ -742,7 +745,7 @@ fn awaitListed(m: *Mcp, arena: std.mem.Allocator, address: []const u8, link: ?[]
 /// real `sketerm-mux --proxy`; one MCP server on each side (plus a durable
 /// member name that left) exercise presence, mail both ways with reply
 /// routing, a cut link with mail queued in between, far refusals and TTL
-/// expiry across the link.
+/// expiry across the link, then the member's trust rule on its socket.
 pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
     if (!prepared) fail("prepare() must run before the federation stage");
     const started = nowMs();
@@ -861,6 +864,36 @@ pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
         expectStr(ev, "to", FED_DOMAIN ++ "/mike", "f6. event to");
     }
     std.debug.print("smoke: peers: federation TTL expiry reaches the sender across the link ok\n", .{});
+
+    // 7. The member trusts its private socket, not the far process: a
+    //    relay on a plain local connection without hello is refused; a
+    //    plain local connection that says hello is a link, and its mail
+    //    is stored and delivered.
+    {
+        const sock = std.fmt.allocPrint(arena, "{s}/sketerm/mux.sock", .{mem.rt}) catch fail("oom");
+        var bare = muxclient.Conn.connectProbed(allocator, sock) catch fail("f7. connect to the member");
+        defer bare.deinit();
+        bare.sendJson(.peer_hub_relay, peermail.Relay{ .kind = .mail, .id = "m-f7nohelo", .from = .{ .address = "lochub/lena" }, .to = "mia", .text = "relayed without hello" }) catch fail("f7. send a relay without hello");
+        const refusal = bare.recvExpectFor(&.{.err}, 10_000) catch fail("f7. a relay without hello was not refused");
+        defer refusal.deinit(allocator);
+        contains(refusal.payload, "before peer_hub_hello", "f7. the refusal names the missing hello");
+
+        var link = muxclient.Conn.connectProbed(allocator, sock) catch fail("f7. connect to the member again");
+        defer link.deinit();
+        link.sendJson(.peer_hub_hello, peermail.HubHello{ .host = "lochub", .as = FED_DOMAIN }) catch fail("f7. send hello");
+        link.sendJson(.peer_hub_relay, peermail.Relay{ .kind = .mail, .id = "m-f7hello1", .from = .{ .address = "lochub/lena" }, .to = "mia", .text = "relayed after a local hello" }) catch fail("f7. send a relay after hello");
+        const deadline = nowMs() + 10_000;
+        while (true) {
+            if (nowMs() > deadline) fail("f7. the member never answered stored on the local link");
+            const f = link.recvExpectFor(&.{.peer_member_relay}, deadline - nowMs()) catch fail("f7. the member refused the local link or its relay");
+            defer f.deinit(allocator);
+            if (std.mem.indexOf(u8, f.payload, "\"stored\"") != null and std.mem.indexOf(u8, f.payload, "m-f7hello1") != null) break;
+        }
+        const it = readOne(&mia, arena, 10_000, "f7. mia reads the locally relayed mail");
+        expectStr(it, "from", "lochub/lena", "f7. from");
+        expectStr(it, "text", "relayed after a local hello", "f7. text");
+    }
+    std.debug.print("smoke: peers: federation trusts a local hello and refuses a relay without one ok\n", .{});
 
     mia.closeStdinWait();
     zed.closeStdinWait();

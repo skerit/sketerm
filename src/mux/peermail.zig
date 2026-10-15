@@ -954,8 +954,8 @@ pub const Store = struct {
         self.presence_dirty = true;
     }
 
-    /// Member: a hub said hello on connection `conn` (the caller checked
-    /// that `conn` is the dialed link). A newer hello replaces an older link.
+    /// Member: a hub said hello on connection `conn`. A newer hello
+    /// replaces an older link.
     pub fn uplinkUp(self: *Store, conn: u32, hello: HubHello, now: i64) LinkError!void {
         if (self.hub) return error.NotLinked;
         peeraddr.validHost(hello.host) catch return error.BadAddress;

@@ -22946,9 +22946,11 @@ CLI and the editor's LSP links use it too). The link says
 `peer_hub_hello` (frame 42, gated on the new welcome flag
 `peer_federation`), then carries `peer_hub_relay` (43) and
 `peer_member_relay` (105): presence snapshots, mail, events and `stored`
-answers (`peermail.Relay`). The member accepts a hello only from the far
-end of a dialed link (its socket peer is a `sketerm-mux --proxy` or
-`--udp-listen`) and relays only on that connection.
+answers (`peermail.Relay`). The member relays only on the connection
+that said hello. A hub's links are dialed by the hub over SSH; on the
+member the socket is private to the user, so a connection that
+completed `peer_hub_hello` is trusted like any same-user client, with
+no OS-specific check.
 
 `peermail.Store` gained routes: one outbound mailbox per host
 (`+<domain>.jsonl`, `+.jsonl` for a member's uplink) under the same

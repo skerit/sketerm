@@ -2978,14 +2978,16 @@ whose config says so; every other daemon is dialed, never dials.
   daemon rebases each on its own clock (the link's transit time is
   ignored). So hosts with skewed clocks still agree on ages, and a
   message's TTL always runs on the clock of the daemon holding it.
-- **Trust**: the links are the hub's own SSH (or UDP/Tor) connections; no
-  new credential exists. A daemon accepts `peer_hub_hello` only from the
-  far end of a link dialed into its host (`sketerm-mux --proxy` or a UDP
-  listener), never on a hub, and relays mail and presence only on that
-  connection; the hub stamps every relayed peer with the host it came
-  from, so a linked host can speak only for its own peers. A peer message
-  from another host is still information from another session, never an
-  approval.
+- **Trust**: the links are the hub's own SSH (or UDP/Tor) connections,
+  dialed by the hub; no new credential exists. On the member the socket
+  is private to the user, so a connection that completed
+  `peer_hub_hello` is trusted like any same-user client; there is no
+  OS-specific check. A hub never joins another hub, relays are accepted
+  only on the connection that said hello, and the hub refuses a member's
+  mail whose `from` is already host-qualified, stamping every relayed
+  peer with the host it came from, so a linked host can speak only for
+  its own peers. A peer message from another host is still information
+  from another session, never an approval.
 
 ## Panels (`ui_*`)
 

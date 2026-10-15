@@ -5,20 +5,17 @@
 //!
 //! Federation: on a hub (`peer_hub`) the broker also owns the
 //! `peerlink.Links` to its domains; on any other broker a hub's link
-//! arrives as a client that says `peer_hub_hello`, accepted only when the
-//! connection's far process is the dialed link's bridge.
+//! arrives as a client that says `peer_hub_hello`. The socket is private
+//! to the user, so that client is trusted like any same-user client.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
 const log = @import("log.zig");
 const peermail = @import("peermail.zig");
 const peerlink = @import("peerlink.zig");
-const selfexec = @import("selfexec.zig");
 const env = @import("../util/env.zig");
 const xdg = @import("../util/xdg.zig");
 const clock = @import("../util/clock.zig");
-const platform = @import("../util/platform.zig");
-const pathz = @import("../util/pathz.zig");
 const Config = @import("../config.zig").Config;
 const dmod = @import("daemon.zig");
 const Daemon = dmod.Daemon;
@@ -141,13 +138,12 @@ pub fn handleAck(d: *Daemon, cl: *Client, payload: []const u8) void {
 }
 
 /// `peer_hub_hello`: a hub's link announces itself. Accepted only on a
-/// broker that is no hub, from the far end of a link dialed into this
-/// host; from then on this connection carries `peer_hub_relay`.
+/// broker that is no hub; from then on this connection carries
+/// `peer_hub_relay`.
 pub fn handleHubHello(d: *Daemon, cl: *Client, payload: []const u8) void {
     const frame = "peer_hub_hello";
     const s = storeFor(d, cl, frame) orelse return;
     if (s.hub) return cl.queueErrFor("peer_hub_hello: this daemon is a peer hub; a hub never joins another", frame);
-    if (!dialedLink(cl.fd)) return cl.queueErrFor("peer_hub_hello is accepted only over a link dialed into this host (sketerm-mux --proxy or a UDP listener)", frame);
     var parsed = std.json.parseFromSlice(peermail.HubHello, d.allocator, payload, .{ .ignore_unknown_fields = true }) catch
         return cl.queueErrFor("bad peer_hub_hello request", frame);
     defer parsed.deinit();
@@ -169,18 +165,6 @@ pub fn handleHubRelay(d: *Daemon, cl: *Client, payload: []const u8) void {
         error.NotLinked => "peer_hub_relay before peer_hub_hello on this connection",
         error.BadAddress, error.NotRegistered, error.OutOfMemory, error.NoEntropy => "peer_hub_relay failed on the broker",
     }, frame);
-}
-
-/// Whether the process at the other end of `fd` bridges a link dialed
-/// into this host. Fails closed where processes cannot be inspected.
-fn dialedLink(fd: c_int) bool {
-    const pid = platform.unixPeerPid(fd) orelse return false;
-    var buf: [4096]u8 = undefined;
-    const argv = platform.argvOfPid(pid, &buf) orelse return false;
-    var args_buf: [32][]const u8 = undefined;
-    const args = selfexec.splitArgv(argv, &args_buf);
-    if (args.len == 0 or !selfexec.isBinaryName(pathz.baseName(args[0]))) return false;
-    return selfexec.modeOf(args).bridgesDialedLink();
 }
 
 fn storeFor(d: *Daemon, cl: *Client, frame: []const u8) ?*peermail.Store {
