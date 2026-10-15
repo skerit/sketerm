@@ -126,7 +126,7 @@ pub fn identify(exe: []const u8, argv: []const u8) ?Identity {
         return null;
 
     var args_buf: [32][]const u8 = undefined;
-    const args = splitArgs(argv, &args_buf);
+    const args = selfexec.splitArgv(argv, &args_buf);
     if (selfexec.isBinaryName(name) or selfexec.isBinaryName(argv0_name)) {
         const mode = selfexec.modeOf(args);
         return .{ .name = name, .replaced = replaced, .role = if (mode != .daemon) .mux_helper else .daemon, .mode = mode };
@@ -138,18 +138,6 @@ pub fn identify(exe: []const u8, argv: []const u8) ?Identity {
         return .{ .name = name, .replaced = replaced, .role = if (subprocess) .cef_subprocess else .webengine, .mode = .daemon };
     }
     return .{ .name = name, .replaced = replaced, .role = .sketerm, .mode = .daemon };
-}
-
-fn splitArgs(argv: []const u8, buf: [][]const u8) []const []const u8 {
-    if (argv.len == 0) return buf[0..0];
-    var n: usize = 0;
-    var it = std.mem.splitScalar(u8, argv, 0);
-    while (it.next()) |a| {
-        if (n == buf.len) break;
-        buf[n] = a;
-        n += 1;
-    }
-    return buf[0..n];
 }
 
 pub const Inventory = struct {

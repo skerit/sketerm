@@ -129,6 +129,11 @@ pub const Flag = enum {
     /// Absent = never send them; peers on that daemon are unavailable and
     /// the MCP peer tools say so.
     peers,
+    /// The broker takes part in peer federation: it accepts a hub's
+    /// `peer_hub_hello` and then `peer_hub_relay` on that connection, and
+    /// answers with `peer_member_relay`. Absent = a hub lists that host
+    /// `unsupported` and refuses sends to it `federation_unavailable`.
+    peer_federation,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

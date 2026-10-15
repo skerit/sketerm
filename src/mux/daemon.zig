@@ -3826,6 +3826,9 @@ pub const Daemon = struct {
                 .revents = 0,
             });
         }
+        // Broker: the peer hub's links (dialer sockets, live links).
+        const peerlink_base = fds.items.len;
+        const n_peerlinks = try daemon_peers.appendPoll(self, &fds);
         // Language-server stderr pipes (LSP channels only; -1 otherwise).
         // Drained every tick: a pipe nobody reads stalls a chatty server.
         const lsperr_base = fds.items.len;
@@ -4005,6 +4008,8 @@ pub const Daemon = struct {
             for (ready[0..n_ready]) |j| self.debugJobReadable(j);
             self.debugJobsTick();
         }
+
+        daemon_peers.servicePoll(self, fds.items[peerlink_base .. peerlink_base + n_peerlinks]);
 
         i = 0;
         while (i < n_channels_built) : (i += 1) {

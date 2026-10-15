@@ -62,6 +62,16 @@ pub const Mode = enum {
         const word = self.flag() orelse return false;
         return std.mem.eql(u8, arg, word);
     }
+
+    /// Whether this process is the far end of a link dialed INTO this
+    /// host (an SSH `--proxy` bridge or a UDP listener): what a peer hub's
+    /// connection must come through.
+    pub fn bridgesDialedLink(self: Mode) bool {
+        return switch (self) {
+            .proxy, .udp_listen => true,
+            .daemon, .job, .keep, .udp_connect, .socks5_connect, .display => false,
+        };
+    }
 };
 
 /// The mode of a full argv (argv[0] included): the first argument naming one, else `.daemon`.
@@ -75,6 +85,20 @@ pub fn modeOf(args: []const []const u8) Mode {
         }
     }
     return .daemon;
+}
+
+/// Split a NUL-separated argv block (`/proc/<pid>/cmdline` without its
+/// final NUL) into `buf`; arguments past `buf.len` are dropped.
+pub fn splitArgv(argv: []const u8, buf: [][]const u8) []const []const u8 {
+    if (argv.len == 0) return buf[0..0];
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, argv, 0);
+    while (it.next()) |a| {
+        if (n == buf.len) break;
+        buf[n] = a;
+        n += 1;
+    }
+    return buf[0..n];
 }
 
 /// True for a file name a sketerm-mux image ships under: the binary itself, the portable
@@ -106,6 +130,16 @@ test "modeOf skips leading options and defaults to the daemon" {
     try t.expectEqual(Mode.display, modeOf(&.{ BINARY, "--socket", "/x", "display", "list" }));
     // argv[0] is never a mode, even when a file is named like one.
     try t.expectEqual(Mode.daemon, modeOf(&.{"--proxy"}));
+}
+
+test "an argv block splits into modes; only link bridges carry a hub" {
+    var buf: [8][]const u8 = undefined;
+    const args = splitArgv("sketerm-mux-0f3a\x00--proxy", &buf);
+    try t.expectEqual(@as(usize, 2), args.len);
+    try t.expect(modeOf(args).bridgesDialedLink());
+    try t.expect(Mode.udp_listen.bridgesDialedLink());
+    try t.expect(!modeOf(splitArgv("sketerm-mux\x00--broker", &buf)).bridgesDialedLink());
+    try t.expectEqual(@as(usize, 0), splitArgv("", &buf).len);
 }
 
 test "isBinaryName accepts shipped and deployed names only" {

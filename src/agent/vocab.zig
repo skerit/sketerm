@@ -98,8 +98,9 @@ pub const PeerOutcome = enum {
     expired,
 };
 
-/// Why a peer message was refused, or (`not_durable_gone`) why a queued
-/// one ended unread.
+/// Why a peer message was refused, why a queued one ended unread
+/// (`not_durable_gone`, or any refusal a far broker made of relayed mail),
+/// or (`host_unreachable`, the one `queues` reason) why it waits.
 pub const RefuseReason = enum {
     unknown_address,
     not_durable_gone,
@@ -108,19 +109,50 @@ pub const RefuseReason = enum {
     self,
     federation_unavailable,
     name_taken_ambiguous,
+    host_unreachable,
 
     /// The sentence a sender reads.
     pub fn describe(self: RefuseReason) []const u8 {
         return switch (self) {
-            .unknown_address => "no peer of that address is known on this host",
+            .unknown_address => "no peer of that address is known on that host",
             .not_durable_gone => "that peer's address was not durable and its server is gone",
             .too_large => "the text is larger than 64 KiB",
             .mailbox_full => "the recipient's mailbox is full",
             .self => "a peer cannot message itself",
-            .federation_unavailable => "host/name addresses need federation, which this daemon does not offer",
+            .federation_unavailable => "host/name addresses need federation, which this daemon (or that host's) does not offer",
             .name_taken_ambiguous => "that name's owner is offline while another live server claims it",
+            .host_unreachable => "the link to that host is down; the message waits on this side until it is back",
         };
     }
+
+    /// Whether this reason comes with `queued` (the message waits) rather
+    /// than with `refused` or an ended message.
+    pub fn queues(self: RefuseReason) bool {
+        return switch (self) {
+            .host_unreachable => true,
+            .unknown_address, .not_durable_gone, .too_large, .mailbox_full, .self, .federation_unavailable, .name_taken_ambiguous => false,
+        };
+    }
+};
+
+/// The state of the link to one federated host.
+pub const PeerLink = enum {
+    up,
+    /// Not connected now (never yet, or dropped): its peers show their
+    /// last state and its mail waits in the outbound mailbox.
+    down,
+    /// That host's daemon predates federation (no welcome flag
+    /// `peer_federation`): sends to it are refused `federation_unavailable`.
+    unsupported,
+};
+
+/// This daemon's part in peer federation.
+pub const PeerFederation = enum {
+    /// Config `peer_hub`: it dials every `[domain.<name>] peers = true`.
+    hub,
+    /// A hub's link said hello to it (now or before).
+    member,
+    off,
 };
 
 /// Why this MCP server's peer tools cannot reach the broker now.
@@ -455,6 +487,10 @@ test "peer vocabulary: every state ranked except unknown, every reason described
     for (std.enums.values(PeerUnavailable)) |r| try t.expect(r.describe().len > 0);
     try t.expectEqualStrings("waiting_user", names(PeerState)[3]);
     try t.expectEqual(@as(usize, 4), names(PeerOutcome).len);
+    try t.expect(RefuseReason.host_unreachable.queues());
+    try t.expect(!RefuseReason.unknown_address.queues());
+    try t.expectEqualStrings("unsupported", names(PeerLink)[2]);
+    try t.expectEqualStrings("member", names(PeerFederation)[1]);
 }
 
 test "a wait outcome never shares a name with an event kind" {

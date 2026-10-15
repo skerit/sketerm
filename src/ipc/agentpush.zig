@@ -234,7 +234,9 @@ pub fn composePeer(arena: std.mem.Allocator, item: PeerItem) !Push {
         },
         .event => |e| {
             try w.print("Your peer message {s} to {s} ", .{ e.id, e.to });
-            if (e.reason) |r| {
+            if (e.outcome == .refused) {
+                try w.print("was refused there: {s}.", .{if (e.reason) |r| r.describe() else "no reason given"});
+            } else if (e.reason) |r| {
                 try w.print("ended unread: {s}.", .{r.describe()});
             } else if (e.outcome == .expired) {
                 try w.writeAll("expired unread after ");
@@ -468,4 +470,8 @@ test "what became of a sent message, and mail that expired while away, read as o
     const away = try composePeer(a, .{ .expired_away = .{ .id = "m-7", .from = "Zenit", .sent_ms = 1_000, .expired_ms = 1_000 + 7 * 3600_000 } });
     try t.expectEqualStrings("Peer message m-7 from Zenit expired unread while you were away (7 h after it was sent).", away.content);
     try t.expectEqualStrings("peer_expired_away", away.meta.kind);
+    // A far broker's refusal of mail queued for a federated host.
+    const far = try composePeer(a, .{ .event = .{ .id = "m-8", .outcome = .refused, .to = "box/Nobody", .reason = .unknown_address } });
+    try t.expectEqualStrings("Your peer message m-8 to box/Nobody was refused there: no peer of that address is known on that host.", far.content);
+    try t.expectEqualStrings("peer_refused", far.meta.kind);
 }

@@ -23,6 +23,7 @@ const peerclient = @import("../mux/peerclient.zig");
 const peermail = peerclient.peermail;
 const vocab = @import("../agent/vocab.zig");
 const clock = @import("../util/clock.zig");
+const Backoff = @import("../util/backoff.zig").Backoff;
 const agentwait = @import("agentwait.zig");
 const mcp_hook = @import("mcp_hook.zig");
 const peer_cli = @import("peer_cli.zig");
@@ -40,8 +41,7 @@ pub const ENV_NAME = "SKETERM_PEER_NAME";
 pub const HISTORY_MAX = 64;
 const LIST_TIMEOUT_MS: i64 = 5_000;
 const SEND_TIMEOUT_MS: i64 = 10_000;
-const BACKOFF_MIN_MS: i64 = 1_000;
-const BACKOFF_MAX_MS: i64 = 60_000;
+const RECONNECT = Backoff{ .min_ms = 1_000, .max_ms = 60_000 };
 /// Pushes taken per loop turn, so a flood never starves stdin.
 const DRAIN_MAX = 64;
 /// Server instructions while the peer tools are offered.
@@ -227,8 +227,7 @@ pub const Link = struct {
     conn: ?*muxclient.Conn = null,
     peer: ?peerclient.Peer = null,
     status: Status = .down,
-    retry_at_ms: i64 = 0,
-    backoff_ms: i64 = 0,
+    backoff: Backoff = RECONNECT,
     /// What is registered (owned).
     name: Name = .{ .address = "", .durable = false },
     app: []u8 = &.{},
@@ -238,6 +237,8 @@ pub const Link = struct {
     durable: bool = false,
     name_taken: bool = false,
     ttl_hours: u32 = 0,
+    /// The daemon's part in federation, as its latest list answer said.
+    federation: vocab.PeerFederation = .off,
     mailbox: ?Mailbox = null,
     lease: ?*mcp_registry.Lease = null,
     /// What its client's hooks and status line reported (`applyPresence`).
@@ -318,7 +319,7 @@ fn connect() void {
         return;
     }
     link.status = .up;
-    link.backoff_ms = 0;
+    link.backoff.reset();
     register();
 }
 
@@ -405,13 +406,12 @@ fn lost() void {
 }
 
 fn scheduleRetry() void {
-    link.backoff_ms = if (link.backoff_ms == 0) BACKOFF_MIN_MS else @min(link.backoff_ms * 2, BACKOFF_MAX_MS);
-    link.retry_at_ms = clock.nowMs() + link.backoff_ms;
+    _ = link.backoff.fail(clock.nowMs());
 }
 
 /// Reconnect a link that is not up once its backoff passed (tool calls only).
 fn ensure() void {
-    if (link.status == .up or clock.nowMs() < link.retry_at_ms) return;
+    if (link.status == .up or !link.backoff.due(clock.nowMs())) return;
     connect();
 }
 
@@ -483,6 +483,7 @@ fn take(push: peerclient.Push) void {
             link.durable = s.durable;
             link.name_taken = s.name_taken;
             link.ttl_hours = s.ttl_hours;
+            link.federation = r.value.federation;
             for (s.expired_while_away) |x| _ = m.add(.{ .expired_away = x }) catch {};
             publish();
         },
@@ -576,6 +577,18 @@ fn peerList(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         try res.textf("{s}", .{aw.written()});
     }
     try res.raw("peers", try jsonOf(arena, lines));
+    link.federation = reply.value.federation;
+    try res.fact("federation", @tagName(reply.value.federation));
+    if (reply.value.hosts.len > 0) {
+        const hosts = try arena.alloc(peer_cli.HostLine, reply.value.hosts.len);
+        for (reply.value.hosts, hosts) |h, *l| {
+            l.* = peer_cli.hostLine(h);
+            var aw: std.Io.Writer.Allocating = .init(arena);
+            try peer_cli.writeHostText(&aw.writer, h);
+            try res.textf("{s}", .{aw.written()});
+        }
+        try res.raw("hosts", try jsonOf(arena, hosts));
+    }
     return res.finish();
 }
 
@@ -681,6 +694,8 @@ pub const CapFact = struct {
     channel_armed: bool,
     /// A presence line from this session's hooks or status line arrived.
     presence: bool,
+    /// `hub`, `member` or `off`, as the daemon last answered.
+    federation: []const u8,
 };
 
 /// `capabilities.peers`.
@@ -695,6 +710,7 @@ pub fn capability() CapFact {
         .name_taken = link.name_taken,
         .channel_armed = link.configured and mcp_agent.state.push == .channel,
         .presence = link.presence,
+        .federation = @tagName(link.federation),
     };
 }
 
@@ -816,7 +832,7 @@ test "an unavailable peer tool answers in its declared shape" {
     const a = arena_state.allocator();
     const saved = link;
     defer link = saved;
-    link = .{ .configured = true, .status = .no_peers, .retry_at_ms = std.math.maxInt(i64), .mailbox = Mailbox.init(t.allocator) };
+    link = .{ .configured = true, .status = .no_peers, .backoff = .{ .min_ms = 1, .max_ms = 1, .retry_at_ms = std.math.maxInt(i64) }, .mailbox = Mailbox.init(t.allocator) };
     defer link.mailbox.?.deinit();
     for ([_][]const u8{ "peer_list", "peer_send", "peer_read" }) |name| {
         const tool = std.meta.stringToEnum(Tool, name).?;

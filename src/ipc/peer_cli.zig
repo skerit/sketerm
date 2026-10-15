@@ -12,6 +12,7 @@ const c = @import("../c.zig").c;
 const fdio = @import("../util/fdio.zig");
 const platform = @import("../util/platform.zig");
 const clock = @import("../util/clock.zig");
+const Backoff = @import("../util/backoff.zig").Backoff;
 const env = @import("../util/env.zig");
 const vocab = @import("../agent/vocab.zig");
 const facts = @import("../agent/facts.zig");
@@ -30,8 +31,7 @@ pub const ENV_NAME = "SKETERM_PEER_NAME";
 const REPLY_MS: i64 = 10_000;
 /// A one-shot read takes what arrives until this long passes with nothing.
 const READ_QUIET_MS: i64 = 300;
-const BACKOFF_MIN_MS: i64 = 1_000;
-const BACKOFF_MAX_MS: i64 = 60_000;
+const RECONNECT = Backoff{ .min_ms = 1_000, .max_ms = 60_000 };
 /// Longest line a follower reads on its stdin (a message plus its JSON).
 const STDIN_LINE_MAX: usize = peermail.PEER_TEXT_MAX * 6 + 1024;
 
@@ -57,7 +57,35 @@ pub const ListLine = struct {
     durable: ?bool = null,
     name_taken: ?bool = null,
     last_notification: ?[]const u8 = null,
+    /// Federation: the host whose link it is reached through.
+    via_host: ?[]const u8 = null,
+    /// Federation: that link's state.
+    link: ?[]const u8 = null,
 };
+
+/// One federated host as `peer_list` and `sketerm peer list --json` report it.
+pub const HostLine = struct {
+    host: []const u8,
+    link: []const u8,
+    last_seen_ms: i64,
+};
+
+pub fn hostLine(h: peermail.HostInfo) HostLine {
+    return .{ .host = h.host, .link = @tagName(h.link), .last_seen_ms = h.last_seen_ms };
+}
+
+/// One line: the host (or "the hub" before it said hello), its link
+/// state, and when it was last heard from while not up.
+pub fn writeHostText(w: *std.Io.Writer, h: peermail.HostInfo) !void {
+    try w.print("host {s}: link {s}", .{ if (h.host.len > 0) h.host else "(the hub, not heard from yet)", @tagName(h.link) });
+    switch (h.link) {
+        .up => {},
+        .down, .unsupported => {
+            var buf: [clock.ISO_LEN]u8 = undefined;
+            if (h.last_seen_ms > 0) if (clock.isoLocal(&buf, h.last_seen_ms)) |iso| try w.print(", last heard {s}", .{iso});
+        },
+    }
+}
 
 fn nonEmpty(s: []const u8) ?[]const u8 {
     return if (s.len > 0) s else null;
@@ -76,6 +104,8 @@ pub fn listLine(pi: peermail.PeerInfo, is_self: bool, detail: bool) ListLine {
         .model = nonEmpty(pi.model),
         .facts = pi.facts,
         .self = if (is_self) true else null,
+        .via_host = nonEmpty(pi.via_host),
+        .link = if (pi.link) |k| @tagName(k) else null,
     };
     if (detail) {
         l.cwd = pi.cwd;
@@ -111,6 +141,11 @@ pub fn writeListText(w: *std.Io.Writer, arena: std.mem.Allocator, pi: peermail.P
         var buf: [clock.ISO_LEN]u8 = undefined;
         if (pi.last_seen_ms > 0) if (clock.isoLocal(&buf, pi.last_seen_ms)) |iso| try w.print(", last seen {s}", .{iso});
     }
+    if (pi.via_host.len > 0) try w.print(", via {s}", .{pi.via_host});
+    if (pi.link) |k| switch (k) {
+        .up => {},
+        .down, .unsupported => try w.print(", link {s} (last known state)", .{@tagName(k)}),
+    };
 }
 
 // ── what a received item prints as ──────────────────────────────
@@ -346,10 +381,18 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             if (o.json) {
                 const lines = arena.alloc(ListLine, reply.value.peers.len) catch return 1;
                 for (reply.value.peers, lines) |pi, *l| l.* = listLine(pi, false, o.detail);
-                aw.writer.print("{f}\n", .{std.json.fmt(.{ .peers = lines }, .{ .emit_null_optional_fields = false })}) catch return 1;
-            } else for (reply.value.peers) |pi| {
-                writeListText(&aw.writer, arena, pi, false) catch return 1;
-                aw.writer.writeAll("\n") catch return 1;
+                const hosts = arena.alloc(HostLine, reply.value.hosts.len) catch return 1;
+                for (reply.value.hosts, hosts) |h, *l| l.* = hostLine(h);
+                aw.writer.print("{f}\n", .{std.json.fmt(.{ .peers = lines, .hosts = hosts, .federation = @tagName(reply.value.federation) }, .{ .emit_null_optional_fields = false })}) catch return 1;
+            } else {
+                for (reply.value.peers) |pi| {
+                    writeListText(&aw.writer, arena, pi, false) catch return 1;
+                    aw.writer.writeAll("\n") catch return 1;
+                }
+                for (reply.value.hosts) |h| {
+                    writeHostText(&aw.writer, h) catch return 1;
+                    aw.writer.writeAll("\n") catch return 1;
+                }
             }
             say(1, aw.written());
             return 0;
@@ -490,25 +533,23 @@ fn follow(allocator: std.mem.Allocator, o: Cli) u8 {
     var watch_stdin = stdinWatched();
     var inbuf: std.ArrayList(u8) = .empty;
     defer inbuf.deinit(allocator);
-    var backoff: i64 = 0;
+    var backoff = RECONNECT;
     while (!quitting()) {
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
         var link = Link.open(allocator) catch |e| {
-            if (backoff == 0) _ = fail("{s}; retrying", .{linkError(e)});
-            backoff = if (backoff == 0) BACKOFF_MIN_MS else @min(backoff * 2, BACKOFF_MAX_MS);
-            if (!pause(backoff, watch_stdin)) break;
+            if (backoff.delay_ms == 0) _ = fail("{s}; retrying", .{linkError(e)});
+            if (!pause(backoff.fail(clock.nowMs()), watch_stdin)) break;
             continue;
         };
         defer link.close();
         link.register(arena, o) catch |e| {
             if (e == error.NameTaken) return fail("{s}", .{linkError(e)});
-            backoff = if (backoff == 0) BACKOFF_MIN_MS else @min(backoff * 2, BACKOFF_MAX_MS);
-            if (!pause(backoff, watch_stdin)) break;
+            if (!pause(backoff.fail(clock.nowMs()), watch_stdin)) break;
             continue;
         };
-        backoff = 0;
+        backoff.reset();
         // Serve this connection until it drops, a signal, or stdin ends.
         while (!quitting()) {
             // What already arrived first (the registration's mail included).

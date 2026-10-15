@@ -26,6 +26,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const clock = @import("../util/clock.zig");
+const Backoff = @import("../util/backoff.zig").Backoff;
 const editorlsp = @import("editorlsp.zig");
 const Manager = editorlsp.Manager;
 const ETab = @import("editorview.zig").ETab;
@@ -45,12 +46,6 @@ const dbg = editorlsp.dbg;
 pub const BACKOFF_MIN_MS: i64 = 2_000;
 pub const BACKOFF_MAX_MS: i64 = 5 * 60 * 1000;
 
-/// The wait after one more failure.
-pub fn nextBackoff(prev_ms: i64) i64 {
-    if (prev_ms <= 0) return BACKOFF_MIN_MS;
-    return @min(prev_ms * 2, BACKOFF_MAX_MS);
-}
-
 pub const RemoteLink = struct {
     /// Host part of the spec ("box", "user@box", "udp:box"), owned.
     host: []u8,
@@ -63,10 +58,9 @@ pub const RemoteLink = struct {
     pending: std.ArrayList(Pending) = .empty,
     /// Tabs parked here until the connect worker hands the socket back.
     waiting: std.ArrayList(u64) = .empty,
-    /// Monotonic ms before which a dead link is not redialed, and the
-    /// wait the NEXT failure will impose.
-    retry_at_ms: i64 = 0,
-    backoff_ms: i64 = 0,
+    /// When a dead link may be redialed, and the wait the NEXT failure
+    /// will impose.
+    backoff: Backoff = .{ .min_ms = BACKOFF_MIN_MS, .max_ms = BACKOFF_MAX_MS },
 
     const Pending = struct { req: u32, tab_id: u64 };
 
@@ -87,7 +81,7 @@ pub const RemoteLink = struct {
 
     /// Whether a dead link may be redialed now.
     pub fn due(self: *const RemoteLink, now_ms: i64) bool {
-        return self.state == .dead and now_ms >= self.retry_at_ms;
+        return self.state == .dead and self.backoff.due(now_ms);
     }
 
     /// Join (or open) the host's shared connection. The link is
@@ -123,7 +117,7 @@ pub const RemoteLink = struct {
             return;
         }
         self.state = .up;
-        self.backoff_ms = 0;
+        self.backoff.reset();
         dbg("link {s}: up", .{self.host});
         registry.onLinkUp(self);
     }
@@ -156,8 +150,7 @@ pub const RemoteLink = struct {
     /// passes.
     fn failed(self: *RemoteLink) void {
         self.state = .dead;
-        self.backoff_ms = nextBackoff(self.backoff_ms);
-        self.retry_at_ms = clock.nowMs() + self.backoff_ms;
+        _ = self.backoff.fail(clock.nowMs());
         self.waiting.clearRetainingCapacity();
     }
 
@@ -349,18 +342,18 @@ pub const RemoteLink = struct {
 
 test "editorlsp link: the redial wait doubles up to its ceiling" {
     const t = std.testing;
-    try t.expectEqual(BACKOFF_MIN_MS, nextBackoff(0));
-    try t.expectEqual(BACKOFF_MIN_MS * 2, nextBackoff(BACKOFF_MIN_MS));
-    var b: i64 = 0;
-    for (0..30) |_| b = nextBackoff(b);
-    try t.expectEqual(BACKOFF_MAX_MS, b);
+    var link = RemoteLink{ .host = @constCast(@as([]const u8, "box")) };
+    try t.expectEqual(BACKOFF_MIN_MS, link.backoff.fail(0));
+    try t.expectEqual(BACKOFF_MIN_MS * 2, link.backoff.fail(0));
+    for (0..30) |_| _ = link.backoff.fail(0);
+    try t.expectEqual(BACKOFF_MAX_MS, link.backoff.delay_ms);
 }
 
 test "editorlsp link: a dead link is due only once its wait has passed" {
     const t = std.testing;
     var link = RemoteLink{ .host = @constCast(@as([]const u8, "box")) };
     link.state = .dead;
-    link.retry_at_ms = 5_000;
+    link.backoff.retry_at_ms = 5_000;
     try t.expect(!link.due(4_999));
     try t.expect(link.due(5_000));
     link.state = .connecting;

@@ -1,9 +1,12 @@
 //! Peer addresses: the ONE grammar home, shared by the MCP server and the
 //! broker. `name` is a peer on the caller's host, `host/name` a peer
-//! reached through federation (phase 2; until then a send to one is
-//! refused `federation_unavailable`). `host` is the `[domain.<host>]`
-//! name the hub knows. A name is also a mailbox file name, so its
-//! charset is closed and it never starts with a dot.
+//! reached through federation. `host` is the `[domain.<host>]` name the
+//! hub knows (or the hub's own host name). A name is also a mailbox file
+//! name, so its charset is closed and it never starts with a dot.
+//!
+//! Only the hub rewrites addresses as mail crosses a link (`qualify` on
+//! the way in, `localize` on the way out), so a member never needs to
+//! know what the hub calls it.
 
 const std = @import("std");
 
@@ -56,6 +59,27 @@ pub fn validName(name: []const u8) Error!void {
     return validPart(name, NAME_MAX);
 }
 
+/// A host part: 1-253 of [A-Za-z0-9._-], not starting with a dot.
+pub fn validHost(host: []const u8) Error!void {
+    return validPart(host, HOST_MAX);
+}
+
+/// `addr` as seen from across the link to `link_host`: a bare name of
+/// that host becomes `link_host/name`; a qualified address is kept.
+pub fn qualify(buf: []u8, link_host: []const u8, addr: []const u8) error{NoSpaceLeft}![]const u8 {
+    if (std.mem.indexOfScalar(u8, addr, '/') != null) return std.fmt.bufPrint(buf, "{s}", .{addr});
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ link_host, addr });
+}
+
+/// `addr` (as the hub `self_host` holds it) as the host behind `link_host`
+/// must read it: a bare hub name becomes `self_host/name`, the link host's
+/// own `link_host/name` becomes `name`, any other host's address is kept.
+pub fn localize(buf: []u8, self_host: []const u8, link_host: []const u8, addr: []const u8) error{NoSpaceLeft}![]const u8 {
+    const slash = std.mem.indexOfScalar(u8, addr, '/') orelse return std.fmt.bufPrint(buf, "{s}/{s}", .{ self_host, addr });
+    if (std.mem.eql(u8, addr[0..slash], link_host)) return std.fmt.bufPrint(buf, "{s}", .{addr[slash + 1 ..]});
+    return std.fmt.bufPrint(buf, "{s}", .{addr});
+}
+
 /// Whether `name` carries the reserved `anon-` prefix.
 pub fn isAnonName(name: []const u8) bool {
     return std.mem.startsWith(u8, name, ANON_PREFIX);
@@ -102,4 +126,22 @@ test "refused addresses name what is wrong" {
     try t.expectError(error.TooLong, Address.parse("a" ** (NAME_MAX + 1)));
     _ = try Address.parse("a" ** NAME_MAX);
     try t.expectError(error.TooLong, validName("x" ** 65));
+}
+
+test "the hub qualifies what arrives and localizes what leaves" {
+    var buf: [ADDRESS_MAX]u8 = undefined;
+    // In from link `box`: its bare peers gain the host, others are kept.
+    try t.expectEqualStrings("box/alice", try qualify(&buf, "box", "alice"));
+    try t.expectEqualStrings("hub/Zenit", try qualify(&buf, "box", "hub/Zenit"));
+    // Out to link `box`: hub peers gain the hub's host, box's own lose it,
+    // a third host's stay as they are.
+    try t.expectEqualStrings("hub/Zenit", try localize(&buf, "hub", "box", "Zenit"));
+    try t.expectEqualStrings("alice", try localize(&buf, "hub", "box", "box/alice"));
+    try t.expectEqualStrings("lab/bob", try localize(&buf, "hub", "box", "lab/bob"));
+    // Round trip: what the hub sends box qualifies back to what it held.
+    try t.expectEqualStrings("Zenit", (try Address.parse(try localize(&buf, "hub", "box", "Zenit"))).name);
+    try t.expectError(error.NoSpaceLeft, qualify(buf[0..4], "box", "alice"));
+    try validHost("hohenheim.local");
+    try t.expectError(error.Empty, validHost(""));
+    try t.expectError(error.BadChar, validHost("a/b"));
 }

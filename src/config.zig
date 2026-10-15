@@ -680,6 +680,9 @@ pub const Domain = struct {
     /// Parse-time only: the `host` value carried a `tor:` prefix, so a
     /// conflicting `transport` key in the same section is an error.
     host_forced_tor: bool = false,
+    /// This daemon, when it is the peer hub (`peer_hub`), federates peer
+    /// messaging with the daemon of this domain: it dials it and relays.
+    peers: bool = false,
 
     /// Allocate the transport-prefixed host string the durable-tab
     /// plumbing speaks (bare = auto, "udp:"/"ssh:" = forced).
@@ -942,6 +945,10 @@ pub const Config = struct {
     /// Hours a peer message waits in a mailbox for its recipient before
     /// it expires and its sender is told. 0 = never.
     peer_mail_ttl_hours: u32 = 6,
+    /// This host's daemon is the peer hub: it dials every `[domain.<name>]`
+    /// with `peers = true` and relays peer presence and mail between them.
+    /// A daemon without it never dials.
+    peer_hub: bool = false,
     /// Smart copy: when no selection is active, Ctrl+Shift+C
     /// forwards as Ctrl+C (interrupt) instead of being a no-op.
     smart_copy: bool = true,
@@ -1731,6 +1738,7 @@ pub const Config = struct {
                     try w.print("host = {s}\n", .{dom.host});
             }
             if (dom.transport != .auto) try w.print("transport = {s}\n", .{@tagName(dom.transport)});
+            if (dom.peers) try w.writeAll("peers = true\n");
         }
 
         // Every key is written for an LSP section rather than diffed
@@ -2384,6 +2392,8 @@ fn applyDomainKv(dom: *Domain, arena: std.mem.Allocator, key: []const u8, value:
         } else if (std.mem.eql(u8, value, "tor")) {
             dom.transport = .tor;
         } else return error.BadTransport;
+    } else if (std.mem.eql(u8, key, "peers")) {
+        dom.peers = try parseBool(value);
     } else return error.UnknownKey;
 }
 
@@ -2692,6 +2702,7 @@ pub const keys = [_]Key{
     .{ .name = "mcp_agent_max_per_host", .codec = .{ .int = .{ .min = 0, .max = 1000 } } },
     .{ .name = "mcp_agent_min_free_mb", .codec = .{ .int = .{ .min = 0, .max = 1024 * 1024 } } },
     .{ .name = "peer_mail_ttl_hours", .codec = .{ .int = .{ .min = 0, .max = 30 * 24 } } },
+    .{ .name = "peer_hub", .codec = .bool },
     // File browser.
     .{ .name = "files_default_view", .codec = .{ .enum_ = .{} } },
     .{ .name = "files_show_hidden", .codec = .bool },
@@ -4374,6 +4385,7 @@ test "config: [domain.name] sections parse, resolve, round-trip" {
         \\
         \\[domain.work]
         \\host = build.example.com
+        \\peers = yes
         \\
         \\[domain.legacy]
         \\host = old.example.com
@@ -4422,6 +4434,14 @@ test "config: [domain.name] sections parse, resolve, round-trip" {
     try std.testing.expectEqual(.tor, cfg2.domains.items[3].transport);
     try std.testing.expectEqualStrings("build.example.com", cfg2.domains.items[1].host);
     try std.testing.expectEqualStrings("127.0.0.1:9150", cfg2.mux_tor_socks_endpoint);
+    try std.testing.expect(cfg.domains.items[1].peers);
+    try std.testing.expect(!cfg.domains.items[0].peers);
+    try std.testing.expect(cfg2.domains.items[1].peers);
+    try std.testing.expect(!cfg2.domains.items[2].peers);
+    var hub = try Config.loadFromBytes(std.testing.allocator, "peer_hub = true\n[domain.x]\nhost = h\npeers = maybe\n");
+    defer hub.deinit();
+    try std.testing.expect(hub.peer_hub);
+    try std.testing.expect(!hub.domains.items[0].peers);
 
     // A pre-Tor binary ignores `transport = tor` but preserves this host
     // line when it serializes. The new parser must recover the forced route.

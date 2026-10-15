@@ -13,6 +13,14 @@
 //!
 //! The wire bodies of the `peer_*` frames are declared here too, beside
 //! the state they describe (as `tombstones.zig` does).
+//!
+//! Federation: a `Route` is one link to another host's broker (on the hub,
+//! one per federated domain; on a member, the one uplink to the hub). Each
+//! route has ONE outbound `Box` (`+<domain>`, `+` for the uplink) under the
+//! same bounds, TTL and persistence as a mailbox. An item leaves it only
+//! when the far broker answers `stored`, so a link that drops mid-flight
+//! loses nothing; the far side recognises a redelivered id. Addresses are
+//! rewritten only on the hub (`peeraddr.qualify`/`localize`).
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -26,6 +34,8 @@ const readfile = @import("../util/readfile.zig");
 pub const PeerState = vocab.PeerState;
 pub const PeerOutcome = vocab.PeerOutcome;
 pub const RefuseReason = vocab.RefuseReason;
+pub const PeerLink = vocab.PeerLink;
+pub const PeerFederation = vocab.PeerFederation;
 
 /// A message text above this many bytes is refused `too_large`.
 pub const PEER_TEXT_MAX: usize = 64 * 1024;
@@ -50,6 +60,14 @@ pub const FILE_EXT = ".jsonl";
 pub const FACTS_MAX: usize = 4096;
 /// Longest `model` / `last_notification` kept from a registration.
 pub const PRESENCE_TEXT_MAX: usize = 128;
+/// Ids of relayed items recently taken, so a redelivery after a lost
+/// `stored` answer is not taken twice.
+pub const SEEN_RING: usize = 256;
+/// A sender waits this long (wall ms) for the far broker's answer to a
+/// relayed send before it is told `queued` / `host_unreachable`.
+pub const PENDING_MS: i64 = 5_000;
+/// Outbound mailboxes are `<this><route>`, a name no peer address can have.
+pub const ROUTE_PREFIX = "+";
 
 // ---------------------------------------------------------------- wire
 
@@ -125,6 +143,18 @@ pub const PeerInfo = struct {
     facts: ?std.json.Value = null,
     model: []const u8 = "",
     last_notification: []const u8 = "",
+    /// Federation: the host whose link this entry came over (empty = local).
+    via_host: []const u8 = "",
+    /// Federation: the state of the link it is reached through (null = local).
+    link: ?PeerLink = null,
+};
+
+/// One federated host as this broker sees it.
+pub const HostInfo = struct {
+    host: []const u8,
+    link: PeerLink,
+    /// Wall ms of the last word over its link; 0 = never.
+    last_seen_ms: i64 = 0,
 };
 
 /// `peer_list` body. `req` echoes `peer_list_req`; 0 = the answer to a
@@ -133,6 +163,9 @@ pub const ListReply = struct {
     req: u32 = 0,
     self: ?SelfInfo = null,
     peers: []const PeerInfo = &.{},
+    /// Federated hosts and their links (empty without federation).
+    hosts: []const HostInfo = &.{},
+    federation: PeerFederation = .off,
 };
 
 /// `peer_send` body.
@@ -185,12 +218,58 @@ pub const Event = struct {
     queued_ms: i64 = 0,
 };
 
+/// `peer_hub_hello` body.
+pub const HubHello = struct {
+    /// The hub's own host name: its peers are `<host>/name` on the member.
+    host: []const u8 = "",
+    /// The name the hub knows the member by (its `[domain.<name>]`).
+    as: []const u8 = "",
+};
+
+/// What one `peer_hub_relay` / `peer_member_relay` carries.
+pub const RelayKind = enum {
+    /// The sender's peers (`peers`, and on the hub's side `hosts`).
+    presence,
+    /// One message; answered by `stored`.
+    mail,
+    /// What became of a message (`owner` sent it); answered by `stored`.
+    event,
+    /// The far broker took (or refused) item `id` of kind `of`.
+    stored,
+};
+
+/// `peer_hub_relay` / `peer_member_relay` body; which fields are set
+/// follows `kind`.
+pub const Relay = struct {
+    kind: RelayKind,
+    id: []const u8 = "",
+    from: From = .{},
+    to: []const u8 = "",
+    /// `event`: the address the event is for.
+    owner: []const u8 = "",
+    sent_ms: i64 = 0,
+    text: []const u8 = "",
+    reply_to: ?[]const u8 = null,
+    outcome: PeerOutcome = .delivered,
+    reason: ?RefuseReason = null,
+    to_state: ?PeerState = null,
+    queued_ms: i64 = 0,
+    /// `stored`: whether `id` named a message or an event.
+    of: Item.Kind = .message,
+    peers: []const PeerInfo = &.{},
+    hosts: []const HostInfo = &.{},
+};
+
 // --------------------------------------------------------------- store
 
 /// What the store hands its owner, synchronously.
 pub const Out = union(enum) {
     deliver: Deliver,
     event: Event,
+    /// The deferred answer to a relayed `peer_send` (`conn` sent it).
+    reply: SendReply,
+    /// One federation item for the link `conn`.
+    relay: Relay,
     /// A persistence or drop notice for the log; `conn` is 0.
     warn: []const u8,
 };
@@ -219,6 +298,8 @@ pub const Item = struct {
     outcome: PeerOutcome = .expired,
     reason: ?RefuseReason = null,
     queued_ms: i64 = 0,
+    /// An event in an outbound mailbox: the far-side address it is for.
+    owner: []const u8 = "",
 
     pub const Kind = enum { message, event };
 };
@@ -265,6 +346,16 @@ const Box = struct {
     fn has(self: *const Box, id: []const u8) bool {
         for (self.items.items) |s| if (std.mem.eql(u8, s.item.id, id)) return true;
         return false;
+    }
+
+    /// An outbound (route) mailbox rather than a peer's.
+    fn isRoute(self: *const Box) bool {
+        return std.mem.startsWith(u8, self.address, ROUTE_PREFIX);
+    }
+
+    fn find(self: *const Box, id: []const u8, kind: Item.Kind) ?usize {
+        for (self.items.items, 0..) |s, i| if (s.item.kind == kind and std.mem.eql(u8, s.item.id, id)) return i;
+        return null;
     }
 
     fn addExpired(self: *Box, item: *const Item, now: i64) void {
@@ -314,17 +405,78 @@ const GoneName = struct {
     }
 };
 
+/// One link to another host's broker.
+const Route = struct {
+    /// The domain on a hub; "" = the uplink to the hub on a member.
+    name: []u8,
+    /// The far host as this side names it: the domain, or the host the
+    /// hub announced (owned; "" until a hello).
+    host: []u8,
+    /// The live link connection; 0 = none.
+    conn: u32 = 0,
+    link: PeerLink = .down,
+    last_seen_ms: i64 = 0,
+    box: *Box,
+    /// The far side's last presence snapshot (addresses as this side
+    /// names them), owned by `arena`.
+    arena: std.heap.ArenaAllocator,
+    peers: []PeerInfo = &.{},
+    hosts: []HostInfo = &.{},
+
+    fn isUplink(self: *const Route) bool {
+        return self.name.len == 0;
+    }
+};
+
+/// Who waits for a relayed item's `stored` answer.
+const Waiter = union(enum) {
+    /// A local `peer_send`: answered with `peer_send_reply`.
+    client: struct { conn: u32, req: u32 },
+    /// A link that relayed the item here: answered with `stored`.
+    link: u32,
+};
+
+const Pending = struct {
+    id_buf: [ID_LEN]u8 = undefined,
+    id_len: u8 = 0,
+    waiter: Waiter,
+    /// The route conn whose answer is awaited; it dropping answers early.
+    route_conn: u32,
+    deadline_ms: i64,
+
+    fn id(self: *const Pending) []const u8 {
+        return self.id_buf[0..self.id_len];
+    }
+};
+
+/// A relayed item taken here, and the answer it got.
+const Seen = struct {
+    id_buf: [ID_LEN]u8 = undefined,
+    id_len: u8 = 0,
+    kind: Item.Kind = .message,
+    outcome: PeerOutcome = .delivered,
+    reason: ?RefuseReason = null,
+};
+
 pub const Options = struct {
     /// Where durable mailboxes persist; null = memory only.
     dir: ?[]const u8 = null,
-    /// This broker's host, stamped into `From.host` and every `PeerInfo`.
+    /// This broker's host, stamped into `From.host` and every `PeerInfo`;
+    /// on a hub also the host part of its peers' addresses elsewhere.
     host: []const u8 = "",
     /// Time-to-live of a queued item; 0 = never expires.
     ttl_ms: i64 = 0,
+    /// This broker is the federation hub (config `peer_hub`).
+    hub: bool = false,
+    /// Hub only: the federated domains, one route each.
+    domains: []const []const u8 = &.{},
     emit: Emit,
 };
 
 pub const Error = error{ NotRegistered, BadAddress, OutOfMemory, NoEntropy };
+/// A federation call on a connection that carries no link (or, for a hello,
+/// on a hub).
+pub const LinkError = Error || error{NotLinked};
 
 pub const SendResult = struct {
     /// Borrowed from the caller's `id_buf`; empty when refused.
@@ -332,6 +484,19 @@ pub const SendResult = struct {
     outcome: PeerOutcome,
     reason: ?RefuseReason = null,
     to_state: ?PeerState = null,
+    /// The answer comes later as `Out.reply` (a relayed send whose link is up).
+    deferred: bool = false,
+};
+
+/// One message to route: a local send, or mail a link relayed here.
+const Msg = struct {
+    /// Null = mint one.
+    id: ?[]const u8 = null,
+    from: From,
+    to: []const u8,
+    sent_ms: i64,
+    text: []const u8,
+    reply_to: ?[]const u8 = null,
 };
 
 pub const Store = struct {
@@ -345,26 +510,50 @@ pub const Store = struct {
     gone: [GONE_RING]GoneName = undefined,
     gone_len: usize = 0,
     gone_head: usize = 0,
+    hub: bool = false,
+    routes: std.ArrayList(*Route) = .empty,
+    pending: std.ArrayList(Pending) = .empty,
+    seen: [SEEN_RING]Seen = undefined,
+    seen_len: usize = 0,
+    seen_head: usize = 0,
+    /// Member: the name the hub knows this host by (its hello's `as`).
+    as_name: []u8 = &.{},
+    /// A presence snapshot is owed to every live link.
+    presence_dirty: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, opts: Options) error{OutOfMemory}!Store {
         const dir = if (opts.dir) |d| try allocator.dupe(u8, d) else null;
         errdefer if (dir) |d| allocator.free(d);
-        return .{
+        const host = try allocator.dupe(u8, opts.host);
+        errdefer allocator.free(host);
+        var s: Store = .{
             .allocator = allocator,
             .dir = dir,
-            .host = try allocator.dupe(u8, opts.host),
+            .host = host,
             .ttl_ms = opts.ttl_ms,
             .emit = opts.emit,
+            .hub = opts.hub,
         };
+        if (opts.hub) for (opts.domains) |name| {
+            _ = s.addRoute(name) catch |e| {
+                s.deinit();
+                return e;
+            };
+        };
+        return s;
     }
 
     pub fn deinit(self: *Store) void {
         for (self.peers.items) |p| self.freePeer(p);
         self.peers.deinit(self.allocator);
+        for (self.routes.items) |r| self.freeRoute(r);
+        self.routes.deinit(self.allocator);
         for (self.boxes.items) |b| self.freeBox(b);
         self.boxes.deinit(self.allocator);
+        self.pending.deinit(self.allocator);
         if (self.dir) |d| self.allocator.free(d);
         self.allocator.free(self.host);
+        self.allocator.free(self.as_name);
     }
 
     // ------------------------------------------------------ registration
@@ -385,6 +574,7 @@ pub const Store = struct {
             const p = self.peers.items[i];
             if (std.mem.eql(u8, p.requested, requested) and p.asked_durable == req.durable) {
                 try self.updatePeer(p, req, now);
+                self.presence_dirty = true;
                 return;
             }
             // A changed address is a new registration on this connection.
@@ -439,6 +629,7 @@ pub const Store = struct {
             self.allocator.free(p.last_notification);
         }
         try self.peers.append(self.allocator, p);
+        self.presence_dirty = true;
     }
 
     /// The connection closed. A durable address keeps its mailbox for the
@@ -449,6 +640,7 @@ pub const Store = struct {
         const i = self.peerIndex(conn) orelse return;
         const p = self.peers.orderedRemove(i);
         defer self.freePeer(p);
+        self.presence_dirty = true;
         const bi = self.boxIndex(p.address) orelse return;
         const box = self.boxes.items[bi];
         box.last_seen_ms = now;
@@ -480,14 +672,28 @@ pub const Store = struct {
 
     // ------------------------------------------------------------- mail
 
-    /// Accept one message from `conn`, stamping `from` and `sent_ms`.
+    /// Accept one message from `conn`, stamping `from` and `sent_ms`; a
+    /// `host/name` of another host goes to that host's route.
     /// @return error.NotRegistered when `conn` never registered.
     pub fn send(self: *Store, conn: u32, req: SendReq, now: i64, id_buf: *[ID_LEN]u8) Error!SendResult {
         const sender = self.peerOf(conn) orelse return error.NotRegistered;
         if (req.text.len > PEER_TEXT_MAX) return refused(.too_large);
-        const addr = peeraddr.Address.parse(req.to) catch return refused(.unknown_address);
-        if (addr.host != null) return refused(.federation_unavailable);
-        if (std.mem.eql(u8, addr.name, sender.address)) return refused(.self);
+        return self.route(.{
+            .from = .{ .address = sender.address, .host = self.host, .cwd = sender.cwd, .app = sender.app, .pid = sender.pid },
+            .to = req.to,
+            .sent_ms = now,
+            .text = req.text,
+            .reply_to = req.reply_to,
+        }, .{ .client = .{ .conn = conn, .req = req.req } }, now, id_buf);
+    }
+
+    /// Route `msg` to a local mailbox or a route's outbound one.
+    fn route(self: *Store, msg: Msg, waiter: Waiter, now: i64, id_buf: *[ID_LEN]u8) Error!SendResult {
+        const addr = peeraddr.Address.parse(msg.to) catch return refused(.unknown_address);
+        if (addr.host) |h| {
+            if (!self.isSelfHost(h)) return self.routeRemote(msg, h, waiter, now, id_buf);
+        }
+        if (std.mem.eql(u8, addr.name, msg.from.address)) return refused(.self);
 
         const live = self.livePeer(addr.name);
         const box = if (live != null) self.boxOf(addr.name).? else blk: {
@@ -496,21 +702,17 @@ pub const Store = struct {
             if (self.liveClaimant(addr.name)) return refused(.name_taken_ambiguous);
             break :blk b;
         };
-        if (box.messageCount() >= PEER_MAIL_MAX or box.textBytes() + req.text.len > PEER_MAIL_MAX_BYTES)
-            return refused(.mailbox_full);
+        if (full(box, msg.text.len)) return refused(.mailbox_full);
 
-        const id = ids.mint(id_buf, ID_PREFIX, ID_CHARS) catch |e| switch (e) {
-            error.NoEntropy => return error.NoEntropy,
-            error.NoSpaceLeft => unreachable,
-        };
+        const id = msg.id orelse try mintId(id_buf);
         const s = try self.newStored(.{
             .kind = .message,
             .id = id,
-            .from = .{ .address = sender.address, .host = self.host, .cwd = sender.cwd, .app = sender.app, .pid = sender.pid },
+            .from = msg.from,
             .to = addr.name,
-            .sent_ms = now,
-            .text = req.text,
-            .reply_to = req.reply_to,
+            .sent_ms = msg.sent_ms,
+            .text = msg.text,
+            .reply_to = msg.reply_to,
             .queued = live == null,
         });
         try self.appendItem(box, s);
@@ -522,6 +724,33 @@ pub const Store = struct {
             return .{ .id = id, .outcome = .queued, .to_state = l.state };
         }
         return .{ .id = id, .outcome = .queued, .to_state = .gone };
+    }
+
+    /// `msg` for `host`: into its route's outbound mailbox, relayed now when
+    /// the link is up (the answer then waits for the far broker's).
+    fn routeRemote(self: *Store, msg: Msg, host: []const u8, waiter: Waiter, now: i64, id_buf: *[ID_LEN]u8) Error!SendResult {
+        const r = self.routeTo(host) orelse return refused(if (self.hub) .unknown_address else .federation_unavailable);
+        switch (r.link) {
+            .unsupported => return refused(.federation_unavailable),
+            .up, .down => {},
+        }
+        if (full(r.box, msg.text.len)) return refused(.mailbox_full);
+        const id = msg.id orelse try mintId(id_buf);
+        const s = try self.newStored(.{
+            .kind = .message,
+            .id = id,
+            .from = msg.from,
+            .to = msg.to,
+            .sent_ms = msg.sent_ms,
+            .text = msg.text,
+            .reply_to = msg.reply_to,
+        });
+        try self.appendItem(r.box, s);
+        if (r.conn != 0 and self.relayItem(r, s)) {
+            try self.addPending(id, waiter, r.conn, now);
+            return .{ .id = id, .outcome = .queued, .deferred = true };
+        }
+        return .{ .id = id, .outcome = .queued, .reason = .host_unreachable };
     }
 
     /// `conn` handed these ids to its client: they leave its mailbox.
@@ -546,7 +775,8 @@ pub const Store = struct {
 
     /// Expire every item older than the TTL: a message becomes an
     /// `expired` event to its sender (queued in the sender's own mailbox
-    /// when the sender is offline) and a tombstone for its recipient; an
+    /// when the sender is offline, relayed when the sender is remote) and a
+    /// tombstone for its recipient (none for a route's outbound mail); an
     /// expired event is dropped with a warning.
     pub fn sweep(self: *Store, now: i64) void {
         if (self.ttl_ms <= 0) return;
@@ -565,11 +795,12 @@ pub const Store = struct {
                 changed = true;
                 switch (s.item.kind) {
                     .message => {
-                        box.addExpired(&s.item, now);
+                        const route_box = box.isRoute();
+                        if (!route_box) box.addExpired(&s.item, now);
                         self.notifySender(&s.item, .{
                             .id = s.item.id,
                             .outcome = .expired,
-                            .to = box.address,
+                            .to = if (route_box) s.item.to else box.address,
                             .queued_ms = now - s.item.sent_ms,
                         }, now);
                     },
@@ -583,10 +814,21 @@ pub const Store = struct {
 
     // ----------------------------------------------------------- views
 
-    /// Every live peer, then every durable address with no live server.
-    /// Strings borrow the store; valid until its next mutation.
+    /// Every live peer, then every durable address with no live server,
+    /// then every federated host's peers. Strings borrow the store; valid
+    /// until its next mutation.
     pub fn list(self: *Store, arena: std.mem.Allocator) error{OutOfMemory}![]PeerInfo {
         var out: std.ArrayList(PeerInfo) = .empty;
+        try self.listLocal(arena, &out);
+        for (self.routes.items) |r| for (r.peers) |p| {
+            var e = p;
+            e.link = linkOf(r, p.link);
+            try out.append(arena, e);
+        };
+        return out.items;
+    }
+
+    fn listLocal(self: *Store, arena: std.mem.Allocator, out: *std.ArrayList(PeerInfo)) error{OutOfMemory}!void {
         for (self.peers.items) |p| {
             const box = self.boxOf(p.address);
             try out.append(arena, .{
@@ -607,7 +849,7 @@ pub const Store = struct {
             });
         }
         for (self.boxes.items) |b| {
-            if (!b.durable or self.livePeer(b.address) != null) continue;
+            if (!b.durable or b.isRoute() or self.livePeer(b.address) != null) continue;
             try out.append(arena, .{
                 .address = b.address,
                 .host = self.host,
@@ -617,7 +859,6 @@ pub const Store = struct {
                 .pending = @intCast(b.items.items.len),
             });
         }
-        return out.items;
     }
 
     /// `conn`'s own registration view; null when it is not registered.
@@ -651,6 +892,413 @@ pub const Store = struct {
         return if (self.peerOf(conn)) |p| p.address else null;
     }
 
+    // ------------------------------------------------------- federation
+
+    /// This broker's part in federation.
+    pub fn federation(self: *const Store) PeerFederation {
+        if (self.hub) return .hub;
+        return if (self.uplink() != null) .member else .off;
+    }
+
+    /// Every federated host and its link: on a hub one per domain; on a
+    /// member the hub (`host` empty until it said hello since this broker
+    /// started) and then the hosts it reported, down while the uplink is.
+    pub fn hostList(self: *Store, arena: std.mem.Allocator) error{OutOfMemory}![]HostInfo {
+        var out: std.ArrayList(HostInfo) = .empty;
+        for (self.routes.items) |r| {
+            try out.append(arena, .{ .host = r.host, .link = r.link, .last_seen_ms = r.last_seen_ms });
+            for (r.hosts) |h| try out.append(arena, .{ .host = h.host, .link = linkOf(r, h.link), .last_seen_ms = h.last_seen_ms });
+        }
+        return out.items;
+    }
+
+    /// Hub: the link to `domain` came up as connection `conn`; its
+    /// outbound mail is relayed at once.
+    pub fn linkUp(self: *Store, domain: []const u8, conn: u32, now: i64) void {
+        const r = self.routeNamed(domain) orelse return;
+        self.attach(r, conn, now);
+    }
+
+    /// Hub: `domain`'s daemon predates federation.
+    pub fn linkUnsupported(self: *Store, domain: []const u8, now: i64) void {
+        const r = self.routeNamed(domain) orelse return;
+        if (r.conn != 0) self.detach(r, now);
+        r.link = .unsupported;
+        r.last_seen_ms = now;
+        self.presence_dirty = true;
+    }
+
+    /// Member: a hub said hello on connection `conn` (the caller checked
+    /// that `conn` is the dialed link). A newer hello replaces an older link.
+    pub fn uplinkUp(self: *Store, conn: u32, hello: HubHello, now: i64) LinkError!void {
+        if (self.hub) return error.NotLinked;
+        peeraddr.validHost(hello.host) catch return error.BadAddress;
+        peeraddr.validHost(hello.as) catch return error.BadAddress;
+        const r = try self.ensureUplink();
+        const host = try self.allocator.dupe(u8, hello.host);
+        errdefer self.allocator.free(host);
+        const as = try self.allocator.dupe(u8, hello.as);
+        self.allocator.free(r.host);
+        r.host = host;
+        self.allocator.free(self.as_name);
+        self.as_name = as;
+        if (r.conn != 0 and r.conn != conn) self.detach(r, now);
+        self.touchFile(r.box);
+        self.attach(r, conn, now);
+    }
+
+    /// Connection `conn` closed: a link it carried is down. Its peers stay
+    /// listed with their last state; sends waiting on it learn `queued`.
+    pub fn connGone(self: *Store, conn: u32, now: i64) void {
+        const r = self.routeByConn(conn) orelse return;
+        self.detach(r, now);
+    }
+
+    /// One relayed item from link `conn`.
+    /// @return error.NotLinked when `conn` carries no link (no hello yet).
+    pub fn relayIn(self: *Store, conn: u32, rl: Relay, now: i64) LinkError!void {
+        const r = self.routeByConn(conn) orelse return error.NotLinked;
+        r.last_seen_ms = now;
+        switch (rl.kind) {
+            .presence => try self.takePresence(r, rl),
+            .mail => try self.takeMail(r, rl, now),
+            .event => self.takeEvent(r, rl, now),
+            .stored => self.takeStored(r, rl, now),
+        }
+    }
+
+    /// Periodic federation work: sends whose far answer is overdue learn
+    /// `queued`, and each live link gets the presence snapshot it is owed.
+    pub fn tick(self: *Store, now: i64) void {
+        self.answerPending(.{ .overdue = now });
+        if (!self.presence_dirty) return;
+        self.presence_dirty = false;
+        for (self.routes.items) |r| {
+            if (r.conn != 0) self.sendPresence(r) catch self.warnf("peermail: out of memory relaying presence to {s}", .{r.host});
+        }
+    }
+
+    fn attach(self: *Store, r: *Route, conn: u32, now: i64) void {
+        r.conn = conn;
+        r.link = .up;
+        r.last_seen_ms = now;
+        self.presence_dirty = true;
+        for (r.box.items.items) |s| {
+            if (s.delivered_to != conn) _ = self.relayItem(r, s);
+        }
+    }
+
+    fn detach(self: *Store, r: *Route, now: i64) void {
+        const old = r.conn;
+        r.conn = 0;
+        r.link = .down;
+        r.last_seen_ms = now;
+        self.presence_dirty = true;
+        self.answerPending(.{ .route_conn = old });
+    }
+
+    fn takePresence(self: *Store, r: *Route, rl: Relay) error{OutOfMemory}!void {
+        _ = r.arena.reset(.free_all);
+        r.peers = &.{};
+        r.hosts = &.{};
+        const a = r.arena.allocator();
+        const via = try a.dupe(u8, r.host);
+        const peers = try a.alloc(PeerInfo, @min(rl.peers.len, PRESENCE_PEERS_MAX));
+        for (rl.peers[0..peers.len], peers) |p, *o| {
+            var b: [peeraddr.ADDRESS_MAX]u8 = undefined;
+            o.* = .{
+                .address = try a.dupe(u8, self.inAddr(&b, r, p.address)),
+                .host = try a.dupe(u8, p.host),
+                .app = try a.dupe(u8, p.app),
+                .cwd = try a.dupe(u8, p.cwd),
+                .pid = p.pid,
+                .state = p.state,
+                .durable = p.durable,
+                .live = p.live,
+                .last_seen_ms = p.last_seen_ms,
+                .pending = p.pending,
+                .name_taken = p.name_taken,
+                .facts = if (p.facts) |f| try cloneJson(a, f) else null,
+                .model = try a.dupe(u8, p.model),
+                .last_notification = try a.dupe(u8, p.last_notification),
+                .via_host = via,
+                // A hub judges its own links; a member keeps the hub's view.
+                .link = if (self.hub) null else p.link,
+            };
+        }
+        r.peers = peers;
+        if (!self.hub) {
+            const hosts = try a.alloc(HostInfo, @min(rl.hosts.len, PRESENCE_PEERS_MAX));
+            for (rl.hosts[0..hosts.len], hosts) |h, *o| o.* = .{ .host = try a.dupe(u8, h.host), .link = h.link, .last_seen_ms = h.last_seen_ms };
+            r.hosts = hosts;
+        }
+        // The hub passes every host's peers on to the others.
+        if (self.hub) self.presence_dirty = true;
+    }
+
+    fn takeMail(self: *Store, r: *Route, rl: Relay, now: i64) Error!void {
+        if (!validId(rl.id)) return self.warnf("peermail: relayed mail from {s} without a valid id dropped", .{r.host});
+        if (self.seenFind(rl.id, .message)) |sn| return self.answerStored(r, rl.id, .message, .{ .outcome = sn.outcome, .reason = sn.reason });
+        // Still waiting for a third host's answer: answer this link instead.
+        if (self.pendingIndex(rl.id)) |i| {
+            self.pending.items[i].waiter = .{ .link = r.conn };
+            return;
+        }
+        // A member speaks only for its own peers, and is handed only mail for them.
+        const foreign = if (self.hub)
+            std.mem.indexOfScalar(u8, rl.from.address, '/') != null
+        else blk: {
+            const to = peeraddr.Address.parse(rl.to) catch break :blk false;
+            break :blk if (to.host) |h| !self.isSelfHost(h) else false;
+        };
+        if (foreign) return self.answerStored(r, rl.id, .message, .{ .outcome = .refused, .reason = .unknown_address });
+        if (rl.text.len > PEER_TEXT_MAX) return self.answerStored(r, rl.id, .message, .{ .outcome = .refused, .reason = .too_large });
+        var fb: [peeraddr.ADDRESS_MAX]u8 = undefined;
+        var tb: [peeraddr.ADDRESS_MAX]u8 = undefined;
+        var idb: [ID_LEN]u8 = undefined;
+        const res = try self.route(.{
+            .id = rl.id,
+            .from = .{ .address = self.inAddr(&fb, r, rl.from.address), .host = rl.from.host, .cwd = rl.from.cwd, .app = rl.from.app, .pid = rl.from.pid },
+            .to = self.inAddr(&tb, r, rl.to),
+            .sent_ms = rl.sent_ms,
+            .text = rl.text,
+            .reply_to = rl.reply_to,
+        }, .{ .link = r.conn }, now, &idb);
+        if (!res.deferred) self.answerStored(r, rl.id, .message, .{ .outcome = res.outcome, .reason = res.reason, .to_state = res.to_state });
+    }
+
+    fn takeEvent(self: *Store, r: *Route, rl: Relay, now: i64) void {
+        if (!validId(rl.id)) return self.warnf("peermail: relayed event from {s} without a valid id dropped", .{r.host});
+        if (self.seenFind(rl.id, .event)) |sn| return self.answerStored(r, rl.id, .event, .{ .outcome = sn.outcome });
+        var ob: [peeraddr.ADDRESS_MAX]u8 = undefined;
+        var tb: [peeraddr.ADDRESS_MAX]u8 = undefined;
+        const owner = self.inAddr(&ob, r, rl.owner);
+        const local = if (peeraddr.Address.parse(owner)) |o| (if (o.host) |h| self.isSelfHost(h) else true) else |_| false;
+        if (self.hub or local) {
+            self.deliverEvent(owner, .{ .id = rl.id, .outcome = rl.outcome, .reason = rl.reason, .to = self.inAddr(&tb, r, rl.to), .queued_ms = rl.queued_ms }, now);
+        } else self.warnf("peer event {s} for {s}, not a peer here, dropped", .{ rl.id, owner });
+        self.answerStored(r, rl.id, .event, .{ .outcome = .delivered });
+    }
+
+    fn takeStored(self: *Store, r: *Route, rl: Relay, now: i64) void {
+        const ans: Answer = .{ .outcome = rl.outcome, .reason = rl.reason, .to_state = rl.to_state };
+        const i = r.box.find(rl.id, rl.of) orelse {
+            // A duplicate answer, or one for an item that expired meanwhile.
+            if (rl.of == .message) if (self.takePending(rl.id)) |p| self.answer(p, ans);
+            return;
+        };
+        const s = r.box.items.orderedRemove(i);
+        defer freeStored(self.allocator, s);
+        self.compact(r.box);
+        switch (rl.of) {
+            .event => {},
+            .message => if (self.takePending(rl.id)) |p| {
+                self.answer(p, ans);
+            } else if (rl.outcome == .refused) {
+                // The sender was told `queued` already: the refusal is news.
+                self.notifySender(&s.item, .{ .id = s.item.id, .outcome = .refused, .reason = rl.reason, .to = s.item.to, .queued_ms = now - s.item.sent_ms }, now);
+            },
+        }
+    }
+
+    fn sendPresence(self: *Store, r: *Route) error{OutOfMemory}!void {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var peers: std.ArrayList(PeerInfo) = .empty;
+        try self.listLocal(a, &peers);
+        var hosts: std.ArrayList(HostInfo) = .empty;
+        if (self.hub) for (self.routes.items) |o| {
+            if (o == r) continue;
+            try hosts.append(a, .{ .host = o.name, .link = o.link, .last_seen_ms = o.last_seen_ms });
+            for (o.peers) |p| {
+                var e = p;
+                e.link = linkOf(o, null);
+                try peers.append(a, e);
+            }
+        };
+        for (peers.items) |*p| {
+            var b: [peeraddr.ADDRESS_MAX]u8 = undefined;
+            p.address = try a.dupe(u8, self.outAddr(&b, r, p.address));
+        }
+        _ = self.emit.call(r.conn, .{ .relay = .{ .kind = .presence, .peers = peers.items, .hosts = hosts.items } });
+    }
+
+    /// Relay one outbound item on `r`'s live link.
+    fn relayItem(self: *Store, r: *Route, s: *Stored) bool {
+        const it = &s.item;
+        var fb: [peeraddr.ADDRESS_MAX]u8 = undefined;
+        var tb: [peeraddr.ADDRESS_MAX]u8 = undefined;
+        const rl: Relay = switch (it.kind) {
+            .message => .{
+                .kind = .mail,
+                .id = it.id,
+                .from = .{ .address = self.outAddr(&fb, r, it.from.address), .host = it.from.host, .cwd = it.from.cwd, .app = it.from.app, .pid = it.from.pid },
+                .to = self.outAddr(&tb, r, it.to),
+                .sent_ms = it.sent_ms,
+                .text = it.text,
+                .reply_to = it.reply_to,
+            },
+            .event => .{
+                .kind = .event,
+                .id = it.id,
+                .owner = self.outAddr(&fb, r, it.owner),
+                .to = self.outAddr(&tb, r, it.to),
+                .outcome = it.outcome,
+                .reason = it.reason,
+                .queued_ms = it.queued_ms,
+            },
+        };
+        if (!self.emit.call(r.conn, .{ .relay = rl })) return false;
+        s.delivered_to = r.conn;
+        return true;
+    }
+
+    /// Tell link `r` that item `id` was taken here (or refused), and
+    /// remember the answer for a redelivery.
+    fn answerStored(self: *Store, r: *Route, id: []const u8, of: Item.Kind, ans: Answer) void {
+        self.seenAdd(id, of, ans);
+        if (r.conn == 0) return;
+        _ = self.emit.call(r.conn, .{ .relay = .{ .kind = .stored, .id = id, .of = of, .outcome = ans.outcome, .reason = ans.reason, .to_state = ans.to_state } });
+    }
+
+    fn answer(self: *Store, p: Pending, ans: Answer) void {
+        switch (p.waiter) {
+            .client => |w| _ = self.emit.call(w.conn, .{ .reply = .{ .req = w.req, .id = p.id(), .outcome = ans.outcome, .reason = ans.reason, .to_state = ans.to_state } }),
+            .link => |lc| if (self.routeByConn(lc)) |o| self.answerStored(o, p.id(), .message, ans),
+        }
+    }
+
+    fn addPending(self: *Store, id: []const u8, waiter: Waiter, route_conn: u32, now: i64) error{OutOfMemory}!void {
+        var p = Pending{ .waiter = waiter, .route_conn = route_conn, .deadline_ms = now + PENDING_MS };
+        const n = @min(id.len, ID_LEN);
+        @memcpy(p.id_buf[0..n], id[0..n]);
+        p.id_len = @intCast(n);
+        try self.pending.append(self.allocator, p);
+    }
+
+    fn pendingIndex(self: *const Store, id: []const u8) ?usize {
+        for (self.pending.items, 0..) |*p, i| if (std.mem.eql(u8, p.id(), id)) return i;
+        return null;
+    }
+
+    fn takePending(self: *Store, id: []const u8) ?Pending {
+        const i = self.pendingIndex(id) orelse return null;
+        return self.pending.orderedRemove(i);
+    }
+
+    const PendingDue = union(enum) {
+        /// Waiting on this link, which dropped.
+        route_conn: u32,
+        /// Past the deadline at this wall time.
+        overdue: i64,
+    };
+
+    /// Answer the matching waits `queued` / `host_unreachable`; their items
+    /// stay in the outbound mailbox for the next link.
+    fn answerPending(self: *Store, due: PendingDue) void {
+        var i: usize = 0;
+        while (i < self.pending.items.len) {
+            const p = self.pending.items[i];
+            const hit = switch (due) {
+                .route_conn => |rc| p.route_conn == rc,
+                .overdue => |now| now >= p.deadline_ms,
+            };
+            if (!hit) {
+                i += 1;
+                continue;
+            }
+            _ = self.pending.orderedRemove(i);
+            self.answer(p, .{ .outcome = .queued, .reason = .host_unreachable });
+        }
+    }
+
+    fn seenAdd(self: *Store, id: []const u8, kind: Item.Kind, ans: Answer) void {
+        var e = Seen{ .kind = kind, .outcome = ans.outcome, .reason = ans.reason };
+        const n = @min(id.len, ID_LEN);
+        @memcpy(e.id_buf[0..n], id[0..n]);
+        e.id_len = @intCast(n);
+        if (self.seen_len < SEEN_RING) {
+            self.seen[self.seen_len] = e;
+            self.seen_len += 1;
+        } else {
+            self.seen[self.seen_head] = e;
+            self.seen_head = (self.seen_head + 1) % SEEN_RING;
+        }
+    }
+
+    fn seenFind(self: *const Store, id: []const u8, kind: Item.Kind) ?Seen {
+        for (self.seen[0..self.seen_len]) |e| {
+            if (e.kind == kind and std.mem.eql(u8, e.id_buf[0..e.id_len], id)) return e;
+        }
+        return null;
+    }
+
+    /// An address as the far side of `r` reads it (only a hub rewrites).
+    fn outAddr(self: *const Store, buf: []u8, r: *const Route, addr: []const u8) []const u8 {
+        if (!self.hub) return addr;
+        return peeraddr.localize(buf, self.host, r.name, addr) catch addr;
+    }
+
+    /// An address from the far side of `r` as this side names it.
+    fn inAddr(self: *const Store, buf: []u8, r: *const Route, addr: []const u8) []const u8 {
+        if (!self.hub) return addr;
+        return peeraddr.qualify(buf, r.name, addr) catch addr;
+    }
+
+    fn isSelfHost(self: *const Store, host: []const u8) bool {
+        if (self.hub) return std.mem.eql(u8, host, self.host);
+        return self.as_name.len > 0 and std.mem.eql(u8, host, self.as_name);
+    }
+
+    /// The route mail for `host` takes: its domain's on a hub, the uplink
+    /// on a member.
+    fn routeTo(self: *const Store, host: []const u8) ?*Route {
+        return if (self.hub) self.routeNamed(host) else self.uplink();
+    }
+
+    fn routeNamed(self: *const Store, name: []const u8) ?*Route {
+        for (self.routes.items) |r| if (!r.isUplink() and std.mem.eql(u8, r.name, name)) return r;
+        return null;
+    }
+
+    fn uplink(self: *const Store) ?*Route {
+        for (self.routes.items) |r| if (r.isUplink()) return r;
+        return null;
+    }
+
+    fn routeByConn(self: *const Store, conn: u32) ?*Route {
+        if (conn == 0) return null;
+        for (self.routes.items) |r| if (r.conn == conn) return r;
+        return null;
+    }
+
+    fn ensureUplink(self: *Store) error{OutOfMemory}!*Route {
+        if (self.uplink()) |r| return r;
+        return self.addRoute("");
+    }
+
+    fn addRoute(self: *Store, name: []const u8) error{OutOfMemory}!*Route {
+        var key_buf: [ROUTE_PREFIX.len + peeraddr.HOST_MAX]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, ROUTE_PREFIX ++ "{s}", .{name}) catch return error.OutOfMemory;
+        const box = try self.ensureBox(key, true);
+        const r = try self.allocator.create(Route);
+        errdefer self.allocator.destroy(r);
+        const owned = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned);
+        r.* = .{ .name = owned, .host = try self.allocator.dupe(u8, name), .box = box, .arena = .init(self.allocator) };
+        errdefer self.allocator.free(r.host);
+        try self.routes.append(self.allocator, r);
+        return r;
+    }
+
+    fn freeRoute(self: *Store, r: *Route) void {
+        r.arena.deinit();
+        self.allocator.free(r.name);
+        self.allocator.free(r.host);
+        self.allocator.destroy(r);
+    }
+
     // ------------------------------------------------------ persistence
 
     /// Load every durable mailbox under `dir`. A file that cannot be read
@@ -666,6 +1314,18 @@ pub const Store = struct {
             const fname = std.mem.span(@as([*:0]const u8, @ptrCast(&de.*.d_name)));
             if (!std.mem.endsWith(u8, fname, FILE_EXT)) continue;
             const address = fname[0 .. fname.len - FILE_EXT.len];
+            if (std.mem.startsWith(u8, address, ROUTE_PREFIX)) {
+                const name = address[ROUTE_PREFIX.len..];
+                if (name.len > 0) peeraddr.validHost(name) catch {
+                    self.warnf("peermail: ignoring {s}: not a route mailbox", .{fname});
+                    continue;
+                };
+                self.loadFile(address);
+                // A member stays one across restarts: its uplink mailbox
+                // is the record that a hub said hello.
+                if (name.len == 0 and !self.hub) _ = self.ensureUplink() catch self.warnf("peermail: out of memory loading {s}", .{fname});
+                continue;
+            }
             peeraddr.validName(address) catch {
                 self.warnf("peermail: ignoring {s}: not a peer address", .{fname});
                 continue;
@@ -777,18 +1437,21 @@ pub const Store = struct {
     fn push(self: *Store, conn: u32, s: *const Stored, now: i64) bool {
         const it = &s.item;
         return switch (it.kind) {
-            .message => self.emit.call(conn, .{ .deliver = .{
-                .id = it.id,
-                .from = it.from,
-                .to = it.to,
-                .sent_ms = it.sent_ms,
-                .text = it.text,
-                .reply_to = it.reply_to,
-                .age_ms = now - it.sent_ms,
-                .sender_live = self.livePeer(it.from.address) != null,
-                .sender_state = if (self.livePeer(it.from.address)) |sp| sp.state else .gone,
-                .queued = it.queued,
-            } }),
+            .message => blk: {
+                const sp = self.senderPresence(it.from.address);
+                break :blk self.emit.call(conn, .{ .deliver = .{
+                    .id = it.id,
+                    .from = it.from,
+                    .to = it.to,
+                    .sent_ms = it.sent_ms,
+                    .text = it.text,
+                    .reply_to = it.reply_to,
+                    .age_ms = now - it.sent_ms,
+                    .sender_live = sp.live,
+                    .sender_state = sp.state,
+                    .queued = it.queued,
+                } });
+            },
             .event => self.emit.call(conn, .{ .event = .{
                 .id = it.id,
                 .outcome = it.outcome,
@@ -799,17 +1462,36 @@ pub const Store = struct {
         };
     }
 
-    /// Queue `ev` in the sender's own mailbox and push it when the sender
-    /// is live; dropped with a warning when the sender has no mailbox.
+    /// A local or federated peer's liveness and state, `gone` when unknown.
+    fn senderPresence(self: *const Store, address: []const u8) struct { live: bool, state: PeerState } {
+        if (self.livePeer(address)) |p| return .{ .live = true, .state = p.state };
+        for (self.routes.items) |r| for (r.peers) |p| {
+            if (std.mem.eql(u8, p.address, address)) return .{ .live = p.live and linkOf(r, p.link) == .up, .state = p.state };
+        };
+        return .{ .live = false, .state = .gone };
+    }
+
     fn notifySender(self: *Store, msg: *const Item, ev: Event, now: i64) void {
-        const box = self.boxOf(msg.from.address) orelse
-            return self.warnf("peer event {s} ({s}) for gone sender {s} dropped", .{ ev.id, @tagName(ev.outcome), msg.from.address });
+        self.deliverEvent(msg.from.address, ev, now);
+    }
+
+    /// Queue `ev` in `owner`'s own mailbox and push it when `owner` is live;
+    /// an owner on another host gets it through that host's route; dropped
+    /// with a warning when `owner` has no mailbox here.
+    fn deliverEvent(self: *Store, owner: []const u8, ev: Event, now: i64) void {
+        const addr = peeraddr.Address.parse(owner) catch
+            return self.warnf("peer event {s} for {s}, not an address, dropped", .{ ev.id, owner });
+        const remote: ?*Route = if (addr.host) |h| (if (self.isSelfHost(h)) null else self.routeTo(h) orelse
+            return self.warnf("peer event {s} for {s}: no link to that host, dropped", .{ ev.id, owner })) else null;
+        const box = if (remote) |r| r.box else self.boxOf(addr.name) orelse
+            return self.warnf("peer event {s} ({s}) for gone sender {s} dropped", .{ ev.id, @tagName(ev.outcome), owner });
         // AIDEV-NOTE: events bypass the mailbox bounds: refusing one would
         // drop the only word the sender gets about its message.
         const s = self.newStored(.{
             .kind = .event,
             .id = ev.id,
             .to = ev.to,
+            .owner = if (remote != null) owner else "",
             .sent_ms = now,
             .outcome = ev.outcome,
             .reason = ev.reason,
@@ -819,7 +1501,9 @@ pub const Store = struct {
             freeStored(self.allocator, s);
             return self.warnf("peer event {s} dropped: out of memory", .{ev.id});
         };
-        if (self.livePeer(box.address)) |p| {
+        if (remote) |r| {
+            if (r.conn != 0) _ = self.relayItem(r, s);
+        } else if (self.livePeer(box.address)) |p| {
             if (self.push(p.conn, s, now)) s.delivered_to = p.conn;
         }
     }
@@ -841,6 +1525,7 @@ pub const Store = struct {
         it.to = try a.dupe(u8, item.to);
         it.text = try a.dupe(u8, item.text);
         it.reply_to = if (item.reply_to) |r| try a.dupe(u8, r) else null;
+        it.owner = try a.dupe(u8, item.owner);
         s.item = it;
         return s;
     }
@@ -993,6 +1678,46 @@ fn refused(reason: RefuseReason) SendResult {
     return .{ .outcome = .refused, .reason = reason };
 }
 
+/// What a far broker (or this one) answered about one relayed item.
+const Answer = struct {
+    outcome: PeerOutcome,
+    reason: ?RefuseReason = null,
+    to_state: ?PeerState = null,
+};
+
+/// Peers taken from one presence snapshot at most (a bound, not a quota).
+const PRESENCE_PEERS_MAX: usize = 1024;
+
+/// The link state an entry reached over `r` shows: the route's own when
+/// it is not up, else what the far side reported (`reported`), else up.
+fn linkOf(r: *const Route, reported: ?PeerLink) PeerLink {
+    return switch (r.link) {
+        .up => reported orelse .up,
+        .down, .unsupported => r.link,
+    };
+}
+
+fn full(box: *const Box, text_len: usize) bool {
+    return box.messageCount() >= PEER_MAIL_MAX or box.textBytes() + text_len > PEER_MAIL_MAX_BYTES;
+}
+
+fn mintId(id_buf: *[ID_LEN]u8) Error![]const u8 {
+    return ids.mint(id_buf, ID_PREFIX, ID_CHARS) catch |e| switch (e) {
+        error.NoEntropy => return error.NoEntropy,
+        error.NoSpaceLeft => unreachable,
+    };
+}
+
+/// A relayed id: exactly what `mintId` makes.
+fn validId(id: []const u8) bool {
+    return id.len == ID_LEN and std.mem.startsWith(u8, id, ID_PREFIX);
+}
+
+fn cloneJson(a: std.mem.Allocator, v: std.json.Value) error{OutOfMemory}!std.json.Value {
+    const text = std.json.Stringify.valueAlloc(a, v, .{}) catch return error.OutOfMemory;
+    return std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch error.OutOfMemory;
+}
+
 fn contains(list: []const []const u8, id: []const u8) bool {
     for (list) |x| if (std.mem.eql(u8, x, id)) return true;
     return false;
@@ -1020,6 +1745,9 @@ const Rec = struct {
         text: []const u8 = "",
         from: []const u8 = "",
         sender_state: ?PeerState = null,
+        to_state: ?PeerState = null,
+        req: u32 = 0,
+        relay: ?RelayKind = null,
     };
 
     fn init() Rec {
@@ -1041,6 +1769,8 @@ const Rec = struct {
         const g: Got = switch (out) {
             .deliver => |d| .{ .conn = conn, .kind = .deliver, .id = a.dupe(u8, d.id) catch "", .to = a.dupe(u8, d.to) catch "", .queued = d.queued, .age_ms = d.age_ms, .text = a.dupe(u8, d.text) catch "", .from = a.dupe(u8, d.from.address) catch "", .sender_state = d.sender_state },
             .event => |e| .{ .conn = conn, .kind = .event, .id = a.dupe(u8, e.id) catch "", .outcome = e.outcome, .reason = e.reason, .to = a.dupe(u8, e.to) catch "" },
+            .reply => |r| .{ .conn = conn, .kind = .reply, .id = a.dupe(u8, r.id) catch "", .outcome = r.outcome, .reason = r.reason, .to_state = r.to_state, .req = r.req },
+            .relay => |r| .{ .conn = conn, .kind = .relay, .id = a.dupe(u8, r.id) catch "", .relay = r.kind, .outcome = r.outcome, .reason = r.reason },
             .warn => |w| .{ .conn = conn, .kind = .warn, .text = a.dupe(u8, w) catch "" },
         };
         self.got.append(a, g) catch return false;
@@ -1411,4 +2141,309 @@ test "presence: a re-registration's state, facts, model and notification reach p
     // 5. A facts document that is not an object is dropped, not refused.
     try s.register(4, .{ .address = "carol", .facts = .{ .integer = 7 } }, 3000);
     for (try s.list(a)) |p| if (std.mem.eql(u8, p.address, "carol")) try t.expect(p.facts == null);
+}
+
+// ---------------------------------------------------------- federation
+
+/// The hub's connection id for its link to `box`, and the member's id for
+/// the hub's connection: arbitrary, distinct from the peers' ids.
+const HUB_LINK: u32 = 0x8000_0001;
+const MEMBER_LINK: u32 = 50;
+
+/// A hub and one member wired together through JSON (the relay bodies
+/// round-trip as on the wire); `up` false drops what is sent.
+const Net = struct {
+    hub_rec: Rec,
+    mem_rec: Rec,
+    hub: Store = undefined,
+    mem: Store = undefined,
+    up: bool = true,
+    hub_link: u32 = HUB_LINK,
+    mem_link: u32 = MEMBER_LINK,
+    queue: std.ArrayList(struct { to_hub: bool, json: []u8 }) = .empty,
+
+    fn init(net: *Net, dir: ?[]const u8) !void {
+        net.* = .{ .hub_rec = Rec.init(), .mem_rec = Rec.init() };
+        net.hub = try Store.init(t.allocator, .{ .host = "hub", .ttl_ms = 10_000, .hub = true, .domains = &.{"box"}, .emit = .{ .ctx = net, .func = hubEmit } });
+        net.mem = try Store.init(t.allocator, .{ .dir = dir, .host = "boxhost", .ttl_ms = 10_000, .emit = .{ .ctx = net, .func = memEmit } });
+    }
+
+    fn deinit(net: *Net) void {
+        for (net.queue.items) |f| t.allocator.free(f.json);
+        net.queue.deinit(t.allocator);
+        net.hub.deinit();
+        net.mem.deinit();
+        net.hub_rec.deinit();
+        net.mem_rec.deinit();
+    }
+
+    fn connect(net: *Net, now: i64) !void {
+        net.up = true;
+        try net.mem.uplinkUp(net.mem_link, .{ .host = "hub", .as = "box" }, now);
+        net.hub.linkUp("box", net.hub_link, now);
+    }
+
+    /// Both ends see the link drop; the next one gets new connection ids.
+    fn cut(net: *Net, now: i64) void {
+        net.up = false;
+        net.hub.connGone(net.hub_link, now);
+        net.mem.connGone(net.mem_link, now);
+        for (net.queue.items) |f| t.allocator.free(f.json);
+        net.queue.clearRetainingCapacity();
+        net.hub_link += 1;
+        net.mem_link += 1;
+    }
+
+    fn send(net: *Net, to_hub: bool, r: Relay) bool {
+        if (!net.up) return false;
+        const json = std.json.Stringify.valueAlloc(t.allocator, r, .{ .emit_null_optional_fields = false }) catch return false;
+        net.queue.append(t.allocator, .{ .to_hub = to_hub, .json = json }) catch {
+            t.allocator.free(json);
+            return false;
+        };
+        return true;
+    }
+
+    fn hubEmit(ctx: *anyopaque, conn: u32, out: Out) bool {
+        const net: *Net = @ptrCast(@alignCast(ctx));
+        if (out == .relay) return conn == net.hub_link and net.send(false, out.relay);
+        return Rec.record(&net.hub_rec, conn, out);
+    }
+
+    fn memEmit(ctx: *anyopaque, conn: u32, out: Out) bool {
+        const net: *Net = @ptrCast(@alignCast(ctx));
+        if (out == .relay) return conn == net.mem_link and net.send(true, out.relay);
+        return Rec.record(&net.mem_rec, conn, out);
+    }
+
+    /// Deliver everything in flight (and what it causes), both ways.
+    fn pump(net: *Net, now: i64) !void {
+        net.hub.tick(now);
+        net.mem.tick(now);
+        while (net.queue.items.len > 0) {
+            const f = net.queue.orderedRemove(0);
+            defer t.allocator.free(f.json);
+            const parsed = try std.json.parseFromSlice(Relay, t.allocator, f.json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            if (f.to_hub) try net.hub.relayIn(net.hub_link, parsed.value, now) else try net.mem.relayIn(net.mem_link, parsed.value, now);
+            net.hub.tick(now);
+            net.mem.tick(now);
+        }
+    }
+};
+
+fn listed(s: *Store, arena: std.mem.Allocator, address: []const u8) ?PeerInfo {
+    for (s.list(arena) catch return null) |p| if (std.mem.eql(u8, p.address, address)) return p;
+    return null;
+}
+
+fn lastOf(rec: *const Rec, conn: u32, kind: std.meta.Tag(Out)) ?Rec.Got {
+    var i = rec.got.items.len;
+    while (i > 0) {
+        i -= 1;
+        const g = rec.got.items[i];
+        if (g.conn == conn and g.kind == kind) return g;
+    }
+    return null;
+}
+
+test "federation: presence and mail cross the hub both ways under host-qualified addresses" {
+    var net: Net = undefined;
+    try net.init(null);
+    defer net.deinit();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try net.hub.register(1, reg("Zenit", true), 0);
+    try net.mem.register(1, reg("alice", true), 0);
+    // 1. Before any link: the member is not federated, the hub lists the
+    // domain down.
+    try t.expectEqual(PeerFederation.off, net.mem.federation());
+    try t.expectEqual(PeerLink.down, (try net.hub.hostList(a))[0].link);
+    // 2. The link comes up: each side lists the other's peer, qualified,
+    // with the host it came through.
+    try net.connect(100);
+    try net.pump(100);
+    try t.expectEqual(PeerFederation.member, net.mem.federation());
+    const on_hub = listed(&net.hub, a, "box/alice") orelse return error.TestUnexpectedResult;
+    try t.expectEqualStrings("box", on_hub.via_host);
+    try t.expectEqual(@as(?PeerLink, .up), on_hub.link);
+    try t.expectEqualStrings("boxhost", on_hub.host);
+    const on_mem = listed(&net.mem, a, "hub/Zenit") orelse return error.TestUnexpectedResult;
+    try t.expectEqualStrings("hub", on_mem.via_host);
+    try t.expect(on_mem.live);
+    try t.expect(listed(&net.mem, a, "box/alice") == null);
+    // 3. alice -> hub/Zenit: the answer waits for the hub, which delivers it
+    // from box/alice and answers `delivered`.
+    var idb: [ID_LEN]u8 = undefined;
+    const r1 = try net.mem.send(1, .{ .req = 7, .to = "hub/Zenit", .text = "hi from box" }, 200, &idb);
+    try t.expect(r1.deferred);
+    try net.pump(200);
+    const d1 = lastOf(&net.hub_rec, 1, .deliver) orelse return error.TestUnexpectedResult;
+    try t.expectEqualStrings("box/alice", d1.from);
+    try t.expectEqualStrings("hi from box", d1.text);
+    try t.expectEqual(@as(?PeerState, .idle), d1.sender_state);
+    const rep = lastOf(&net.mem_rec, 1, .reply) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(u32, 7), rep.req);
+    try t.expectEqual(PeerOutcome.delivered, rep.outcome);
+    try t.expectEqualStrings(r1.id, rep.id);
+    // The member's outbound mailbox is empty once the hub stored it.
+    try t.expectEqual(@as(usize, 0), net.mem.uplink().?.box.items.items.len);
+    // 4. Zenit replies to the address it saw; alice gets it from hub/Zenit.
+    const r2 = try net.hub.send(1, .{ .req = 8, .to = "box/alice", .text = "and back", .reply_to = d1.id }, 300, &idb);
+    try t.expect(r2.deferred);
+    try net.pump(300);
+    const d2 = lastOf(&net.mem_rec, 1, .deliver) orelse return error.TestUnexpectedResult;
+    try t.expectEqualStrings("hub/Zenit", d2.from);
+    try t.expectEqualStrings("and back", d2.text);
+    try t.expectEqual(PeerOutcome.delivered, (lastOf(&net.hub_rec, 1, .reply) orelse return error.TestUnexpectedResult).outcome);
+    // 5. The member's own host name in an address is local to it.
+    try net.mem.register(2, reg("bob", true), 300);
+    try t.expectEqual(PeerOutcome.delivered, (try net.mem.send(1, .{ .to = "box/bob", .text = "local" }, 300, &idb)).outcome);
+}
+
+test "federation: a dropped link queues host_unreachable and delivers once when it is back" {
+    var net: Net = undefined;
+    try net.init(null);
+    defer net.deinit();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try net.hub.register(1, reg("Zenit", true), 0);
+    try net.mem.register(1, reg("alice", true), 0);
+    try net.connect(0);
+    try net.pump(0);
+    // 1. The link drops: the remote peer stays listed, link down.
+    net.cut(1000);
+    try t.expectEqual(@as(?PeerLink, .down), (listed(&net.hub, a, "box/alice") orelse return error.TestUnexpectedResult).link);
+    try t.expectEqual(@as(?PeerLink, .down), (listed(&net.mem, a, "hub/Zenit") orelse return error.TestUnexpectedResult).link);
+    // 2. A send now is queued with the reason, answered at once.
+    var idb: [ID_LEN]u8 = undefined;
+    const r = try net.mem.send(1, .{ .to = "hub/Zenit", .text = "while down" }, 1100, &idb);
+    try t.expectEqual(PeerOutcome.queued, r.outcome);
+    try t.expectEqual(@as(?RefuseReason, .host_unreachable), r.reason);
+    try t.expect(!r.deferred);
+    // 3. Back up: delivered once, with its age; the outbound box empties.
+    try net.connect(3000);
+    try net.pump(3000);
+    try t.expectEqual(@as(usize, 1), net.hub_rec.count(1, .deliver));
+    const d = lastOf(&net.hub_rec, 1, .deliver) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(i64, 1900), d.age_ms);
+    try t.expectEqual(@as(usize, 0), net.mem.uplink().?.box.items.items.len);
+    // 4. A redelivery of the same id (its `stored` answer lost) is
+    // recognised: answered again, never delivered twice.
+    const again = Relay{ .kind = .mail, .id = d.id, .from = .{ .address = "alice" }, .to = "hub/Zenit", .text = "while down", .sent_ms = 1100 };
+    try net.hub.relayIn(net.hub_link, again, 3100);
+    try net.pump(3100);
+    try t.expectEqual(@as(usize, 1), net.hub_rec.count(1, .deliver));
+    // 5. A send in flight when the link drops is answered queued.
+    const r3 = try net.mem.send(1, .{ .req = 4, .to = "hub/Zenit", .text = "in flight" }, 3200, &idb);
+    try t.expect(r3.deferred);
+    net.cut(3300);
+    const rep = lastOf(&net.mem_rec, 1, .reply) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(PeerOutcome.queued, rep.outcome);
+    try t.expectEqual(@as(?RefuseReason, .host_unreachable), rep.reason);
+    try t.expectEqual(@as(usize, 1), net.mem.uplink().?.box.items.items.len);
+}
+
+test "federation: far refusals and expiry come back to the sender" {
+    var net: Net = undefined;
+    try net.init(null);
+    defer net.deinit();
+    try net.hub.register(1, reg("Zenit", true), 0);
+    try net.mem.register(1, reg("alice", true), 0);
+    try net.mem.register(2, reg("mike", true), 0);
+    net.mem.deregister(2, 10);
+    try net.connect(0);
+    try net.pump(0);
+    var idb: [ID_LEN]u8 = undefined;
+    // 1. An unknown name on the far host: the far broker's refusal is the reply.
+    _ = try net.hub.send(1, .{ .req = 1, .to = "box/Nobody", .text = "?" }, 100, &idb);
+    try net.pump(100);
+    const rep = lastOf(&net.hub_rec, 1, .reply) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(PeerOutcome.refused, rep.outcome);
+    try t.expectEqual(@as(?RefuseReason, .unknown_address), rep.reason);
+    // 2. Sent while the link is down, refused later: the sender gets an event.
+    net.cut(200);
+    _ = try net.hub.send(1, .{ .to = "box/Nobody", .text = "?" }, 300, &idb);
+    try net.connect(400);
+    try net.pump(400);
+    const ev = lastOf(&net.hub_rec, 1, .event) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(PeerOutcome.refused, ev.outcome);
+    try t.expectEqual(@as(?RefuseReason, .unknown_address), ev.reason);
+    try t.expectEqualStrings("box/Nobody", ev.to);
+    // 3. Queued for an offline durable name over there, it expires there;
+    // the event crosses back, naming the recipient as the sender knows it.
+    _ = try net.hub.send(1, .{ .req = 2, .to = "box/mike", .text = "later" }, 500, &idb);
+    try net.pump(500);
+    const q = lastOf(&net.hub_rec, 1, .reply) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(PeerOutcome.queued, q.outcome);
+    try t.expectEqual(@as(?PeerState, .gone), q.to_state);
+    net.mem.sweep(500 + 10_000);
+    try net.pump(500 + 10_000);
+    const ex = lastOf(&net.hub_rec, 1, .event) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(PeerOutcome.expired, ex.outcome);
+    try t.expectEqualStrings("box/mike", ex.to);
+    // 4. The hub's outbound mail expires too while the link is down.
+    net.cut(20_000);
+    _ = try net.hub.send(1, .{ .to = "box/alice", .text = "never" }, 20_000, &idb);
+    net.hub.sweep(30_000);
+    const ex2 = lastOf(&net.hub_rec, 1, .event) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(PeerOutcome.expired, ex2.outcome);
+    try t.expectEqualStrings("box/alice", ex2.to);
+}
+
+test "federation: trust gate, unknown and unsupported hosts" {
+    var net: Net = undefined;
+    try net.init(null);
+    defer net.deinit();
+    try net.hub.register(1, reg("Zenit", true), 0);
+    var idb: [ID_LEN]u8 = undefined;
+    // 1. A relay on a connection that never said hello is refused, on
+    // either side; a hub never becomes a member.
+    const mail = Relay{ .kind = .mail, .id = "m-abcdefgh", .from = .{ .address = "x" }, .to = "Zenit", .text = "forged" };
+    try t.expectError(error.NotLinked, net.mem.relayIn(77, mail, 0));
+    try t.expectError(error.NotLinked, net.hub.relayIn(77, mail, 0));
+    try t.expectError(error.NotLinked, net.hub.uplinkUp(77, .{ .host = "h", .as = "a" }, 0));
+    try t.expectEqual(@as(usize, 0), net.hub_rec.count(1, .deliver));
+    // 2. A member speaks only for its own peers: a qualified `from` is refused.
+    try net.connect(0);
+    try net.pump(0);
+    try net.hub.relayIn(net.hub_link, .{ .kind = .mail, .id = "m-abcdefgi", .from = .{ .address = "hub/Zenit" }, .to = "hub/Zenit", .text = "forged" }, 10);
+    try t.expectEqual(@as(usize, 0), net.hub_rec.count(1, .deliver));
+    // 3. An unknown host is refused on the hub; an old daemon's host is
+    // listed unsupported and refused `federation_unavailable`.
+    try t.expectEqual(@as(?RefuseReason, .unknown_address), (try net.hub.send(1, .{ .to = "nope/x", .text = "?" }, 20, &idb)).reason);
+    net.hub.linkUnsupported("box", 30);
+    try t.expectEqual(@as(?RefuseReason, .federation_unavailable), (try net.hub.send(1, .{ .to = "box/x", .text = "?" }, 40, &idb)).reason);
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    try t.expectEqual(PeerLink.unsupported, (try net.hub.hostList(arena.allocator()))[0].link);
+}
+
+test "federation: the outbound mailbox and membership survive a restart" {
+    var td = pathz.TempDir.make("peerfed") orelse return error.SkipZigTest;
+    defer td.remove();
+    {
+        var net: Net = undefined;
+        try net.init(td.path());
+        defer net.deinit();
+        try net.mem.register(1, reg("alice", true), 0);
+        try net.connect(0);
+        net.cut(10);
+        var idb: [ID_LEN]u8 = undefined;
+        _ = try net.mem.send(1, .{ .to = "hub/Zenit", .text = "kept" }, 20, &idb);
+    }
+    var rec = Rec.init();
+    defer rec.deinit();
+    var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "boxhost", .emit = rec.emit() });
+    defer s.deinit();
+    s.load();
+    try t.expectEqual(PeerFederation.member, s.federation());
+    try t.expectEqual(@as(usize, 1), s.uplink().?.box.items.items.len);
+    try t.expectEqualStrings("hub/Zenit", s.uplink().?.box.items.items[0].item.to);
+    // A peer list never shows the outbound mailbox as a peer.
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    for (try s.list(arena.allocator())) |p| try t.expect(!std.mem.startsWith(u8, p.address, ROUTE_PREFIX));
 }

@@ -59,6 +59,7 @@ comptime {
     _ = @import("util/platform.zig");
     _ = @import("util/lifetime.zig");
     _ = @import("util/clock.zig");
+    _ = @import("util/backoff.zig");
     _ = @import("util/env.zig");
     _ = @import("util/strz.zig");
     _ = @import("smoke/a11ynode.zig");
@@ -331,6 +332,7 @@ comptime {
     _ = @import("mux/peermail.zig");
     _ = @import("mux/peerclient.zig");
     _ = @import("mux/daemon_peers.zig");
+    _ = @import("mux/peerlink.zig");
     _ = @import("mux/webstore.zig");
     _ = @import("mux/fsserve.zig");
     _ = @import("mux/disk_usage.zig");
