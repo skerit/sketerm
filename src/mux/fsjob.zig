@@ -846,29 +846,10 @@ fn pdfinfoText(source: [*:0]const u8, out: []u8) usize {
 }
 
 fn rasterThumbnail(allocator: std.mem.Allocator, source: [:0]const u8, output: [:0]const u8, bound: c_int) bool {
-    var width: c_int = 0;
-    var height: c_int = 0;
-    var channels: c_int = 0;
-    const pixels = c.stbi_load(source.ptr, &width, &height, &channels, 4) orelse return false;
-    defer c.stbi_image_free(pixels);
-    if (width <= 0 or height <= 0) return false;
-    const scale = @max(@as(f64, @floatFromInt(width)) / @as(f64, @floatFromInt(bound)), @as(f64, @floatFromInt(height)) / @as(f64, @floatFromInt(bound)));
-    const out_w: c_int = if (scale > 1) @intFromFloat(@max(1.0, @as(f64, @floatFromInt(width)) / scale)) else width;
-    const out_h: c_int = if (scale > 1) @intFromFloat(@max(1.0, @as(f64, @floatFromInt(height)) / scale)) else height;
-    const src: [*]const u8 = @ptrCast(pixels);
-    const rgba = src[0 .. @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4];
-    if (out_w == width and out_h == height)
-        return c.stbi_write_png(output.ptr, out_w, out_h, 4, rgba.ptr, out_w * 4) != 0;
-    const scaled = png.downscaleRgba(
-        allocator,
-        rgba,
-        @intCast(width),
-        @intCast(height),
-        @intCast(out_w),
-        @intCast(out_h),
-    ) catch return false;
-    defer allocator.free(scaled);
-    return c.stbi_write_png(output.ptr, out_w, out_h, 4, scaled.ptr, out_w * 4) != 0;
+    const img = loadScaledRgba(allocator, source, @intCast(bound)) orelse return false;
+    defer img.deinit(allocator);
+    const w: c_int = @intCast(img.w);
+    return c.stbi_write_png(output.ptr, w, @intCast(img.h), 4, img.rgba.ptr, w * 4) != 0;
 }
 
 /// Must match the GUI's PREVIEW_IMAGE_CAP: reads refuse larger assets.
@@ -903,7 +884,7 @@ const ScaledRgba = struct {
     }
 };
 
-/// Decode `source_path` and scale it down to fit `bound` px.
+/// Decode `source_path` and scale it down to fit `bound` px; the longest side lands exactly on `bound`.
 fn loadScaledRgba(allocator: std.mem.Allocator, source_path: []const u8, bound: u32) ?ScaledRgba {
     var pz: [4096:0]u8 = undefined;
     const path = std.fmt.bufPrintZ(&pz, "{s}", .{source_path}) catch return null;
@@ -4229,6 +4210,31 @@ test "transportPreview serves PNG when jxl/webp cannot, refuses without any acce
     // A receiver accepting nothing usable gets a refusal, not a PNG.
     var out2: [4096:0]u8 = undefined;
     try t.expect(transportPreview(t.allocator, src, "", 512, &out2) == null);
+}
+
+test "rasterThumbnail puts the longest side exactly on the bound and keeps small images as-is" {
+    const t = std.testing;
+    var src_z: [128:0]u8 = undefined;
+    const src = std.fmt.bufPrintZ(&src_z, "/tmp/.sketerm-test-rt-{d}.png", .{c.getpid()}) catch unreachable;
+    var out_z: [128:0]u8 = undefined;
+    const out = std.fmt.bufPrintZ(&out_z, "/tmp/.sketerm-test-rt-{d}-out.png", .{c.getpid()}) catch unreachable;
+    // 289 / (289 / 35) truncates to 34 in floating point; the bound must still be met.
+    var rgba: [289 * 10 * 4]u8 = undefined;
+    @memset(&rgba, 0x40);
+    try t.expect(c.stbi_write_png(src.ptr, 289, 10, 4, &rgba, 289 * 4) != 0);
+    defer _ = c.unlink(src.ptr);
+    defer _ = c.unlink(out.ptr);
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var n: c_int = 0;
+    try t.expect(rasterThumbnail(t.allocator, src, out, 35));
+    try t.expect(c.stbi_info(out.ptr, &w, &h, &n) != 0);
+    try t.expectEqual(@as(c_int, 35), w);
+    try t.expectEqual(@as(c_int, 1), h);
+    try t.expect(rasterThumbnail(t.allocator, src, out, 512));
+    try t.expect(c.stbi_info(out.ptr, &w, &h, &n) != 0);
+    try t.expectEqual(@as(c_int, 289), w);
+    try t.expectEqual(@as(c_int, 10), h);
 }
 
 test "fileHasBytes: absent and empty both read as no output" {
