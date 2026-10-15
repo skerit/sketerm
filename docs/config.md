@@ -132,7 +132,7 @@ first, and that is also the order rules are scanned in).
 | --- | --- |
 | `[profile.<name>]` | profile-level keys; `<name>` = `default` edits the Default bundle |
 | `[platform.<name>]` | anything the top level accepts, applied only on `<name>` (`linux`, `macos`) |
-| `[domain.<name>]` | `host`, `transport` |
+| `[domain.<name>]` | `host`, `transport`, `peers` |
 | `[lsp.<name>]` | `command`, `args`, `languages`, `root_files`, `init_options`, `settings`, `enabled` |
 | `[mcp]` | `tools`, `web_gui` (defaults for every `sketerm mcp` run) |
 | `[mcp.<name>]` | `tools`, `web_gui` (an MCP profile selected with `--profile`; a different namespace from `[profile.<name>]`) |
@@ -797,6 +797,7 @@ editor_keybind.sort_lines =
 | `mcp_agent_max_per_host` | int | `0` | `agent_open` refuses (`refused`, naming the host and the count) to start another sub-agent on a host that already runs this many of the MCP server's live agents (this machine counts as one host). 0 = no cap. 0-1000. |
 | `mcp_agent_min_free_mb` | int | `0` | `agent_open` refuses to start a sub-agent on a host whose available memory (Linux `MemAvailable`, macOS free + inactive + speculative pages) is below this many MB. A host that cannot say, or does not answer within a few seconds, is not refused; the result says the cap was not checked. 0 = no cap. |
 | `peer_mail_ttl_hours` | int | `6` | Hours a peer message (`peer_send` to another assistant session) waits in its recipient's mailbox on the per-user daemon before it expires; its sender is then told (`expired`), and the recipient sees it under `expired_while_away`. Mailboxes of durable addresses persist under `$XDG_STATE_HOME/sketerm/peermail/`. Read when the daemon starts. 0 = never expires. 0-720. |
+| `peer_hub` | bool | `false` | This host's daemon is the peer federation hub: it dials every `[domain.<name>]` with `peers = true` over that domain's transport and relays peer presence and mail between them, so peers address each other as `<host>/<name>`. A daemon without it never dials; it federates only when a hub dials it. Read when the daemon starts. See [mcp.md](mcp.md), "Federation". |
 | `input_method` | enum | `auto` | `simple` = GTK's in-process compose tables (dead keys always work, no IME); `multi` = the per-display IM module (ibus/fcitx, but on Wayland that module has no compose engine); `auto` picks `multi` only where an input method is visibly configured. Under `auto` the terminal always resolves to `simple`; the editor and the app host follow the heuristic. An explicit value applies to every face. Applies to faces created after the change. |
 
 ### Background layer
@@ -985,6 +986,7 @@ palette gains a "New Tab on `<name>`" entry, and `sketerm mux <name>`
 | --- | --- | --- | --- |
 | `host` | string | unset | `host` or `user@host`. Empty means the section is ignored. A `tor:` prefix (`tor:hidden.onion`) forces the Tor transport and a later `transport` key may not demote it. |
 | `transport` | enum | `auto` | `auto` probes roaming UDP and falls back to the SSH pipe; `ssh` and `udp` force one; `tor` forces SSH through `mux_tor_socks_endpoint` with no direct fallback. |
+| `peers` | bool | `false` | Peer federation with this domain's daemon, used only when this host sets `peer_hub`: the hub keeps a link to it and its peers are `<name>/<peer>`. The section name must be a valid address host (A-Za-z0-9._-, not this host's own name). |
 
 ```
 [domain.devbox]

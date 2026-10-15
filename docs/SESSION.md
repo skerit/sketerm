@@ -22933,3 +22933,34 @@ JSON lines on its stdin from that address, and reconnects with backoff.
 The smoke peer stage gained sections h (hooks and status line run inside
 a server's client tree via `mcpproc`'s `runs_dir`) and i (follow, kill,
 queued read, send back).
+
+## 2026-10-15: peer federation across hosts (phase 2)
+
+Peers on other hosts are addressed `host/name`. A daemon whose config sets
+`peer_hub = true` dials every `[domain.<name>] peers = true` from its
+broker (`src/mux/peerlink.zig`): `Conn.connectRemote` runs in a forked
+dialer child that passes the welcomed socket back with SCM_RIGHTS, the
+broker polls it, and a dropped or failed link redials after a 2-60 s
+`util/backoff.zig` wait (the new shared home; the MCP peer link, the peer
+CLI and the editor's LSP links use it too). The link says
+`peer_hub_hello` (frame 42, gated on the new welcome flag
+`peer_federation`), then carries `peer_hub_relay` (43) and
+`peer_member_relay` (105): presence snapshots, mail, events and `stored`
+answers (`peermail.Relay`). The member accepts a hello only from the far
+end of a dialed link (its socket peer is a `sketerm-mux --proxy` or
+`--udp-listen`) and relays only on that connection.
+
+`peermail.Store` gained routes: one outbound mailbox per host
+(`+<domain>.jsonl`, `+.jsonl` for a member's uplink) under the same
+bounds, TTL and persistence. Mail leaves it only on the far broker's
+`stored` answer, a redelivered id is answered from a seen ring, and a
+sender's `peer_send` waits up to 5 s for the far outcome; with the link
+down it is `queued` with the new reason `host_unreachable`. Only the hub
+rewrites addresses (`peeraddr.qualify`/`localize`). A dropped link keeps
+its peers listed with `link: down`; an old far daemon is `unsupported`
+and refused `federation_unavailable`. `peer_list` adds `via_host`,
+`link` and `hosts`; `capabilities.peers.federation` is `hub`, `member`
+or `off`. Unit tests drive a hub and a member through JSON; the smoke
+peer stage gained a federation section (two exec'd daemons, a fake ssh
+cut by pid and restored, TTL expiry across the link), and the rig's
+broker now reads an isolated config.

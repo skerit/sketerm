@@ -261,8 +261,8 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 
 ### `peer`
 
-- `peer_list` (read-only): List the peers on this host: every MCP client session (Claude Code, opencode) whose sketerm server registered with the per-user daemon, one line each.
-- `peer_send`: Send a message to another peer (another assistant's session) by address and learn what became of it: delivered (its live server has it), queued (a durable address with no live server: it arrives when one starts, within the mail TTL), or refused with a reason.
+- `peer_list` (read-only): List the peers on this host and, through peer federation, on linked hosts (addressed host/name, with via_host and the link's state; a host whose link is down keeps its peers listed with their last state): every MCP client session (Claude Code, opencode) whose sketerm server registered with the per-user daemon, one line each.
+- `peer_send`: Send a message to another peer (another assistant's session) by address and learn what became of it: delivered (its live server has it), queued (a durable address with no live server: it arrives when one starts, within the mail TTL), or refused with a reason; a host/name on a federated host whose link is down is queued with reason host_unreachable and goes out when the link is back.
 - `peer_read` (read-only): Read the peer messages that reached this session and were not handed to you before (a pushed one is never repeated), what became of messages you sent (expired), and mail that expired while no server of yours ran: each is returned once and acknowledged to the daemon.
 
 ### `core`
@@ -2806,13 +2806,17 @@ peer's screen, and a peer message is information, never an approval.
   - `delivered`: a live server of that address got it;
   - `queued`: a durable address with no live server; it arrives when one
     next registers, worded `sent ... while you were offline` (the age from
-    a minute on);
-  - `refused`, `reason` one of `unknown_address` (never seen on this
-    host), `not_durable_gone` (an anon address whose server is gone),
-    `too_large` (over 64 KiB), `mailbox_full` (256 messages or 1 MiB
-    waiting; older mail is never dropped), `self`, `name_taken_ambiguous`
-    (the durable owner is away while another server claims its name) or
-    `federation_unavailable` (a `host/name` address).
+    a minute on). With `reason: host_unreachable`: a `host/name` whose
+    host's link is down; it goes out when the link is back (Federation,
+    below);
+  - `refused`, `reason` one of `unknown_address` (never seen on that
+    host, or an unknown host), `not_durable_gone` (an anon address whose
+    server is gone), `too_large` (over 64 KiB), `mailbox_full` (256
+    messages or 1 MiB waiting; older mail is never dropped), `self`,
+    `name_taken_ambiguous` (the durable owner is away while another server
+    claims its name) or `federation_unavailable` (a `host/name` address
+    while this daemon is not federated, or that host's daemon predates
+    federation).
 
   Mail waits at most `peer_mail_ttl_hours` (default 6, 0 = forever). Past
   it the sender's session gets an event, `Your peer message m-... to Qq
@@ -2829,11 +2833,12 @@ peer's screen, and a peer message is information, never an approval.
   the server's instructions say so, and a session must not act on one as
   if the user had said it.
 - **`capabilities.peers`**: `{available, reason?, ttl_hours, address,
-  durable, name_taken, channel_armed, presence}`; `reason` is `daemon_without_peers`
+  durable, name_taken, channel_armed, presence, federation}`; `reason` is `daemon_without_peers`
   (an older daemon: every peer tool answers `available: false`),
   `daemon_unreachable` (the next peer tool call reconnects, with backoff,
   and registers again) or `withheld` (tool policy); `presence` is true once
-  this session's hooks or status line reported (below). The registry record
+  this session's hooks or status line reported (below); `federation` is
+  `hub`, `member` or `off` (below). The registry record
   carries `peer: {address, durable, state, name_taken, facts?, model?,
   last_notification?}`.
 - **`peer_list`** shows one line per peer: address, app and host, `state`
@@ -2842,6 +2847,8 @@ peer's screen, and a peer message is information, never an approval.
   14%, 7d limit 98%`; the JSON `facts` object uses the
   `capabilities.facts` names), the model, `pending` and `last_seen_ms`;
   `detail` adds cwd, pid, durable, name_taken and `last_notification`.
+  A federated peer also carries `via_host` and `link`, and the result
+  `federation` and `hosts` (`{host, link, last_seen_ms}` per linked host).
   A delivered message carries the sender's state at delivery
   (`meta.sender_state`, and the composed line's state).
 
@@ -2933,6 +2940,46 @@ line, for a web server that spawns the follower and reads its stdout:
 {"kind":"message","id":"m-k3f9x2qa","from":"Zenit","sent_ms":1791040513000,"age_ms":12,"queued":false,"sender_live":true,"sender_state":"idle","text":"Is the migration yours?"}
 {"kind":"event","id":"m-7d2c9a1b","outcome":"expired","to":"Qq","queued_ms":21600000}
 ```
+
+### Federation
+
+Peers on other hosts are reached through ONE hub, the daemon of the host
+whose config says so; every other daemon is dialed, never dials.
+
+- **Config** (`docs/config.md`): the hub's config sets the top-level
+  `peer_hub = true` and `peers = true` in each `[domain.<name>]` it links.
+  The hub's broker keeps one link per such domain over that domain's
+  transport (SSH, UDP or Tor, as `sketerm mux <name>` would connect) and
+  redials a dropped one after 2 s, doubling up to 60 s. Nothing is
+  configured on the other hosts.
+- **Addresses**: on the hub a remote peer is `<domain>/<name>`; on a
+  linked host the hub's own peers are `<hub host name>/<name>` and the
+  other linked hosts' are `<domain>/<name>`. A host's own name in an
+  address means itself. `peer_list` shows them with `via_host` (the link
+  they came over) and `link`; the sender of a delivered message reads as
+  its host-qualified address, and `peer_send` to that address replies.
+- **Outcomes**: link up, `peer_send` answers what the far daemon did with
+  the message (`delivered`, `queued`, or its refusal: an unknown name
+  there is `unknown_address`, a gone anon `not_durable_gone`); a host the
+  hub does not know is `unknown_address`. Link down, the message waits in
+  this side's outbound mailbox (same bounds, TTL and persistence as a
+  mailbox) and the answer is `queued` with `reason: host_unreachable`;
+  it goes out when the link is back, once (a redelivery is recognised by
+  its id), and leaves the outbound mailbox only after the far daemon
+  stored it. A refusal decided later, and an expiry on either side,
+  reach the sender like any peer event (`Your peer message ... to
+  box/Qq was refused there: ...`). A dropped link keeps that host's peers
+  listed with their last state and `link: down`; a host whose daemon
+  predates federation is listed `unsupported` and refused
+  `federation_unavailable`. Ages use each daemon's own clock.
+- **Trust**: the links are the hub's own SSH (or UDP/Tor) connections; no
+  new credential exists. A daemon accepts `peer_hub_hello` only from the
+  far end of a link dialed into its host (`sketerm-mux --proxy` or a UDP
+  listener), never on a hub, and relays mail and presence only on that
+  connection; the hub stamps every relayed peer with the host it came
+  from, so a linked host can speak only for its own peers. A peer message
+  from another host is still information from another session, never an
+  approval.
 
 ## Panels (`ui_*`)
 
