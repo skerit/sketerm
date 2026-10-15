@@ -36,6 +36,7 @@ pub const PeerOutcome = vocab.PeerOutcome;
 pub const RefuseReason = vocab.RefuseReason;
 pub const PeerLink = vocab.PeerLink;
 pub const PeerFederation = vocab.PeerFederation;
+pub const PeerLinkDirection = vocab.PeerLinkDirection;
 
 /// A message text above this many bytes is refused `too_large`.
 pub const PEER_TEXT_MAX: usize = 64 * 1024;
@@ -195,6 +196,9 @@ pub const HostInfo = struct {
     link: PeerLink,
     /// Wall ms of the last word over its link; 0 = never.
     last_seen_ms: i64 = 0,
+    /// Which side dials this host's link; null for a host reported over
+    /// another link.
+    direction: ?PeerLinkDirection = null,
 };
 
 /// `peer_list` body. `req` echoes `peer_list_req`; 0 = the answer to a
@@ -267,6 +271,12 @@ pub const HubHello = struct {
     host: []const u8 = "",
     /// The name the hub knows the member by (its `[domain.<name>]`).
     as: []const u8 = "",
+};
+
+/// `peer_member_hello` body.
+pub const MemberHello = struct {
+    /// The member's host: the hub's `[domain.<host>]` with `peer_link = inbound`.
+    host: []const u8 = "",
 };
 
 /// `peer_subject` body. On a broker connection `address` names the peer
@@ -515,6 +525,8 @@ const Route = struct {
     /// The live link connection; 0 = none.
     conn: u32 = 0,
     link: PeerLink = .down,
+    /// Who dials it: config `peer_link` on a hub, the hello's side on a member.
+    direction: PeerLinkDirection = .outbound,
     last_seen_ms: i64 = 0,
     box: *Box,
     /// The far side's last presence snapshot (addresses as this side
@@ -570,6 +582,8 @@ pub const Options = struct {
     hub: bool = false,
     /// Hub only: the federated domains, one route each.
     domains: []const []const u8 = &.{},
+    /// Hub only: those of `domains` whose member calls in (`peer_link = inbound`).
+    inbound: []const []const u8 = &.{},
     emit: Emit,
 };
 
@@ -638,10 +652,13 @@ pub const Store = struct {
             .hub = opts.hub,
         };
         if (opts.hub) for (opts.domains) |name| {
-            _ = s.addRoute(name) catch |e| {
+            const r = s.addRoute(name) catch |e| {
                 s.deinit();
                 return e;
             };
+            for (opts.inbound) |in| {
+                if (std.mem.eql(u8, in, name)) r.direction = .inbound;
+            }
         };
         return s;
     }
@@ -1055,7 +1072,7 @@ pub const Store = struct {
     pub fn hostList(self: *Store, arena: std.mem.Allocator) error{OutOfMemory}![]HostInfo {
         var out: std.ArrayList(HostInfo) = .empty;
         for (self.routes.items) |r| {
-            try out.append(arena, .{ .host = r.host, .link = r.link, .last_seen_ms = r.last_seen_ms });
+            try out.append(arena, .{ .host = r.host, .link = r.link, .last_seen_ms = r.last_seen_ms, .direction = r.direction });
             for (r.hosts) |h| try out.append(arena, .{ .host = h.host, .link = linkOf(r, h.link), .last_seen_ms = h.last_seen_ms });
         }
         return out.items;
@@ -1068,18 +1085,19 @@ pub const Store = struct {
         self.attach(r, conn, now);
     }
 
-    /// Hub: `domain`'s daemon predates federation.
+    /// `domain`'s daemon predates federation (on a member: the hub it
+    /// calls in to predates call-ins).
     pub fn linkUnsupported(self: *Store, domain: []const u8, now: i64) void {
-        const r = self.routeNamed(domain) orelse return;
+        const r = (if (self.hub) self.routeNamed(domain) else (self.ensureUplink() catch null)) orelse return;
         if (r.conn != 0) self.detach(r, now);
         r.link = .unsupported;
         r.last_seen_ms = now;
         self.presence_dirty = true;
     }
 
-    /// Member: a hub said hello on connection `conn`. A newer hello
-    /// replaces an older link.
-    pub fn uplinkUp(self: *Store, conn: u32, hello: HubHello, now: i64) LinkError!void {
+    /// Member: a hub said hello on connection `conn`, which `direction`
+    /// says who dialed. A newer hello replaces an older link.
+    pub fn uplinkUp(self: *Store, conn: u32, hello: HubHello, direction: PeerLinkDirection, now: i64) LinkError!void {
         if (self.hub) return error.NotLinked;
         peeraddr.validHost(hello.host) catch return error.BadAddress;
         peeraddr.validHost(hello.as) catch return error.BadAddress;
@@ -1093,6 +1111,7 @@ pub const Store = struct {
         self.as_name = as;
         if (r.conn != 0 and r.conn != conn) self.detach(r, now);
         self.touchFile(r.box);
+        r.direction = direction;
         self.attach(r, conn, now);
     }
 
@@ -2477,7 +2496,8 @@ test "presence: a re-registration's state, facts, model and notification reach p
 // ---------------------------------------------------------- federation
 
 /// The hub's connection id for its link to `box`, and the member's id for
-/// the hub's connection: arbitrary, distinct from the peers' ids.
+/// the hub's connection: arbitrary, distinct from the peers' ids. A
+/// call-in swaps them: the dialing side holds the link-range id.
 const HUB_LINK: u32 = 0x8000_0001;
 const MEMBER_LINK: u32 = 50;
 
@@ -2492,12 +2512,31 @@ const Net = struct {
     up: bool = true,
     hub_link: u32 = HUB_LINK,
     mem_link: u32 = MEMBER_LINK,
+    /// Who dialed, as the member sees it: the hub (inbound) unless a call-in.
+    mem_direction: PeerLinkDirection = .inbound,
     queue: std.ArrayList(struct { to_hub: bool, json: []u8 }) = .empty,
     skew: i64 = 0,
 
     fn init(net: *Net, dir: ?[]const u8) !void {
+        return net.initLink(dir, .outbound);
+    }
+
+    /// `link` is the hub's `peer_link` for `box`: inbound = box calls in.
+    fn initLink(net: *Net, dir: ?[]const u8, link: PeerLinkDirection) !void {
         net.* = .{ .hub_rec = Rec.init(), .mem_rec = Rec.init() };
-        net.hub = try Store.init(t.allocator, .{ .host = "hub", .ttl_ms = 10_000, .hub = true, .domains = &.{"box"}, .emit = .{ .ctx = net, .func = hubEmit } });
+        const inbound: []const []const u8 = switch (link) {
+            .outbound => &.{},
+            .inbound => &.{"box"},
+        };
+        switch (link) {
+            .outbound => {},
+            .inbound => {
+                net.hub_link = MEMBER_LINK;
+                net.mem_link = HUB_LINK;
+                net.mem_direction = .outbound;
+            },
+        }
+        net.hub = try Store.init(t.allocator, .{ .host = "hub", .ttl_ms = 10_000, .hub = true, .domains = &.{"box"}, .inbound = inbound, .emit = .{ .ctx = net, .func = hubEmit } });
         net.mem = try Store.init(t.allocator, .{ .dir = dir, .host = "boxhost", .ttl_ms = 10_000, .emit = .{ .ctx = net, .func = memEmit } });
     }
 
@@ -2512,7 +2551,7 @@ const Net = struct {
 
     fn connect(net: *Net, now: i64) !void {
         net.up = true;
-        try net.mem.uplinkUp(net.mem_link, .{ .host = "hub", .as = "box" }, now + net.skew);
+        try net.mem.uplinkUp(net.mem_link, .{ .host = "hub", .as = "box" }, net.mem_direction, now + net.skew);
         net.hub.linkUp("box", net.hub_link, now);
     }
 
@@ -2581,8 +2620,18 @@ fn lastOf(rec: *const Rec, conn: u32, kind: std.meta.Tag(Out)) ?Rec.Got {
 }
 
 test "federation: presence and mail cross the hub both ways under host-qualified addresses" {
+    try exchangeOver(.outbound);
+}
+
+test "federation: a call-in link carries the same exchange; only the direction differs" {
+    try exchangeOver(.inbound);
+}
+
+/// The hub-and-member exchange over a link the hub dials (`outbound`) or
+/// the member calls in on (`inbound`).
+fn exchangeOver(link: PeerLinkDirection) !void {
     var net: Net = undefined;
-    try net.init(null);
+    try net.initLink(null, link);
     defer net.deinit();
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
@@ -2590,14 +2639,16 @@ test "federation: presence and mail cross the hub both ways under host-qualified
     try net.hub.register(1, reg("Zenit", true), 0);
     try net.mem.register(1, reg("alice", true), 0);
     // 1. Before any link: the member is not federated, the hub lists the
-    // domain down.
+    // domain down with its configured direction.
     try t.expectEqual(PeerFederation.off, net.mem.federation());
     try t.expectEqual(PeerLink.down, (try net.hub.hostList(a))[0].link);
+    try t.expectEqual(@as(?PeerLinkDirection, link), (try net.hub.hostList(a))[0].direction);
     // 2. The link comes up: each side lists the other's peer, qualified,
     // with the host it came through.
     try net.connect(100);
     try net.pump(100);
     try t.expectEqual(PeerFederation.member, net.mem.federation());
+    try t.expectEqual(@as(?PeerLinkDirection, net.mem_direction), (try net.mem.hostList(a))[0].direction);
     const on_hub = listed(&net.hub, a, "box/alice") orelse return error.TestUnexpectedResult;
     try t.expectEqualStrings("box", on_hub.via_host);
     try t.expectEqual(@as(?PeerLink, .up), on_hub.link);
@@ -2762,7 +2813,7 @@ test "federation: trust gate, unknown and unsupported hosts" {
     const mail = Relay{ .kind = .mail, .id = "m-abcdefgh", .from = .{ .address = "x" }, .to = "Zenit", .text = "forged" };
     try t.expectError(error.NotLinked, net.mem.relayIn(77, mail, 0));
     try t.expectError(error.NotLinked, net.hub.relayIn(77, mail, 0));
-    try t.expectError(error.NotLinked, net.hub.uplinkUp(77, .{ .host = "h", .as = "a" }, 0));
+    try t.expectError(error.NotLinked, net.hub.uplinkUp(77, .{ .host = "h", .as = "a" }, .inbound, 0));
     try t.expectEqual(@as(usize, 0), net.hub_rec.count(1, .deliver));
     // 2. A member speaks only for its own peers: a qualified `from` is refused.
     try net.connect(0);

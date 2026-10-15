@@ -148,11 +148,21 @@ pub const PeerLink = enum {
 
 /// This daemon's part in peer federation.
 pub const PeerFederation = enum {
-    /// Config `peer_hub`: it dials every `[domain.<name>] peers = true`.
+    /// Config `peer_hub`: it dials every outbound `[domain.<name>] peers =
+    /// true` and takes the call-ins of the inbound ones.
     hub,
-    /// A hub's link said hello to it (now or before).
+    /// A hub's link said hello to it (now or before), whichever side dialed.
     member,
     off,
+};
+
+/// Which side dials a federation link, as this daemon sees it: a hub
+/// domain's config `peer_link`, and `direction` in `peer_list` `hosts`.
+pub const PeerLinkDirection = enum {
+    /// This daemon dials it: a hub's domain by default, a call-in member's hub.
+    outbound,
+    /// The far daemon dials this one: a call-in member (`peer_hub_domain`).
+    inbound,
 };
 
 /// Why this MCP server's peer tools cannot reach the broker now.
@@ -491,6 +501,7 @@ test "peer vocabulary: every state ranked except unknown, every reason described
     try t.expect(!RefuseReason.unknown_address.queues());
     try t.expectEqualStrings("unsupported", names(PeerLink)[2]);
     try t.expectEqualStrings("member", names(PeerFederation)[1]);
+    try t.expectEqualStrings("inbound", names(PeerLinkDirection)[1]);
 }
 
 test "a wait outcome never shares a name with an event kind" {

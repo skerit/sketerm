@@ -291,11 +291,12 @@ pub const FrameType = enum(u8) {
     /// Ids handed to the client (`peermail.AckReq`); no reply.
     peer_ack = 41,
     /// Federation (`peermail.HubHello`), sent by a peer hub's link right
-    /// after the welcome, only to daemons advertising `peer_federation`.
-    /// No reply; a member that refuses it answers `.err`.
+    /// after the welcome, only to daemons advertising `peer_federation`;
+    /// on a call-in link the hub sends it back as the answer to
+    /// `peer_member_hello`. No reply; a member that refuses it answers `.err`.
     peer_hub_hello = 42,
     /// One federation item from the hub (`peermail.Relay`), accepted only on
-    /// the connection that completed `peer_hub_hello`.
+    /// the connection that completed `peer_hub_hello`, whichever side dialed.
     peer_hub_relay = 43,
     /// Ask, set or clear a peer's user-set subject (`peermail.SubjectReq`),
     /// only to daemons advertising `peer_subject`. On a broker connection
@@ -304,6 +305,11 @@ pub const FrameType = enum(u8) {
     /// it to the broker for the peer running in that session's process
     /// tree, and the answer is the `session_meta` `peer` push that follows.
     peer_subject = 44,
+    /// A call-in member's link announces itself (`peermail.MemberHello`),
+    /// only to hubs advertising `peer_callin`. Answered by `peer_hub_hello`
+    /// on the same connection, or `.err` naming why it was refused. From
+    /// then on `peer_hub_relay` comes back and `peer_member_relay` goes out.
+    peer_member_hello = 45,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -1191,6 +1197,7 @@ test "wire: append-only frame and event values include panel RPC" {
     try std.testing.expectEqual(@as(u8, 105), @intFromEnum(FrameType.peer_member_relay));
     try std.testing.expectEqual(@as(u8, 44), @intFromEnum(FrameType.peer_subject));
     try std.testing.expectEqual(@as(u8, 106), @intFromEnum(FrameType.peer_subject_reply));
+    try std.testing.expectEqual(@as(u8, 45), @intFromEnum(FrameType.peer_member_hello));
     try std.testing.expectEqual(@as(u8, 7), @intFromEnum(ChannelKind.web_helper));
     try std.testing.expectEqual(@as(u8, 64), @intFromEnum(FrameType.welcome));
     try std.testing.expectEqual(@as(u8, 94), @intFromEnum(FrameType.play_state));

@@ -667,6 +667,7 @@ pub const Profile = struct {
 /// palette / `sketerm mux <name>` can offer "new tab on devbox"
 /// without retyping hosts.
 pub const DomainTransport = enum { auto, ssh, udp, tor };
+pub const PeerLinkDirection = @import("agent/vocab.zig").PeerLinkDirection;
 
 pub const Domain = struct {
     name: []const u8,
@@ -679,8 +680,11 @@ pub const Domain = struct {
     /// conflicting `transport` key in the same section is an error.
     host_forced_tor: bool = false,
     /// This daemon, when it is the peer hub (`peer_hub`), federates peer
-    /// messaging with the daemon of this domain: it dials it and relays.
+    /// messaging with the daemon of this domain and relays.
     peers: bool = false,
+    /// Hub only: `outbound` dials the domain; `inbound` waits for that
+    /// member to call in (`peer_hub_domain` there), so `host` may be empty.
+    peer_link: PeerLinkDirection = .outbound,
 
     /// Allocate the transport-prefixed host string the durable-tab
     /// plumbing speaks (bare = auto, "udp:"/"ssh:" = forced).
@@ -946,6 +950,10 @@ pub const Config = struct {
     /// with `peers = true` and relays peer presence and mail between them.
     /// A daemon without it never dials.
     peer_hub: bool = false,
+    /// A call-in member: its daemon dials this `[domain.<name>]` (the hub's
+    /// host) and joins the hub's federation from its side. Refused with
+    /// `peer_hub`. Empty = never dial.
+    peer_hub_domain: []const u8 = "",
     /// Smart copy: when no selection is active, Ctrl+Shift+C
     /// forwards as Ctrl+C (interrupt) instead of being a no-op.
     smart_copy: bool = true,
@@ -1736,6 +1744,7 @@ pub const Config = struct {
             }
             if (dom.transport != .auto) try w.print("transport = {s}\n", .{@tagName(dom.transport)});
             if (dom.peers) try w.writeAll("peers = true\n");
+            if (dom.peer_link != .outbound) try w.print("peer_link = {s}\n", .{@tagName(dom.peer_link)});
         }
 
         // Every key is written for an LSP section rather than diffed
@@ -1976,6 +1985,19 @@ pub const Config = struct {
             return d.hostSpec(allocator) catch null;
         }
         return null;
+    }
+
+    /// The `[domain.<name>]` a call-in member dials (`peer_hub_domain`);
+    /// null when unset.
+    /// @return error.HubAndCallin together with `peer_hub`; error.NoSuchDomain
+    /// when that section is missing or sets no host.
+    pub fn peerHubDomain(self: *const Config) error{ HubAndCallin, NoSuchDomain }!?*const Domain {
+        if (self.peer_hub_domain.len == 0) return null;
+        if (self.peer_hub) return error.HubAndCallin;
+        for (self.domains.items) |*d| {
+            if (std.mem.eql(u8, d.name, self.peer_hub_domain)) return if (d.host.len == 0) error.NoSuchDomain else d;
+        }
+        return error.NoSuchDomain;
     }
 };
 
@@ -2391,6 +2413,8 @@ fn applyDomainKv(dom: *Domain, arena: std.mem.Allocator, key: []const u8, value:
         } else return error.BadTransport;
     } else if (std.mem.eql(u8, key, "peers")) {
         dom.peers = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "peer_link")) {
+        dom.peer_link = std.meta.stringToEnum(PeerLinkDirection, value) orelse return error.BadValue;
     } else return error.UnknownKey;
 }
 
@@ -2700,6 +2724,7 @@ pub const keys = [_]Key{
     .{ .name = "mcp_agent_min_free_mb", .codec = .{ .int = .{ .min = 0, .max = 1024 * 1024 } } },
     .{ .name = "peer_mail_ttl_hours", .codec = .{ .int = .{ .min = 0, .max = 30 * 24 } } },
     .{ .name = "peer_hub", .codec = .bool },
+    .{ .name = "peer_hub_domain", .codec = .string },
     // File browser.
     .{ .name = "files_default_view", .codec = .{ .enum_ = .{} } },
     .{ .name = "files_show_hidden", .codec = .bool },
@@ -4447,6 +4472,26 @@ test "config: [domain.name] sections parse, resolve, round-trip" {
     defer hub.deinit();
     try std.testing.expect(hub.peer_hub);
     try std.testing.expect(!hub.domains.items[0].peers);
+
+    // Call-in: the hub waits for an inbound domain (no host needed); the
+    // member names its hub's section; both roles at once are refused.
+    var in_hub = try Config.loadFromBytes(std.testing.allocator, "peer_hub = true\n[domain.aeor]\npeers = true\npeer_link = inbound\n[domain.box]\nhost = b\npeers = true\npeer_link = outbound\n");
+    defer in_hub.deinit();
+    try std.testing.expectEqual(.inbound, in_hub.domains.items[0].peer_link);
+    try std.testing.expectEqual(.outbound, in_hub.domains.items[1].peer_link);
+    try std.testing.expectEqual(@as(?*const Domain, null), try in_hub.peerHubDomain());
+    var member = try Config.loadFromBytes(std.testing.allocator, "peer_hub_domain = archdev\n[domain.archdev]\nhost = archdev\n");
+    defer member.deinit();
+    try std.testing.expectEqualStrings("archdev", (try member.peerHubDomain()).?.host);
+    var both = try Config.loadFromBytes(std.testing.allocator, "peer_hub = true\npeer_hub_domain = archdev\n[domain.archdev]\nhost = archdev\n");
+    defer both.deinit();
+    try std.testing.expectError(error.HubAndCallin, both.peerHubDomain());
+    var missing = try Config.loadFromBytes(std.testing.allocator, "peer_hub_domain = nowhere\n");
+    defer missing.deinit();
+    try std.testing.expectError(error.NoSuchDomain, missing.peerHubDomain());
+    var bad_link = try Config.loadFromBytes(std.testing.allocator, "[domain.x]\nhost = h\npeer_link = sideways\n");
+    defer bad_link.deinit();
+    try std.testing.expectEqual(.outbound, bad_link.domains.items[0].peer_link);
 
     // A pre-Tor binary ignores `transport = tor` but preserves this host
     // line when it serializes. The new parser must recover the forced route.

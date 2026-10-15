@@ -3,10 +3,12 @@
 //! phase 2 deregisters a dying connection by id). A worker holds no
 //! peers and refuses every `peer_*` frame, naming why.
 //!
-//! Federation: on a hub (`peer_hub`) the broker also owns the
-//! `peerlink.Links` to its domains; on any other broker a hub's link
-//! arrives as a client that says `peer_hub_hello`. The socket is private
-//! to the user, so that client is trusted like any same-user client.
+//! Federation: on a hub (`peer_hub`) or a call-in member
+//! (`peer_hub_domain`) the broker also owns the `peerlink.Links` it dials;
+//! a link dialed TO this broker arrives as a client that says
+//! `peer_hub_hello` (on a member) or `peer_member_hello` (on a hub, from an
+//! inbound domain). The socket is private to the user, so that client is
+//! trusted like any same-user client.
 //!
 //! Subjects: the broker tells each session's worker which peer runs in
 //! that session's process tree (`peerInTree`, the ancestry walk
@@ -26,6 +28,7 @@ const env = @import("../util/env.zig");
 const xdg = @import("../util/xdg.zig");
 const clock = @import("../util/clock.zig");
 const Config = @import("../config.zig").Config;
+const wire = @import("wire.zig");
 const dmod = @import("daemon.zig");
 const Daemon = dmod.Daemon;
 const Client = dmod.Client;
@@ -33,6 +36,8 @@ const Worker = dmod.Worker;
 
 /// Rigs override the mail TTL in milliseconds (config is in hours).
 pub const TTL_ENV = "SKETERM_MUX_PEER_TTL_MS";
+/// Rigs override this host's name in peer addresses (default: gethostname).
+pub const HOST_ENV = "SKETERM_MUX_PEER_HOST";
 /// The TTL sweep runs at most this often (monotonic ms).
 pub const SWEEP_EVERY_MS: i64 = 1000;
 
@@ -86,6 +91,7 @@ pub fn clientGone(d: *Daemon, id: u32) void {
     const s = if (d.peers.store) |*st| st else return;
     const now = clock.wallMs();
     s.deregister(id, now);
+    if (d.peers.links) |*l| l.clientGone(id);
     s.connGone(id, now);
 }
 
@@ -188,23 +194,52 @@ pub fn handleHubHello(d: *Daemon, cl: *Client, payload: []const u8) void {
     var parsed = std.json.parseFromSlice(peermail.HubHello, d.allocator, payload, .{ .ignore_unknown_fields = true }) catch
         return cl.queueErrFor("bad peer_hub_hello request", frame);
     defer parsed.deinit();
-    s.uplinkUp(cl.id, parsed.value, clock.wallMs()) catch |e| return cl.queueErrFor(switch (e) {
+    s.uplinkUp(cl.id, parsed.value, .inbound, clock.wallMs()) catch |e| return cl.queueErrFor(switch (e) {
         error.BadAddress => "peer_hub_hello: the hub's host or this host's name is not an address host",
         error.NotLinked, error.NotRegistered, error.OutOfMemory, error.NoEntropy => "peer_hub_hello failed on the broker",
     }, frame);
     log.info("peer federation: hub {s} linked, calling this host {s}", .{ parsed.value.host, parsed.value.as });
 }
 
-/// `peer_hub_relay`: one federation item, only after `peer_hub_hello`.
-pub fn handleHubRelay(d: *Daemon, cl: *Client, payload: []const u8) void {
-    const frame = "peer_hub_relay";
+/// `peer_member_hello`: a call-in member's link announces itself. Accepted
+/// only on a hub, for a `[domain.<host>] peers = true` with `peer_link =
+/// inbound`; answered by `peer_hub_hello`, and from then on this
+/// connection is that domain's link. A newer call-in replaces an older one.
+pub fn handleMemberHello(d: *Daemon, cl: *Client, payload: []const u8) void {
+    const frame = "peer_member_hello";
     const s = storeFor(d, cl, frame) orelse return;
+    const links = (if (s.hub) (if (d.peers.links) |*l| l else null) else null) orelse
+        return cl.queueErrFor("peer_member_hello: this daemon is no peer hub; a member calls in only to a hub", frame);
+    var parsed = std.json.parseFromSlice(peermail.MemberHello, d.allocator, payload, .{ .ignore_unknown_fields = true }) catch
+        return cl.queueErrFor("bad peer_member_hello request", frame);
+    defer parsed.deinit();
+    const l = links.callin(parsed.value.host) catch |e| return cl.queueErrFor(switch (e) {
+        error.UnknownDomain => "peer_member_hello: this hub has no [domain.<host>] peers = true for that host",
+        error.NotInbound => "peer_member_hello: that host's [domain] is peer_link = outbound here; the hub dials it, it never calls in",
+    }, frame);
+    // The hello goes out before `up` relays the domain's queued mail.
+    cl.queueJson(.peer_hub_hello, peermail.HubHello{ .host = s.host, .as = l.domain });
+    const old = links.acceptCallin(l, cl.id, s, clock.wallMs());
+    if (old != 0) if (liveClient(d, old)) |gone| {
+        gone.dead = true;
+    };
+}
+
+/// `peer_hub_relay` (on a member) or `peer_member_relay` (on a hub): one
+/// federation item, only on the connection that completed the hello.
+pub fn handleRelay(d: *Daemon, cl: *Client, ftype: wire.FrameType, payload: []const u8) void {
+    const frame = @tagName(ftype);
+    const s = storeFor(d, cl, frame) orelse return;
+    if (ftype != peerlink.relayFrame(!s.hub)) return cl.queueErrFor(if (s.hub)
+        "peer_hub_relay: this daemon is a peer hub; its members send peer_member_relay"
+    else
+        "peer_member_relay: this daemon is no peer hub; a hub sends peer_hub_relay", frame);
     var parsed = std.json.parseFromSlice(peermail.Relay, d.allocator, payload, .{ .ignore_unknown_fields = true }) catch
-        return cl.queueErrFor("bad peer_hub_relay request", frame);
+        return cl.queueErrFor("bad relay request", frame);
     defer parsed.deinit();
     s.relayIn(cl.id, parsed.value, clock.wallMs()) catch |e| return cl.queueErrFor(switch (e) {
-        error.NotLinked => "peer_hub_relay before peer_hub_hello on this connection",
-        error.BadAddress, error.NotRegistered, error.OutOfMemory, error.NoEntropy => "peer_hub_relay failed on the broker",
+        error.NotLinked => if (s.hub) "peer_member_relay before peer_member_hello on this connection" else "peer_hub_relay before peer_hub_hello on this connection",
+        error.BadAddress, error.NotRegistered, error.OutOfMemory, error.NoEntropy => "a relay failed on the broker",
     }, frame);
 }
 
@@ -395,33 +430,55 @@ fn ensure(d: *Daemon) ?*peermail.Store {
     defer if (dir) |p| d.allocator.free(p);
     if (dir == null) log.warn("peermail: no state directory; mailboxes are kept in memory only", .{});
     var host_buf: [256]u8 = undefined;
-    const host: []const u8 = if (c.gethostname(&host_buf, host_buf.len) == 0)
+    const host: []const u8 = env.nonEmpty(HOST_ENV) orelse if (c.gethostname(&host_buf, host_buf.len) == 0)
         std.mem.sliceTo(&host_buf, 0)
     else
         "";
     var cfg = Config.load(d.allocator);
     defer cfg.deinit();
+    // A hub or a call-in member, never both.
+    var both = false;
+    const callin = cfg.peerHubDomain() catch |e| blk: {
+        switch (e) {
+            error.HubAndCallin => {
+                both = true;
+                log.warn("peer federation: peer_hub and peer_hub_domain are both set; a hub never calls in to another, so federation is off", .{});
+            },
+            error.NoSuchDomain => log.warn("peer federation: peer_hub_domain = {s} names no [domain.<name>] with a host; nothing is dialed", .{cfg.peer_hub_domain}),
+        }
+        break :blk null;
+    };
     // The hub's own peers are `<host>/name` elsewhere: no host, no hub.
-    const hub = cfg.peer_hub and blk: {
+    const hub = cfg.peer_hub and !both and blk: {
         @import("../ipc/peeraddr.zig").validHost(host) catch {
             log.warn("peer federation: this host's name \"{s}\" is not an address host; peer_hub is ignored", .{host});
             break :blk false;
         };
         break :blk true;
     };
-    if (hub) d.peers.links = peerlink.Links.init(d.allocator, &cfg, host) catch blk: {
-        log.warn("peer federation: out of memory reading the domains", .{});
-        break :blk null;
-    };
+    if (hub) {
+        d.peers.links = peerlink.Links.init(d.allocator, &cfg, host) catch blk: {
+            log.warn("peer federation: out of memory reading the domains", .{});
+            break :blk null;
+        };
+    } else if (callin) |dom| {
+        d.peers.links = peerlink.Links.initCallin(d.allocator, dom) catch blk: {
+            log.warn("peer federation: out of memory reading peer_hub_domain", .{});
+            break :blk null;
+        };
+    }
     var arena: std.heap.ArenaAllocator = .init(d.allocator);
     defer arena.deinit();
-    const domains: []const []const u8 = if (d.peers.links) |*l| (l.domains(arena.allocator()) catch &.{}) else &.{};
+    const links: ?*peerlink.Links = if (hub) (if (d.peers.links) |*l| l else null) else null;
+    const domains: []const []const u8 = if (links) |l| (l.domains(arena.allocator()) catch &.{}) else &.{};
+    const inbound: []const []const u8 = if (links) |l| (l.inbound(arena.allocator()) catch &.{}) else &.{};
     d.peers.store = peermail.Store.init(d.allocator, .{
         .dir = dir,
         .host = host,
         .ttl_ms = ttlMs(&cfg),
         .hub = hub,
         .domains = domains,
+        .inbound = inbound,
         .emit = .{ .ctx = d, .func = emit },
     }) catch {
         log.warn("peermail: out of memory starting the store", .{});
@@ -432,6 +489,7 @@ fn ensure(d: *Daemon) ?*peermail.Store {
     const s = &d.peers.store.?;
     s.load();
     if (hub) log.info("peer federation: hub {s}, {d} domain(s)", .{ host, domains.len });
+    if (callin) |dom| log.info("peer federation: call-in member {s}, dialing hub domain {s}", .{ host, dom.name });
     return s;
 }
 
@@ -481,8 +539,10 @@ fn emit(ctx: *anyopaque, conn: u32, out: peermail.Out) bool {
         },
         .relay => |v| {
             if (conn >= peerlink.LINK_ID_BASE) return if (d.peers.links) |*l| l.queue(conn, v) else false;
+            // A link dialed to this broker: a hub's (on a member) or a
+            // call-in member's (on a hub).
             const cl = liveClient(d, conn) orelse return false;
-            cl.queueJson(.peer_member_relay, v);
+            cl.queueJson(peerlink.relayFrame(if (d.peers.store) |*s| s.hub else false), v);
             return true;
         },
     }

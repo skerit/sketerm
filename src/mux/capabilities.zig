@@ -139,6 +139,10 @@ pub const Flag = enum {
     /// an attached session by the `session_meta` `peer` push), and
     /// `subject` in `peer_list`/`peer_deliver`. Absent = never send them.
     peer_subject,
+    /// The broker takes call-in members: a member's link says
+    /// `peer_member_hello` and gets `peer_hub_hello` back on the same
+    /// connection. Absent = a call-in member lists its hub `unsupported`.
+    peer_callin,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

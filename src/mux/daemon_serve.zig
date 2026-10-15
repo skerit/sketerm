@@ -370,7 +370,9 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
         .peer_ack => daemon_peers.handleAck(self, cl, frame.payload),
         // Federation: a hub's link (the broker keeps the routes).
         .peer_hub_hello => daemon_peers.handleHubHello(self, cl, frame.payload),
-        .peer_hub_relay => daemon_peers.handleHubRelay(self, cl, frame.payload),
+        // A call-in member's link (on a hub).
+        .peer_member_hello => daemon_peers.handleMemberHello(self, cl, frame.payload),
+        .peer_hub_relay, .peer_member_relay => daemon_peers.handleRelay(self, cl, frame.ftype, frame.payload),
         // The broker keeps subjects; on an attached session the worker
         // hands it to the broker for that session's peer.
         .peer_subject => daemon_peers.handleSubject(self, cl, frame.payload),
