@@ -25,8 +25,6 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const client_mod = @import("mux/client.zig");
 const wire = @import("mux/wire.zig");
-const snapshot = @import("mux/snapshot.zig");
-const Screen = @import("grid/screen.zig").Screen;
 const Pool = @import("grid/style_pool.zig").Pool;
 
 fn fail(comptime msg: []const u8) noreturn {
@@ -42,35 +40,7 @@ const LINE_LEN: usize = 64;
 /// per-frame path is exercised with a non-empty queue already pending.
 const FRAME_BYTES: usize = 128 * 1024;
 
-const Mirror = struct {
-    allocator: std.mem.Allocator,
-    pool: *Pool,
-    screen: ?*Screen = null,
-
-    fn applySnapshot(self: *Mirror, payload: []const u8) !void {
-        if (payload.len < 9) return error.Truncated;
-        if (self.screen) |s| s.deinit();
-        self.screen = null;
-        self.pool.deinit();
-        self.pool.* = try Pool.init(self.allocator);
-        self.screen = try snapshot.restore(self.allocator, self.pool, (try snapshot.peelEnvelope(payload)).body);
-    }
-
-    fn applyEvents(self: *Mirror, payload: []const u8) !void {
-        const screen = self.screen orelse return error.NoScreen;
-        if (payload.len < 12) return error.Truncated;
-        var r = wire.Reader.init(payload[12..]);
-        while (!r.atEnd()) {
-            var ev = try r.getEvent(self.allocator);
-            screen.apply(ev);
-            ev.deinit(self.allocator);
-        }
-    }
-
-    fn screenText(self: *Mirror) ![]u8 {
-        return (self.screen orelse return error.NoScreen).extractScreen(self.allocator);
-    }
-};
+const Mirror = @import("smoke/muxrig.zig").Mirror;
 
 /// Deterministic printable payload: 64-byte lines (canonical mode caps a
 /// single line at 4095 bytes; complete lines then throttle the master
@@ -97,7 +67,7 @@ fn waitForText(allocator: std.mem.Allocator, conn: *client_mod.Conn, mirror: *Mi
         defer f.deinit(allocator);
         if (f.ftype == .events) mirror.applyEvents(f.payload) catch fail("events apply");
         if (f.ftype == .snapshot) mirror.applySnapshot(f.payload) catch fail("snapshot apply");
-        const txt = mirror.screenText() catch fail("extract");
+        const txt = mirror.text() catch fail("extract");
         defer allocator.free(txt);
         if (std.mem.indexOf(u8, txt, needle) != null) return true;
     }
@@ -158,7 +128,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
     if (!waitForText(allocator, &conn, &mirror, "DONE", 30_000)) {
         fail("md5sum never finished: the daemon lost the EOF or bytes before it (truncated input)");
     }
-    const txt = mirror.screenText() catch fail("extract");
+    const txt = mirror.text() catch fail("extract");
     defer allocator.free(txt);
     if (std.mem.indexOf(u8, txt, hex) == null) {
         std.debug.print("expected md5 {s}\nscreen:\n{s}\n", .{ hex, txt });

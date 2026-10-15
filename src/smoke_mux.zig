@@ -20,7 +20,6 @@ const wlprotocol = @import("wlhost/protocol.zig");
 const wldmabuf = @import("wlhost/dmabuf.zig");
 const native_endian = @import("builtin").cpu.arch.endian();
 const snapshot = @import("mux/snapshot.zig");
-const Screen = @import("grid/screen.zig").Screen;
 const Pool = @import("grid/style_pool.zig").Pool;
 
 fn fail(comptime msg: []const u8) noreturn {
@@ -131,36 +130,7 @@ fn writeRedRgba(path: []const u8) !void {
     if (c.fwrite(&px, 1, px.len, fp) != px.len) return error.WriteFailed;
 }
 
-/// Client-side mirror: snapshot restore + event application.
-const Mirror = struct {
-    allocator: std.mem.Allocator,
-    pool: *Pool,
-    screen: ?*Screen = null,
-
-    fn applySnapshot(self: *Mirror, payload: []const u8) !void {
-        if (payload.len < 9) return error.Truncated; // [seq:u64][app:u8] header
-        if (self.screen) |s| s.deinit();
-        self.screen = null;
-        self.pool.deinit();
-        self.pool.* = try Pool.init(self.allocator);
-        self.screen = try snapshot.restore(self.allocator, self.pool, (try snapshot.peelEnvelope(payload)).body);
-    }
-
-    fn applyEvents(self: *Mirror, payload: []const u8) !void {
-        const screen = self.screen orelse return error.NoScreen;
-        if (payload.len < 12) return error.Truncated;
-        var r = wire.Reader.init(payload[12..]);
-        while (!r.atEnd()) {
-            var ev = try r.getEvent(self.allocator);
-            screen.apply(ev);
-            ev.deinit(self.allocator);
-        }
-    }
-
-    fn screenText(self: *Mirror) ![]u8 {
-        return (self.screen orelse return error.NoScreen).extractScreen(self.allocator);
-    }
-};
+const Mirror = muxrig.Mirror;
 
 /// Native app pipe: a fake Wayland app drives the daemon's display
 /// socket directly (registry binds, shm pool over SCM_RIGHTS,
@@ -2010,7 +1980,7 @@ fn isolatedStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
         const f = conn.recvFrame() catch fail("iso stream read");
         defer f.deinit(allocator);
         if (f.ftype == .events) mirror.applyEvents(f.payload) catch fail("iso events apply");
-        const txt = mirror.screenText() catch fail("iso extract");
+        const txt = mirror.text() catch fail("iso extract");
         defer allocator.free(txt);
         // Match "RT=/" so we catch the OUTPUT line (expanded path), not
         // the echoed command (which carries the literal "$XDG_...").
@@ -2073,7 +2043,7 @@ fn uploadStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, mirror: *Mi
         const f = conn.recvFrame() catch fail("up cd stream");
         defer f.deinit(allocator);
         if (f.ftype == .events) mirror.applyEvents(f.payload) catch fail("up events apply");
-        const txt = mirror.screenText() catch fail("up extract");
+        const txt = mirror.text() catch fail("up extract");
         defer allocator.free(txt);
         if (std.mem.count(u8, txt, "UPCWDOK") >= 2) {
             cd_ok = true;
@@ -2313,7 +2283,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const f = conn.recvFrame() catch fail("stream read");
         defer f.deinit(allocator);
         if (f.ftype == .events) mirror.applyEvents(f.payload) catch fail("events apply");
-        const txt = mirror.screenText() catch fail("extract");
+        const txt = mirror.text() catch fail("extract");
         defer allocator.free(txt);
         // Output line + echoed command = 2 occurrences.
         if (std.mem.count(u8, txt, MARKER) >= 2) {
@@ -2333,7 +2303,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const f = conn.recvFrame() catch fail("ses stream read");
         defer f.deinit(allocator);
         if (f.ftype == .events) mirror.applyEvents(f.payload) catch fail("ses events apply");
-        const txt = mirror.screenText() catch fail("ses extract");
+        const txt = mirror.text() catch fail("ses extract");
         defer allocator.free(txt);
         if (std.mem.indexOf(u8, txt, "SESCHK=[smoke]") != null) {
             ses_ok = true;
@@ -2392,7 +2362,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     mirror.applySnapshot(snap2.payload) catch fail("snapshot2 apply");
     snap2.deinit(allocator);
     {
-        const txt = mirror.screenText() catch fail("extract2");
+        const txt = mirror.text() catch fail("extract2");
         defer allocator.free(txt);
         if (std.mem.count(u8, txt, MARKER) < 2) fail("marker lost across reattach");
         // Image placement restored from the snapshot.
