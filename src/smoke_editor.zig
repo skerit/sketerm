@@ -685,9 +685,10 @@ pub fn main() !u8 {
     {
         var i: usize = 0;
         while (i < fb_bytes) : (i += 4) {
-            const r = fb[i];
-            const g = fb[i + 1];
-            const b = fb[i + 2];
+            // Widened: the dominance checks below add margins to a channel.
+            const r: u16 = fb[i];
+            const g: u16 = fb[i + 1];
+            const b: u16 = fb[i + 2];
             if (r > 0x40 and g > 0x40) lit += 1;
             // Selection blue (0.20,0.35,0.60 over dark bg) — blue-dominant.
             if (b > 0x60 and b > r + 0x20 and b > g + 0x18) sel_px += 1;
