@@ -88,6 +88,9 @@ pub const Root = struct {
     subpops: std.ArrayList(*c.GtkWidget) = .empty,
     /// Set by popup(); what item activation pops down.
     pop: ?*c.GtkWidget = null,
+    /// The window's focus when the menu opened (weak), where a closing
+    /// menu hands focus back.
+    prior_focus: ?*c.GtkWidget = null,
 
     const Owned = struct { cb: Cleanup, ctx: ?*anyopaque };
 
@@ -123,6 +126,7 @@ pub const Root = struct {
 
     fn destroyCb(user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(Root, user);
+        if (self.prior_focus) |w| c.g_object_remove_weak_pointer(@ptrCast(w), @ptrCast(&self.prior_focus));
         for (self.cleanups.items) |o| o.cb(o.ctx);
         self.cleanups.deinit(self.allocator);
         self.subpops.deinit(self.allocator);
@@ -170,6 +174,11 @@ pub const Root = struct {
                 c.gtk_scrolled_window_set_max_content_height(@ptrCast(sw), cap);
         }
         self.pop = pop;
+        const prior = if (c.gtk_widget_get_root(parent)) |r| c.gtk_root_get_focus(r) else null;
+        if (prior) |f| {
+            self.prior_focus = f;
+            c.g_object_add_weak_pointer(@ptrCast(f), @ptrCast(&self.prior_focus));
+        }
 
         c.g_object_set_data_full(@ptrCast(pop), "sketerm-classicmenu", @ptrCast(self), @ptrCast(&destroyCb));
         c.gtk_widget_set_parent(pop, parent);
@@ -267,10 +276,27 @@ fn unparentIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
             if (c.gtk_widget_get_parent(sp) != null) c.gtk_widget_unparent(sp);
         }
         root.subpops.clearRetainingCapacity();
+        handBackFocus(root, pop);
     }
     if (c.gtk_widget_get_parent(pop) != null) c.gtk_widget_unparent(pop);
     c.g_object_unref(@as(?*anyopaque, @ptrCast(pop)));
     return 0;
+}
+
+/// A closed menu leaves the window's focus on its hidden row (or on
+/// nothing), where no key reaches any handler: give it back to the
+/// widget that held it when the menu opened, else into the menu's
+/// parent. Focus the activated item moved elsewhere is left alone.
+fn handBackFocus(root: *Root, pop: *c.GtkWidget) void {
+    const parent = c.gtk_widget_get_parent(pop) orelse return;
+    const win = c.gtk_widget_get_root(parent) orelse return;
+    if (c.gtk_root_get_focus(win)) |f| {
+        if (f != pop and c.gtk_widget_is_ancestor(f, pop) == 0) return;
+    }
+    if (root.prior_focus) |w| {
+        if (c.gtk_widget_get_root(w) == win and c.gtk_widget_is_visible(w) != 0 and c.gtk_widget_grab_focus(w) != 0) return;
+    }
+    _ = c.gtk_widget_child_focus(parent, c.GTK_DIR_TAB_FORWARD);
 }
 
 /// Heap context for one activatable row.
