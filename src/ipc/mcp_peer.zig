@@ -391,7 +391,7 @@ fn drain() void {
     var n: usize = 0;
     while (n < DRAIN_MAX and link.status == .up and (buffered() or readable())) : (n += 1) {
         const p = if (link.peer) |*pp| pp else return;
-        const push = (p.nextPush(link.allocator, 1) catch return lost()) orelse return;
+        const push = (p.nextPush(link.allocator, 0) catch return lost()) orelse return;
         defer push.deinit();
         take(push);
     }

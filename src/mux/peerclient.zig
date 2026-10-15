@@ -76,7 +76,9 @@ pub const Peer = struct {
     }
 
     /// The oldest push received so far, or the next one within `timeout_ms`
-    /// (0 = only what is already buffered); other frames are skipped.
+    /// (0 = only what has already arrived: the inbox, frames buffered on
+    /// the connection and bytes waiting on its socket); other frames are
+    /// skipped.
     /// @return null on timeout.
     pub fn nextPush(self: *Peer, allocator: std.mem.Allocator, timeout_ms: i64) !?Push {
         const deadline = nowMs() + timeout_ms;
@@ -88,10 +90,12 @@ pub const Peer = struct {
                 continue;
             }
             const remain = deadline - nowMs();
-            if (remain <= 0) return null;
-            const f = self.conn.recvFrameFor(remain) catch |e| switch (e) {
+            const f = if (remain > 0) self.conn.recvFrameFor(remain) catch |e| switch (e) {
                 error.Timeout => return null,
                 else => return e,
+            } else blk: {
+                if (!self.conn.fillAvailable()) return error.Disconnected;
+                break :blk (try self.conn.takeFrame()) orelse return null;
             };
             defer f.deinit(self.conn.allocator);
             if (try decode(allocator, f)) |p| return p;
@@ -178,4 +182,31 @@ test "pushes decode by frame type; a request's list answer is not a push" {
     defer a.free(ans);
     try t.expect((try decode(a, .{ .ftype = .peer_list, .payload = ans })) == null);
     try t.expect((try decode(a, .{ .ftype = .welcome, .payload = ans })) == null);
+}
+
+test "nextPush 0 takes frames already buffered or arrived, then reports nothing" {
+    const t = std.testing;
+    const a = t.allocator;
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), @import("../util/platform.zig").socketpairCloexec(&pair));
+    var conn = Conn{ .allocator = a, .fd = pair[0], .proto = wire.PROTO_VERSION };
+    defer conn.deinit();
+    var broker = Conn{ .allocator = a, .fd = pair[1], .proto = wire.PROTO_VERSION };
+    defer broker.deinit();
+    var peer = Peer.init(&conn);
+    defer peer.deinit();
+    // 1. Two pushes on the socket, none read yet: both arrive with no wait.
+    try broker.sendJson(.peer_deliver, peermail.Deliver{ .id = "m-00000001", .from = .{ .address = "Zenit" }, .to = "Qq", .text = "one" });
+    try broker.sendJson(.peer_deliver, peermail.Deliver{ .id = "m-00000002", .from = .{ .address = "Zenit" }, .to = "Qq", .text = "two" });
+    const p1 = (try peer.nextPush(a, 0)).?;
+    defer p1.deinit();
+    try t.expectEqualStrings("m-00000001", p1.deliver.value.id);
+    // 2. The second is now buffered on the connection (read with the
+    // first), not in the inbox and not on the socket: still taken.
+    try t.expect(conn.rbuf.items.len > 0);
+    const p2 = (try peer.nextPush(a, 0)).?;
+    defer p2.deinit();
+    try t.expectEqualStrings("m-00000002", p2.deliver.value.id);
+    // 3. Nothing left: null at once, the connection still usable.
+    try t.expect((try peer.nextPush(a, 0)) == null);
 }
