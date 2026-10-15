@@ -2303,8 +2303,23 @@ fn projectStage(
         if (!fileContains(other_path, "NEEDLETOKEN"))
             return "the replace preview changed the file it only previewed";
 
-        // Ctrl+Enter applies.
+        // Ctrl+Enter applies, into BUFFERS only (docs/project.md "Replace:
+        // preview, then apply"): the open tab changes, the disk does not
+        // until the user saves.
         app.pressKey(null, "ctrl+return") catch return "injecting ctrl+return failed";
+        if (!waitPaneText(allocator, sock_path, ppane, "REPLACEDTOKEN", 20_000))
+            return "the applied project-wide replace never reached the open buffer";
+        if (fileContains(other_path, "REPLACEDTOKEN"))
+            return "the applied replace wrote to disk behind the user's back";
+        _ = app.waitVisualSettle(win_id, 600, 15_000, 0.002, null);
+        if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("zig-out/smoke-e2e-replace-applied.png", shot.png);
+        } else |_| {}
+        app.pressKey(null, "escape") catch {};
+        _ = app.waitIdle(300, 4_000);
+        // Save All, from the canvas the closed panel hands focus back to.
+        app.pressKey(null, "ctrl+alt+s") catch return "injecting ctrl+alt+s failed";
         var wrote = false;
         var w_tries: u32 = 0;
         while (w_tries < 80) : (w_tries += 1) {
@@ -2314,16 +2329,9 @@ fn projectStage(
                 break;
             }
         }
-        if (!wrote) return "the applied project-wide replace never reached the file";
+        if (!wrote) return "Save All never wrote the applied replace to the file";
         if (fileContains(other_path, "NEEDLETOKEN"))
             return "the applied replace left the old token behind";
-        _ = app.waitVisualSettle(win_id, 600, 15_000, 0.002, null);
-        if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
-            defer allocator.free(shot.png);
-            writePng("zig-out/smoke-e2e-replace-applied.png", shot.png);
-        } else |_| {}
-        app.pressKey(null, "escape") catch {};
-        _ = app.waitIdle(300, 4_000);
     }
 
     // ── the session the layout persists ───────────────────────────
