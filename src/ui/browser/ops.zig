@@ -2180,7 +2180,9 @@ pub fn verifyInlineRenameTeardown(self: *BrowserView, tab: ?*BTab, scope: []cons
         c.abort();
     };
     if (ctx.idle_source == 0 or (tab != null and ctx.tab != tab.?)) {
-        std.debug.print("sketerm: inline rename teardown missed its pending source ({s})\n", .{scope});
+        std.debug.print("sketerm: inline rename teardown missed its pending source ({s}; verdict {s})\n", .{
+            scope, if (!ctx.done) "not reached" else if (ctx.commit) "commit" else "cancel",
+        });
         c.abort();
     }
     // A split close can leave another BrowserView alive in the same

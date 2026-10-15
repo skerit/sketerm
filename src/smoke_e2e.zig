@@ -10799,8 +10799,17 @@ fn inlineRenameLifetimeStage(
     if (std.mem.indexOf(u8, browser, "\"ok\":true") == null)
         return "inline rename browser-here was rejected";
     pumpFor(app, 1_500);
-    if (!armInlineRename(app, pane_child.win, "p", "abandoned", 0.82, true))
+    // No Escape here: nothing orders an IPC request after seat input, and
+    // under load close-pane can overtake the key and find no verdict. The
+    // cancel comes from focus loss instead, by focusing the sibling over
+    // the SAME socket, so it lands strictly before the close.
+    if (!armInlineRename(app, pane_child.win, "p", "abandoned", 0.82, false))
         return "could not arm inline rename before pane close";
+    const refocus = roundtrip(allocator, sock, "{\"cmd\":\"focus\",\"pane\":1}\n") orelse
+        return "inline rename sibling focus did not reply";
+    defer allocator.free(refocus);
+    if (std.mem.indexOf(u8, refocus, "\"ok\":true") == null)
+        return "inline rename sibling focus was rejected";
     var close_buf: [128]u8 = undefined;
     const close_req = std.fmt.bufPrint(&close_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{pane_id}) catch
         return "inline rename close-pane request is too long";
