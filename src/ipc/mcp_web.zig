@@ -477,6 +477,9 @@ const MotionSetup = struct {
     pack: ?[]u8 = null,
     summary: ?motion_pack.Pack.Summary = null,
     broken: ?[]const u8 = null,
+    /// What `configureMotion` allocated `pack_name`, `pack` and an owned `broken` with.
+    owner: ?std.mem.Allocator = null,
+    broken_owned: bool = false,
 };
 
 var g_motion: MotionSetup = .{};
@@ -486,8 +489,11 @@ var g_motion: MotionSetup = .{};
 /// replay default every action then fails closed, and `capabilities`
 /// reports it before the first click does. The same holds for an idle
 /// drift default with no pack: every web_open then fails closed.
-pub fn configureMotion(allocator: std.mem.Allocator, default: motion_replay.Mode, default_source: MotionSource, idle_drift: bool, idle_drift_source: MotionSource, pack_name: []const u8, pack_source: MotionSource) void {
-    g_motion = .{ .default = default, .default_source = default_source, .idle_drift = idle_drift, .idle_drift_source = idle_drift_source, .pack_name = pack_name, .pack_source = pack_source };
+/// @param pack_name is copied; `deinitMotion` frees the copy and the loaded pack.
+pub fn configureMotion(allocator: std.mem.Allocator, default: motion_replay.Mode, default_source: MotionSource, idle_drift: bool, idle_drift_source: MotionSource, pack_name_in: []const u8, pack_source: MotionSource) void {
+    deinitMotion();
+    const pack_name = allocator.dupe(u8, pack_name_in) catch "";
+    g_motion = .{ .default = default, .default_source = default_source, .idle_drift = idle_drift, .idle_drift_source = idle_drift_source, .pack_name = pack_name, .pack_source = pack_source, .owner = allocator };
     if (pack_name.len == 0) {
         if (default == .replay)
             g_motion.broken = "web_motion_default is replay but no motion pack is selected (config web_motion_pack, or sketerm mcp --web-motion-pack NAME; sketerm motion list shows the installed packs)"
@@ -504,13 +510,30 @@ pub fn configureMotion(allocator: std.mem.Allocator, default: motion_replay.Mode
             error.NoDataDir => "neither XDG_DATA_HOME nor HOME names a data directory",
             else => @errorName(err),
         };
-        g_motion.broken = std.fmt.allocPrint(allocator, "motion pack '{s}' cannot be used: {s}", .{ pack_name, why }) catch "the selected motion pack cannot be used";
+        setMotionBroken("motion pack '{s}' cannot be used: {s}", .{ pack_name, why }, "the selected motion pack cannot be used");
         return;
     };
     g_motion.pack = loaded.bytes;
     g_motion.summary = loaded.summary;
     if (idle_drift and loaded.summary.drift == 0)
-        g_motion.broken = std.fmt.allocPrint(allocator, "web_motion_idle_drift is on but motion pack '{s}' has no idle segment in which the pointer moved, so every web_open fails (record them on the trainer's Idle drift page: sketerm motion record --name {s})", .{ pack_name, pack_name }) catch "web_motion_idle_drift is on but the motion pack has no replayable idle drift";
+        setMotionBroken("web_motion_idle_drift is on but motion pack '{s}' has no idle segment in which the pointer moved, so every web_open fails (record them on the trainer's Idle drift page: sketerm motion record --name {s})", .{ pack_name, pack_name }, "web_motion_idle_drift is on but the motion pack has no replayable idle drift");
+}
+
+/// Record why the motion setup cannot work; `fallback` stands in when formatting runs out of memory.
+fn setMotionBroken(comptime fmt: []const u8, args: anytype, fallback: []const u8) void {
+    if (std.fmt.allocPrint(g_motion.owner.?, fmt, args)) |why| {
+        g_motion.broken = why;
+        g_motion.broken_owned = true;
+    } else |_| g_motion.broken = fallback;
+}
+
+/// Free what `configureMotion` allocated and return to the built-in setup.
+pub fn deinitMotion() void {
+    const a = g_motion.owner orelse return;
+    a.free(g_motion.pack_name);
+    if (g_motion.pack) |p| a.free(p);
+    if (g_motion.broken_owned) a.free(g_motion.broken.?);
+    g_motion = .{};
 }
 
 /// The `web_motion*` capability facts.
@@ -8610,6 +8633,35 @@ test "web motion: a replay that cannot happen is refused, never run direct" {
     var bytes = [_]u8{'x'};
     g_motion = .{ .pack_name = "p", .pack = &bytes };
     try t.expectEqual(motion_replay.Mode.replay, (try motionFor(drv, arena, replay_arg)).mode);
+}
+
+test "web motion: the startup setup frees its pack name, pack and reason" {
+    const t = std.testing;
+    const saved = g_motion;
+    defer g_motion = saved;
+    g_motion = .{};
+    const td = pathz.TempDir.make("motioncfg") orelse return error.SkipZigTest;
+    defer td.remove();
+    var data: @import("../util/env.zig").Saved = .{};
+    try data.override("XDG_DATA_HOME", td.pathZ());
+    defer data.restore();
+
+    // A pack that is not installed: an owned reason, nothing loaded.
+    configureMotion(t.allocator, .replay, .config, false, .built_in, "absent", .config);
+    try t.expect(g_motion.pack == null);
+    try t.expect(std.mem.indexOf(u8, g_motion.broken.?, "'absent' cannot be used") != null);
+
+    // An installed pack replaces it: configureMotion frees the previous
+    // setup, and the drift check may add a reason of its own.
+    const bytes = try @import("../motion/synth.zig").generate(t.allocator, .{ .seed = 5 });
+    defer t.allocator.free(bytes);
+    var diag: motion_pack.Diag = .{};
+    _ = try motion_store.installBytes(t.allocator, bytes, "mine", &diag);
+    configureMotion(t.allocator, .replay, .config, true, .config, "mine", .config);
+    try t.expect(g_motion.pack != null);
+    try t.expectEqualStrings("mine", g_motion.pack_name);
+    deinitMotion();
+    try t.expect(g_motion.owner == null and g_motion.pack == null);
 }
 
 test "web_open idle_drift: off unless asked or configured, refused when it cannot happen" {

@@ -892,8 +892,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         motion_pack = n;
         motion_pack_source = .flag;
     }
-    // The config arena dies with `cfg`; the pack name must outlive it.
-    @import("mcp_web.zig").configureMotion(allocator, motion_default, motion_default_source, idle_drift, idle_drift_source, allocator.dupe(u8, motion_pack) catch "", motion_pack_source);
+    @import("mcp_web.zig").configureMotion(allocator, motion_default, motion_default_source, idle_drift, idle_drift_source, motion_pack, motion_pack_source);
+    defer @import("mcp_web.zig").deinitMotion();
     @import("mcp_web.zig").configureIdleClose(web_idle_close_secs);
     @import("mcp_web.zig").configureWebgl(web_webgl orelse .auto);
     @import("mcp_web.zig").configureScreen(web_screen, web_screen_source);
