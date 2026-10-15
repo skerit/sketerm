@@ -1091,11 +1091,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (std.mem.indexOf(u8, badsh, "invalid 'shell'") == null)
             fail("shell metacharacters were not rejected");
         // ps-safety: the command line never appears in any process's
-        // argv — only the grep that searches for it matches itself,
-        // so the count is exactly 1 (the old sh -c transport made 2+).
-        const psq = m.callTool("term_exec", "{\"term\":3,\"command\":\"ps -eo args | grep -c SK_PS_CANARY_42\",\"timeout_ms\":15000}");
-        if (std.mem.indexOf(u8, psq, "\"exit_status\":0") == null or
-            std.mem.indexOf(u8, psq, "\"output\":\"1\\n") == null)
+        // argv. The plaintext canary rides only the `:` no-op; grep
+        // searches for it by a pattern its own argv cannot match, so
+        // any count above 0 is a leak (an `sh -c` transport makes 1).
+        // Counting grep itself raced a ps that read /proc before grep
+        // exec'd, and matched a concurrent rig's grep on the host.
+        const psq = m.callTool("term_exec", "{\"term\":3,\"command\":\": SK_PS_CANARY_42; ps -eo args | grep -c 'SK_PS_CANARY[_]42'\",\"timeout_ms\":15000}");
+        if (std.mem.indexOf(u8, psq, "\"exit_status\":1") == null or
+            std.mem.indexOf(u8, psq, "\"output\":\"0\\n") == null)
             fail("the exec transport leaked the command onto a process command line (ps saw it)");
 
         // ── term_wait_exit: real process exit, not output idle ────
