@@ -292,9 +292,24 @@ pub const Item = struct {
 };
 
 pub const Delivery = struct {
-    /// Borrowed from the queue: valid until the queue next evicts.
+    /// Each points into `events`, never into the queue: a caller holds a
+    /// delivery while the queue grows (which moves its events) and evicts
+    /// (which frees their text), e.g. a call's pre-wait events combined
+    /// with what its wait delivers.
     items: []Item,
+    /// Copies of the delivered events, text and detail included.
+    events: []Event = &.{},
     digest: ?Digest,
+
+    /// Frees what `Cursor.take` allocated with `alloc`.
+    pub fn deinit(self: Delivery, alloc: std.mem.Allocator) void {
+        for (self.events) |ev| {
+            alloc.free(ev.text);
+            alloc.free(ev.detail);
+        }
+        alloc.free(self.events);
+        alloc.free(self.items);
+    }
 };
 
 pub const Cursor = struct {
@@ -320,7 +335,7 @@ pub const Cursor = struct {
     /// Everything that wakes this consumer and nobody delivered yet (a
     /// replaying one: everything after its mark), or null. What it returns
     /// is marked delivered for every consumer of the queue.
-    /// @param alloc owns the returned `items` slice.
+    /// @param alloc owns the returned delivery (`Delivery.deinit`).
     pub fn take(self: *Cursor, q: *Queue, filter: Filter, now_ms: i64, alloc: std.mem.Allocator) !?Delivery {
         var items: std.ArrayList(Item) = .empty;
         errdefer items.deinit(alloc);
@@ -343,7 +358,6 @@ pub const Cursor = struct {
             }
         }
         self.seen = q.next_seq - 1;
-        for (items.items) |it| @constCast(it.event).delivered = true;
         if (items.items.len == 0) {
             items.deinit(alloc);
             // A held-back digest is delivered alone once a token is back.
@@ -352,9 +366,35 @@ pub const Cursor = struct {
             self.digest = null;
             return .{ .items = &.{}, .digest = d };
         }
+        const owned = try alloc.alloc(Event, items.items.len);
+        var copied: usize = 0;
+        errdefer {
+            for (owned[0..copied]) |ev| {
+                alloc.free(ev.text);
+                alloc.free(ev.detail);
+            }
+            alloc.free(owned);
+        }
+        for (items.items, owned) |it, *copy| {
+            copy.* = it.event.*;
+            copy.text = try alloc.dupe(u8, it.event.text);
+            copy.detail = alloc.dupe(u8, it.event.detail) catch |err| {
+                alloc.free(copy.text);
+                return err;
+            };
+            copied += 1;
+        }
+        const out = try items.toOwnedSlice(alloc);
+        // Nothing below fails: the events are marked delivered only once
+        // the delivery that hands them over exists.
+        for (out, owned) |*it, *copy| {
+            @constCast(it.event).delivered = true;
+            copy.delivered = true;
+            it.event = copy;
+        }
         const d = self.digest;
         self.digest = null;
-        return .{ .items = try items.toOwnedSlice(alloc), .digest = d };
+        return .{ .items = out, .events = owned, .digest = d };
     }
 
     /// Milliseconds until a held digest can be delivered alone, or null
@@ -370,7 +410,25 @@ pub const Cursor = struct {
 const t = std.testing;
 
 fn freeDelivery(d: ?Delivery) void {
-    if (d) |x| t.allocator.free(x.items);
+    if (d) |x| x.deinit(t.allocator);
+}
+
+test "a delivery stays readable while the queue grows and evicts after it" {
+    var q = Queue.init(t.allocator, .{ .cap = 4 });
+    defer q.deinit();
+    _ = try q.push(0, .done, null, "first answer", "its detail");
+    var c: Cursor = .{};
+    const d = (try c.take(&q, .{}, 0, t.allocator)).?;
+    defer d.deinit(t.allocator);
+    // A call holds its pre-wait delivery while the wait pushes more: the
+    // queue's storage moves and the delivered event is evicted.
+    var buf: [32]u8 = undefined;
+    for (0..64) |i| _ = try q.push(@intCast(i + 1), .needs_input, null, try std.fmt.bufPrint(&buf, "prompt {d}", .{i}), "");
+    try t.expect(q.evicted > 0);
+    try t.expectEqualStrings("first answer", d.items[0].event.text);
+    try t.expectEqualStrings("its detail", d.items[0].event.detail);
+    try t.expectEqual(vocab.EventKind.done, d.items[0].event.kind);
+    try t.expect(d.items[0].event.delivered);
 }
 
 test "always-on events are delivered in order and advance the cursor" {
@@ -381,7 +439,7 @@ test "always-on events are delivered in order and advance the cursor" {
     _ = try q.push(5, .done, null, "final answer", "");
     try t.expectEqual(@as(usize, 2), q.undelivered());
     const d = (try c.take(&q, .{}, 10, t.allocator)).?;
-    defer t.allocator.free(d.items);
+    defer d.deinit(t.allocator);
     try t.expectEqual(@as(usize, 0), q.undelivered());
     try t.expectEqual(@as(usize, 2), d.items.len);
     try t.expectEqual(vocab.EventKind.needs_input, d.items[0].kind);
@@ -399,7 +457,7 @@ test "messages wake only consumers that asked, match is case-insensitive" {
 
     var m: Cursor = .{};
     const d = (try m.take(&q, .{ .match = "finished" }, 1, t.allocator)).?;
-    defer t.allocator.free(d.items);
+    defer d.deinit(t.allocator);
     try t.expectEqual(vocab.EventKind.match, d.items[0].kind);
 
     var miss: Cursor = .{};
@@ -420,7 +478,7 @@ test "opt-in flood: burst passes, the rest coalesce into a digest, nothing is lo
     const first_opt = try c.take(&q, .{ .messages = true }, 1000, t.allocator);
     try t.expect(first_opt != null);
     const first = first_opt.?;
-    defer t.allocator.free(first.items);
+    defer first.deinit(t.allocator);
     try t.expectEqual(@as(usize, 3), first.items.len);
     try t.expect(first.digest != null);
     try t.expectEqual(@as(u32, 4), first.digest.?.count);
@@ -440,7 +498,7 @@ test "opt-in flood: burst passes, the rest coalesce into a digest, nothing is lo
     const later_opt = try c.take(&q, .{ .messages = true }, 31_001, t.allocator);
     try t.expect(later_opt != null);
     const later = later_opt.?;
-    defer t.allocator.free(later.items);
+    defer later.deinit(t.allocator);
     try t.expectEqual(@as(usize, 0), later.items.len);
     try t.expect(later.digest != null);
     try t.expectEqual(@as(u32, 2), later.digest.?.count);
@@ -454,7 +512,7 @@ test "an always-on event bypasses the empty bucket and carries the pending diges
     _ = try q.push(0, .message, null, "one", "");
     const a_opt = try c.take(&q, .{ .messages = true }, 0, t.allocator);
     try t.expect(a_opt != null);
-    t.allocator.free(a_opt.?.items);
+    a_opt.?.deinit(t.allocator);
     _ = try q.push(0, .message, null, "two", "");
     try t.expect((try c.take(&q, .{ .messages = true }, 0, t.allocator)) == null);
     try t.expect(c.digest != null);
@@ -462,7 +520,7 @@ test "an always-on event bypasses the empty bucket and carries the pending diges
     const b_opt = try c.take(&q, .{ .messages = true }, 1, t.allocator);
     try t.expect(b_opt != null);
     const b = b_opt.?;
-    defer t.allocator.free(b.items);
+    defer b.deinit(t.allocator);
     try t.expectEqual(@as(usize, 1), b.items.len);
     try t.expectEqual(vocab.EventKind.@"error", b.items[0].kind);
     try t.expectEqualStrings("resets 5pm", b.items[0].event.detail);
@@ -479,7 +537,7 @@ test "one delivery state: what one consumer delivered never wakes another" {
     var w2: Cursor = .{};
     _ = try q.push(0, .done, null, "first", "");
     const a = (try w1.take(&q, .{}, 0, t.allocator)).?;
-    defer t.allocator.free(a.items);
+    defer a.deinit(t.allocator);
     try t.expectEqual(@as(usize, 1), a.items.len);
     // Delivered by the first waiter: the other waiter and the tool keep waiting.
     try t.expect((try w2.take(&q, .{}, 0, t.allocator)) == null);
@@ -487,7 +545,7 @@ test "one delivery state: what one consumer delivered never wakes another" {
     // The next one goes to whoever takes first, once.
     _ = try q.push(1, .needs_input, null, "permission: rm", "");
     const b = (try tool.take(&q, .{}, 1, t.allocator)).?;
-    defer t.allocator.free(b.items);
+    defer b.deinit(t.allocator);
     try t.expectEqual(@as(usize, 1), b.items.len);
     try t.expect((try w1.take(&q, .{}, 1, t.allocator)) == null);
     try t.expect((try w2.take(&q, .{}, 1, t.allocator)) == null);
@@ -495,13 +553,13 @@ test "one delivery state: what one consumer delivered never wakes another" {
     _ = try q.push(2, .message, null, "progress", "");
     try t.expect((try tool.take(&q, .{}, 2, t.allocator)) == null);
     const m = (try w2.take(&q, .{ .messages = true }, 2, t.allocator)).?;
-    defer t.allocator.free(m.items);
+    defer m.deinit(t.allocator);
     try t.expectEqual(vocab.EventKind.message, m.items[0].kind);
     try t.expect((try w1.take(&q, .{ .messages = true }, 2, t.allocator)) == null);
     // An explicit since re-reads everything after it, delivered or not.
     var again = Cursor.replayFrom(0);
     const r = (try again.take(&q, .{}, 3, t.allocator)).?;
-    defer t.allocator.free(r.items);
+    defer r.deinit(t.allocator);
     try t.expectEqual(@as(usize, 2), r.items.len);
     try t.expect((try again.take(&q, .{}, 3, t.allocator)) == null);
 }
@@ -515,7 +573,7 @@ test "history a resumed app reprints is delivered, a prompt it shows is not" {
     q.deliverAnnounced();
     var c: Cursor = .{};
     const d = (try c.take(&q, .{ .messages = true }, 0, t.allocator)).?;
-    defer t.allocator.free(d.items);
+    defer d.deinit(t.allocator);
     try t.expectEqual(@as(usize, 1), d.items.len);
     try t.expectEqual(vocab.EventKind.needs_input, d.items[0].kind);
 }
@@ -529,13 +587,13 @@ test "a retrying error wakes only a consumer that opted in; other errors always"
     try t.expect((try plain.take(&q, .{}, 0, t.allocator)) == null);
     var opted: Cursor = .{};
     const d = (try opted.take(&q, .{ .retrying = true }, 0, t.allocator)).?;
-    defer t.allocator.free(d.items);
+    defer d.deinit(t.allocator);
     try t.expectEqual(vocab.ErrorClass.retrying, d.items[0].event.class.?);
     try t.expect((try opted.take(&q, .{ .retrying = true }, 0, t.allocator)) == null);
     // The retry turned into a real error: that wakes everyone.
     _ = try q.push(1, .@"error", .api, "Repeated 529 Overloaded errors", "");
     const e = (try plain.take(&q, .{}, 1, t.allocator)).?;
-    defer t.allocator.free(e.items);
+    defer e.deinit(t.allocator);
     try t.expectEqual(vocab.ErrorClass.api, e.items[0].event.class.?);
 }
 
@@ -556,13 +614,13 @@ test "a done fired at the background cap wakes only a consumer that opted in, an
     try t.expect((try retrying.take(&q, .{ .retrying = true }, 0, t.allocator)) == null);
     var opted: Cursor = .{};
     const d = (try opted.take(&q, .{ .background = true }, 0, t.allocator)).?;
-    defer t.allocator.free(d.items);
+    defer d.deinit(t.allocator);
     try t.expectEqual(@as(?u32, 2), d.items[0].event.background_tasks);
     // The settled done of the same job wakes everyone and settles the turn.
     _ = try q.pushDone(1, 3, 3, "build green", 11, null);
     try t.expect(q.events.items[1].quiet() == null);
     const e = (try plain.take(&q, .{}, 1, t.allocator)).?;
-    defer t.allocator.free(e.items);
+    defer e.deinit(t.allocator);
     try t.expectEqualStrings("build green", e.items[0].event.text);
     try t.expectEqual(vocab.EventKind.done, q.lastSettle(0).?.kind);
     // A done a retry holds reaches no filter at all.
@@ -617,7 +675,7 @@ test "the last settling event from a seq: delivered or not, never a quiet error 
     _ = try q.push(4, .needs_input, null, "permission", "");
     var c: Cursor = .{};
     const d = (try c.take(&q, .{}, 5, t.allocator)).?;
-    defer t.allocator.free(d.items);
+    defer d.deinit(t.allocator);
     try t.expectEqual(vocab.EventKind.needs_input, q.lastSettle(from).?.kind);
     // The newest one wins; an older range still sees it.
     try t.expectEqual(vocab.EventKind.needs_input, q.lastSettle(0).?.kind);

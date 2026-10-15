@@ -459,7 +459,7 @@ test "the outcome of a wake-up is its highest-ranked kind" {
     _ = try q.push(0, .needs_input, null, "permission: rm?", "");
     var cur: events.Cursor = .{};
     const d = (try cur.take(&q, .{ .messages = true }, 0, testing.allocator)).?;
-    defer testing.allocator.free(d.items);
+    defer d.deinit(testing.allocator);
     try testing.expectEqualStrings("needs_input", outcomeOf(d.items, .waiting_user, false, false));
     try testing.expectEqualStrings("done", outcomeOf(d.items[0..2], .idle, false, false));
     try testing.expectEqualStrings("message", outcomeOf(d.items[0..1], .working, false, false));

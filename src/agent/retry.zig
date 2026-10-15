@@ -228,7 +228,7 @@ fn run(tr: *Tracker, q: *events.Queue, now: i64) Step {
 fn wakes(q: *events.Queue, buf: []vocab.EventKind) ![]vocab.EventKind {
     var c: events.Cursor = .{};
     const d = (try c.take(q, .{}, 0, t.allocator)) orelse return buf[0..0];
-    defer t.allocator.free(d.items);
+    defer d.deinit(t.allocator);
     for (d.items, 0..) |it, i| buf[i] = it.kind;
     return buf[0..d.items.len];
 }
@@ -270,7 +270,7 @@ test "an overload is held and retried; the continued turn's done recovers, the e
     // A consumer that opts into quiet errors still learns of the overload.
     var opted = events.Cursor.replayFrom(0);
     const d = (try opted.take(&q, .{ .retrying = true }, 0, t.allocator)).?;
-    defer t.allocator.free(d.items);
+    defer d.deinit(t.allocator);
     try t.expectEqual(vocab.EventKind.@"error", d.items[0].kind);
 }
 
@@ -312,7 +312,7 @@ test "limits, auth failures and other errors are never retried, and end a pendin
     try t.expect(run(&tr, &q, 0) == .none);
     try t.expectEqual(@as(usize, 2), q.undelivered());
     var c: events.Cursor = .{};
-    if (try c.take(&q, .{}, 0, t.allocator)) |d| t.allocator.free(d.items);
+    if (try c.take(&q, .{}, 0, t.allocator)) |d| d.deinit(t.allocator);
     // An overload held, then a limit in the continued turn: both wake.
     _ = try q.push(1, .@"error", .overloaded, "APIError 503", "");
     try t.expect(run(&tr, &q, 1) == .scheduled);
