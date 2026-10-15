@@ -2977,7 +2977,8 @@ says the daemon keeps subjects (welcome flag `peer_subject`).
 ### Federation
 
 Peers on other hosts are reached through ONE hub, the daemon of the host
-whose config says so; every other daemon is dialed, never dials.
+whose config says so; every other daemon is dialed by it, or calls in
+("Call-in members" below).
 
 - **Config** (`docs/config.md`): the hub's config sets the top-level
   `peer_hub = true` and `peers = true` in each `[domain.<name>]` it links.
@@ -3021,6 +3022,47 @@ whose config says so; every other daemon is dialed, never dials.
   peer with the host it came from, so a linked host can speak only for
   its own peers. A peer message from another host is still information
   from another session, never an approval.
+
+#### Call-in members
+
+A host the hub cannot reach can dial the hub instead. Only the direction
+of the connection differs: once its link is up, presence, mail, outbound
+mailboxes, `stored` acks, expiry events, addresses and clocks behave
+exactly as on a hub-dialed link.
+
+- **Hub** (archdev): list the member with `peer_link = inbound`; the hub
+  never dials it, and `host` is not needed:
+
+  ```
+  peer_hub = true
+  [domain.aeor]
+  peers = true
+  peer_link = inbound
+  ```
+
+- **Member** (aeor): name the section of the hub's host in
+  `peer_hub_domain`; its daemon dials it over that domain's transport,
+  redialing after 2 s doubling to 60 s, like the hub's own dials:
+
+  ```
+  peer_hub_domain = archdev
+  [domain.archdev]
+  host = archdev
+  ```
+
+- **Handshake**: the member sends `peer_member_hello` with its own host
+  name; the hub accepts it only from a `[domain.<that host>] peers =
+  true` with `peer_link = inbound` (anything else is refused with an
+  error naming why) and answers `peer_hub_hello` on the same connection.
+  A newer call-in replaces an older live one. Trust is that of every
+  connection to the hub's private socket: the member reached it over SSH
+  as the same user. A hub without the welcome flag `peer_callin` leaves
+  the member listing it `unsupported`, retried every 60 s. A daemon with
+  both `peer_hub` and `peer_hub_domain` is refused: federation stays off.
+- **Listing**: each side's `peer_list` `hosts` entry for the link carries
+  `direction` (`inbound` on the hub, `outbound` on the member). A dropped
+  call-in stays listed `link: down` with its mail queued until the member
+  calls in again.
 
 ## Panels (`ui_*`)
 

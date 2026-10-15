@@ -22991,3 +22991,21 @@ the peer whose process runs below the session's child
 the subject in place of the OSC title. Unit tests cover the store,
 persistence, refusals, the relay, the formatter, the composer, the CLI
 parser and the pane lookup; the smoke peer stage gained section j.
+
+## 2026-10-15: call-in members for peer federation
+
+One host (aeor) cannot be reached from the hub, only reach it. A member
+now sets `peer_hub_domain = <its [domain] for the hub>`: its broker dials
+that domain with the hub's own dial machinery (`peerlink.Links`, forked
+dialer, socketpair hand-back, `Backoff`), sends new frame
+`peer_member_hello` (45, welcome flag `peer_callin`) and waits for the
+hub's `peer_hub_hello` on the same connection. The hub lists the member
+as `[domain.<host>] peers = true` plus `peer_link = inbound` (vocabulary
+`PeerLinkDirection`, default `outbound`), never dials it, and adopts the
+accepted client as that domain's link through the same `Links.up` step a
+dialed link takes; relays then flow as on any link (`relayFrame` picks
+`peer_hub_relay`/`peer_member_relay` by role, not by who dialed).
+`peer_list` hosts carry `direction`. Unit tests cover the config, the
+hub's accept/refuse/replace, and the peermail exchange over an inbound
+link; the smoke federation stage gained section 8 (a third daemon calls
+in, mail both ways, cut by its proxy's pid, redial, delivered once).
