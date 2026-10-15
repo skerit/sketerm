@@ -5,11 +5,10 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
-const platform = @import("platform.zig");
+const sharedata = @import("sharedata.zig");
 
-/// Locate the shell-integration script directory: env override →
-/// installed share dir next to the exe → repo data/ (dev tree) →
-/// /usr/share. Null = feature unavailable. The result aliases `buf`.
+/// Locate the shell-integration script directory: env override, else
+/// `sharedata.find`'s order. Null = feature unavailable. The result aliases `buf`.
 pub fn baseDir(buf: *[4096]u8) ?[]const u8 {
     if (c.getenv("SKETERM_SHELL_INTEGRATION_DIR")) |env| {
         const s = std.mem.span(@as([*:0]const u8, @ptrCast(env)));
@@ -19,27 +18,8 @@ pub fn baseDir(buf: *[4096]u8) ?[]const u8 {
         }
         return null;
     }
-    var exe_buf: [4096]u8 = undefined;
-    if (platform.exePath(&exe_buf)) |exe_path| {
-        const exe_dir = std.fs.path.dirname(exe_path) orelse "/usr/bin";
-        const candidates = [_][]const u8{
-            "/../share/sketerm/shell-integration",
-            "/../../data/shell-integration",
-        };
-        for (candidates) |suffix| {
-            const cand = std.fmt.bufPrintZ(buf, "{s}{s}/sketerm.zsh", .{ exe_dir, suffix }) catch continue;
-            if (c.access(cand.ptr, c.R_OK) == 0) {
-                return buf[0 .. exe_dir.len + suffix.len];
-            }
-        }
-    }
-    const sys = "/usr/share/sketerm/shell-integration";
-    const sys_probe = std.fmt.bufPrintZ(buf, "{s}/sketerm.zsh", .{sys}) catch return null;
-    if (c.access(sys_probe.ptr, c.R_OK) == 0) {
-        @memcpy(buf[0..sys.len], sys);
-        return buf[0..sys.len];
-    }
-    return null;
+    const probe = sharedata.find(buf, "shell-integration/sketerm.zsh") orelse return null;
+    return std.fs.path.dirname(probe);
 }
 
 /// Per-shell injection setup: `kind` is the SpawnReq wire string,

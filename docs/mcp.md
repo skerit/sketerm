@@ -2321,9 +2321,10 @@ TUI attached to that server for a human to watch is optional, see below).
     dialog) loses the pushed events: `agent_read` still returns the
     records.
   - **opencode (a plugin).** `data/opencode/sketerm-agents.js`, installed
-    as `/usr/share/sketerm/opencode/sketerm-agents.js`; enable it with
-    `mkdir -p ~/.config/opencode/plugin && ln -s /usr/share/sketerm/opencode/sketerm-agents.js ~/.config/opencode/plugin/`
-    (or a project's `.opencode/plugin/`).
+    as `/usr/share/sketerm/opencode/sketerm-agents.js`; `sketerm mcp setup`
+    links it into opencode's `plugin/` directory (by hand:
+    `ln -s /usr/share/sketerm/opencode/sketerm-agents.js ~/.config/opencode/plugin/`,
+    or a project's `.opencode/plugin/`).
     On the first `agent_*` tool call of a session (its
     `tool.execute.before` hook) it starts `<sketerm> mcp agent-wait
     --server --follow --json --parent <its pid>`, which finds the server
@@ -2875,12 +2876,29 @@ rendering. Without them a peer is listed `unknown`, never guessed.
   status line command with the same stdin and prints exactly what it
   prints. Your command is the one your Claude Code settings name (resolved
   as for the agents sketerm opens), or `--user-command CMD`; since the
-  pasted settings make this forwarder your settings' command, pass your
-  previous one with `--user-command`. A forwarder that finds itself as its
+  installed settings make this forwarder your settings' command, setup
+  passes your previous one with `--user-command`. A forwarder that finds itself as its
   own user command (the `SKETERM_STATUSLINE_FORWARDED` marker) stops there,
   and with no user command it prints nothing.
-- `sketerm mcp hook --print-settings` prints what to merge into
-  `~/.claude/settings.json`:
+- `sketerm mcp setup [--config-dir DIR] [--dry-run]` installs all of it, and
+  is safe to run again: it adds only what is missing, one line per change
+  ("already set up" when nothing was). It merges into `DIR/settings.json`,
+  else `$CLAUDE_CONFIG_DIR/settings.json`, else `~/.claude/settings.json`
+  (created when absent), keeping key order, indent width, mode and a
+  symlinked file's link: the five hooks below on any event that has no
+  `sketerm mcp hook` entry yet, other tools' hooks untouched; the status
+  line, where a command of your own becomes `sketerm mcp statusline
+  --user-command '<yours>'` with its padding kept, and a `refreshInterval`
+  over 600 (milliseconds, where Claude Code reads seconds) is converted
+  and reported; `ListAgents` in `permissions.deny`, so the peer bus, not
+  Claude Code's own session discovery, finds other sessions. It runs
+  `claude mcp add --scope user sketerm -- sketerm mcp` unless the
+  `.claude.json` beside the settings (else `~/.claude.json`, only ever read)
+  registers `sketerm` or a `.mcp.json` from the current directory up does,
+  and links the opencode plugin when opencode's config directory
+  (`$OPENCODE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/opencode`) exists. A file
+  that is not plain JSON (comments) is left untouched, exit 1.
+- `sketerm mcp hook --print-settings` prints the settings setup merges:
 
 ```json
 {

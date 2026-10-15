@@ -1,5 +1,26 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-16: `sketerm mcp setup` installs the Claude Code and opencode integration
+
+`sketerm mcp setup [--user] [--config-dir DIR] [--dry-run]` (`src/ipc/mcp_setup.zig`)
+merges what `sketerm mcp hook --print-settings` printed into the user's settings
+instead of a paste that replaced their status line. It adds only what is missing,
+one line per change ("already set up" otherwise): the presence hooks on events
+without a `sketerm mcp hook` entry (other tools' hooks, nib's PreToolUse, kept in
+place); the status line, a foreign command wrapped as `sketerm mcp statusline
+--user-command '<C>'` with its padding kept and a millisecond `refreshInterval`
+(above 600) converted and reported; `ListAgents` in `permissions.deny`; `claude
+mcp add --scope user sketerm -- sketerm mcp` unless `.claude.json` (read only) or
+a `.mcp.json` from the cwd up registers it; a symlink to the shipped opencode
+plugin. Key order, number text, indent width, mode and a symlinked settings file
+survive; JSONC is refused with exit 1. `mcp_hook.hookGroup`/`statusLineSetting`
+build both the printed and the merged settings off `HookEvent`, and
+`util/sharedata.zig` is now the one `share/sketerm` lookup (shell integration,
+shaders, the plugin). The peer instructions now say SendMessage only continues
+your own Agent subagents. Unit tests cover the merge cases and a temp-dir run
+through an injected `claude`; a manual run against a temp config dir with a stub
+`claude` on PATH showed the merge, then "already set up".
+
 ## 2026-10-14: live input updates the recorded-motion origin
 
 The live pointer path paused idle drift without updating `View.motion_ptr`.

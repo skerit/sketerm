@@ -281,8 +281,8 @@ pub const HOOK_HELP =
     \\ancestry (--parent PID: the server PID started). peer_list shows it.
     \\Prints nothing, exits 0 whatever happens, and gives up after 300 ms;
     \\SKETERM_HOOK_DEBUG=1 says on stderr why nothing was reported.
-    \\--print-settings prints the hooks and statusLine settings to paste into
-    \\~/.claude/settings.json.
+    \\--print-settings prints the hooks and statusLine settings; `sketerm mcp
+    \\setup` merges them into your Claude Code settings for you.
     \\
 ;
 
@@ -298,8 +298,22 @@ pub const STATUSLINE_HELP =
     \\
 ;
 
-/// The `hooks` and `statusLine` settings, as pasted into `~/.claude/settings.json`.
+/// The `hooks` and `statusLine` settings `sketerm mcp setup` merges into `~/.claude/settings.json`.
 pub fn settingsJson(arena: std.mem.Allocator) ![]const u8 {
+    var hooks: std.json.ObjectMap = .empty;
+    for (std.enums.values(HookEvent)) |ev| {
+        var groups = std.json.Array.init(arena);
+        try groups.append(try hookGroup(arena));
+        try hooks.put(arena, @tagName(ev), .{ .array = groups });
+    }
+    var root: std.json.ObjectMap = .empty;
+    try root.put(arena, "hooks", .{ .object = hooks });
+    try root.put(arena, "statusLine", try statusLineSetting(arena));
+    return std.fmt.allocPrint(arena, "{f}\n", .{std.json.fmt(std.json.Value{ .object = root }, .{ .whitespace = .indent_2 })});
+}
+
+/// One hook group (an entry of a `hooks.<event>` list) running `HOOK_COMMAND`.
+pub fn hookGroup(arena: std.mem.Allocator) !std.json.Value {
     var hook: std.json.ObjectMap = .empty;
     try hook.put(arena, "type", .{ .string = "command" });
     try hook.put(arena, "command", .{ .string = HOOK_COMMAND });
@@ -309,21 +323,27 @@ pub fn settingsJson(arena: std.mem.Allocator) ![]const u8 {
     try hook_list.append(.{ .object = hook });
     var group: std.json.ObjectMap = .empty;
     try group.put(arena, "hooks", .{ .array = hook_list });
-    var hooks: std.json.ObjectMap = .empty;
-    for (std.enums.values(HookEvent)) |ev| {
-        var groups = std.json.Array.init(arena);
-        try groups.append(.{ .object = group });
-        try hooks.put(arena, @tagName(ev), .{ .array = groups });
-    }
+    return .{ .object = group };
+}
+
+/// The `statusLine` setting running `STATUSLINE_COMMAND`; `refreshInterval` is in seconds.
+pub fn statusLineSetting(arena: std.mem.Allocator) !std.json.Value {
     var status: std.json.ObjectMap = .empty;
     try status.put(arena, "type", .{ .string = "command" });
     try status.put(arena, "command", .{ .string = STATUSLINE_COMMAND });
     try status.put(arena, "padding", .{ .integer = 0 });
     try status.put(arena, "refreshInterval", .{ .integer = REFRESH_INTERVAL_S });
-    var root: std.json.ObjectMap = .empty;
-    try root.put(arena, "hooks", .{ .object = hooks });
-    try root.put(arena, "statusLine", .{ .object = status });
-    return std.fmt.allocPrint(arena, "{f}\n", .{std.json.fmt(std.json.Value{ .object = root }, .{ .whitespace = .indent_2 })});
+    return .{ .object = status };
+}
+
+/// Whether the shell command `command` runs `sketerm mcp <sub>` (or `sketerm-mcp <sub>`), sketerm under any path.
+pub fn runsSubcommand(command: []const u8, sub: []const u8) bool {
+    var words = std.mem.tokenizeAny(u8, command, " \t");
+    const exe = std.fs.path.basename(words.next() orelse return false);
+    if (std.mem.eql(u8, exe, "sketerm")) {
+        if (!std.mem.eql(u8, words.next() orelse return false, "mcp")) return false;
+    } else if (!std.mem.eql(u8, exe, "sketerm-mcp")) return false;
+    return std.mem.eql(u8, words.next() orelse return false, sub);
 }
 
 /// `sketerm mcp hook ...`.

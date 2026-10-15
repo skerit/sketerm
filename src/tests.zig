@@ -38,6 +38,7 @@ comptime {
     _ = @import("ipc/agentwait.zig");
     _ = @import("ipc/agentsline.zig");
     _ = @import("ipc/mcp_hook.zig");
+    _ = @import("ipc/mcp_setup.zig");
     _ = @import("ipc/peer_cli.zig");
     _ = @import("ipc/agentglance.zig");
     _ = @import("ipc/agentpush.zig");

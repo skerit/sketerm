@@ -135,10 +135,8 @@ pub fn pickPaneShader(self: *Window) void {
     };
 }
 
-/// Directory holding the shipped CRT shader presets, or null.
-/// Same resolution order as the shell-integration scripts:
-/// installed share dir next to the exe → repo data/ (dev tree)
-/// → /usr/share. Resolved once, cached for the process.
+/// Directory holding the shipped CRT shader presets, or null
+/// (`sharedata.find`'s order). Resolved once, cached for the process.
 pub fn shaderPresetDirZ() ?[*:0]const u8 {
     const S = struct {
         var buf: [4096]u8 = undefined;
@@ -147,23 +145,7 @@ pub fn shaderPresetDirZ() ?[*:0]const u8 {
     };
     if (S.done) return S.resolved;
     S.done = true;
-    var exe_buf: [4096]u8 = undefined;
-    if (@import("../util/platform.zig").exePath(&exe_buf)) |exe_path| {
-        const exe_dir = std.fs.path.dirname(exe_path) orelse "/usr/bin";
-        const candidates = [_][]const u8{
-            "/../share/sketerm/shaders",
-            "/../../data/shaders",
-        };
-        for (candidates) |suffix| {
-            const cand = std.fmt.bufPrintZ(&S.buf, "{s}{s}", .{ exe_dir, suffix }) catch continue;
-            if (c.access(cand.ptr, c.R_OK) == 0) {
-                S.resolved = cand.ptr;
-                return S.resolved;
-            }
-        }
-    }
-    const sys = std.fmt.bufPrintZ(&S.buf, "/usr/share/sketerm/shaders", .{}) catch return null;
-    if (c.access(sys.ptr, c.R_OK) == 0) S.resolved = sys.ptr;
+    if (@import("../util/sharedata.zig").find(&S.buf, "shaders")) |dir| S.resolved = dir.ptr;
     return S.resolved;
 }
 

@@ -45,6 +45,7 @@ const mcp_webfetch = @import("mcp_webfetch.zig");
 const agentwait = @import("agentwait.zig");
 const agentsline = @import("agentsline.zig");
 const mcp_hook = @import("mcp_hook.zig");
+const mcp_setup = @import("mcp_setup.zig");
 const peer_cli = @import("peer_cli.zig");
 const agentpush = @import("agentpush.zig");
 const mcp_testkit = @import("mcp_testkit.zig");
@@ -64,6 +65,7 @@ const MCP_HELP =
     \\       sketerm mcp agents [--format line|compact|json] [--parent PID]
     \\                   [--hosts] [--no-color]
     \\       sketerm mcp hook [--parent PID] | --print-settings
+    \\       sketerm mcp setup [--user] [--config-dir DIR] [--dry-run]
     \\       sketerm mcp statusline [--parent PID] [--user-command CMD]
     \\       sketerm mcp peer list|send|read|subject ...   (= sketerm peer)
     \\
@@ -144,7 +146,7 @@ const MCP_HELP =
     \\status line; see `sketerm mcp agents --help`. `sketerm mcp hook` and
     \\`sketerm mcp statusline` report a Claude Code session's presence
     \\(working, idle, waiting, context use) to its server from its own hooks
-    \\and status line, for peer_list (`sketerm mcp hook --print-settings`).
+    \\and status line, for peer_list; `sketerm mcp setup` installs them.
     \\
     \\Pushed agent events: in a Claude Code session started with
     \\`--dangerously-load-development-channels server:sketerm` (or
@@ -817,6 +819,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     // Presence from the client's hooks and status line, posted to its server.
     if (args.len > 0 and std.mem.eql(u8, args[0], mcp_hook.HOOK_SUBCOMMAND)) return mcp_hook.hookCli(allocator, args[1..]);
     if (args.len > 0 and std.mem.eql(u8, args[0], mcp_hook.STATUSLINE_SUBCOMMAND)) return mcp_hook.statuslineCli(allocator, args[1..]);
+    if (args.len > 0 and std.mem.eql(u8, args[0], mcp_setup.SUBCOMMAND)) return mcp_setup.cli(allocator, args[1..]);
     // A non-MCP peer: `sketerm-mcp peer ...` answers like `sketerm peer ...`.
     if (args.len > 0 and std.mem.eql(u8, args[0], peer_cli.SUBCOMMAND)) return peer_cli.cli(allocator, args[1..]);
     const opts = Opts.parse(args) catch |err| {
