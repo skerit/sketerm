@@ -5171,6 +5171,12 @@ const Pair = struct {
     }
 };
 
+/// How long a scripted test helper waits for the engine's request: only a
+/// hang guard. A fixed 2 s from the thread's start sat under the engine's
+/// own 5 s send budget, so on a loaded runner the helper gave up first and
+/// the engine reported a timeout the test never meant to provoke.
+const PEER_WAIT_GUARD_MS: i64 = 4 * SEND_TIMEOUT_MS;
+
 const StreamPeer = struct {
     peer: c_int,
     audio: u8 = 0,
@@ -5182,7 +5188,7 @@ const StreamPeer = struct {
 
     fn run(self: *StreamPeer) void {
         var buf: [4096]u8 = undefined;
-        const deadline = clock.nowMs() + 2000;
+        const deadline = clock.nowMs() + PEER_WAIT_GUARD_MS;
         while (clock.nowMs() < deadline) {
             const n = c.recv(self.peer, &buf, buf.len, c.MSG_PEEK | c.MSG_DONTWAIT);
             if (n > 0) {
@@ -5442,15 +5448,9 @@ const PolicyPeer = struct {
     /// saw the request from the engine timing out on it.
     saw_request: bool = false,
 
-    /// Bound on waiting for the request: only a hang guard. It used to be
-    /// 2 s from the thread's start, under the engine's own 5 s budget, so
-    /// a loaded runner whose helper gave up first turned `disappear` into
-    /// the engine's `PolicyAckTimeout`.
-    const WAIT_GUARD_MS: i64 = 4 * SEND_TIMEOUT_MS;
-
     fn run(self: *PolicyPeer) void {
         var buf: [65536]u8 = undefined;
-        const deadline = clock.nowMs() + WAIT_GUARD_MS;
+        const deadline = clock.nowMs() + PEER_WAIT_GUARD_MS;
         while (clock.nowMs() < deadline) {
             const n = c.recv(self.peer, &buf, buf.len, c.MSG_PEEK | c.MSG_DONTWAIT);
             if (n <= 0) {
