@@ -2829,11 +2829,110 @@ peer's screen, and a peer message is information, never an approval.
   the server's instructions say so, and a session must not act on one as
   if the user had said it.
 - **`capabilities.peers`**: `{available, reason?, ttl_hours, address,
-  durable, name_taken, channel_armed}`; `reason` is `daemon_without_peers`
+  durable, name_taken, channel_armed, presence}`; `reason` is `daemon_without_peers`
   (an older daemon: every peer tool answers `available: false`),
   `daemon_unreachable` (the next peer tool call reconnects, with backoff,
-  and registers again) or `withheld` (tool policy). The registry record
-  carries `peer: {address, durable, state, name_taken}`.
+  and registers again) or `withheld` (tool policy); `presence` is true once
+  this session's hooks or status line reported (below). The registry record
+  carries `peer: {address, durable, state, name_taken, facts?, model?,
+  last_notification?}`.
+- **`peer_list`** shows one line per peer: address, app and host, `state`
+  (`starting`, `working`, `idle`, `waiting_user`, `unknown`, `gone`) and its
+  `attention`, the status line facts by their compact labels (`context
+  14%, 7d limit 98%`; the JSON `facts` object uses the
+  `capabilities.facts` names), the model, `pending` and `last_seen_ms`;
+  `detail` adds cwd, pid, durable, name_taken and `last_notification`.
+  A delivered message carries the sender's state at delivery
+  (`meta.sender_state`, and the composed line's state).
+
+### Presence: hooks and status line
+
+A peer's state comes from its own Claude Code hooks and status line, never
+from its screen, so Claude Code keeps its normal (alternate-buffer)
+rendering. Without them a peer is listed `unknown`, never guessed.
+
+- `sketerm mcp hook` is the hook command: it reads the hook's JSON on
+  stdin, finds the sketerm MCP server its Claude Code started (walking its
+  own ancestry against the registry, as `sketerm mcp agents` does;
+  `--parent PID` names the starter) and posts one presence line to that
+  server's waiter socket. `SessionStart` and `Stop` mean `idle`,
+  `UserPromptSubmit` `working`, `SessionEnd` `gone`, a `Notification` of
+  type `permission_prompt`, `idle_prompt` or `elicitation_*` `waiting_user`
+  (other types change nothing but are kept as `last_notification`); other
+  events change nothing. It never blocks the session: it prints nothing,
+  exits 0 whatever happens, gives up after 300 ms, and the settings run it
+  `async`. `SKETERM_HOOK_DEBUG=1` says on stderr why nothing was posted.
+- `sketerm mcp statusline` is the status line command: it posts the
+  document's facts (the claude adapter's `facts.map`: context use, cost,
+  rate limits) and model without waiting on the server, then runs your own
+  status line command with the same stdin and prints exactly what it
+  prints. Your command is the one your Claude Code settings name (resolved
+  as for the agents sketerm opens), or `--user-command CMD`; since the
+  pasted settings make this forwarder your settings' command, pass your
+  previous one with `--user-command`. A forwarder that finds itself as its
+  own user command (the `SKETERM_STATUSLINE_FORWARDED` marker) stops there,
+  and with no user command it prints nothing.
+- `sketerm mcp hook --print-settings` prints what to merge into
+  `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sketerm mcp hook",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [ ...the same... ],
+    "Stop": [ ...the same... ],
+    "Notification": [ ...the same... ],
+    "SessionEnd": [ ...the same... ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "sketerm mcp statusline",
+    "padding": 0,
+    "refreshInterval": 5
+  }
+}
+```
+
+The server applies a post to its registry record and re-registers with the
+daemon, so every other peer's `peer_list` shows it at once.
+
+### Non-MCP peers: `sketerm peer`
+
+Any program is a peer through `sketerm peer` (also `sketerm mcp peer`, and
+`sketerm-mcp peer`), a client of the same daemon frames:
+
+- `sketerm peer list [--json] [--detail]`: the peers, one line each.
+- `sketerm peer send --name NAME [--json] [--reply-to ID] TO [TEXT]`: sends
+  TEXT (else stdin) from the durable address NAME and prints the outcome
+  (exit 1 when refused).
+- `sketerm peer read --name NAME [--json]`: prints the mail waiting for
+  NAME, acknowledges it, exits.
+- `sketerm peer read --follow --name NAME [--json]`: keeps NAME
+  registered (durable, app `cli` or `--app APP`) and prints each message
+  as it arrives, acknowledging it once the line is written; it reconnects
+  with backoff (1-60 s) when the daemon goes away and exits on
+  SIGINT/SIGTERM or the end of its stdin (a pipe, socket or terminal).
+  While it follows, a line `{"to":"Zenit","text":"...","reply_to":"m-..."}`
+  on its stdin is sent from NAME (a second `send --name NAME` would find
+  the name taken), answered with a `{"kind":"sent",...}` line.
+
+`NAME` may come from `SKETERM_PEER_NAME`. With `--json` each item is one
+line, for a web server that spawns the follower and reads its stdout:
+
+```text
+{"kind":"message","id":"m-k3f9x2qa","from":"Zenit","sent_ms":1791040513000,"age_ms":12,"queued":false,"sender_live":true,"sender_state":"idle","text":"Is the migration yours?"}
+{"kind":"event","id":"m-7d2c9a1b","outcome":"expired","to":"Qq","queued_ms":21600000}
+```
 
 ## Panels (`ui_*`)
 
