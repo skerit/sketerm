@@ -10195,6 +10195,19 @@ fn filesBrowserBugsStage(
     if (!viewerWaitOcr(allocator, app, child.win, "AAAROW", 40_000))
         return "files bugs: the listing never rendered";
     _ = app.waitVisualSettle(child.win, 400, 10_000, 0.002, null);
+    // Step 5 opens the Information panel beside the listing: at the
+    // launch width it squeezes Name until both AAAROW rows truncate to
+    // "AAARO...", which no OCR read can find. Every step runs wider.
+    {
+        const launched = app.windowGeometry(child.win) orelse return "files bugs: the window has no size";
+        app.resizeWindow(child.win, 1400, launched.h) catch return "files bugs: widening the window failed";
+        const deadline = clock.nowMs() + 10_000;
+        while ((app.windowGeometry(child.win) orelse return "files bugs: window vanished").w < 1400) {
+            if (clock.nowMs() >= deadline) return "files bugs: the window never took the wider size";
+            pumpFor(app, 100);
+        }
+        _ = app.waitVisualSettle(child.win, 400, 10_000, 0.002, null);
+    }
 
     // -- 1. the status count is the rows on screen, hidden ones named --
     // Three rows are visible, one entry is hidden: "3 items (1 hidden)",
