@@ -2208,6 +2208,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // which this smoke binary cannot answer itself.
     if (init.args.vector.len > 1)
         _ = c.setenv("SKETERM_MUX_BIN", init.args.vector[1], 1);
+    // The built sketerm-mcp (argv[2], from build.zig): the peer stage's
+    // servers.
+    const mcp_bin: [*:0]const u8 = if (init.args.vector.len > 2) init.args.vector[2] else fail("argv[2] must name the sketerm-mcp binary (zig build smoke-mux passes it)");
     // The broker below is a real process with no exec and no PDEATHSIG,
     // and `fail` exits past every kill: the fence is what retires it and
     // its workers when this harness is gone, by any exit path.
@@ -2254,6 +2257,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     var path_buf: [128]u8 = undefined;
     const sock_path = std.fmt.bufPrint(&path_buf, "/tmp/sketerm-mux-smoke-{d}/mux.sock", .{c.getpid()}) catch unreachable;
+
+    // The peer stage's broker settings (mail TTL, state home) are read
+    // when the broker starts.
+    @import("smoke_peers.zig").prepare();
 
     // A real broker process, forked before any thread exists (its
     // per-session workers fork from it); reaped after the shutdown
@@ -2522,6 +2529,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // probe window must refuse `quit_idle` (shared stage, also run
     // against a real broker by smoke-broker).
     @import("smoke_quit_idle.zig").run(allocator, sock_path);
+
+    // Peer messaging between real MCP servers (shared stage, also run by
+    // smoke-broker).
+    @import("smoke_peers.zig").run(allocator, sock_path, mcp_bin);
 
     // Shutdown; the broker retires (reaping its workers), unlinks its
     // socket and reports the daemon-side leak verdict as its exit status.
