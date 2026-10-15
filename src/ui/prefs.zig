@@ -1601,7 +1601,7 @@ const predictive_echo_labels = std.EnumArray(PredictMode, [*:0]const u8).init(.{
 });
 
 fn addPredictiveEchoRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
-    var labels: [predictive_echo_labels.values.len:null]?[*:0]const u8 = undefined;
+    var labels: [predictive_echo_labels.values.len:null]?[*:0]const u8 = @splat(null);
     for (predictive_echo_labels.values, 0..) |label, i| labels[i] = label;
     const items = c.gtk_string_list_new(&labels);
     const row = c.adw_combo_row_new();
@@ -3045,7 +3045,7 @@ const hint_action_rows = [_]struct { action: config_mod.HintAction, label: [*:0]
 };
 
 const hint_action_labels = blk: {
-    var labels: [hint_action_rows.len:null]?[*:0]const u8 = undefined;
+    var labels: [hint_action_rows.len:null]?[*:0]const u8 = @splat(null);
     for (hint_action_rows, 0..) |r, i| labels[i] = r.label;
     break :blk labels;
 };

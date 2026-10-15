@@ -502,7 +502,7 @@ pub const Choice = enum(u8) {
     /// Every row's `label`, in `all` order and null-terminated: what a
     /// dropdown is built from, so its index IS the choice's value.
     pub const labels = blk: {
-        var names: [all.len:null]?[*:0]const u8 = undefined;
+        var names: [all.len:null]?[*:0]const u8 = @splat(null);
         for (all, 0..) |ch, i| names[i] = ch.label();
         break :blk names;
     };
