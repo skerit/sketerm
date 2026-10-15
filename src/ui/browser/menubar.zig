@@ -312,9 +312,9 @@ fn onBarDestroyed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
 fn openMenu(btn: *c.GtkButton, ctx: *BarCtx) ?*c.GtkWidget {
     const win = ctx.win;
     const a = ctx.allocator;
-    const root = classicmenu.Root.create(a) orelse return null;
-    const m = root.top();
     const bv = targetBrowser(win, ctx.state.target_pane);
+    const root = (if (bv) |v| v.newMenu() else classicmenu.Root.create(a)) orelse return null;
+    const m = root.top();
     const target_pane = ctx.state.target_pane;
     switch (ctx.which) {
         .file => {

@@ -91,6 +91,11 @@ pub const Root = struct {
     /// The window's focus when the menu opened (weak), where a closing
     /// menu hands focus back.
     prior_focus: ?*c.GtkWidget = null,
+    /// Where a closing menu sends focus when `prior_focus` is gone or
+    /// cannot take it; null leaves it to GTK.
+    focus_home: ?FocusHome = null,
+
+    pub const FocusHome = struct { cb: *const fn (?*anyopaque) void, ctx: ?*anyopaque };
 
     const Owned = struct { cb: Cleanup, ctx: ?*anyopaque };
 
@@ -261,6 +266,9 @@ fn tidySeparators(box: *c.GtkWidget) void {
 }
 
 fn onClosed(pop: *c.GtkPopover, _: ?*anyopaque) callconv(.c) void {
+    const w: *c.GtkWidget = @ptrCast(@alignCast(pop));
+    if (c.g_object_get_data(@ptrCast(@alignCast(w)), "sketerm-classicmenu")) |data|
+        handBackFocus(@ptrCast(@alignCast(data)), w);
     _ = c.g_object_ref(@as(?*anyopaque, @ptrCast(pop)));
     _ = c.g_idle_add(@ptrCast(&unparentIdle), @ptrCast(pop));
 }
@@ -276,17 +284,20 @@ fn unparentIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
             if (c.gtk_widget_get_parent(sp) != null) c.gtk_widget_unparent(sp);
         }
         root.subpops.clearRetainingCapacity();
-        handBackFocus(root, pop);
     }
     if (c.gtk_widget_get_parent(pop) != null) c.gtk_widget_unparent(pop);
     c.g_object_unref(@as(?*anyopaque, @ptrCast(pop)));
     return 0;
 }
 
-/// A closed menu leaves the window's focus on its hidden row (or on
-/// nothing), where no key reaches any handler: give it back to the
-/// widget that held it when the menu opened, else into the menu's
-/// parent. Focus the activated item moved elsewhere is left alone.
+/// Hiding a menu that holds the keyboard leaves the window's focus on a
+/// hidden row and makes GTK move it at the next frame's after-paint, to
+/// the first ancestor of the popover that takes focus (a GtkPaned
+/// around the host), where no host chord ever arrives. Runs from
+/// `closed`, while that move is still pending: a grab on a visible
+/// widget cancels it. Focus goes back to the widget that held it when
+/// the menu opened, else to the host's `focus_home`. An activated item
+/// runs after this, so focus it moves elsewhere is left alone.
 fn handBackFocus(root: *Root, pop: *c.GtkWidget) void {
     const parent = c.gtk_widget_get_parent(pop) orelse return;
     const win = c.gtk_widget_get_root(parent) orelse return;
@@ -296,7 +307,7 @@ fn handBackFocus(root: *Root, pop: *c.GtkWidget) void {
     if (root.prior_focus) |w| {
         if (c.gtk_widget_get_root(w) == win and c.gtk_widget_is_visible(w) != 0 and c.gtk_widget_grab_focus(w) != 0) return;
     }
-    _ = c.gtk_widget_child_focus(parent, c.GTK_DIR_TAB_FORWARD);
+    if (root.focus_home) |home| home.cb(home.ctx);
 }
 
 /// Heap context for one activatable row.

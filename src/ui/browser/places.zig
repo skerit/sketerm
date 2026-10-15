@@ -1319,7 +1319,7 @@ pub fn onPlacesRightClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user:
         .spec = spec_owned,
         .popover = undefined,
     };
-    const root = classicmenu.Root.create(self.allocator) orelse {
+    const root = self.newMenu() orelse {
         self.allocator.free(ctx.spec);
         self.allocator.destroy(ctx);
         return;
@@ -1416,7 +1416,7 @@ fn appendSidebarConfigItems(self: *BrowserView, root: *classicmenu.Root, m: clas
 fn showSectionMenu(self: *BrowserView, title: []const u8, x: f64, y: f64) void {
     var kbuf: [180]u8 = undefined;
     const key = sectionKeyForTitle(self, title, &kbuf);
-    const root = classicmenu.Root.create(self.allocator) orelse return;
+    const root = self.newMenu() orelse return;
     const m = root.top();
     if (key) |k| {
         if (SectionCtx.make(self, root, k)) |ctx| {
@@ -1435,7 +1435,7 @@ fn showSectionMenu(self: *BrowserView, title: []const u8, x: f64, y: f64) void {
 
 /// Right-click on empty sidebar space.
 fn showSidebarConfigMenu(self: *BrowserView, x: f64, y: f64) void {
-    const root = classicmenu.Root.create(self.allocator) orelse return;
+    const root = self.newMenu() orelse return;
     appendSidebarConfigItems(self, root, root.top());
     _ = root.popupVia(@ptrCast(@alignCast(self.places_list)), self.root_box, x, y);
 }
@@ -1508,7 +1508,7 @@ fn parseWidgetSpec(spec: []const u8) ?struct { si: usize, wi: usize } {
 
 fn showWidgetRowMenu(self: *BrowserView, spec: []const u8, x: f64, y: f64) void {
     const ids = parseWidgetSpec(spec) orelse return;
-    const root = classicmenu.Root.create(self.allocator) orelse return;
+    const root = self.newMenu() orelse return;
     const m = root.top();
     var sbuf: [64]u8 = undefined;
     const key = std.fmt.bufPrint(&sbuf, "{d}:{d}", .{ ids.si, ids.wi }) catch return;

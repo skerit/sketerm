@@ -345,7 +345,7 @@ fn onTabMenuReopen(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
 /// TabHost strip right-click: the browser's strip menu (New Tab +
 /// Reopen Closed Tab).
 pub fn showStripMenu(self: *BrowserView, x: f64, y: f64) void {
-    const root = classicmenu.Root.create(self.allocator) orelse return;
+    const root = self.newMenu() orelse return;
     const m = root.top();
     m.itemIcon("New Tab", .{ .name = "tab-new-symbolic" }, &onStripNewTab, @ptrCast(self));
     if (self.closed_tabs.closed.items.len > 0) {

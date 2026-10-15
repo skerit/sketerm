@@ -1841,7 +1841,7 @@ fn cardMenuItem(root: *classicmenu.Root, m: classicmenu.Menu, ctx: *const CardMe
 fn onCardMenu(gesture: ?*c.GtkGestureClick, _: c.gint, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     _ = gesture;
     const ctx = cast.userData(CardMenuCtx, user);
-    const root = classicmenu.Root.create(ctx.view.allocator) orelse return;
+    const root = ctx.view.newMenu() orelse return;
     const m = root.top();
     cardMenuItem(root, m, ctx, "Copy Source Path", ctx.src);
     cardMenuItem(root, m, ctx, "Copy Destination Path", ctx.dst);

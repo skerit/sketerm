@@ -83,6 +83,7 @@ const templates_mod = @import("templates.zig");
 const mountbypass = @import("mountbypass.zig");
 const viewsmod = @import("views.zig");
 const cast = @import("../../util/cast.zig");
+const classicmenu = @import("classicmenu.zig");
 
 /// Constrained-presentation hooks for the file PICKER (src/ui/
 /// picker.zig). `null` on a BrowserView means normal browsing --
@@ -1269,6 +1270,21 @@ pub const BrowserView = struct {
             if (c.gtk_widget_grab_focus(target) != 0) return;
         }
         _ = c.gtk_widget_child_focus(self.root_box, c.GTK_DIR_TAB_FORWARD);
+    }
+
+    /// A menu for this face: closing it hands focus to the listing
+    /// when the widget that held focus at popup is gone or
+    /// cannot take it back.
+    pub fn newMenu(self: *BrowserView) ?*classicmenu.Root {
+        const root = classicmenu.Root.create(self.allocator) orelse return null;
+        root.focus_home = .{ .cb = &menuFocusHome, .ctx = self };
+        return root;
+    }
+
+    fn menuFocusHome(ctx: ?*anyopaque) void {
+        const self = cast.userData(BrowserView, ctx);
+        if (self.widgets_dead) return;
+        self.focusListing();
     }
 
     /// The file-manager clipboard. Process-wide on purpose: a copy in

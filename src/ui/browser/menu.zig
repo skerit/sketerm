@@ -178,7 +178,7 @@ pub fn showEntryMenu(
         .is_dir = is_dir,
         .popover = undefined, // set right after popup, before any item can fire
     };
-    const root = classicmenu.Root.create(self.allocator) orelse {
+    const root = self.newMenu() orelse {
         MenuCtx.free(@ptrCast(ctx));
         return;
     };
@@ -315,7 +315,7 @@ pub fn showHamburgerMenu(self: *BrowserView, anchor: *c.GtkWidget) void {
         .is_dir = false,
         .popover = undefined,
     };
-    const root = classicmenu.Root.create(self.allocator) orelse {
+    const root = self.newMenu() orelse {
         MenuCtx.free(@ptrCast(ctx));
         return;
     };
