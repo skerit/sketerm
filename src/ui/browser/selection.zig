@@ -17,7 +17,6 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
-const input = @import("../input.zig");
 const places_mod = @import("../../filebrowser/places.zig");
 const registers = @import("../../filebrowser/registers.zig");
 const toolbtn = @import("../toolbtn.zig");
@@ -443,20 +442,6 @@ pub fn onSelectionKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, st
                 }
             }
         }
-    }
-    const nav = @import("nav.zig");
-    if (tab.view.currentTab() != tab or nav.hasBubbleChord(keyval, state) or nav.isTypeaheadKey(keyval, state)) return 0;
-    // GtkColumnView consumes PageUp/PageDown before the browser root's
-    // global fallback. Forward only tree actions after every local
-    // capture chord declined; returning true prevents double dispatch.
-    const pane = tab.view.pane;
-    const ictx = if (pane) |p| p.input_ctx else null;
-    if (ictx) |ctx| {
-        const action = input.matchWithDefaults(ctx.bindings, keyval, state);
-        if (action) |a| switch (a) {
-            .toggle_tab_sidebar, .tab_collapse, .tab_expand, .tab_tree_next, .tab_tree_prev => return input.runAction(ctx, a),
-            else => {},
-        };
     }
     return 0;
 }

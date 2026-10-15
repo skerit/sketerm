@@ -2698,6 +2698,19 @@ fn selectedTabPane(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?u32 {
     return selectedTabFirstPane(r);
 }
 
+/// Poll `list` until the selected window tab is no longer `before`. A
+/// seat key and this IPC read are separate channels, so one read after
+/// a quiet window raced a key still queued under load.
+/// @return null when a `list` roundtrip failed.
+fn waitSelectedTabLeaves(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, before: u32, timeout_ms: i64) ?bool {
+    const deadline = clock.nowMs() + timeout_ms;
+    while (true) {
+        if ((selectedTabPane(allocator, sock_path) orelse return null) != before) return true;
+        if (clock.nowMs() >= deadline) return false;
+        pumpFor(app, 200);
+    }
+}
+
 fn expectRealTreeStep(
     allocator: std.mem.Allocator,
     app: *appdrive.App,
@@ -2707,12 +2720,31 @@ fn expectRealTreeStep(
 ) ?[]const u8 {
     const before = selectedTabPane(allocator, sock_path) orelse return "list failed before a real tree shortcut";
     app.pressKey(null, key) catch return "injecting a real tree shortcut failed";
-    _ = app.waitIdle(300, 5_000);
-    const after = selectedTabPane(allocator, sock_path) orelse return "list failed after a real tree shortcut";
-    if (before == after) {
+    const moved = waitSelectedTabLeaves(allocator, app, sock_path, before, 10_000) orelse
+        return "list failed after a real tree shortcut";
+    if (!moved) {
         _ = c.fprintf(platform.stderr(), "smoke-e2e: real tree key did not move from %.*s focus\n", @as(c_int, @intCast(context.len)), context.ptr);
         return "a real tree shortcut did not move the window tab selection";
     }
+    return null;
+}
+
+/// Open a file-browser tab on `dir` next to pane 1 and focus it.
+fn focusNewBrowserTab(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, dir: []const u8) ?[]const u8 {
+    var req_buf: [768]u8 = undefined;
+    const browser_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"new-browser-tab\",\"pane\":1,\"data\":\"{s}\"}}\n", .{dir}) catch
+        return "building the browser-face setup request failed";
+    const browser_resp = roundtrip(allocator, sock_path, browser_req) orelse return "new-browser-tab setup failed";
+    const browser_pane = parseNumAfter(browser_resp, "\"pane\":") orelse {
+        allocator.free(browser_resp);
+        return "new-browser-tab setup returned no pane";
+    };
+    allocator.free(browser_resp);
+    var browser_focus_buf: [96]u8 = undefined;
+    const browser_focus = std.fmt.bufPrint(&browser_focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{browser_pane}) catch
+        return "building the file-browser focus request failed";
+    if (roundtrip(allocator, sock_path, browser_focus)) |r| allocator.free(r) else return "file-browser focus failed before real tree-key coverage";
+    _ = app.waitIdle(400, 8_000);
     return null;
 }
 
@@ -2853,23 +2885,21 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     if (expectRealTreeStep(allocator, app, sock_path, tree_prev_key, "terminal")) |err| return err;
     if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
 
-    var req_buf: [768]u8 = undefined;
-    const browser_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"new-browser-tab\",\"pane\":1,\"data\":\"{s}\"}}\n", .{rt}) catch
-        return "building the browser-face setup request failed";
-    const browser_resp = roundtrip(allocator, sock_path, browser_req) orelse return "new-browser-tab setup failed";
-    const browser_pane = parseNumAfter(browser_resp, "\"pane\":") orelse {
-        allocator.free(browser_resp);
-        return "new-browser-tab setup returned no pane";
-    };
-    allocator.free(browser_resp);
-    var browser_focus_buf: [96]u8 = undefined;
-    const browser_focus = std.fmt.bufPrint(&browser_focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{browser_pane}) catch
-        return "building the file-browser focus request failed";
-    if (roundtrip(allocator, sock_path, browser_focus)) |r| allocator.free(r) else return "file-browser focus failed before real tree-key coverage";
-    _ = app.waitIdle(400, 8_000);
+    if (focusNewBrowserTab(allocator, app, sock_path, rt)) |err| return err;
     if (app.windows.items.len == 0) return "the display session lost its window";
     const win_id = mainWin(app).id;
     if (expectRealTreeStep(allocator, app, sock_path, tree_prev_key, "file browser")) |err| return err;
+    // An EMPTY folder hides the rows and focuses the listing's message
+    // inside the browser's GtkNotebook, whose own Ctrl+Alt+PageUp
+    // binding used to swallow the chord before the browser saw it.
+    {
+        var empty_buf: [512:0]u8 = undefined;
+        const empty_dir = std.fmt.bufPrintZ(&empty_buf, "{s}/tree-empty", .{rt}) catch
+            return "building the empty-folder path failed";
+        if (c.mkdir(empty_dir.ptr, 0o700) != 0) return "creating the empty folder for real tree-key coverage failed";
+        if (focusNewBrowserTab(allocator, app, sock_path, empty_dir)) |err| return err;
+        if (expectRealTreeStep(allocator, app, sock_path, tree_prev_key, "empty-folder file browser")) |err| return err;
+    }
 
     const editor_resp = roundtrip(allocator, sock_path, "{\"cmd\":\"new-editor-tab\",\"pane\":1}\n") orelse
         return "new-editor-tab setup failed";
@@ -2957,20 +2987,9 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     if (roundtrip(allocator, sock_path, initial_web_focus)) |r| allocator.free(r) else return "web focus roundtrip failed before the closed-sidebar tree check";
     _ = app.waitIdle(200, 4_000);
     app.pressKey(null, tree_prev_key) catch return "injecting tab_tree_prev failed with the sidebar closed";
-    {
-        // Polled, as `waitActiveWebView`: the key and this read are
-        // separate channels.
-        const deadline = clock.nowMs() + 10_000;
-        while (true) {
-            const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
-                return "list roundtrip failed after the closed-sidebar tree step";
-            defer allocator.free(r);
-            if (selectedTabFirstPane(r) != closed_tab) break;
-            if (clock.nowMs() >= deadline)
-                return "with the sidebar closed, tab_tree_prev did not step through WINDOW tabs";
-            pumpFor(app, 200);
-        }
-    }
+    const closed_moved = waitSelectedTabLeaves(allocator, app, sock_path, closed_tab, 10_000) orelse
+        return "list roundtrip failed after the closed-sidebar tree step";
+    if (!closed_moved) return "with the sidebar closed, tab_tree_prev did not step through WINDOW tabs";
     {
         const r = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse
             return "web-list roundtrip failed after the closed-sidebar tree step";

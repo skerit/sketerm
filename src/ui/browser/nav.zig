@@ -1027,6 +1027,35 @@ pub fn onBrowserKey(
     return 0;
 }
 
+/// The tab-tree action a browser-root CAPTURE controller runs for this
+/// key, ahead of the inner widgets whose own bindings would claim it.
+/// @return null for every other key, and for one the browser's own
+/// chords or type-ahead own.
+pub fn treeChordAction(bindings: []const input.Binding, keyval: c_uint, state: c.GdkModifierType) ?input.Action {
+    if (hasBubbleChord(keyval, state) or isTypeaheadKey(keyval, state)) return null;
+    const a = input.matchWithDefaults(bindings, keyval, state) orelse return null;
+    return switch (a) {
+        .toggle_tab_sidebar, .tab_collapse, .tab_expand, .tab_tree_next, .tab_tree_prev => a,
+        else => null,
+    };
+}
+
+pub fn onBrowserTreeKey(
+    _: *c.GtkEventControllerKey,
+    keyval: c_uint,
+    _: c_uint,
+    state: c.GdkModifierType,
+    user: ?*anyopaque,
+) callconv(.c) c.gboolean {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    // An inline-rename editor owns every key while it is up.
+    if (self.inline_rename != null) return 0;
+    const pane = self.pane orelse return 0;
+    const ictx = pane.input_ctx orelse return 0;
+    const a = treeChordAction(ictx.bindings, keyval, state) orelse return 0;
+    return input.runAction(ictx, a);
+}
+
 pub fn onBackClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(BrowserView, user);
     if (self.currentTab()) |t| self.goBack(t);
@@ -1847,13 +1876,21 @@ test "type-ahead takes any printable codepoint, not just ASCII" {
     try t.expect(!printableKey(0x110000));
 }
 
-test "capture forwarding leaves bubble browser chords to the browser" {
+test "the root capture forwards only tab-tree chords, never browser chords or type-ahead" {
     try std.testing.expect(hasBubbleChord(c.GDK_KEY_l, c.GDK_CONTROL_MASK));
     try std.testing.expect(!hasBubbleChord(c.GDK_KEY_Page_Up, c.GDK_CONTROL_MASK | c.GDK_ALT_MASK));
     try std.testing.expect(!hasBubbleChord(c.GDK_KEY_Up, 0));
     try std.testing.expect(isTypeaheadKey(c.GDK_KEY_a, 0));
     try std.testing.expect(isTypeaheadKey(c.GDK_KEY_A, c.GDK_SHIFT_MASK));
     try std.testing.expect(!isTypeaheadKey(c.GDK_KEY_a, c.GDK_CONTROL_MASK));
+    // GtkNotebook binds exactly these two; the capture must win them.
+    try std.testing.expectEqual(@as(?input.Action, .tab_tree_prev), treeChordAction(&.{}, c.GDK_KEY_Page_Up, c.GDK_CONTROL_MASK | c.GDK_ALT_MASK));
+    try std.testing.expectEqual(@as(?input.Action, .tab_tree_next), treeChordAction(&.{}, c.GDK_KEY_Page_Down, c.GDK_CONTROL_MASK | c.GDK_ALT_MASK));
+    // A pane binding that is not a tree action still bubbles.
+    try std.testing.expectEqual(@as(?input.Action, null), treeChordAction(&.{}, c.GDK_KEY_Page_Up, c.GDK_CONTROL_MASK));
+    // A tree action rebound onto a browser chord leaves it to the browser.
+    const shadowed = [_]input.Binding{.{ .keyval = c.GDK_KEY_l, .mods = c.GDK_CONTROL_MASK, .action = .tab_tree_next }};
+    try std.testing.expectEqual(@as(?input.Action, null), treeChordAction(&shadowed, c.GDK_KEY_l, c.GDK_CONTROL_MASK));
 }
 
 test "a status write after teardown never touches the finalized label" {

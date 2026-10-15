@@ -515,6 +515,7 @@ pub const BrowserView = struct {
     pub const countSelected = @import("nav.zig").countSelected;
     pub const entryForPath = @import("nav.zig").entryForPath;
     pub const onBrowserKey = @import("nav.zig").onBrowserKey;
+    pub const onBrowserTreeKey = @import("nav.zig").onBrowserTreeKey;
     pub const onBackClicked = @import("nav.zig").onBackClicked;
     pub const onFwdClicked = @import("nav.zig").onFwdClicked;
     pub const onUpClicked = @import("nav.zig").onUpClicked;
@@ -1885,6 +1886,14 @@ pub const BrowserView = struct {
         const keys = c.gtk_event_controller_key_new();
         _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&onBrowserKey), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(vbox, @ptrCast(keys));
+        // Tab-tree chords run in the CAPTURE phase, ahead of every
+        // inner widget's own bindings: GtkNotebook claims
+        // Ctrl+Alt+PageUp/PageDown and GtkColumnView PageUp/PageDown,
+        // so bubbling up to the forwarder above lost them.
+        const tree_keys = c.gtk_event_controller_key_new();
+        c.gtk_event_controller_set_propagation_phase(@ptrCast(tree_keys), c.GTK_PHASE_CAPTURE);
+        _ = c.g_signal_connect_data(tree_keys, "key-pressed", @ptrCast(&onBrowserTreeKey), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(vbox, @ptrCast(tree_keys));
 
         // Clicking anywhere in this face makes it the pane the chords
         // act on. Lots of it cannot take focus (the places sidebar's
