@@ -22899,3 +22899,37 @@ sides, the follower route and the channel route. smoke-mcp's stdio driver
 moved to `src/smoke/mcpproc.zig` so all three rigs share it, and
 `peerclient.nextPush(.., 0)` now also takes frames already buffered on the
 connection, which the MCP server's drain relied on a 1 ms wait for.
+
+## 2026-10-15: peer presence from hooks and status line, non-MCP peers (phase 1b)
+
+A peer's state now comes from its own Claude Code hooks and status line,
+never its screen. `sketerm mcp hook` (`src/ipc/mcp_hook.zig`) reads the
+hook JSON, finds the server its Claude Code started by the same ancestry
+walk `sketerm mcp agents` does, and posts one `presence` line on that
+server's waiter socket (`agentwait.Presence`, beside the subscriptions);
+it prints nothing, exits 0 always and gives up after 300 ms. The mapping
+is exhaustive over the subscribed events (`HookEvent`, `NotificationKind`);
+unknown events and notification types change nothing. `sketerm mcp
+statusline` posts the claude adapter's facts (`facts.map`) and the model
+without waiting, then runs the user's own status command (resolved by
+the new `statusline.localUserObject`, which agent_open now uses too) with
+the same stdin, stdout passed straight through; a marker variable stops a
+forwarder that is its own user command. `sketerm mcp hook
+--print-settings` prints the settings snippet.
+
+The server applies a post to its registry record and re-registers:
+`RegisterReq` gained `facts`, `model` and `last_notification`, the broker
+keeps them per peer and lists them, and `peer_deliver` carries the
+sender's `sender_state`, so the composed line names the real state.
+`peer_list` reads through one formatter shared with the CLI (compact fact
+labels from facts.json, attention where it reads differently, model,
+last seen); `capabilities.peers.presence` says a post arrived.
+
+`sketerm peer list|send|read [--follow] [--json] --name NAME`
+(`src/ipc/peer_cli.zig`, also `sketerm mcp peer`) makes any program a
+peer over `peerclient.Peer`: `read --follow` keeps a durable address,
+prints each message as one JSON line and acks it once written, sends the
+JSON lines on its stdin from that address, and reconnects with backoff.
+The smoke peer stage gained sections h (hooks and status line run inside
+a server's client tree via `mcpproc`'s `runs_dir`) and i (follow, kill,
+queued read, send back).
