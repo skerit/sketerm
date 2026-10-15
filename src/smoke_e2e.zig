@@ -6960,9 +6960,23 @@ fn offloadPolicyStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:
     const animate = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"sh -c 'trap exit INT; i=0; while :; do printf \\\\rFRAME-%s $i; i=$((i+1)); sleep 0.02; done'\\n\"}}\n", .{panes[1]}) catch return "offload redraw format";
     const sent = roundtrip(allocator, sock, animate) orelse return "offload redraw command failed";
     defer allocator.free(sent);
-    const deadline = clock.nowMs() + 60_000;
+    // A wall-clock budget for 600 frames measured the build, not the
+    // offload: the dev-profile daemon processes this 1000x614 damage at
+    // ~3 frames/s (174 in 60 s at load 2, its main thread at 100% CPU),
+    // so the stage fails on a STALL instead (no frame for 10 s), under a
+    // cap no healthy profile reaches.
+    const cap = clock.nowMs() + 600_000;
+    var last_frames = mainWin(app).frames;
+    var last_progress = clock.nowMs();
     while (mainWin(app).frames - start < 600) {
-        if (clock.nowMs() >= deadline) return "offload sibling never rendered 600 frames";
+        const now = clock.nowMs();
+        const got = mainWin(app).frames;
+        if (got != last_frames) {
+            last_frames = got;
+            last_progress = now;
+        }
+        if (now - last_progress >= 10_000 or now >= cap)
+            return whyf("offload sibling stalled after {d} of 600 frames", .{got - start});
         if (expectOffload(allocator, app, 1, 2)) |why| return why;
         _ = app.pumpOnce(20);
     }
