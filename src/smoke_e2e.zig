@@ -13327,6 +13327,23 @@ fn waitMuxSessionGone(allocator: std.mem.Allocator, sock_path: []const u8, name:
     return false;
 }
 
+/// An isolated MCP must not reach the GUI session's live pane. It has no
+/// GUI socket, so its pane tools address only the headless terminals IT
+/// opened (list_terminals' contract since the MCP group split; it used to
+/// be an error): none yet, and neither roster may name `session`.
+fn expectOriginPaneHidden(m: *McpChild, session: []const u8, comptime origin: []const u8) ?[]const u8 {
+    const listed = m.call("list_terminals", "{}", 20_000) orelse
+        return origin ++ "-origin list_terminals timed out";
+    if (std.mem.indexOf(u8, listed, session) != null or
+        !mcpHas(listed, "\"headless\":true") or !mcpHas(listed, "\"count\":0"))
+        return whyf("the " ++ origin ++ " panel origin exposed its live pane through GUI terminal tools: {s}", .{capsExcerpt(listed, "\"terminals\"")});
+    const private_terms = m.call("term_list", "{}", 20_000) orelse
+        return origin ++ "-origin term_list timed out";
+    if (std.mem.indexOf(u8, private_terms, session) != null)
+        return "the " ++ origin ++ " panel origin leaked into the MCP private terminal roster";
+    return null;
+}
+
 /// Default isolated MCP plus the exact local pane origin, on the real
 /// external-display/seat path.
 fn mcpMuxPanelStage(
@@ -13379,15 +13396,7 @@ fn mcpMuxPanelStage(
     if (!mcpHas(caps, "\"selected\":\"mux_relay\""))
         return whyf("local-origin capabilities did not select the mux relay: {s}", .{capsExcerpt(caps, "panel_transport")});
 
-    const gui_terms = m.call("list_terminals", "{}", 20_000) orelse
-        return "isolated list_terminals timed out";
-    if (!mcpHas(gui_terms, "isError") or
-        std.mem.indexOf(u8, gui_terms, session) != null)
-        return "the panel origin exposed its live pane through GUI terminal tools";
-    const private_terms = m.call("term_list", "{}", 20_000) orelse
-        return "isolated term_list timed out";
-    if (std.mem.indexOf(u8, private_terms, session) != null)
-        return "the panel origin leaked into the MCP private terminal roster";
+    if (expectOriginPaneHidden(&m, session, "local")) |why| return why;
 
     var baseline = app.frameRef(term_win, true) orelse
         return "could not capture the origin pane before ui_show";
@@ -13779,15 +13788,7 @@ fn remotePanelAssetStage(
         return whyf("remote-origin capabilities claim a direct GUI socket: {s}", .{capsExcerpt(caps, "\"gui_socket\"")});
     if (!mcpHas(caps, "\"selected\":\"mux_relay\""))
         return whyf("remote-origin capabilities did not select the mux relay: {s}", .{capsExcerpt(caps, "panel_transport")});
-    const gui_terms = m.call("list_terminals", "{}", 20_000) orelse
-        return "remote-origin list_terminals timed out";
-    if (!mcpHas(gui_terms, "isError") or
-        std.mem.indexOf(u8, gui_terms, session) != null)
-        return "the remote panel origin exposed its live pane through GUI terminal tools";
-    const private_terms = m.call("term_list", "{}", 20_000) orelse
-        return "remote-origin term_list timed out";
-    if (std.mem.indexOf(u8, private_terms, session) != null)
-        return "the remote panel origin leaked into the MCP private terminal roster";
+    if (expectOriginPaneHidden(&m, session, "remote")) |why| return why;
 
     const app_result = m.call(
         "launch_app",
