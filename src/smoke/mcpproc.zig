@@ -21,6 +21,11 @@ pub const Options = struct {
     /// option, as `agentpush.ancestorNamesChannel` reads it). Takes no
     /// `extra`.
     under: ?[]const [*:0]const u8 = null,
+    /// With `under`: the parent shell also runs every `*.sh` dropped in
+    /// this directory (as the server's sibling, so its ancestry is the
+    /// server's client's), until the server exits. A file is renamed to
+    /// `.sh.run` once taken.
+    runs_dir: ?[*:0]const u8 = null,
     /// Removed from the child's environment, before `set_env` applies.
     unset_env: []const [*:0]const u8 = &.{},
     set_env: []const [2][*:0]const u8 = &.{},
@@ -62,7 +67,12 @@ pub fn Mcp(comptime fail: anytype) type {
                 argv_buf[0] = "/bin/sh";
                 argv_buf[1] = "-c";
                 // Not the last command, so sh does not exec it away.
-                argv_buf[2] = "\"$0\" mcp; :";
+                argv_buf[2] = if (opts.runs_dir != null)
+                    // In the background with its stdin kept (an async list
+                    // otherwise reads /dev/null), polling the drop directory.
+                    "\"$0\" mcp <&0 & s=$!; while kill -0 $s 2>/dev/null; do for f in \"$MCPPROC_RUNS\"/*.sh; do [ -f \"$f\" ] && mv \"$f\" \"$f.run\" && sh \"$f.run\"; done; sleep 0.05; done; wait $s"
+                else
+                    "\"$0\" mcp; :";
                 argv_buf[3] = exe;
                 for (parent_args, 0..) |e, i| argv_buf[4 + i] = e;
             } else {
@@ -89,6 +99,7 @@ pub fn Mcp(comptime fail: anytype) type {
                 _ = c.close(out_pipe[1]);
                 for (opts.unset_env) |k| _ = unsetEnv(k);
                 for (opts.set_env) |kv| _ = c.setenv(kv[0], kv[1], 1);
+                if (opts.runs_dir) |d| _ = c.setenv("MCPPROC_RUNS", d, 1);
                 _ = c.execv(path, @ptrCast(@constCast(argv_buf)));
                 c._exit(127);
             }

@@ -13,6 +13,9 @@ const c = @import("c.zig").c;
 const mcpproc = @import("smoke/mcpproc.zig");
 const daemon_peers = @import("mux/daemon_peers.zig");
 const nowMs = @import("util/clock.zig").nowMs;
+const atomicwrite = @import("util/atomicwrite.zig");
+const readfile = @import("util/readfile.zig");
+const facts = @import("agent/facts.zig");
 
 fn fail(comptime msg: []const u8) noreturn {
     std.debug.print("smoke peers stage: FAIL: " ++ msg ++ "\n", .{});
@@ -95,7 +98,69 @@ const Stage = struct {
             .set_env = self.env(name),
         });
     }
+
+    /// A server under a parent shell that also runs the scripts dropped
+    /// in `runs` (`runInTree`): processes of its client's tree.
+    fn serverWithTree(self: *Stage, name: [*:0]const u8, runs: [*:0]const u8) Mcp {
+        return Mcp.spawnWith(self.allocator, self.exe, .{
+            .under = &.{},
+            .runs_dir = runs,
+            .unset_env = &UNSET,
+            .set_env = self.env(name),
+        });
+    }
 };
+
+/// What a script run inside a server's client tree printed, and its status.
+const TreeRun = struct { out: []const u8, rc: []const u8 };
+
+var tree_seq: u32 = 0;
+
+/// Drop `body` (a sh command line; `{exe}` is the sketerm-mcp binary)
+/// in `runs` and wait for the parent shell to have run it: its stdout,
+/// stderr dropped, and exit status.
+fn runInTree(arena: std.mem.Allocator, runs: []const u8, exe: [*:0]const u8, body: []const u8, comptime what: []const u8) TreeRun {
+    tree_seq += 1;
+    const base = std.fmt.allocPrint(arena, "{s}/r{d}", .{ runs, tree_seq }) catch fail("oom");
+    const cmd = std.mem.replaceOwned(u8, arena, body, "{exe}", std.mem.span(exe)) catch fail("oom");
+    const script = std.fmt.allocPrint(arena, "{s} > '{s}.out' 2>/dev/null; echo $? > '{s}.rc.tmp'; mv '{s}.rc.tmp' '{s}.rc'\n", .{ cmd, base, base, base, base }) catch fail("oom");
+    atomicwrite.writeFile(std.fmt.allocPrint(arena, "{s}.sh", .{base}) catch fail("oom"), script, 0o600) catch fail(what ++ ": write the script");
+    const rc_path = std.fmt.allocPrint(arena, "{s}.rc", .{base}) catch fail("oom");
+    const deadline = nowMs() + 10_000;
+    while (nowMs() < deadline) {
+        if (readfile.capped(arena, rc_path, 64)) |rc| {
+            const out = readfile.capped(arena, std.fmt.allocPrint(arena, "{s}.out", .{base}) catch fail("oom"), 1 << 20) orelse fail(what ++ ": no output file");
+            return .{ .out = out, .rc = std.mem.trimEnd(u8, rc, "\n") };
+        }
+        _ = c.usleep(20_000);
+    }
+    fail(what ++ ": the script never ran in the server's tree");
+}
+
+/// Write `bytes` to `<runs>/<name>`; its path.
+fn inputFile(arena: std.mem.Allocator, runs: []const u8, name: []const u8, bytes: []const u8) []const u8 {
+    const p = std.fmt.allocPrint(arena, "{s}/{s}", .{ runs, name }) catch fail("oom");
+    atomicwrite.writeFile(p, bytes, 0o600) catch fail("write an input file");
+    return p;
+}
+
+/// Poll `m`'s peer_list until `address` shows `state`.
+fn awaitState(m: *Mcp, arena: std.mem.Allocator, address: []const u8, state: []const u8, comptime what: []const u8) std.json.ObjectMap {
+    const deadline = nowMs() + 10_000;
+    while (nowMs() < deadline) {
+        if (listed(m, arena, address, what)) |p| {
+            if (std.mem.eql(u8, str(p, "state", what), state)) return p;
+        }
+        _ = c.usleep(50_000);
+    }
+    fail(what ++ ": the peer never showed the state its hook reported");
+}
+
+/// A hook or status line run printed nothing and exited 0.
+fn expectSilentOk(r: TreeRun, comptime what: []const u8) void {
+    if (r.out.len != 0) fail(what ++ ": printed on stdout");
+    if (!std.mem.eql(u8, r.rc, "0")) fail(what ++ ": did not exit 0");
+}
 
 /// One tools/call: its structuredContent (skipping notification lines).
 fn call(m: *Mcp, arena: std.mem.Allocator, tool: []const u8, args: []const u8, comptime what: []const u8) std.json.ObjectMap {
@@ -258,7 +323,11 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
     // -- a. two named servers see each other --
     // 2. alice and bob register under SKETERM_PEER_NAME: capabilities
     //    report peers available, durable, at that address.
-    var alice = stage.server("alice", null);
+    // alice's parent shell stands in for her Claude Code: the hook and
+    // status line runs of section h are processes of its tree.
+    const runs = std.fmt.allocPrintSentinel(arena, "{s}/runs", .{std.mem.sliceTo(&root_buf, 0)}, 0) catch fail("oom");
+    mkdirOrFail(runs);
+    var alice = stage.serverWithTree("alice", runs.ptr);
     alice.initialize();
     var bob = stage.server("bob", null);
     bob.initialize();
@@ -440,6 +509,119 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
     // 20. handed out by the channel: peer_read does not repeat it.
     expectNothing(&dave, arena, "20. dave peer_read after the channel");
     std.debug.print("smoke: peers: Claude Code channel delivery ok\n", .{});
+
+    // -- h. presence from the session's own hooks and status line --
+    const hook_in = struct {
+        const prompt = "{\"session_id\":\"s\",\"cwd\":\"/w\",\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"hi\"}";
+        const permission = "{\"session_id\":\"s\",\"cwd\":\"/w\",\"hook_event_name\":\"Notification\",\"message\":\"Claude needs your permission to use Bash\",\"notification_type\":\"permission_prompt\"}";
+        const stop = "{\"session_id\":\"s\",\"cwd\":\"/w\",\"hook_event_name\":\"Stop\",\"stop_hook_active\":false}";
+    };
+    const prompt_in = inputFile(arena, runs, "prompt.json", hook_in.prompt);
+    const permission_in = inputFile(arena, runs, "permission.json", hook_in.permission);
+    const stop_in = inputFile(arena, runs, "stop.json", hook_in.stop);
+    const status_in = inputFile(arena, runs, "status.json", facts.CLAUDE_SAMPLE);
+    // 21. UserPromptSubmit in alice's client tree: bob2 sees her working;
+    //     the hook printed nothing and exited 0.
+    expectSilentOk(runInTree(arena, runs, exe, std.fmt.allocPrint(arena, "'{{exe}}' mcp hook < '{s}'", .{prompt_in}) catch fail("oom"), "21. hook"), "21. hook");
+    expectStr(awaitState(&bob2, arena, "alice", "working", "21. alice working"), "attention", "working", "21. attention");
+    // 22. A permission prompt: waiting on her user, attention needs_input,
+    //     the notification type recorded.
+    expectSilentOk(runInTree(arena, runs, exe, std.fmt.allocPrint(arena, "'{{exe}}' mcp hook < '{s}'", .{permission_in}) catch fail("oom"), "22. hook"), "22. hook");
+    {
+        const p = awaitState(&bob2, arena, "alice", "waiting_user", "22. alice waiting");
+        expectStr(p, "attention", "needs_input", "22. attention");
+        expectStr(p, "last_notification", "permission_prompt", "22. last_notification");
+    }
+    // 23. Stop: idle again.
+    expectSilentOk(runInTree(arena, runs, exe, std.fmt.allocPrint(arena, "'{{exe}}' mcp hook < '{s}'", .{stop_in}) catch fail("oom"), "23. hook"), "23. hook");
+    _ = awaitState(&bob2, arena, "alice", "idle", "23. alice idle");
+    // 24. The status line: the user's command's output byte for byte, and
+    //     alice's context use and model in bob2's list; her capabilities
+    //     report presence.
+    {
+        const r = runInTree(arena, runs, exe, std.fmt.allocPrint(arena, "'{{exe}}' mcp statusline --user-command \"printf 'ctx|'\" < '{s}'", .{status_in}) catch fail("oom"), "24. statusline");
+        if (!std.mem.eql(u8, r.out, "ctx|")) fail("24. the user command's output was not passed through byte for byte");
+        const deadline = nowMs() + 10_000;
+        while (true) {
+            const p = listed(&bob2, arena, "alice", "24.") orelse fail("24. alice not listed");
+            if (p.get("facts")) |f| {
+                const pct = f.object.get("context_used_percent") orelse fail("24. no context_used_percent");
+                if (pct != .integer or pct.integer != 14) fail("24. context_used_percent is not the document's 14");
+                expectStr(p, "model", "Haiku 4.5", "24. model");
+                break;
+            }
+            if (nowMs() > deadline) fail("24. alice's facts never reached peer_list");
+            _ = c.usleep(50_000);
+        }
+        if (!boolOf(registered(&alice, arena, "24. alice caps"), "presence", "24.")) fail("24. capabilities.peers.presence is false after a presence post");
+    }
+    // 25. The forwarder as its own user command stops at once (no loop);
+    //     with no user command anywhere (an empty home) it prints nothing.
+    expectSilentOk(runInTree(arena, runs, exe, std.fmt.allocPrint(arena, "'{{exe}}' mcp statusline --user-command \"'{{exe}}' mcp statusline\" < '{s}'", .{status_in}) catch fail("oom"), "25. recursion"), "25. recursion");
+    expectSilentOk(runInTree(arena, runs, exe, std.fmt.allocPrint(arena, "env -u CLAUDE_CONFIG_DIR HOME='{s}' '{{exe}}' mcp statusline < '{s}'", .{ runs, status_in }) catch fail("oom"), "25. no user command"), "25. no user command");
+    // 26. A hook with no server of its own (--parent 1) or with garbage on
+    //     stdin still prints nothing and exits 0; alice stays idle.
+    expectSilentOk(runInTree(arena, runs, exe, std.fmt.allocPrint(arena, "'{{exe}}' mcp hook --parent 1 < '{s}'", .{prompt_in}) catch fail("oom"), "26. no server"), "26. no server");
+    expectSilentOk(runInTree(arena, runs, exe, "echo garbage | '{exe}' mcp hook", "26. garbage"), "26. garbage");
+    expectStr(listed(&bob2, arena, "alice", "26.") orelse fail("26. alice not listed"), "state", "idle", "26. alice still idle");
+    // 27. Her messages now carry her state.
+    expectStr(send(&alice, arena, "bob", "with presence", "27. send"), "outcome", "delivered", "27. outcome");
+    contains(str(readOne(&bob2, arena, 5_000, "27. bob2 peer_read"), "content", "27."), ", idle). id m-", "27. the sender's state in the composed line");
+    std.debug.print("smoke: peers: hook and status line presence ok\n", .{});
+
+    // -- i. a non-MCP peer: sketerm peer --
+    // 28. `peer read --follow --json --name webapp` as a child: once it is
+    //     listed, alice's message arrives on its stdout as one JSON line.
+    {
+        var follower = Mcp.spawnWith(allocator, exe, .{
+            .extra = &.{ "peer", "read", "--follow", "--json", "--name", "webapp" },
+            .unset_env = &UNSET,
+            .set_env = stage.env(null),
+        });
+        {
+            const deadline = nowMs() + 10_000;
+            while (true) {
+                if (listed(&alice, arena, "webapp", "28.")) |p| if (boolOf(p, "live", "28.")) break;
+                if (nowMs() > deadline) fail("28. the follower never registered webapp");
+                _ = c.usleep(50_000);
+            }
+        }
+        expectStr(send(&alice, arena, "webapp", "hello web app", "28. send"), "outcome", "delivered", "28. outcome");
+        const line = follower.recvLineOrNull(10_000) orelse fail("28. the follower printed nothing");
+        const v = std.json.parseFromSliceLeaky(std.json.Value, arena, arena.dupe(u8, line) catch fail("oom"), .{}) catch fail("28. the follower's line is not JSON");
+        expectStr(v.object, "kind", "message", "28. kind");
+        expectStr(v.object, "from", "alice", "28. from");
+        expectStr(v.object, "text", "hello web app", "28. text");
+        expectStr(v.object, "sender_state", "idle", "28. sender_state");
+        if (boolOf(v.object, "queued", "28.")) fail("28. a live delivery reads as queued");
+        // 29. Killed (its exact pid): webapp goes offline, mail queues.
+        follower.terminate();
+    }
+    awaitOffline(&alice, arena, "webapp", false, "29. webapp offline");
+    expectStr(send(&alice, arena, "webapp", "while you were down", "29. send"), "outcome", "queued", "29. outcome");
+    // 30. A one-shot `peer read` returns it, queued.
+    {
+        var reader = Mcp.spawnWith(allocator, exe, .{ .extra = &.{ "peer", "read", "--json", "--name", "webapp" }, .unset_env = &UNSET, .set_env = stage.env(null) });
+        const line = reader.recvLineOrNull(10_000) orelse fail("30. peer read printed nothing");
+        const v = std.json.parseFromSliceLeaky(std.json.Value, arena, arena.dupe(u8, line) catch fail("oom"), .{}) catch fail("30. not JSON");
+        expectStr(v.object, "text", "while you were down", "30. text");
+        if (!boolOf(v.object, "queued", "30.")) fail("30. queued mail is not marked queued");
+        reader.closeStdinWait();
+    }
+    // 31. `peer send --name webapp --json` to alice: delivered, and alice
+    //     reads it from webapp, app cli.
+    {
+        var sender = Mcp.spawnWith(allocator, exe, .{ .extra = &.{ "peer", "send", "--json", "--name", "webapp", "alice", "reply from the web app" }, .unset_env = &UNSET, .set_env = stage.env(null) });
+        const line = sender.recvLineOrNull(10_000) orelse fail("31. peer send printed nothing");
+        const v = std.json.parseFromSliceLeaky(std.json.Value, arena, arena.dupe(u8, line) catch fail("oom"), .{}) catch fail("31. not JSON");
+        expectStr(v.object, "outcome", "delivered", "31. outcome");
+        sender.closeStdinWait();
+        const it = readOne(&alice, arena, 5_000, "31. alice peer_read");
+        expectStr(it, "from", "webapp", "31. from");
+        expectStr(it, "text", "reply from the web app", "31. text");
+        contains(str(it, "content", "31."), "Peer message from webapp (cli", "31. app cli");
+    }
+    std.debug.print("smoke: peers: sketerm peer follow, read and send ok\n", .{});
 
     dave.closeStdinWait();
     bob2.closeStdinWait();
