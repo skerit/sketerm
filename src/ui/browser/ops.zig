@@ -24,7 +24,6 @@ const confirm = @import("../confirm.zig");
 const conflict = @import("conflict.zig");
 const dnd = @import("dnd.zig");
 const oproots = @import("oproots.zig");
-const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const menuDone = @import("menu.zig").menuDone;
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;

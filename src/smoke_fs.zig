@@ -12,7 +12,6 @@ const c = @import("c.zig").c;
 const unsetEnv = @import("util/env.zig").unset;
 const daemon_mod = @import("mux/daemon.zig");
 const client_mod = @import("mux/client.zig");
-const wire = @import("mux/wire.zig");
 const fsdrive = @import("ipc/fsdrive.zig");
 const fstransfer = @import("ipc/fstransfer.zig");
 const fsserve = @import("mux/fsserve.zig");
