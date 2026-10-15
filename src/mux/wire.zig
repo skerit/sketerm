@@ -297,6 +297,13 @@ pub const FrameType = enum(u8) {
     /// One federation item from the hub (`peermail.Relay`), accepted only on
     /// the connection that completed `peer_hub_hello`.
     peer_hub_relay = 43,
+    /// Ask, set or clear a peer's user-set subject (`peermail.SubjectReq`),
+    /// only to daemons advertising `peer_subject`. On a broker connection
+    /// it names the address and is answered by `peer_subject_reply`; on a
+    /// connection attached to a session (address empty) the worker hands
+    /// it to the broker for the peer running in that session's process
+    /// tree, and the answer is the `session_meta` `peer` push that follows.
+    peer_subject = 44,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -456,6 +463,8 @@ pub const FrameType = enum(u8) {
     /// One federation item from a member to its hub (`peermail.Relay`),
     /// only on the connection that sent `peer_hub_hello`.
     peer_member_relay = 105,
+    /// `peermail.SubjectReply`, echoing `peer_subject.req`.
+    peer_subject_reply = 106,
     _,
 };
 
@@ -1180,6 +1189,8 @@ test "wire: append-only frame and event values include panel RPC" {
     try std.testing.expectEqual(@as(u8, 42), @intFromEnum(FrameType.peer_hub_hello));
     try std.testing.expectEqual(@as(u8, 43), @intFromEnum(FrameType.peer_hub_relay));
     try std.testing.expectEqual(@as(u8, 105), @intFromEnum(FrameType.peer_member_relay));
+    try std.testing.expectEqual(@as(u8, 44), @intFromEnum(FrameType.peer_subject));
+    try std.testing.expectEqual(@as(u8, 106), @intFromEnum(FrameType.peer_subject_reply));
     try std.testing.expectEqual(@as(u8, 7), @intFromEnum(ChannelKind.web_helper));
     try std.testing.expectEqual(@as(u8, 64), @intFromEnum(FrameType.welcome));
     try std.testing.expectEqual(@as(u8, 94), @intFromEnum(FrameType.play_state));

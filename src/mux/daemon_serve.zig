@@ -371,6 +371,9 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
         // Federation: a hub's link (the broker keeps the routes).
         .peer_hub_hello => daemon_peers.handleHubHello(self, cl, frame.payload),
         .peer_hub_relay => daemon_peers.handleHubRelay(self, cl, frame.payload),
+        // The broker keeps subjects; on an attached session the worker
+        // hands it to the broker for that session's peer.
+        .peer_subject => daemon_peers.handleSubject(self, cl, frame.payload),
         .rec_stop => {
             const s = cl.attached orelse {
                 cl.queueErr("not attached");

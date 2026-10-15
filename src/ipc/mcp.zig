@@ -65,7 +65,7 @@ const MCP_HELP =
     \\                   [--hosts] [--no-color]
     \\       sketerm mcp hook [--parent PID] | --print-settings
     \\       sketerm mcp statusline [--parent PID] [--user-command CMD]
-    \\       sketerm mcp peer list|send|read ...   (= sketerm peer)
+    \\       sketerm mcp peer list|send|read|subject ...   (= sketerm peer)
     \\
     \\Runs a Model Context Protocol server on stdio. Register it in an
     \\MCP client (Claude Code, etc.) as command "sketerm" with args

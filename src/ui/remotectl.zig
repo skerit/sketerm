@@ -1234,6 +1234,7 @@ fn paneRoute(action: input.Action) PaneRoute {
         .shader_pick,
         .shader_clear,
         .set_pane_title,
+        .set_peer_subject,
         .screenshot_pane,
         .record_session,
         .record_session_stop,

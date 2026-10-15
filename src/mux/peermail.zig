@@ -60,6 +60,12 @@ pub const FILE_EXT = ".jsonl";
 pub const FACTS_MAX: usize = 4096;
 /// Longest `model` / `last_notification` kept from a registration.
 pub const PRESENCE_TEXT_MAX: usize = 128;
+/// Longest subject (bytes of UTF-8) a peer may carry.
+pub const SUBJECT_MAX: usize = 200;
+/// A durable address's own state beside its mailbox: `<address>` + this
+/// holds `AddressMeta`. It never ends in `FILE_EXT`, so `load` never
+/// reads it as a mailbox, and an older broker ignores it.
+pub const META_EXT = ".meta.json";
 /// Ids of relayed items recently taken, so a redelivery after a lost
 /// `stored` answer is not taken twice.
 pub const SEEN_RING: usize = 256;
@@ -80,6 +86,33 @@ pub const From = struct {
     pid: i32 = 0,
 };
 
+/// Why a subject is refused.
+pub const SubjectError = error{ SubjectTooLong, SubjectNotText };
+
+/// The one rule for a peer's subject: at most `SUBJECT_MAX` bytes of
+/// UTF-8 with no control character (C0, DEL or C1); "" clears it.
+pub fn checkSubject(text: []const u8) SubjectError!void {
+    if (text.len > SUBJECT_MAX) return error.SubjectTooLong;
+    const view = std.unicode.Utf8View.init(text) catch return error.SubjectNotText;
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (cp < 0x20 or (cp >= 0x7f and cp <= 0x9f)) return error.SubjectNotText;
+    }
+}
+
+/// The refusal every surface prints for `e`.
+pub fn subjectRefusal(e: SubjectError) []const u8 {
+    return switch (e) {
+        error.SubjectTooLong => "the subject is longer than 200 bytes",
+        error.SubjectNotText => "the subject must be UTF-8 text without control characters (no newlines or tabs)",
+    };
+}
+
+/// What `<address>` + `META_EXT` holds.
+pub const AddressMeta = struct {
+    subject: []const u8 = "",
+};
+
 /// `peer_register` body; re-sent whenever a field changes.
 pub const RegisterReq = struct {
     /// Empty = the broker mints an `anon-` address.
@@ -97,6 +130,11 @@ pub const RegisterReq = struct {
     model: []const u8 = "",
     /// The latest notification type its hooks reported, empty = none.
     last_notification: []const u8 = "",
+    /// What the session works on, set by its user (`sketerm peer
+    /// subject`, through the server): null = unchanged, "" = clear it.
+    /// The broker keeps it with the address, not with the connection, so
+    /// a server that starts again under a durable name finds it there.
+    subject: ?[]const u8 = null,
 };
 
 /// `peer_list_req` body.
@@ -143,6 +181,8 @@ pub const PeerInfo = struct {
     facts: ?std.json.Value = null,
     model: []const u8 = "",
     last_notification: []const u8 = "",
+    /// The user-set subject of the address, empty = none.
+    subject: []const u8 = "",
     /// Federation: the host whose link this entry came over (empty = local).
     via_host: []const u8 = "",
     /// Federation: the state of the link it is reached through (null = local).
@@ -206,6 +246,9 @@ pub const Deliver = struct {
     sender_state: ?PeerState = null,
     /// The recipient had no live server when it was sent.
     queued: bool = false,
+    /// The sender's user-set subject at delivery, empty = none (or a
+    /// broker that predates it).
+    sender_subject: []const u8 = "",
 };
 
 /// `peer_event` body: what became of a message this connection sent.
@@ -224,6 +267,34 @@ pub const HubHello = struct {
     host: []const u8 = "",
     /// The name the hub knows the member by (its `[domain.<name>]`).
     as: []const u8 = "",
+};
+
+/// `peer_subject` body. On a broker connection `address` names the peer
+/// (a live one or a durable address of this host); on a connection
+/// attached to a session it is empty and the peer is the one whose
+/// process runs in that session's tree.
+pub const SubjectReq = struct {
+    req: u32 = 0,
+    address: []const u8 = "",
+    /// Null = only ask; "" = clear it.
+    subject: ?[]const u8 = null,
+};
+
+/// `peer_subject_reply` body, echoing `req`.
+pub const SubjectReply = struct {
+    req: u32 = 0,
+    found: bool = false,
+    address: []const u8 = "",
+    subject: []const u8 = "",
+    /// Why a set was refused (`subjectRefusal`).
+    refused: ?[]const u8 = null,
+};
+
+/// The peer running in a session's process tree, as the session's worker
+/// tells its viewers (`session_meta` `peer`); empty address = none.
+pub const SessionPeer = struct {
+    address: []const u8 = "",
+    subject: []const u8 = "",
 };
 
 /// What one `peer_hub_relay` / `peer_member_relay` carries.
@@ -354,6 +425,9 @@ const Box = struct {
     expired_len: usize = 0,
     expired_head: usize = 0,
     last_seen_ms: i64 = 0,
+    /// Owned; the user-set subject, "" = none. Persisted beside a durable
+    /// mailbox (`META_EXT`); a non-durable one lives as long as the box.
+    subject: []u8 = &.{},
 
     fn messageCount(self: *const Box) usize {
         var n: usize = 0;
@@ -546,6 +620,9 @@ pub const Store = struct {
     as_name: []u8 = &.{},
     /// A presence snapshot is owed to every live link.
     presence_dirty: bool = false,
+    /// Bumped whenever a peer comes, goes or changes subject: the owner
+    /// re-derives what depends on the set of live peers.
+    roster_gen: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, opts: Options) error{OutOfMemory}!Store {
         const dir = if (opts.dir) |d| try allocator.dupe(u8, d) else null;
@@ -599,6 +676,7 @@ pub const Store = struct {
             const p = self.peers.items[i];
             if (std.mem.eql(u8, p.requested, req.address) and p.asked_durable == req.durable) {
                 try self.updatePeer(p, req, now);
+                if (req.subject) |sj| self.subjectFromRegistration(p.address, sj);
                 self.presence_dirty = true;
                 return;
             }
@@ -660,6 +738,8 @@ pub const Store = struct {
         }
         try self.peers.append(self.allocator, p);
         self.presence_dirty = true;
+        self.roster_gen +%= 1;
+        if (req.subject) |sj| self.subjectFromRegistration(p.address, sj);
     }
 
     /// The connection closed. A durable address keeps its mailbox for the
@@ -671,6 +751,7 @@ pub const Store = struct {
         const p = self.peers.orderedRemove(i);
         defer self.freePeer(p);
         self.presence_dirty = true;
+        self.roster_gen +%= 1;
         const bi = self.boxIndex(p.address) orelse return;
         const box = self.boxes.items[bi];
         box.last_seen_ms = now;
@@ -876,6 +957,7 @@ pub const Store = struct {
                 .facts = if (p.facts_json.len > 0) std.json.parseFromSliceLeaky(std.json.Value, arena, p.facts_json, .{}) catch null else null,
                 .model = p.model,
                 .last_notification = p.last_notification,
+                .subject = if (box) |b| b.subject else "",
             });
         }
         for (self.boxes.items) |b| {
@@ -887,6 +969,7 @@ pub const Store = struct {
                 .durable = true,
                 .last_seen_ms = b.last_seen_ms,
                 .pending = @intCast(b.items.items.len),
+                .subject = b.subject,
             });
         }
     }
@@ -920,6 +1003,42 @@ pub const Store = struct {
     /// The effective address of `conn`, if registered.
     pub fn addressOf(self: *Store, conn: u32) ?[]const u8 {
         return if (self.peerOf(conn)) |p| p.address else null;
+    }
+
+    /// Set (or with "" clear) the subject of `address`: a live peer of this
+    /// host or a durable address (`knows`). A durable one persists it at once.
+    /// @return error.UnknownAddress when it is neither.
+    pub fn setSubject(self: *Store, address: []const u8, subject: []const u8) (SubjectError || error{ UnknownAddress, OutOfMemory })!void {
+        try checkSubject(subject);
+        if (!self.knows(address)) return error.UnknownAddress;
+        const box = self.boxOf(address).?;
+        if (std.mem.eql(u8, box.subject, subject)) return;
+        const owned = try self.allocator.dupe(u8, subject);
+        self.allocator.free(box.subject);
+        box.subject = owned;
+        self.presence_dirty = true;
+        self.roster_gen +%= 1;
+        self.writeMeta(box);
+    }
+
+    /// The subject of `address`, "" when none or unknown.
+    pub fn subjectOf(self: *const Store, address: []const u8) []const u8 {
+        return if (self.boxOf(address)) |b| b.subject else "";
+    }
+
+    /// `address` is a live peer of this host or a durable address here.
+    pub fn knows(self: *const Store, address: []const u8) bool {
+        const box = self.boxOf(address) orelse return false;
+        return !box.isRoute() and (box.durable or self.livePeer(address) != null);
+    }
+
+    /// A registration carried a subject: one the rule refuses costs only
+    /// the subject (the client checks first; this guards the broker).
+    fn subjectFromRegistration(self: *Store, address: []const u8, subject: []const u8) void {
+        self.setSubject(address, subject) catch |e| switch (e) {
+            error.SubjectTooLong, error.SubjectNotText => self.warnf("peermail: {s}'s registration carried a refused subject: {s}", .{ address, subjectRefusal(@errorCast(e)) }),
+            error.UnknownAddress, error.OutOfMemory => self.warnf("peermail: {s}'s subject was not kept", .{address}),
+        };
     }
 
     // ------------------------------------------------------- federation
@@ -1051,6 +1170,7 @@ pub const Store = struct {
                 .facts = if (p.facts) |f| try cloneJson(a, f) else null,
                 .model = try a.dupe(u8, p.model),
                 .last_notification = try a.dupe(u8, p.last_notification),
+                .subject = try a.dupe(u8, p.subject),
                 .via_host = via,
                 // A hub judges its own links; a member keeps the hub's view.
                 .link = if (self.hub) null else p.link,
@@ -1365,8 +1485,45 @@ pub const Store = struct {
         }
     }
 
+    fn metaPath(self: *Store, buf: []u8, address: []const u8) ?[]const u8 {
+        const dir = self.dir orelse return null;
+        return std.fmt.bufPrint(buf, "{s}/{s}" ++ META_EXT, .{ dir, address }) catch null;
+    }
+
+    /// Persist a durable address's `AddressMeta`; nothing to keep removes the file.
+    fn writeMeta(self: *Store, box: *Box) void {
+        if (!box.durable or self.dir == null) return;
+        var pbuf: [4096]u8 = undefined;
+        const path = self.metaPath(&pbuf, box.address) orelse return;
+        if (box.subject.len == 0) {
+            var z: [4096]u8 = undefined;
+            const pz = pathz.pathZ(&z, path) catch return;
+            if (c.unlink(pz) != 0 and std.c._errno().* != c.ENOENT) self.warnf("peermail: cannot remove {s}", .{path});
+            return;
+        }
+        pathz.makeDirs(self.dir.?, 0o700) catch return self.warnf("peermail: cannot create {s}; the subject of {s} is kept in memory only", .{ self.dir.?, box.address });
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        std.json.Stringify.value(AddressMeta{ .subject = box.subject }, .{}, &aw.writer) catch return self.warnf("peermail: out of memory writing {s}", .{path});
+        atomicwrite.writeFileExact(path, aw.written(), 0o600) catch |e| self.warnf("peermail: cannot write {s} ({s})", .{ path, @errorName(e) });
+    }
+
+    /// Read a durable address's `AddressMeta`; a missing file is none, and
+    /// an unreadable one or a subject the rule refuses costs only itself.
+    fn loadMeta(self: *Store, box: *Box) void {
+        var pbuf: [4096]u8 = undefined;
+        const path = self.metaPath(&pbuf, box.address) orelse return;
+        const parsed = readfile.json(AddressMeta, self.allocator, path, 4096) orelse return;
+        defer parsed.deinit();
+        checkSubject(parsed.value.subject) catch return self.warnf("peermail: {s}: the subject is refused, ignored", .{path});
+        const owned = self.allocator.dupe(u8, parsed.value.subject) catch return;
+        self.allocator.free(box.subject);
+        box.subject = owned;
+    }
+
     fn loadFile(self: *Store, address: []const u8) void {
         const box = self.ensureBox(address, true) catch return self.warnf("peermail: out of memory loading {s}", .{address});
+        self.loadMeta(box);
         var pbuf: [4096]u8 = undefined;
         const path = self.filePath(&pbuf, address) orelse return;
         const bytes = readfile.cappedAlloc(self.allocator, path, FILE_MAX) catch |e| {
@@ -1480,6 +1637,7 @@ pub const Store = struct {
                     .age_ms = now - it.sent_ms,
                     .sender_live = sp.live,
                     .sender_state = sp.state,
+                    .sender_subject = sp.subject,
                     .queued = it.queued,
                 } });
             },
@@ -1494,12 +1652,13 @@ pub const Store = struct {
     }
 
     /// A local or federated peer's liveness and state, `gone` when unknown.
-    fn senderPresence(self: *const Store, address: []const u8) struct { live: bool, state: PeerState } {
-        if (self.livePeer(address)) |p| return .{ .live = true, .state = p.state };
+    fn senderPresence(self: *const Store, address: []const u8) struct { live: bool, state: PeerState, subject: []const u8 = "" } {
+        const subject: []const u8 = if (self.boxOf(address)) |b| b.subject else "";
+        if (self.livePeer(address)) |p| return .{ .live = true, .state = p.state, .subject = subject };
         for (self.routes.items) |r| for (r.peers) |p| {
-            if (std.mem.eql(u8, p.address, address)) return .{ .live = p.live and linkOf(r, p.link) == .up, .state = p.state };
+            if (std.mem.eql(u8, p.address, address)) return .{ .live = p.live and linkOf(r, p.link) == .up, .state = p.state, .subject = p.subject };
         };
-        return .{ .live = false, .state = .gone };
+        return .{ .live = false, .state = .gone, .subject = subject };
     }
 
     fn notifySender(self: *Store, msg: *const Item, ev: Event, now: i64) void {
@@ -1696,6 +1855,7 @@ pub const Store = struct {
         for (b.items.items) |s| freeStored(self.allocator, s);
         b.items.deinit(self.allocator);
         self.allocator.free(b.address);
+        self.allocator.free(b.subject);
         self.allocator.destroy(b);
     }
 };
@@ -1780,6 +1940,7 @@ const Rec = struct {
         to_state: ?PeerState = null,
         req: u32 = 0,
         relay: ?RelayKind = null,
+        sender_subject: []const u8 = "",
     };
 
     fn init() Rec {
@@ -1799,7 +1960,7 @@ const Rec = struct {
         const a = self.arena.allocator();
         for (self.dead.items) |d| if (d == conn) return false;
         const g: Got = switch (out) {
-            .deliver => |d| .{ .conn = conn, .kind = .deliver, .id = a.dupe(u8, d.id) catch "", .to = a.dupe(u8, d.to) catch "", .queued = d.queued, .age_ms = d.age_ms, .text = a.dupe(u8, d.text) catch "", .from = a.dupe(u8, d.from.address) catch "", .sender_state = d.sender_state },
+            .deliver => |d| .{ .conn = conn, .kind = .deliver, .id = a.dupe(u8, d.id) catch "", .to = a.dupe(u8, d.to) catch "", .queued = d.queued, .age_ms = d.age_ms, .text = a.dupe(u8, d.text) catch "", .from = a.dupe(u8, d.from.address) catch "", .sender_state = d.sender_state, .sender_subject = a.dupe(u8, d.sender_subject) catch "" },
             .event => |e| .{ .conn = conn, .kind = .event, .id = a.dupe(u8, e.id) catch "", .outcome = e.outcome, .reason = e.reason, .to = a.dupe(u8, e.to) catch "", .queued_ms = e.queued_ms },
             .reply => |r| .{ .conn = conn, .kind = .reply, .id = a.dupe(u8, r.id) catch "", .outcome = r.outcome, .reason = r.reason, .to_state = r.to_state, .req = r.req },
             .relay => |r| .{ .conn = conn, .kind = .relay, .id = a.dupe(u8, r.id) catch "", .relay = r.kind, .outcome = r.outcome, .reason = r.reason },
@@ -2144,6 +2305,114 @@ test "durable mailboxes survive a restart: append, compaction on ack, unreadable
     try t.expectEqual(@as(usize, 2), got.items.len);
     try t.expectEqualStrings("second", got.items[0]);
     try t.expectEqualStrings("third", got.items[1]);
+}
+
+test "subject: set by a registration, kept across re-registrations, a new server and a broker restart; cleared; refused" {
+    var td = pathz.TempDir.make("peermail-subject") orelse return error.SkipZigTest;
+    defer td.remove();
+    var rec = Rec.init();
+    defer rec.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var idb: [ID_LEN]u8 = undefined;
+    {
+        var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
+        defer s.deinit();
+        // 1. A registration carrying a subject sets it; the list shows it.
+        var r = reg("Arcana", true);
+        r.subject = "template links";
+        try s.register(1, r, 0);
+        try s.register(2, reg("bob", true), 0);
+        const gen = s.roster_gen;
+        try t.expectEqualStrings("template links", (listed(&s, a, "Arcana") orelse return error.TestUnexpectedResult).subject);
+        // 2. A presence re-registration without one (null) keeps it.
+        var upd = reg("Arcana", true);
+        upd.state = .working;
+        try s.register(1, upd, 10);
+        try t.expectEqualStrings("template links", s.subjectOf("Arcana"));
+        try t.expectEqual(gen, s.roster_gen);
+        // 3. A message from Arcana carries it.
+        _ = try sendText(&s, 1, "bob", "hi", 20, &idb);
+        try t.expectEqualStrings("template links", rec.last().sender_subject);
+        // 4. The server stops: the offline address keeps it; the next
+        // server registers without one and finds it.
+        s.deregister(1, 30);
+        try t.expectEqualStrings("template links", (listed(&s, a, "Arcana") orelse return error.TestUnexpectedResult).subject);
+        try s.register(3, reg("Arcana", true), 40);
+        try t.expectEqualStrings("template links", (listed(&s, a, "Arcana") orelse return error.TestUnexpectedResult).subject);
+        // 5. Refused subjects change nothing: too long, a control
+        // character (C0 or C1), not UTF-8; an unknown address.
+        try t.expectError(error.SubjectTooLong, s.setSubject("Arcana", "x" ** (SUBJECT_MAX + 1)));
+        try t.expectError(error.SubjectNotText, s.setSubject("Arcana", "two\nlines"));
+        try t.expectError(error.SubjectNotText, s.setSubject("Arcana", "\xc2\x85"));
+        try t.expectError(error.SubjectNotText, s.setSubject("Arcana", "\xff"));
+        try checkSubject("x" ** SUBJECT_MAX);
+        try checkSubject("caf\u{e9} \u{1f600}");
+        var bad = reg("Arcana", true);
+        bad.subject = "tab\there";
+        try s.register(3, bad, 45);
+        try t.expectEqualStrings("template links", s.subjectOf("Arcana"));
+        try t.expectError(error.UnknownAddress, s.setSubject("nobody", "x"));
+        // 6. Set by address (the CLI's --name, a pane's peer), persisted.
+        try s.setSubject("bob", "reviewing");
+        try t.expect(s.roster_gen != gen);
+    }
+    // 7. A broker restart loads both from the state directory; an empty
+    // subject clears one, file and all.
+    {
+        var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
+        defer s.deinit();
+        s.load();
+        try t.expectEqualStrings("template links", s.subjectOf("Arcana"));
+        try t.expectEqualStrings("reviewing", (listed(&s, a, "bob") orelse return error.TestUnexpectedResult).subject);
+        try s.register(1, .{ .address = "Arcana", .durable = true, .subject = "" }, 50);
+        try t.expectEqualStrings("", s.subjectOf("Arcana"));
+    }
+    {
+        var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
+        defer s.deinit();
+        s.load();
+        try t.expectEqualStrings("", s.subjectOf("Arcana"));
+        try t.expectEqualStrings("reviewing", s.subjectOf("bob"));
+    }
+    // 8. A non-durable anon peer has one for its lifetime only.
+    {
+        var s = try Store.init(t.allocator, .{ .host = "h", .emit = rec.emit() });
+        defer s.deinit();
+        try s.register(1, .{ .subject = "scratch" }, 0);
+        const anon = try a.dupe(u8, s.addressOf(1).?);
+        try t.expectEqualStrings("scratch", s.subjectOf(anon));
+        s.deregister(1, 10);
+        try t.expectEqualStrings("", s.subjectOf(anon));
+        try t.expectError(error.UnknownAddress, s.setSubject(anon, "x"));
+    }
+}
+
+test "federation: a peer's subject crosses the hub with its presence and its mail" {
+    var net: Net = undefined;
+    try net.init(null);
+    defer net.deinit();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var r = reg("alice", true);
+    r.subject = "relay work";
+    try net.mem.register(1, r, 0);
+    try net.hub.register(1, reg("Zenit", true), 0);
+    try net.connect(100);
+    try net.pump(100);
+    // 1. The hub lists box/alice with her subject.
+    try t.expectEqualStrings("relay work", (listed(&net.hub, a, "box/alice") orelse return error.TestUnexpectedResult).subject);
+    // 2. Her mail delivered on the hub carries it.
+    var idb: [ID_LEN]u8 = undefined;
+    _ = try net.mem.send(1, .{ .to = "hub/Zenit", .text = "hi" }, 200, &idb);
+    try net.pump(200);
+    try t.expectEqualStrings("relay work", (lastOf(&net.hub_rec, 1, .deliver) orelse return error.TestUnexpectedResult).sender_subject);
+    // 3. Cleared on her host: the next presence relay clears it on the hub.
+    try net.mem.setSubject("alice", "");
+    try net.pump(300);
+    try t.expectEqualStrings("", (listed(&net.hub, a, "box/alice") orelse return error.TestUnexpectedResult).subject);
 }
 
 test "the wire bodies round-trip their vocabulary by name" {

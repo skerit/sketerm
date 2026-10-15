@@ -124,32 +124,47 @@ pub fn notificationOf(p: agentwait.Presence) ?[]const u8 {
     return if (n.len > 0) n else null;
 }
 
-/// The waiter sockets of the servers the nearest of `starters` (nearest
-/// first) started; one client may start several, all of them its own.
-pub fn serverSockets(arena: std.mem.Allocator, entries: []const registry.Entry, starters: []const c.pid_t) ![]const []const u8 {
+/// The servers the nearest of `starters` (nearest first) started that
+/// listen on a waiter socket; one client may start several, all of them
+/// its own.
+pub fn ownServers(arena: std.mem.Allocator, entries: []const registry.Entry, starters: []const c.pid_t) ![]const registry.Entry {
     for (starters) |s| {
-        var out: std.ArrayList([]const u8) = .empty;
+        var out: std.ArrayList(registry.Entry) = .empty;
         for (entries) |e| {
-            if (e.ppid == s and e.agent_socket.len > 0) try out.append(arena, e.agent_socket);
+            if (e.ppid == s and e.agent_socket.len > 0) try out.append(arena, e);
         }
         if (out.items.len > 0) return out.items;
     }
     return &.{};
 }
 
-/// Post `line` to every server of this process's client.
-/// @return how many took it.
-fn postToServers(arena: std.mem.Allocator, parent: ?c.pid_t, line: []const u8) usize {
+/// The waiter sockets of `ownServers`.
+pub fn serverSockets(arena: std.mem.Allocator, entries: []const registry.Entry, starters: []const c.pid_t) ![]const []const u8 {
+    const own = try ownServers(arena, entries, starters);
+    const out = try arena.alloc([]const u8, own.len);
+    for (own, out) |e, *o| o.* = e.agent_socket;
+    return out;
+}
+
+/// The servers this process's client started, found by walking this
+/// process's ancestry against the registry (`parent` overrides the walk).
+/// An unreadable registry reads as none.
+pub fn serversOfThisClient(arena: std.mem.Allocator, parent: ?c.pid_t) []const registry.Entry {
     var buf: [agentsline.MAX_ANCESTRY]c.pid_t = undefined;
     var one: [1]c.pid_t = undefined;
     const starters: []const c.pid_t = if (parent) |p| blk: {
         one[0] = p;
         break :blk &one;
     } else agentsline.ancestry(&buf, c.getpid(), platform.parentOf);
-    const entries = registry.list(arena, false) catch return 0;
-    const socks = serverSockets(arena, entries, starters) catch return 0;
+    const entries = registry.list(arena, false) catch return &.{};
+    return ownServers(arena, entries, starters) catch &.{};
+}
+
+/// Post `line` to every server of this process's client.
+/// @return how many took it.
+pub fn postToServers(arena: std.mem.Allocator, parent: ?c.pid_t, line: []const u8) usize {
     var n: usize = 0;
-    for (socks) |s| n += @intFromBool(agentwait.postPresence(s, line));
+    for (serversOfThisClient(arena, parent)) |e| n += @intFromBool(agentwait.postPresence(e.agent_socket, line));
     return n;
 }
 

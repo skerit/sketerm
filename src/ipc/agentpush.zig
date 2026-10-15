@@ -218,7 +218,9 @@ pub fn composePeer(arena: std.mem.Allocator, item: PeerItem) !Push {
             if (m.from.host.len > 0) try w.print(" on {s}", .{m.from.host});
             if (m.from.cwd.len > 0) try w.print(", {s}", .{m.from.cwd});
             const presence = senderState(m);
-            try w.print(", {s})", .{@tagName(presence)});
+            try w.print(", {s}", .{@tagName(presence)});
+            if (m.sender_subject.len > 0) try w.print("; subject: {s}", .{m.sender_subject});
+            try w.writeAll(")");
             const aged = m.age_ms >= PEER_AGE_SHOWN_MS;
             if (aged or m.queued) try w.writeAll(", sent");
             if (aged) {
@@ -266,6 +268,7 @@ fn peerMeta(arena: std.mem.Allocator, item: PeerItem) !agentwait.Meta {
             .queued = if (m.queued) "true" else "false",
             .age_s = try std.fmt.allocPrint(arena, "{d}", .{@divTrunc(@max(m.age_ms, 0), 1000)}),
             .sender_state = @tagName(senderState(m)),
+            .sender_subject = nonEmpty(m.sender_subject),
             .at = try wallAt(arena, m.sent_ms),
         },
         .event => |e| .{
@@ -433,6 +436,11 @@ test "a peer message reads as the plan's sentence: age from a minute on, offline
     const busy = try composePeer(a, .{ .message = .{ .id = "m-9", .from = from, .text = "x", .sender_live = true, .sender_state = .working } });
     try t.expect(std.mem.startsWith(u8, busy.content, "Peer message from Zenit (claude-code on hohenheim, /home/u/zenit-workspace, working). id m-9."));
     try t.expectEqualStrings("working", busy.meta.sender_state.?);
+    try t.expect(busy.meta.sender_subject == null);
+    // The sender's user-set subject follows its state.
+    const about = try composePeer(a, .{ .message = .{ .id = "m-8", .from = from, .text = "x", .sender_live = true, .sender_state = .idle, .sender_subject = "template links" } });
+    try t.expect(std.mem.startsWith(u8, about.content, "Peer message from Zenit (claude-code on hohenheim, /home/u/zenit-workspace, idle; subject: template links). id m-8."));
+    try t.expectEqualStrings("template links", about.meta.sender_subject.?);
 
     // Aged but delivered live: the age alone.
     const aged = try composePeer(a, .{ .message = .{ .id = "m-1", .from = from, .text = "x", .age_ms = 5 * 60_000 + 10, .sender_live = true } });

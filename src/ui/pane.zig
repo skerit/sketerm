@@ -513,6 +513,7 @@ pub const Pane = struct {
         terminal.on_pointer_shape = onPointerShapeEvent;
         terminal.on_set_profile = onSetProfileEvent;
         terminal.on_session_renamed = onSessionRenamedEvent;
+        terminal.on_session_peer = onSessionPeerEvent;
         terminal.on_peers = onPeersChanged;
         terminal.on_app_view = onAppViewEvent;
         terminal.on_app_window = onAppWindowEvent;
@@ -1398,14 +1399,22 @@ pub const Pane = struct {
     }
 
     /// The pane's own title by the precedence chain manual lock >
-    /// visible face title > OSC title; null when it has none yet.
+    /// visible face title > the subject of the peer running in its
+    /// session (set by its user) > OSC title; null when it has none yet.
     pub fn displayTitle(self: *Pane) ?[]const u8 {
         if (!self.title_locked) {
             if (self.face_title) |ft| {
                 if (self.faceCoversTerminal()) return ft;
             }
         }
-        return self.titlebar_text;
+        return self.shownSubject() orelse self.titlebar_text;
+    }
+
+    /// The subject of the peer running in this pane's session, while it
+    /// titles the pane in place of the OSC title (never over a lock).
+    pub fn shownSubject(self: *Pane) ?[]const u8 {
+        if (self.title_locked) return null;
+        return self.terminal.peerSubject();
     }
 
     fn refreshTitlebarLabel(self: *Pane) void {
@@ -1754,6 +1763,14 @@ fn onNotificationEvent(ctx: ?*anyopaque, ev: Screen.NotificationEvent) void {
 fn onSessionRenamedEvent(ctx: ?*anyopaque, name: []const u8) void {
     const self = cast.userData(Pane, ctx);
     if (self.sinks.on_session_renamed) |f| f(self.sinks.ctx, self, name);
+}
+
+/// The daemon said which peer runs in this session, or its subject
+/// moved: the subject titles the pane and its tab in place of the OSC title.
+fn onSessionPeerEvent(ctx: ?*anyopaque) void {
+    const self = cast.userData(Pane, ctx);
+    self.refreshTitlebarLabel();
+    self.notifyTitleFact();
 }
 
 /// The session's primary app host changed (fires at channel open —
@@ -2301,6 +2318,8 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
     const is_durable = if (self.terminal.remote) |r| !r.ephemeral else false;
     const is_host_remote = if (self.terminal.remote) |r| r.host != null else false;
     for ([_]Action{ .mux_detach, .mux_rename, .mux_kill }) |a| menu.setEnabled(group, a, is_durable);
+    // "Set Subject…" needs a peer running in this session.
+    menu.setEnabled(group, .set_peer_subject, self.terminal.sessionPeer() != null);
     for ([_]Action{ .upload_file, .download_file }) |a| menu.setEnabled(group, a, is_host_remote);
 
     // Recording rows: exactly one of the start/stop pair shows,

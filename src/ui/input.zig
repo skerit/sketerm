@@ -485,6 +485,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .shader_clear => "Clear this pane's shader",
         .apply_profile => "Apply profile to pane (colors, font, scrollback…)",
         .set_pane_title => "Set pane title…",
+        .set_peer_subject => "Set subject (what this session's assistant works on)…",
         .screenshot_pane => "Screenshot pane to a PNG…",
         .record_session => "Record session (asciicast)…",
         .record_session_stop => "Stop session recording",

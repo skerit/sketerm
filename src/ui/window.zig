@@ -2648,6 +2648,41 @@ pub const Window = struct {
         _ = c.gtk_widget_grab_focus(entry);
     }
 
+    /// "Set Subject…": a popover entry pre-filled with the subject of the
+    /// peer running in the focused pane's session. Enter sends it to the
+    /// daemon (empty clears it); the title follows the daemon's push.
+    pub fn setFocusedPeerSubject(self: *Window) void {
+        const pane = self.focusedPane() orelse return;
+        if (pane.terminal.sessionPeer() == null) return;
+        const popover = c.gtk_popover_new();
+        const entry = c.gtk_entry_new();
+        c.gtk_entry_set_placeholder_text(@ptrCast(entry), "What this session works on (empty = clear)");
+        if (pane.terminal.peerSubject()) |cur| {
+            if (self.allocator.dupeZ(u8, cur) catch null) |zz| {
+                defer self.allocator.free(zz);
+                c.gtk_editable_set_text(@ptrCast(entry), zz.ptr);
+                c.gtk_editable_select_region(@ptrCast(entry), 0, -1);
+            }
+        }
+        c.gtk_popover_set_child(@ptrCast(popover), entry);
+        parentManualPopover(popover, @ptrCast(pane.surface.area));
+        const w = c.gtk_widget_get_width(@ptrCast(pane.surface.area));
+        const rect = c.GdkRectangle{ .x = @divFloor(w, 2), .y = 1, .width = 1, .height = 1 };
+        c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
+        const ctx = self.allocator.create(PaneTitleCtx) catch return;
+        ctx.* = .{ .pane_id = pane.id, .popover = popover, .allocator = self.allocator };
+        _ = c.g_signal_connect_data(
+            entry,
+            "activate",
+            @ptrCast(&onPeerSubjectActivate),
+            @ptrCast(ctx),
+            @ptrCast(cast.destroyCtx(Window.PaneTitleCtx)),
+            c.G_CONNECT_DEFAULT,
+        );
+        c.gtk_popover_popup(@ptrCast(popover));
+        _ = c.gtk_widget_grab_focus(entry);
+    }
+
     /// "Kill Session" on a mux pane: tell the daemon to tear the
     /// session down, then close the pane. The daemon's GONE broadcast
     /// covers any other client attached to the same session.
@@ -3616,6 +3651,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .shader_pick => self.pickPaneShader(),
         .shader_clear => self.clearPaneShader(),
         .set_pane_title => self.setFocusedPaneTitle(),
+        .set_peer_subject => self.setFocusedPeerSubject(),
         .screenshot_pane => screenshotFocusedPane(self),
         .record_session => recordFocusedSession(self),
         .record_session_stop => if (self.focusedPane()) |p| p.terminal.requestRecordStop(),
@@ -3755,6 +3791,16 @@ fn onMuxRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void 
             const text = std.mem.span(@as([*:0]const u8, @ptrCast(text_c)));
             if (text.len > 0) ref.pane.terminal.renameSession(text);
         }
+    }
+    c.gtk_popover_popdown(@ptrCast(ctx.popover));
+}
+
+fn onPeerSubjectActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Window.PaneTitleCtx, user);
+    if (Window.remotectl.livePaneById(ctx.pane_id)) |ref| {
+        const text_c = c.gtk_editable_get_text(@ptrCast(entry));
+        const text: []const u8 = if (text_c != null) std.mem.span(@as([*:0]const u8, @ptrCast(text_c))) else "";
+        _ = ref.pane.terminal.setPeerSubject(text);
     }
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
 }

@@ -75,6 +75,19 @@ pub const Peer = struct {
         try self.conn.sendJson(.peer_ack, peermail.AckReq{ .ids = ids });
     }
 
+    /// Whether the broker keeps user-set subjects (welcome flag `peer_subject`).
+    pub fn subjects(self: *const Peer) bool {
+        return self.conn.caps.peer_subject;
+    }
+
+    /// Ask (`subject` null), set or clear (`""`) the subject of `address`.
+    pub fn subject(self: *Peer, allocator: std.mem.Allocator, address: []const u8, value: ?[]const u8, timeout_ms: i64) !std.json.Parsed(peermail.SubjectReply) {
+        if (!self.subjects()) return error.Unsupported;
+        const req = self.nextReq();
+        try self.conn.sendJson(.peer_subject, peermail.SubjectReq{ .req = req, .address = address, .subject = value });
+        return self.awaitReply(peermail.SubjectReply, allocator, .peer_subject_reply, req, timeout_ms);
+    }
+
     /// The oldest push received so far, or the next one within `timeout_ms`
     /// (0 = only what has already arrived: the inbox, frames buffered on
     /// the connection and bytes waiting on its socket); other frames are

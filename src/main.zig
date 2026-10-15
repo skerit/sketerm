@@ -219,7 +219,7 @@ const HELP_TEXT =
     \\                         press keys, run commands). Register in an
     \\                         MCP client as command "sketerm", args
     \\                         ["mcp"]. `sketerm mcp --help` for details.
-    \\  sketerm peer list|send|read [--follow] [--json] --name NAME
+    \\  sketerm peer list|send|read|subject [--follow] [--json] [--name NAME]
     \\                         take part in peer messaging between
     \\                         assistants' sessions from any program.
     \\                         `sketerm peer --help` for details.

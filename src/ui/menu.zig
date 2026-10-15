@@ -103,6 +103,7 @@ const MENU = [_]Item{
     .{ .submenu = .{ .label = "Pane", .icon = "view-grid-symbolic", .items = &.{
         .{ .label = "Zoom / Unzoom Pane", .icon = "view-fullscreen-symbolic", .action = .zoom_pane },
         .{ .label = "Set Pane Title…", .icon = "document-edit-symbolic", .action = .set_pane_title },
+        .{ .label = "Set Subject…", .icon = "document-edit-symbolic", .action = .set_peer_subject },
         .{ .label = "Apply Profile to Pane…", .icon = "preferences-other-symbolic", .action = .apply_profile },
         .{ .label = "Screenshot Pane…", .icon = "camera-photo-symbolic", .action = .screenshot_pane },
         .{ .label = "Record Session (asciicast)…", .icon = "media-record-symbolic", .action = .record_session, .rec_row = 1 },

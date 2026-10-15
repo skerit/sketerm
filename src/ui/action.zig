@@ -123,6 +123,9 @@ pub const Action = enum {
     apply_profile,
     /// Give the focused pane a title of its own (titlebar + tab).
     set_pane_title,
+    /// Set (or clear) the subject of the peer running in the focused
+    /// pane's session: what it works on, for peer_list and the tab title.
+    set_peer_subject,
     /// Save the focused pane as a PNG through a save dialog.
     screenshot_pane,
     /// Start an asciicast recording of the focused session; the file is

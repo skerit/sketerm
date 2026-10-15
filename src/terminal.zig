@@ -17,6 +17,7 @@ const Pool = @import("grid/style_pool.zig").Pool;
 const percent = @import("util/percent.zig");
 const mux_client = @import("mux/client.zig");
 const mux_wire = @import("mux/wire.zig");
+const peermail = @import("mux/peermail.zig");
 const mux_snapshot = @import("mux/snapshot.zig");
 const platform = @import("util/platform.zig");
 const predict_mod = @import("mux/predict.zig");
@@ -127,6 +128,9 @@ pub const Terminal = struct {
     /// Fired when the mux daemon confirmed a session rename. The new
     /// name is already committed to `remote.session`.
     on_session_renamed: ?*const fn (ctx: ?*anyopaque, name: []const u8) void = null,
+    /// Fired when the daemon said which peer runs in this session's
+    /// process tree, or its subject changed (`sessionPeer`, `peerSubject`).
+    on_session_peer: ?*const fn (ctx: ?*anyopaque) void = null,
     /// Fired when the daemon acks a recording start/stop (see
     /// `recording`), so the UI can toggle its menu/indicator.
     on_recording_changed: ?*const fn (ctx: ?*anyopaque, recording: bool) void = null,
@@ -222,6 +226,14 @@ pub const Terminal = struct {
     /// comm string and it changes as often as the user runs a command.
     program_buf: [32]u8 = undefined,
     program_len: u8 = 0,
+
+    /// The peer whose process runs in this session's tree and its
+    /// user-set subject, as the daemon's `session_meta` `peer` last said.
+    /// Fixed buffers: both are bounded by the peer rules.
+    peer_address_buf: [64]u8 = undefined,
+    peer_address_len: u8 = 0,
+    peer_subject_buf: [peermail.SUBJECT_MAX]u8 = undefined,
+    peer_subject_len: u8 = 0,
 
     /// Print every applied daemon event and every snapshot swap to
     /// stderr (`--debug-events`).
@@ -1586,6 +1598,7 @@ pub const Terminal = struct {
                     name: []const u8 = "",
                     origin_name: []const u8 = "",
                     origin_id: []const u8 = "",
+                    peer: ?peermail.SessionPeer = null,
                 };
                 var parsed = std.json.parseFromSlice(Meta, self.allocator, frame.payload, .{
                     .ignore_unknown_fields = true,
@@ -1593,6 +1606,7 @@ pub const Terminal = struct {
                 defer parsed.deinit();
                 if (parsed.value.cwd.len > 0) self.setCwd(parsed.value.cwd);
                 if (parsed.value.program.len > 0) self.setProgram(parsed.value.program);
+                if (parsed.value.peer) |sp| self.setSessionPeer(sp);
                 const remote = self.remote orelse return;
                 if (parsed.value.origin_name.len > 0 and
                     !std.mem.eql(u8, remote.origin_name, parsed.value.origin_name))
@@ -3097,6 +3111,45 @@ pub const Terminal = struct {
         if (self.on_cwd_changed) |f| f(self.user_ctx, owned);
     }
 
+    fn setSessionPeer(self: *Terminal, sp: peermail.SessionPeer) void {
+        const a: u8 = @intCast(@min(sp.address.len, self.peer_address_buf.len));
+        const s: u8 = @intCast(@min(sp.subject.len, self.peer_subject_buf.len));
+        if (a == self.peer_address_len and s == self.peer_subject_len and
+            std.mem.eql(u8, self.peer_address_buf[0..a], sp.address[0..a]) and
+            std.mem.eql(u8, self.peer_subject_buf[0..s], sp.subject[0..s])) return;
+        @memcpy(self.peer_address_buf[0..a], sp.address[0..a]);
+        self.peer_address_len = a;
+        @memcpy(self.peer_subject_buf[0..s], sp.subject[0..s]);
+        self.peer_subject_len = s;
+        if (self.on_session_peer) |f| f(self.user_ctx);
+    }
+
+    /// The address of the peer running in this session, null when none.
+    pub fn sessionPeer(self: *const Terminal) ?[]const u8 {
+        return if (self.peer_address_len > 0) self.peer_address_buf[0..self.peer_address_len] else null;
+    }
+
+    /// That peer's user-set subject, null when none.
+    pub fn peerSubject(self: *const Terminal) ?[]const u8 {
+        if (self.sessionPeer() == null or self.peer_subject_len == 0) return null;
+        return self.peer_subject_buf[0..self.peer_subject_len];
+    }
+
+    /// Set (or with "" clear) the subject of the peer running in this
+    /// session; the daemon's `session_meta` push confirms it.
+    /// @return whether the request went out (a daemon without
+    /// `peer_subject`, or no peer here, sends nothing).
+    pub fn setPeerSubject(self: *Terminal, text: []const u8) bool {
+        const remote = self.remote orelse return false;
+        if (!remote.canSend() or !remote.conn.caps.peer_subject or self.sessionPeer() == null) return false;
+        peermail.checkSubject(text) catch return false;
+        remote.conn.sendJson(.peer_subject, peermail.SubjectReq{ .subject = text }) catch {
+            self.transportLost("peer_subject write failed");
+            return false;
+        };
+        return true;
+    }
+
     /// Replay snapshot-restored image placements into the image sink
     /// and drop them. Must run AFTER the pane wired `on_image` (the
     /// sink chain ends in the pane's ImageStore) — Window calls this
@@ -3212,6 +3265,7 @@ pub const Terminal = struct {
         self.on_recording_changed = null;
         self.on_transfer = null;
         self.on_listing = null;
+        self.on_session_peer = null;
         self.listing_ctx = null;
         self.on_apps = null;
         self.apps_ctx = null;

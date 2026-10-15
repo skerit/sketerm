@@ -23,6 +23,7 @@ const nowMs = @import("../util/clock.zig").nowMs;
 const cwdOfPid = dmod.cwdOfPid;
 const daemon_adopt = @import("daemon_adopt.zig");
 const lifetime = @import("../util/lifetime.zig");
+const daemon_peers = @import("daemon_peers.zig");
 
 // ── broker ↔ worker control channel (process isolation) ─────────
 //
@@ -35,10 +36,15 @@ const lifetime = @import("../util/lifetime.zig");
 // -1/ECONNRESET. Worker-handled opcodes (workerOnControl): 'A' attach
 // (payload is PassedClient's append-only byte encoding + the client fd),
 // 'K' kill, 'R' broker-authoritative rename, 'n' result of a rename this
-// worker forwarded. Broker-handled opcodes (brokerOnWorkerControl):
-// 'Y' ready, 'E' spawn-failure reason, 'M' metadata push, 'N' an attached
-// client's rename forwarded by the worker, 'T' why the session ends
-// (`tombstones.End`, sent before the session goes).
+// worker forwarded, 'S' the peer running in the session's process tree
+// (`daemon_peers.SessionPeer`). Broker-handled opcodes
+// (brokerOnWorkerControl): 'Y' ready, 'E' spawn-failure reason, 'M'
+// metadata push, 'N' an attached client's rename forwarded by the worker,
+// 'T' why the session ends (`tombstones.End`, sent before the session
+// goes), 'P' an attached client's `peer_subject` (`peermail.SubjectReq`).
+
+/// Longest control datagram a worker reads ('S' carries a subject).
+const WORKER_CONTROL_BUF: usize = 1024;
 
 /// Graceful worker stop, shared by the broker's 'K' and control EOF: close
 /// panel scopes, tell live clients it is intentional, and leave the loop.
@@ -50,7 +56,7 @@ fn workerShutdown(self: *Daemon) void {
 
 /// Worker side: drain one control datagram and act on it.
 pub fn workerOnControl(self: *Daemon) void {
-    var buf: [256]u8 = undefined;
+    var buf: [WORKER_CONTROL_BUF]u8 = undefined;
     var passed: c_int = -1;
     const n = controlRecv(self.control_fd, &buf, &passed);
     if (n <= 0) {
@@ -78,6 +84,10 @@ pub fn workerOnControl(self: *Daemon) void {
         'n' => {
             if (passed >= 0) _ = c.close(passed);
             workerRenameResult(self, buf[0..@intCast(n)]);
+        },
+        'S' => {
+            if (passed >= 0) _ = c.close(passed);
+            daemon_peers.workerApplyPeer(self, buf[1..@intCast(n)]);
         },
         else => if (passed >= 0) {
             _ = c.close(passed);
@@ -430,6 +440,7 @@ pub fn brokerOnWorkerControl(self: *Daemon, w: *Worker) void {
         },
         'N' => self.brokerWorkerRename(w, buf[0..@intCast(n)]),
         'D' => daemon_adopt.brokerOnAdoptRecord(self, w, buf[1..@intCast(n)]),
+        'P' => daemon_peers.workerSubject(self, w, buf[1..@intCast(n)]),
         else => {},
     }
 }

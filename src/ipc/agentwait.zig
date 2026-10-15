@@ -140,12 +140,16 @@ pub const Meta = struct {
     age_s: ?[]const u8 = null,
     /// Peer: the sender's `vocab.PeerState` at delivery.
     sender_state: ?[]const u8 = null,
+    /// Peer: the sender's user-set subject, absent when none.
+    sender_subject: ?[]const u8 = null,
 };
 
 /// `Presence.kind`: the first line is a presence post, not a subscription.
 pub const PRESENCE_KIND = "presence";
 /// `Presence.event` of a statusline post (the others are hook event names).
 pub const STATUSLINE_EVENT = "statusline";
+/// `Presence.event` of `sketerm peer subject`'s post.
+pub const SUBJECT_EVENT = "subject";
 
 /// One presence post: what a hook or the statusline saw. The server maps
 /// `event` (+ `notification`) to a `vocab.PeerState` (`mcp_hook.stateFor`);
@@ -159,6 +163,11 @@ pub const Presence = struct {
     /// Known facts as `facts.toJson` writes them (`data/agents/facts.json` names).
     facts: ?std.json.Value = null,
     model: ?[]const u8 = null,
+    /// The user-set subject (`sketerm peer subject`): "" clears it, null
+    /// leaves it. A subject is a presence fact like the others, so it
+    /// rides this line rather than a line kind of its own: one parse, one
+    /// handler, one re-registration.
+    subject: ?[]const u8 = null,
 };
 
 /// Whether the line is a presence post.

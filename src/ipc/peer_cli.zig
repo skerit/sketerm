@@ -1,11 +1,14 @@
-//! `sketerm peer list|send|read`: any program is a peer by running this,
-//! a client of the same `peer_*` frames the MCP server speaks
+//! `sketerm peer list|send|read|subject`: any program is a peer by running
+//! this, a client of the same `peer_*` frames the MCP server speaks
 //! (`peerclient.Peer`, no wire of its own). `read --follow` registers a
 //! durable address and prints each incoming message as it arrives (one
 //! JSON line with `--json`), acknowledging it only once the line is
-//! written; lines it reads on its stdin are sent from that address. It
-//! is also the one home of how a peer list entry reads, for this CLI and
-//! the `peer_list` tool alike (`listLine`, `writeListText`).
+//! written; lines it reads on its stdin are sent from that address.
+//! `subject` sets what a session works on: inside an assistant session it
+//! finds that session's own servers the way `sketerm mcp hook` does and
+//! posts the subject as a presence line; `--name` sets it on the broker
+//! by address. It is also the one home of how a peer list entry reads,
+//! for this CLI and the `peer_list` tool alike (`listLine`, `writeListText`).
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -20,6 +23,8 @@ const peeraddr = @import("peeraddr.zig");
 const agentpush = @import("agentpush.zig");
 const muxclient = @import("../mux/client.zig");
 const peerclient = @import("../mux/peerclient.zig");
+const agentwait = @import("agentwait.zig");
+const mcp_hook = @import("mcp_hook.zig");
 const peermail = peerclient.peermail;
 
 /// The argv word that selects this command (`sketerm peer`, `sketerm mcp peer`).
@@ -49,6 +54,8 @@ pub const ListLine = struct {
     pending: u32,
     last_seen_ms: i64,
     model: ?[]const u8 = null,
+    /// What it works on, set by its user; absent when none.
+    subject: ?[]const u8 = null,
     /// Its known facts (`data/agents/facts.json` names).
     facts: ?std.json.Value = null,
     self: ?bool = null,
@@ -102,6 +109,7 @@ pub fn listLine(pi: peermail.PeerInfo, is_self: bool, detail: bool) ListLine {
         .pending = pi.pending,
         .last_seen_ms = pi.last_seen_ms,
         .model = nonEmpty(pi.model),
+        .subject = nonEmpty(pi.subject),
         .facts = pi.facts,
         .self = if (is_self) true else null,
         .via_host = nonEmpty(pi.via_host),
@@ -118,8 +126,8 @@ pub fn listLine(pi: peermail.PeerInfo, is_self: bool, detail: bool) ListLine {
 }
 
 /// One line: address, app and host, state (and its attention when that
-/// reads differently), the facts' compact labels, model, pending, and
-/// when an offline peer was last seen.
+/// reads differently), its subject, the facts' compact labels, model,
+/// pending, and when an offline peer was last seen.
 pub fn writeListText(w: *std.Io.Writer, arena: std.mem.Allocator, pi: peermail.PeerInfo, is_self: bool) !void {
     try w.print("{s}{s} {s} on {s}, {s}", .{
         pi.address,
@@ -131,6 +139,7 @@ pub fn writeListText(w: *std.Io.Writer, arena: std.mem.Allocator, pi: peermail.P
     if (pi.state.attention()) |at| {
         if (!std.mem.eql(u8, at.label(), @tagName(pi.state))) try w.print(" ({s})", .{at.label()});
     }
+    if (pi.subject.len > 0) try w.print(", subject: {s}", .{pi.subject});
     if (pi.facts) |f| if (facts.shipped()) |v| {
         if (try facts.compactLine(arena, v, try facts.fromJson(arena, v, f))) |line| try w.print(", {s}", .{line});
     } else |_| {};
@@ -160,6 +169,7 @@ const MessageLine = struct {
     sender_live: bool,
     sender_state: []const u8,
     text: []const u8,
+    sender_subject: ?[]const u8 = null,
     reply_to: ?[]const u8 = null,
 };
 
@@ -208,6 +218,7 @@ pub fn itemText(arena: std.mem.Allocator, item: agentpush.PeerItem, json: bool) 
             .sender_live = m.sender_live,
             .sender_state = @tagName(m.sender_state orelse if (m.sender_live) vocab.PeerState.unknown else .gone),
             .text = m.text,
+            .sender_subject = nonEmpty(m.sender_subject),
             .reply_to = m.reply_to,
         }),
         .event => |e| jsonLine(arena, EventLine{ .id = e.id, .outcome = @tagName(e.outcome), .reason = if (e.reason) |r| @tagName(r) else null, .to = e.to, .queued_ms = e.queued_ms }),
@@ -230,7 +241,7 @@ fn sentText(arena: std.mem.Allocator, from: []const u8, to: []const u8, r: peerm
 
 // ── arguments ────────────────────────────────────────────────────
 
-pub const Verb = enum { list, send, read };
+pub const Verb = enum { list, send, read, subject };
 
 pub const Cli = struct {
     verb: ?Verb = null,
@@ -239,14 +250,20 @@ pub const Cli = struct {
     json: bool = false,
     follow: bool = false,
     detail: bool = false,
+    /// `subject --clear`.
+    clear: bool = false,
     reply_to: ?[]const u8 = null,
     /// `send`: the address, then the text (null: read from stdin).
+    /// `subject`: the text (null: print the current one).
     to: ?[]const u8 = null,
     text: ?[]const u8 = null,
     help: bool = false,
 
-    pub const ParseError = error{ UnknownFlag, MissingValue, ExtraArgument, UnknownVerb, NoName, NoAddress, BadName, NotForVerb };
+    pub const ParseError = error{ UnknownFlag, MissingValue, ExtraArgument, UnknownVerb, NoName, NoAddress, BadName, NotForVerb } || peermail.SubjectError;
 
+    /// `env_name` (SKETERM_PEER_NAME) names the peer for send and read; a
+    /// subject is set on another peer only by an explicit `--name`, so
+    /// inside a session it always reaches that session's own server.
     pub fn parse(args: []const []const u8, env_name: ?[]const u8) ParseError!Cli {
         var o: Cli = .{};
         var i: usize = 0;
@@ -262,6 +279,8 @@ pub const Cli = struct {
                 o.follow = true;
             } else if (eql(u8, a, "--detail")) {
                 o.detail = true;
+            } else if (eql(u8, a, "--clear")) {
+                o.clear = true;
             } else if (eql(u8, a, "--name") or eql(u8, a, "--app") or eql(u8, a, "--reply-to")) {
                 if (i + 1 >= args.len) return error.MissingValue;
                 i += 1;
@@ -282,16 +301,24 @@ pub const Cli = struct {
         }
         if (o.help) return o;
         const verb = o.verb orelse return error.UnknownVerb;
-        if (o.name == null) o.name = env_name;
+        if (o.name == null and verb != .subject) o.name = env_name;
         switch (verb) {
             .list => if (o.to != null) return error.ExtraArgument,
             .read => if (o.to != null) return error.ExtraArgument,
             .send => if (o.to == null) return error.NoAddress,
+            .subject => {
+                if (o.text != null) return error.ExtraArgument;
+                o.text = o.to;
+                o.to = null;
+                if (o.clear and o.text != null) return error.ExtraArgument;
+                if (o.text) |tx| try peermail.checkSubject(tx);
+            },
         }
         if (o.follow and verb != .read) return error.NotForVerb;
         if (o.reply_to != null and verb != .send) return error.NotForVerb;
+        if (o.clear and verb != .subject) return error.NotForVerb;
         if (verb != .list) {
-            const n = o.name orelse return error.NoName;
+            const n = o.name orelse if (verb == .subject) return o else return error.NoName;
             const addr = peeraddr.Address.parse(n) catch return error.BadName;
             if (addr.host != null) return error.BadName;
         }
@@ -303,6 +330,7 @@ pub const HELP =
     \\Usage: sketerm peer list [--json] [--detail]
     \\       sketerm peer send --name NAME [--json] [--reply-to ID] TO [TEXT]
     \\       sketerm peer read --name NAME [--json] [--follow]
+    \\       sketerm peer subject [--name NAME] [TEXT | --clear]
     \\       (--app APP on send and read: the app the peer registers as, default cli)
     \\
     \\Takes part in peer messaging (the peer_* tools of `sketerm mcp`) from any
@@ -316,11 +344,21 @@ pub const HELP =
     \\follows, each line on its stdin {"to":ADDR,"text":TEXT,"reply_to":ID?}
     \\is sent from NAME, answered with a "sent" line. --json prints one JSON
     \\object per line: messages {"kind":"message","id","from","sent_ms",
-    \\"age_ms","queued","sender_live","sender_state","text","reply_to"?}, and
-    \\"event" / "expired_away" for what became of mail.
+    \\"age_ms","queued","sender_live","sender_state","sender_subject"?,"text",
+    \\"reply_to"?}, and "event" / "expired_away" for what became of mail.
+    \\
+    \\subject sets what a session works on, shown by peer_list, in its peer
+    \\messages and on its sketerm tab: at most 200 bytes of text without
+    \\control characters; --clear removes it, no TEXT prints it. Run inside an
+    \\assistant session (Claude Code: `! sketerm peer subject "..."`) it sets
+    \\that session's own peer, found through this process's ancestry; --name
+    \\NAME sets the peer NAME instead (a `read --follow` program, or any
+    \\session by its address). The daemon keeps it with the address, across
+    \\server restarts.
     \\
     \\Exit status: 0 done, 1 the daemon could not be reached, the name is held
-    \\by another live peer, or a send was refused; 2 bad usage.
+    \\by another live peer, a send was refused, or no server or peer was found
+    \\for subject; 2 bad usage (a refused subject too).
     \\
 ;
 
@@ -354,11 +392,15 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             error.UnknownFlag => "peer: unknown flag (see --help)\n",
             error.MissingValue => "peer: flag needs a value\n",
             error.ExtraArgument => "peer: too many arguments (see --help)\n",
-            error.UnknownVerb => "peer: say list, send or read (see --help)\n",
+            error.UnknownVerb => "peer: say list, send, read or subject (see --help)\n",
             error.NoName => "peer: --name NAME (or SKETERM_PEER_NAME) is required: the address this program is reached at\n",
             error.NoAddress => "peer: send needs the address to send to\n",
             error.BadName => "peer: the name must be 1-64 of A-Za-z0-9._- (no host)\n",
-            error.NotForVerb => "peer: --follow is for read, --reply-to for send\n",
+            error.NotForVerb => "peer: --follow is for read, --reply-to for send, --clear for subject\n",
+            error.SubjectTooLong, error.SubjectNotText => {
+                _ = fail("{s}", .{peermail.subjectRefusal(@errorCast(err))});
+                return 2;
+            },
         });
         return 2;
     };
@@ -371,6 +413,7 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     if (o.verb.? == .read and o.follow) return follow(allocator, o);
+    if (o.verb.? == .subject) return subject(allocator, arena, o);
 
     var link = Link.open(allocator) catch |e| return fail("{s}", .{linkError(e)});
     defer link.close();
@@ -417,7 +460,60 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             link.peer.ack(ids.items) catch {};
             return 0;
         },
+        .subject => unreachable,
     }
+}
+
+/// `sketerm peer subject`: set (`o.text`), clear (`o.clear`) or print the
+/// subject of `o.name`, else of this process's own session.
+fn subject(allocator: std.mem.Allocator, arena: std.mem.Allocator, o: Cli) u8 {
+    const value: ?[]const u8 = if (o.clear) "" else o.text;
+    if (o.name) |name| {
+        var link = Link.open(allocator) catch |e| return fail("{s}", .{linkError(e)});
+        defer link.close();
+        if (!link.peer.subjects()) return fail("the per-user sketerm daemon predates peer subjects (restart it idle)", .{});
+        const r = link.peer.subject(arena, name, value, REPLY_MS) catch return fail("the daemon did not answer the subject request", .{});
+        if (r.value.refused) |why| return fail("{s}", .{why});
+        if (!r.value.found) return fail("no peer {s} here: neither a live peer nor a durable address this daemon knows", .{name});
+        say(1, subjectText(arena, name, value, r.value.subject) catch return 1);
+        return 0;
+    }
+    const own = mcp_hook.serversOfThisClient(arena, null);
+    if (own.len == 0) return fail("no sketerm MCP server in this process's ancestry: run it inside an assistant session (Claude Code: ! sketerm peer subject ...), or name a peer with --name", .{});
+    if (value) |v| {
+        const line = agentwait.encodePresence(arena, .{ .event = agentwait.SUBJECT_EVENT, .subject = v }) catch return 1;
+        var took: usize = 0;
+        for (own) |e| took += @intFromBool(agentwait.postPresence(e.agent_socket, line));
+        if (took == 0) return fail("this session's server did not take the subject", .{});
+    }
+    // The broker names the server's peer (its registration carries the pid).
+    const me = ownPeer(allocator, arena, own) orelse {
+        if (value == null) return fail("this session's server is not registered as a peer with the per-user daemon", .{});
+        say(1, subjectText(arena, "this session", value, "") catch return 1);
+        return 0;
+    };
+    say(1, subjectText(arena, me.address, value, me.subject) catch return 1);
+    return 0;
+}
+
+/// What `subject` prints: the confirmation of a set or clear, or the
+/// current subject alone (nothing when there is none).
+fn subjectText(arena: std.mem.Allocator, address: []const u8, value: ?[]const u8, current: []const u8) ![]const u8 {
+    const v = value orelse return if (current.len > 0) std.fmt.allocPrint(arena, "{s}\n", .{current}) else "";
+    if (v.len == 0) return std.fmt.allocPrint(arena, "subject of {s} cleared\n", .{address});
+    return std.fmt.allocPrint(arena, "subject of {s}: {s}\n", .{ address, v });
+}
+
+/// The live peer of this host one of `own` registered (by its pid).
+fn ownPeer(allocator: std.mem.Allocator, arena: std.mem.Allocator, own: []const @import("mcp_registry.zig").Entry) ?struct { address: []const u8, subject: []const u8 } {
+    var link = Link.open(allocator) catch return null;
+    defer link.close();
+    const reply = link.peer.list(arena, REPLY_MS) catch return null;
+    for (reply.value.peers) |pi| {
+        if (!pi.live or pi.via_host.len > 0) continue;
+        for (own) |e| if (e.pid == pi.pid) return .{ .address = pi.address, .subject = pi.subject };
+    }
+    return null;
 }
 
 const LinkError = error{ Unreachable, NoPeers, NameTaken, NoAnswer };
@@ -638,7 +734,7 @@ fn pause(ms: i64, watch_stdin: bool) bool {
 
 const t = std.testing;
 
-test "arguments: a name for send and read (flag or SKETERM_PEER_NAME), none for list" {
+test "arguments: a name for send and read (flag or SKETERM_PEER_NAME), none for list; subject's text or --clear" {
     const r = try Cli.parse(&.{ "read", "--follow", "--json", "--name", "webapp" }, null);
     try t.expectEqual(Verb.read, r.verb.?);
     try t.expect(r.follow and r.json);
@@ -658,6 +754,33 @@ test "arguments: a name for send and read (flag or SKETERM_PEER_NAME), none for 
     try t.expectError(error.UnknownVerb, Cli.parse(&.{"drain"}, null));
     try t.expectError(error.UnknownFlag, Cli.parse(&.{ "list", "--bogus" }, null));
     try t.expectError(error.ExtraArgument, Cli.parse(&.{ "read", "--name", "w", "extra" }, null));
+    // subject: the text, --clear or nothing (print); SKETERM_PEER_NAME never
+    // redirects it, only --name does.
+    const set = try Cli.parse(&.{ "subject", "template links" }, "env-name");
+    try t.expectEqual(Verb.subject, set.verb.?);
+    try t.expectEqualStrings("template links", set.text.?);
+    try t.expect(set.name == null and set.to == null and !set.clear);
+    const clr = try Cli.parse(&.{ "subject", "--clear", "--name", "webapp" }, null);
+    try t.expect(clr.clear and clr.text == null);
+    try t.expectEqualStrings("webapp", clr.name.?);
+    const ask = try Cli.parse(&.{"subject"}, null);
+    try t.expect(ask.text == null and !ask.clear);
+    try t.expectError(error.ExtraArgument, Cli.parse(&.{ "subject", "--clear", "x" }, null));
+    try t.expectError(error.ExtraArgument, Cli.parse(&.{ "subject", "a", "b" }, null));
+    try t.expectError(error.SubjectTooLong, Cli.parse(&.{ "subject", "x" ** (peermail.SUBJECT_MAX + 1) }, null));
+    try t.expectError(error.SubjectNotText, Cli.parse(&.{ "subject", "two\nlines" }, null));
+    try t.expectError(error.BadName, Cli.parse(&.{ "subject", "--name", "h/w", "x" }, null));
+    try t.expectError(error.NotForVerb, Cli.parse(&.{ "list", "--clear" }, null));
+}
+
+test "subject prints a confirmation, or the current subject alone" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try t.expectEqualStrings("subject of Arcana: template links\n", try subjectText(a, "Arcana", "template links", ""));
+    try t.expectEqualStrings("subject of Arcana cleared\n", try subjectText(a, "Arcana", "", "old"));
+    try t.expectEqualStrings("template links\n", try subjectText(a, "Arcana", null, "template links"));
+    try t.expectEqualStrings("", try subjectText(a, "Arcana", null, ""));
 }
 
 test "a received message prints as one JSON line with the documented fields" {
@@ -692,4 +815,10 @@ test "a list entry: compact facts by their labels, attention only where it reads
     try t.expect(l.attention == null);
     try t.expectEqualStrings("idle_prompt", l.last_notification.?);
     try t.expect(listLine(.{ .address = "bob", .last_notification = "x" }, false, false).last_notification == null);
+    // A subject reads right after the state, and in the compact JSON.
+    aw.clearRetainingCapacity();
+    try writeListText(&aw.writer, a, .{ .address = "carol", .app = "claude-code", .state = .idle, .live = true, .subject = "template links", .model = "Opus" }, false);
+    try t.expectEqualStrings("carol claude-code on this host, idle, subject: template links, Opus, pending 0", aw.written());
+    try t.expectEqualStrings("template links", listLine(.{ .address = "carol", .subject = "template links" }, false, false).subject.?);
+    try t.expect(listLine(.{ .address = "carol" }, false, false).subject == null);
 }

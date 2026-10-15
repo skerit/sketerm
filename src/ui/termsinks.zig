@@ -287,9 +287,11 @@ pub fn paneFacts(self: *Window, pane: *Pane, rel_buf: []u8) titlefmt.Facts {
     const cwd: []const u8 = if (term.cwd) |p| p else "";
     // A face covering the terminal (the file browser's folder, an
     // editor's document, a web page) titles the tab; the shell behind
-    // it has nothing to say about what the user is looking at.
+    // it has nothing to say about what the user is looking at. Else the
+    // subject its user set on the peer running in the session does,
+    // ahead of whatever title that app emits itself.
     var facts = titlefmt.Facts{
-        .title = if (pane.shownFaceTitle()) |ft| ft else if (term.screen.last_title) |t| t else "",
+        .title = if (pane.shownFaceTitle()) |ft| ft else if (pane.shownSubject()) |sj| sj else if (term.screen.last_title) |t| t else "",
         .program = term.program(),
         .absolute_path = cwd,
         .relative_path = if (cwd.len > 0) abbreviateHome(cwd, rel_buf) else "",

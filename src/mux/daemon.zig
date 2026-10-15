@@ -6090,6 +6090,7 @@ pub const Daemon = struct {
             .origin_name = s.origin_name,
             .origin_id = &s.origin_id,
         });
+        daemon_peers.queueSessionPeer(self, cl);
         // A cast viewer needs the playback state to render controls.
         if (s.castPtr()) |cp| daemon_cast.queuePlayState(cl, cp);
     }

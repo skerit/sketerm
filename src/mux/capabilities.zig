@@ -134,6 +134,11 @@ pub const Flag = enum {
     /// answers with `peer_member_relay`. Absent = a hub lists that host
     /// `unsupported` and refuses sends to it `federation_unavailable`.
     peer_federation,
+    /// The broker keeps a user-set subject per peer: `peer_register`'s
+    /// `subject`, `peer_subject` (answered by `peer_subject_reply`, or on
+    /// an attached session by the `session_meta` `peer` push), and
+    /// `subject` in `peer_list`/`peer_deliver`. Absent = never send them.
+    peer_subject,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

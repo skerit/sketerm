@@ -136,6 +136,8 @@ pub const curated = [_]Row{
        .desc = "Move focus to the previous pane within this tab.", .action = .pane_prev },
     .{ .icon = "document-edit-symbolic", .title = "Set Pane Title…",
        .desc = "Give the focused pane a title of its own, shown on its titlebar and tab.", .action = .set_pane_title },
+    .{ .icon = "document-edit-symbolic", .title = "Set Subject…",
+       .desc = "Say what the assistant in the focused pane works on: shown on its tab, in peer_list and in its peer messages.", .action = .set_peer_subject },
     .{ .icon = "camera-photo-symbolic", .title = "Screenshot Pane…",
        .desc = "Save the focused pane as a PNG image.", .action = .screenshot_pane },
     .{ .icon = "view-refresh-symbolic", .title = "Reset Terminal",

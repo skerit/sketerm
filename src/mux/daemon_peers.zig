@@ -7,12 +7,21 @@
 //! `peerlink.Links` to its domains; on any other broker a hub's link
 //! arrives as a client that says `peer_hub_hello`. The socket is private
 //! to the user, so that client is trusted like any same-user client.
+//!
+//! Subjects: the broker tells each session's worker which peer runs in
+//! that session's process tree (`peerInTree`, the ancestry walk
+//! `sketerm mcp hook` uses) and its subject, as control `'S'`; the worker
+//! pushes it to its viewers as `session_meta` `peer`. A viewer's
+//! `peer_subject` comes back the other way as control `'P'`.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
 const log = @import("log.zig");
 const peermail = @import("peermail.zig");
 const peerlink = @import("peerlink.zig");
+const daemon_control = @import("daemon_control.zig");
+const platform = @import("../util/platform.zig");
+const agentsline = @import("../ipc/agentsline.zig");
 const env = @import("../util/env.zig");
 const xdg = @import("../util/xdg.zig");
 const clock = @import("../util/clock.zig");
@@ -20,6 +29,7 @@ const Config = @import("../config.zig").Config;
 const dmod = @import("daemon.zig");
 const Daemon = dmod.Daemon;
 const Client = dmod.Client;
+const Worker = dmod.Worker;
 
 /// Rigs override the mail TTL in milliseconds (config is in hours).
 pub const TTL_ENV = "SKETERM_MUX_PEER_TTL_MS";
@@ -33,7 +43,21 @@ pub const State = struct {
     /// Hub only: the links to the federated domains.
     links: ?peerlink.Links = null,
     last_sweep_ms: i64 = 0,
+    /// Broker: what each worker was last told its session's peer is.
+    told: std.ArrayList(Told) = .empty,
+    /// Broker: the store's `roster_gen` and the workers' signature the
+    /// last `remap` saw.
+    mapped_gen: u32 = 0,
+    mapped_sig: u64 = 0,
+    /// Worker: the peer in this session's tree, as the broker last said
+    /// (owned); null = never said.
+    session_peer: ?SessionPeer = null,
 };
+
+/// The `'S'` control payload, also the `session_meta` `peer` member.
+pub const SessionPeer = peermail.SessionPeer;
+
+const Told = struct { worker_pid: c.pid_t, json: []u8 };
 
 /// Load the durable mailboxes; a broker calls this before serving.
 pub fn start(d: *Daemon) void {
@@ -45,6 +69,16 @@ pub fn deinit(d: *Daemon) void {
     d.peers.links = null;
     if (d.peers.store) |*s| s.deinit();
     d.peers.store = null;
+    for (d.peers.told.items) |tl| d.allocator.free(tl.json);
+    d.peers.told.deinit(d.allocator);
+    freeSessionPeer(d);
+}
+
+fn freeSessionPeer(d: *Daemon) void {
+    const sp = d.peers.session_peer orelse return;
+    d.allocator.free(sp.address);
+    d.allocator.free(sp.subject);
+    d.peers.session_peer = null;
 }
 
 /// Connection `id` is going away (reap phase 2).
@@ -56,13 +90,20 @@ pub fn clientGone(d: *Daemon, id: u32) void {
 }
 
 /// Expire queued mail past its TTL (called from reap, next to `ttlSweep`),
-/// tick the links and send the presence the links are owed.
+/// tick the links, send the presence the links are owed and tell the
+/// workers whose session's peer changed.
 pub fn sweep(d: *Daemon) void {
     const s = if (d.peers.store) |*st| st else return;
     const now = clock.nowMs();
     const wall = clock.wallMs();
     if (d.peers.links) |*l| l.tick(d, s, now, wall);
     s.tick(wall);
+    const sig = workersSignature(d);
+    if (s.roster_gen != d.peers.mapped_gen or sig != d.peers.mapped_sig) {
+        d.peers.mapped_gen = s.roster_gen;
+        d.peers.mapped_sig = sig;
+        remap(d, s);
+    }
     if (now - d.peers.last_sweep_ms < SWEEP_EVERY_MS) return;
     d.peers.last_sweep_ms = now;
     s.sweep(wall);
@@ -165,6 +206,165 @@ pub fn handleHubRelay(d: *Daemon, cl: *Client, payload: []const u8) void {
         error.NotLinked => "peer_hub_relay before peer_hub_hello on this connection",
         error.BadAddress, error.NotRegistered, error.OutOfMemory, error.NoEntropy => "peer_hub_relay failed on the broker",
     }, frame);
+}
+
+/// `peer_subject`. On a broker connection: ask, set or clear the subject
+/// of `address`, answered by `peer_subject_reply`. On a worker (an
+/// attached viewer): handed to the broker for the peer in this session's
+/// tree; the `session_meta` push that follows is the answer.
+pub fn handleSubject(d: *Daemon, cl: *Client, payload: []const u8) void {
+    const frame = "peer_subject";
+    var parsed = std.json.parseFromSlice(peermail.SubjectReq, d.allocator, payload, .{ .ignore_unknown_fields = true }) catch
+        return cl.queueErrFor("bad peer_subject request", frame);
+    defer parsed.deinit();
+    const q = parsed.value;
+    if (d.isWorker()) {
+        if (q.address.len > 0) return cl.queueErrFor("peer_subject on an attached session names no address", frame);
+        if (cl.attached == null) return cl.queueErrFor("peer_subject: not attached", frame);
+        if (!cl.actsOnSession()) return cl.queueErrFor("a view-only attachment cannot set the subject", frame);
+        const subject = q.subject orelse return;
+        peermail.checkSubject(subject) catch |e| return cl.queueErrFor(peermail.subjectRefusal(e), frame);
+        var buf: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        w.writeByte('P') catch return;
+        std.json.Stringify.value(peermail.SubjectReq{ .subject = subject }, .{}, &w) catch return cl.queueErrFor("peer_subject: the subject does not fit", frame);
+        if (!daemon_control.controlSend(d.control_fd, w.buffered(), -1)) cl.queueErrFor("peer_subject could not reach the broker", frame);
+        return;
+    }
+    const s = storeFor(d, cl, frame) orelse return;
+    if (q.address.len == 0) return cl.queueErrFor("peer_subject needs the peer's address on a connection that is not attached", frame);
+    var reply = peermail.SubjectReply{ .req = q.req, .address = q.address, .found = s.knows(q.address) };
+    if (q.subject) |subject| s.setSubject(q.address, subject) catch |e| switch (e) {
+        error.SubjectTooLong, error.SubjectNotText => reply.refused = peermail.subjectRefusal(@errorCast(e)),
+        error.UnknownAddress => {},
+        error.OutOfMemory => return cl.queueErrFor("peer_subject failed on the broker", frame),
+    };
+    reply.subject = s.subjectOf(q.address);
+    cl.queueJson(.peer_subject_reply, reply);
+}
+
+/// Broker: control `'P'` from worker `w`, a viewer's `peer_subject`.
+pub fn workerSubject(d: *Daemon, w: *Worker, payload: []const u8) void {
+    const s = ensure(d) orelse return;
+    var parsed = std.json.parseFromSlice(peermail.SubjectReq, d.allocator, payload, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+    const subject = parsed.value.subject orelse return;
+    var arena: std.heap.ArenaAllocator = .init(d.allocator);
+    defer arena.deinit();
+    const live = livePeers(arena.allocator(), s) catch return;
+    const i = peerInTree(live, w.child_pid, platform.parentOf) orelse
+        return log.info("peer_subject: no peer runs in session '{s}'", .{w.name});
+    s.setSubject(live[i].address, subject) catch |e| log.warn("peer_subject for {s} in session '{s}' refused: {s}", .{ live[i].address, w.name, @errorName(e) });
+}
+
+/// Worker: control `'S'`, the peer in this session's tree; every viewer hears it.
+pub fn workerApplyPeer(d: *Daemon, payload: []const u8) void {
+    var parsed = std.json.parseFromSlice(SessionPeer, d.allocator, payload, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+    const address = d.allocator.dupe(u8, parsed.value.address) catch return;
+    const subject = d.allocator.dupe(u8, parsed.value.subject) catch {
+        d.allocator.free(address);
+        return;
+    };
+    freeSessionPeer(d);
+    d.peers.session_peer = .{ .address = address, .subject = subject };
+    if (d.sessions.items.len == 0) return;
+    const session = d.sessions.items[0];
+    for (d.clients.items) |cl| {
+        if (!cl.dead and Daemon.terminalViewer(cl, session)) queueSessionPeer(d, cl);
+    }
+}
+
+/// Worker: tell an attaching viewer the session's peer, once known.
+pub fn queueSessionPeer(d: *Daemon, cl: *Client) void {
+    const sp = d.peers.session_peer orelse return;
+    cl.queueJson(.session_meta, .{ .peer = sp });
+}
+
+/// The index of the peer whose process runs nearest below `root` (the
+/// process itself counts), null when none runs in that tree.
+pub fn peerInTree(peers: []const peermail.PeerInfo, root: c.pid_t, parentOf: *const fn (c.pid_t) ?c.pid_t) ?usize {
+    if (root <= 0) return null;
+    var best: ?usize = null;
+    var best_hops: usize = std.math.maxInt(usize);
+    for (peers, 0..) |p, i| {
+        if (p.pid <= 0) continue;
+        const hops: usize = if (p.pid == root) 0 else blk: {
+            var buf: [agentsline.MAX_ANCESTRY]c.pid_t = undefined;
+            const chain = agentsline.ancestry(&buf, p.pid, parentOf);
+            const k = std.mem.indexOfScalar(c.pid_t, chain, root) orelse continue;
+            break :blk k + 1;
+        };
+        if (hops < best_hops) {
+            best = i;
+            best_hops = hops;
+        }
+    }
+    return best;
+}
+
+/// The live peers of this host (no federated entries).
+fn livePeers(arena: std.mem.Allocator, s: *peermail.Store) error{OutOfMemory}![]const peermail.PeerInfo {
+    var out: std.ArrayList(peermail.PeerInfo) = .empty;
+    for (try s.list(arena)) |p| {
+        if (p.live and p.via_host.len == 0) try out.append(arena, p);
+    }
+    return out.items;
+}
+
+/// What `remap` depends on besides the store: which workers run which child.
+fn workersSignature(d: *Daemon) u64 {
+    var h = std.hash.Wyhash.init(0);
+    for (d.workers.items) |w| {
+        const pids = [3]i64{ w.pid, w.child_pid, @intFromBool(w.dead) };
+        h.update(std.mem.asBytes(&pids));
+    }
+    return h.final();
+}
+
+/// Tell every worker whose session's peer (or its subject) changed.
+fn remap(d: *Daemon, s: *peermail.Store) void {
+    var arena_state: std.heap.ArenaAllocator = .init(d.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const live = livePeers(a, s) catch return;
+    for (d.workers.items) |w| {
+        if (w.dead or w.child_pid <= 0) continue;
+        const sp: SessionPeer = if (peerInTree(live, w.child_pid, platform.parentOf)) |i| .{ .address = live[i].address, .subject = live[i].subject } else .{};
+        const json = std.json.Stringify.valueAlloc(a, sp, .{}) catch continue;
+        const ti = toldIndex(d, w.pid);
+        if (ti) |k| {
+            if (std.mem.eql(u8, d.peers.told.items[k].json, json)) continue;
+        } else if (sp.address.len == 0) continue;
+        const msg = a.alloc(u8, json.len + 1) catch continue;
+        msg[0] = 'S';
+        @memcpy(msg[1..], json);
+        if (!daemon_control.controlSend(w.control_fd, msg, -1)) continue;
+        const owned = d.allocator.dupe(u8, json) catch continue;
+        if (ti) |k| {
+            d.allocator.free(d.peers.told.items[k].json);
+            d.peers.told.items[k].json = owned;
+        } else d.peers.told.append(d.allocator, .{ .worker_pid = w.pid, .json = owned }) catch d.allocator.free(owned);
+    }
+    // Forget workers that are gone.
+    var i: usize = 0;
+    while (i < d.peers.told.items.len) {
+        const pid = d.peers.told.items[i].worker_pid;
+        const alive = for (d.workers.items) |w| {
+            if (w.pid == pid and !w.dead) break true;
+        } else false;
+        if (alive) {
+            i += 1;
+            continue;
+        }
+        d.allocator.free(d.peers.told.items[i].json);
+        _ = d.peers.told.swapRemove(i);
+    }
+}
+
+fn toldIndex(d: *Daemon, worker_pid: c.pid_t) ?usize {
+    for (d.peers.told.items, 0..) |tl, i| if (tl.worker_pid == worker_pid) return i;
+    return null;
 }
 
 fn storeFor(d: *Daemon, cl: *Client, frame: []const u8) ?*peermail.Store {
@@ -299,4 +499,36 @@ test "the TTL override accepts only non-negative integers" {
     try t.expectEqual(@as(?i64, 0), parseTtlMs("0"));
     try t.expectEqual(@as(?i64, null), parseTtlMs("-1"));
     try t.expectEqual(@as(?i64, null), parseTtlMs("6h"));
+}
+
+fn fakeParent(pid: c.pid_t) ?c.pid_t {
+    // A pane shell (10) runs claude (20), which runs two servers (30, 31);
+    // another pane (50) runs a follower (60) under a subshell (55).
+    return switch (pid) {
+        30, 31 => 20,
+        20 => 10,
+        60 => 55,
+        55 => 50,
+        10, 50 => 1,
+        else => null,
+    };
+}
+
+test "a pane's peer is the nearest one in its process tree; a pane without one has none" {
+    const t = std.testing;
+    const peers = [_]peermail.PeerInfo{
+        .{ .address = "far", .pid = 60 },
+        .{ .address = "Arcana", .pid = 30 },
+        .{ .address = "second", .pid = 31 },
+        .{ .address = "unknown-pid", .pid = 0 },
+    };
+    // 1. The pane shell 10: both servers are two hops below; the first wins.
+    try t.expectEqual(@as(?usize, 1), peerInTree(&peers, 10, fakeParent));
+    // 2. The other pane finds its follower through the subshell.
+    try t.expectEqual(@as(?usize, 0), peerInTree(&peers, 50, fakeParent));
+    // 3. A process that is itself the peer is its own nearest.
+    try t.expectEqual(@as(?usize, 2), peerInTree(&peers, 31, fakeParent));
+    // 4. A pane nothing runs in, and an unknown child pid, have none.
+    try t.expectEqual(@as(?usize, null), peerInTree(&peers, 77, fakeParent));
+    try t.expectEqual(@as(?usize, null), peerInTree(&peers, 0, fakeParent));
 }
