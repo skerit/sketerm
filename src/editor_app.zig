@@ -140,18 +140,7 @@ pub fn collect(allocator: std.mem.Allocator, args: []const []const u8, cwd: ?[]c
             if (arg.len > 0 and arg[0] == '-') continue;
         }
 
-        const normalized = try entry.normalizeArgAlloc(allocator, arg);
-        defer allocator.free(normalized);
-        const loc = paths.parseSpec(normalized);
-        const owned = if (loc.current_host and (loc.path.len == 0 or loc.path[0] != '/')) blk: {
-            const base = cwd orelse ".";
-            const joined = if (std.mem.eql(u8, base, "/"))
-                try std.fmt.allocPrint(allocator, "/{s}", .{loc.path})
-            else
-                try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, loc.path });
-            defer allocator.free(joined);
-            break :blk try paths.formatSpecAlloc(allocator, null, joined);
-        } else try paths.formatSpecAlloc(allocator, loc.host, loc.path);
+        const owned = try entry.resolveArgAlloc(allocator, arg, cwd);
         try out.append(allocator, owned);
     }
 

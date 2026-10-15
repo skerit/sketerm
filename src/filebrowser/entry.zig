@@ -168,6 +168,22 @@ pub fn normalizeArgAlloc(allocator: std.mem.Allocator, arg: []const u8) ![]u8 {
     return paths.formatSpecAlloc(allocator, host, decoded[0..w]);
 }
 
+/// A command-line resource as an owned spec; a relative current-host path resolves against `cwd` (null reads as ".").
+pub fn resolveArgAlloc(allocator: std.mem.Allocator, arg: []const u8, cwd: ?[]const u8) ![]u8 {
+    const normalized = try normalizeArgAlloc(allocator, arg);
+    defer allocator.free(normalized);
+    const loc = paths.parseSpec(normalized);
+    if (!loc.current_host or (loc.path.len > 0 and loc.path[0] == '/'))
+        return paths.formatSpecAlloc(allocator, loc.host, loc.path);
+    const base = cwd orelse ".";
+    const joined = if (std.mem.eql(u8, base, "/"))
+        try std.fmt.allocPrint(allocator, "/{s}", .{loc.path})
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, loc.path });
+    defer allocator.free(joined);
+    return paths.formatSpecAlloc(allocator, null, joined);
+}
+
 /// A file manager registered for `inode/directory` can still be handed
 /// a FILE (drag onto the launcher, "Open With"). Browsing then starts
 /// in the file's PARENT directory -- the start location cannot express
@@ -223,6 +239,25 @@ test "normalizeArgAlloc does not truncate long file URIs" {
     try std.testing.expect(std.mem.startsWith(u8, normalized, "local:/tmp/"));
     try std.testing.expect(std.mem.endsWith(u8, normalized, "x end.png"));
     try std.testing.expect(normalized.len > paths.SPEC_BUF_LEN);
+}
+
+test "resolveArgAlloc joins relative local paths onto cwd and keeps absolute, remote and URI specs" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { arg: []const u8, cwd: ?[]const u8, want: []const u8 }{
+        .{ .arg = "notes.txt", .cwd = "/home/u", .want = "local:/home/u/notes.txt" },
+        .{ .arg = "notes.txt", .cwd = "/", .want = "local:/notes.txt" },
+        .{ .arg = "notes.txt", .cwd = null, .want = "local:./notes.txt" },
+        .{ .arg = "/etc/hosts", .cwd = "/home/u", .want = "local:/etc/hosts" },
+        .{ .arg = "box:/srv/a", .cwd = "/home/u", .want = "box:/srv/a" },
+        .{ .arg = "local:/tmp/b", .cwd = "/home/u", .want = "local:/tmp/b" },
+        .{ .arg = "file:///tmp/a%20b", .cwd = "/home/u", .want = "local:/tmp/a b" },
+        .{ .arg = "file://box/srv/c", .cwd = "/home/u", .want = "box:/srv/c" },
+    };
+    for (cases) |case| {
+        const got = try resolveArgAlloc(a, case.arg, case.cwd);
+        defer a.free(got);
+        try std.testing.expectEqualStrings(case.want, got);
+    }
 }
 
 test "files entry: bare invocation defaults to the dedicated window" {
