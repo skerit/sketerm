@@ -300,6 +300,20 @@ fn expectLiveDurable(m: *Mcp, arena: std.mem.Allocator, address: []const u8, com
     expectStr(p, "state", "unknown", what ++ ": a peer without hooks reports a state");
 }
 
+/// Poll `m`'s peer_list until `address` is live with `subject` (null: none).
+fn awaitSubject(m: *Mcp, arena: std.mem.Allocator, address: []const u8, subject: ?[]const u8, comptime what: []const u8) void {
+    const deadline = nowMs() + 10_000;
+    while (nowMs() < deadline) {
+        if (listed(m, arena, address, what)) |p| {
+            const got: ?[]const u8 = if (p.get("subject")) |v| (if (v == .string) v.string else null) else null;
+            const matches = if (subject) |want| (got != null and std.mem.eql(u8, got.?, want)) else got == null;
+            if (boolOf(p, "live", what) and matches) return;
+        }
+        _ = c.usleep(50_000);
+    }
+    fail(what ++ ": peer_list never showed the expected subject");
+}
+
 pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const u8) void {
     if (!prepared) fail("prepare() must run before the broker is forked");
     const started = nowMs();
@@ -632,6 +646,58 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
         contains(str(it, "content", "31."), "Peer message from webapp (cli", "31. app cli");
     }
     std.debug.print("smoke: peers: sketerm peer follow, read and send ok\n", .{});
+
+    // -- j. the user-set subject --
+    // 32. `peer subject TEXT` in alice's client tree (as `! sketerm peer
+    //     subject` runs in a Claude Code session): exit 0, confirmed for
+    //     alice, whose server it found through its ancestry.
+    {
+        const r = runInTree(arena, runs, exe, "'{exe}' peer subject 'template links'", "32. set");
+        if (!std.mem.eql(u8, r.rc, "0")) fail("32. peer subject did not exit 0");
+        contains(r.out, "subject of alice: template links", "32. the confirmation");
+    }
+    // 33. bob2's peer_list shows it; with no argument it prints it back.
+    awaitSubject(&bob2, arena, "alice", "template links", "33.");
+    if (!std.mem.eql(u8, runInTree(arena, runs, exe, "'{exe}' peer subject", "33. print").out, "template links\n")) fail("33. peer subject did not print the subject alone");
+    // 34. A message from alice carries it in the header.
+    expectStr(send(&alice, arena, "bob", "with a subject", "34. send"), "outcome", "delivered", "34. outcome");
+    contains(str(readOne(&bob2, arena, 5_000, "34. bob2 peer_read"), "content", "34."), ", idle; subject: template links). id m-", "34. the subject in the composed line");
+    // 35. A subject with a control character is refused (2); an unknown
+    //     --name finds no peer (1). Neither changes alice's.
+    if (!std.mem.eql(u8, runInTree(arena, runs, exe, "'{exe}' peer subject \"$(printf 'a\\tb')\"", "35. refused").rc, "2")) fail("35. a subject with a tab was not refused with status 2");
+    if (!std.mem.eql(u8, runInTree(arena, runs, exe, "'{exe}' peer subject --name nobody x", "35. unknown").rc, "1")) fail("35. an unknown --name did not exit 1");
+    awaitSubject(&bob2, arena, "alice", "template links", "35.");
+    // 36. alice's server restarts: the broker kept the subject with her
+    //     durable name, so the new server's peer has it at once.
+    alice.closeStdinWait();
+    awaitOffline(&bob2, arena, "alice", false, "36. alice offline");
+    alice = stage.serverWithTree("alice", runs.ptr);
+    alice.initialize();
+    expectStr(registered(&alice, arena, "36. alice again"), "address", "alice", "36. address");
+    if (!boolOf(registered(&alice, arena, "36. caps"), "subject", "36.")) fail("36. capabilities.peers.subject is false on a daemon that keeps subjects");
+    awaitSubject(&bob2, arena, "alice", "template links", "36.");
+    // 37. --clear in the new server's tree: gone from bob2's list.
+    {
+        const r = runInTree(arena, runs, exe, "'{exe}' peer subject --clear", "37. clear");
+        if (!std.mem.eql(u8, r.rc, "0")) fail("37. peer subject --clear did not exit 0");
+        contains(r.out, "subject of alice cleared", "37. the confirmation");
+    }
+    awaitSubject(&bob2, arena, "alice", null, "37.");
+    // 38. A `peer read --follow` program gets one by --name from anywhere.
+    {
+        var follower = Mcp.spawnWith(allocator, exe, .{
+            .extra = &.{ "peer", "read", "--follow", "--json", "--name", "webapp2" },
+            .unset_env = &UNSET,
+            .set_env = stage.env(null),
+        });
+        awaitSubject(&bob2, arena, "webapp2", null, "38. follower listed");
+        const r = runInTree(arena, runs, exe, "'{exe}' peer subject --name webapp2 'serves the tavern'", "38. --name");
+        if (!std.mem.eql(u8, r.rc, "0")) fail("38. peer subject --name did not exit 0");
+        contains(r.out, "subject of webapp2: serves the tavern", "38. the confirmation");
+        awaitSubject(&bob2, arena, "webapp2", "serves the tavern", "38.");
+        follower.terminate();
+    }
+    std.debug.print("smoke: peers: user-set subject ok\n", .{});
 
     dave.closeStdinWait();
     bob2.closeStdinWait();
