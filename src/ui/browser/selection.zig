@@ -30,6 +30,7 @@ const colview = @import("colview.zig");
 const render_mod = @import("render.zig");
 const dnd = @import("dnd.zig");
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
+const prepareAnchoredPopover = @import("menu.zig").prepareAnchoredPopover;
 const entryForPath = @import("nav.zig").entryForPath;
 const formatSpec = @import("../../filebrowser/paths.zig").formatSpec;
 const menuButton = @import("menu.zig").menuButton;
@@ -924,18 +925,7 @@ pub fn onSelectionMenuClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c)
     }
 
     c.gtk_popover_set_child(@ptrCast(popover), box);
-    var bounds: c.graphene_rect_t = undefined;
-    if (c.gtk_widget_compute_bounds(@ptrCast(btn), @ptrCast(btn), &bounds) != 0) {
-        const rect = c.GdkRectangle{
-            .x = @intFromFloat(bounds.origin.x),
-            .y = @intFromFloat(bounds.origin.y),
-            .width = @intFromFloat(bounds.size.width),
-            .height = @intFromFloat(bounds.size.height),
-        };
-        c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
-    }
-    c.gtk_widget_set_parent(popover, @ptrCast(btn));
-    connectPopoverAutoUnparent(popover);
+    prepareAnchoredPopover(popover, @ptrCast(btn));
     c.gtk_popover_popup(@ptrCast(popover));
 }
 

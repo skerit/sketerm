@@ -31,7 +31,7 @@ const Entry = @import("types.zig").Entry;
 const HostConn = @import("types.zig").HostConn;
 const OwnedSearch = @import("types.zig").OwnedSearch;
 const WireJobEv = @import("types.zig").WireJobEv;
-const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
+const prepareAnchoredPopover = @import("menu.zig").prepareAnchoredPopover;
 const cast = @import("../../util/cast.zig");
 
 /// Duplicate finder: a host-side scan buckets files by SIZE, then
@@ -564,19 +564,7 @@ pub fn onPresetClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         c.gtk_box_append(@ptrCast(box), item);
     }
     c.gtk_popover_set_child(@ptrCast(popover), box);
-    // Without an explicit rect a popover with a wide child never maps.
-    var bounds: c.graphene_rect_t = undefined;
-    if (c.gtk_widget_compute_bounds(@ptrCast(btn), @ptrCast(btn), &bounds) != 0) {
-        const rect = c.GdkRectangle{
-            .x = @intFromFloat(bounds.origin.x),
-            .y = @intFromFloat(bounds.origin.y),
-            .width = @intFromFloat(bounds.size.width),
-            .height = @intFromFloat(bounds.size.height),
-        };
-        c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
-    }
-    c.gtk_widget_set_parent(popover, @ptrCast(btn));
-    connectPopoverAutoUnparent(popover);
+    prepareAnchoredPopover(popover, @ptrCast(btn));
     c.gtk_popover_popup(@ptrCast(popover));
 }
 

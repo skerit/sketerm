@@ -19,7 +19,7 @@ const toolbtn = @import("../toolbtn.zig");
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
 const Entry = @import("types.zig").Entry;
-const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
+const prepareAnchoredPopover = @import("menu.zig").prepareAnchoredPopover;
 const menuButton = @import("menu.zig").menuButton;
 const showColumnPicker = @import("render.zig").showColumnPicker;
 const cast = @import("../../util/cast.zig");
@@ -771,18 +771,7 @@ pub fn onViewMenuClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void
     menuButton(box, atxt, &onForgetAllFolders, @ptrCast(self), true);
 
     c.gtk_popover_set_child(@ptrCast(popover), box);
-    var bounds: c.graphene_rect_t = undefined;
-    if (c.gtk_widget_compute_bounds(@ptrCast(btn), @ptrCast(btn), &bounds) != 0) {
-        const rect = c.GdkRectangle{
-            .x = @intFromFloat(bounds.origin.x),
-            .y = @intFromFloat(bounds.origin.y),
-            .width = @intFromFloat(bounds.size.width),
-            .height = @intFromFloat(bounds.size.height),
-        };
-        c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
-    }
-    c.gtk_widget_set_parent(popover, @ptrCast(btn));
-    connectPopoverAutoUnparent(popover);
+    prepareAnchoredPopover(popover, @ptrCast(btn));
     _ = c.g_signal_connect_data(popover, "closed", @ptrCast(&onViewMenuClosed), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
     c.gtk_popover_popup(@ptrCast(popover));
 }

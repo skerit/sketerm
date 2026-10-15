@@ -920,6 +920,23 @@ pub fn connectPopoverAutoUnparent(popover: *c.GtkWidget) void {
     _ = c.g_signal_connect_data(popover, "closed", @ptrCast(&onPopoverClosed), @ptrCast(popover), null, c.G_CONNECT_DEFAULT);
 }
 
+/// Point `popover` at the whole of `anchor`, parent it there and unparent it again on close; the caller still pops it up.
+/// Without an explicit rect a popover with a wide child never maps.
+pub fn prepareAnchoredPopover(popover: *c.GtkWidget, anchor: *c.GtkWidget) void {
+    var bounds: c.graphene_rect_t = undefined;
+    if (c.gtk_widget_compute_bounds(anchor, anchor, &bounds) != 0) {
+        const rect = c.GdkRectangle{
+            .x = @intFromFloat(bounds.origin.x),
+            .y = @intFromFloat(bounds.origin.y),
+            .width = @intFromFloat(bounds.size.width),
+            .height = @intFromFloat(bounds.size.height),
+        };
+        c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
+    }
+    c.gtk_widget_set_parent(popover, anchor);
+    connectPopoverAutoUnparent(popover);
+}
+
 pub fn menuDone(ctx: *MenuCtx) void {
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
 }
@@ -1558,4 +1575,27 @@ pub fn onActionActivated(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
         _ = c.g_spawn_command_line_async(cl.ptr, null);
         self.setStatus("action started");
     }
+}
+
+test "prepareAnchoredPopover parents the popover on its anchor until it closes" {
+    // Run only with an explicitly supplied isolated display.
+    const opt_in = c.getenv("SKETERM_TEST_BROWSER_UI") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, std.mem.span(opt_in), "1")) return error.SkipZigTest;
+    const t = std.testing;
+    try t.expect(c.gtk_init_check() != 0);
+    const anchor = c.gtk_button_new_with_label("anchor").?;
+    _ = c.g_object_ref_sink(anchor);
+    defer c.g_object_unref(anchor);
+    const popover = c.gtk_popover_new().?;
+    _ = c.g_object_ref(popover);
+    defer c.g_object_unref(popover);
+
+    prepareAnchoredPopover(popover, anchor);
+    // 1. Parented on the anchor, and an unrealized anchor has no bounds to point at.
+    try t.expect(c.gtk_widget_get_parent(popover) == anchor);
+    var rect: c.GdkRectangle = undefined;
+    try t.expect(c.gtk_popover_get_pointing_to(@ptrCast(popover), &rect) == 0);
+    // 2. Closing unparents it, so the anchor can be destroyed without it.
+    c.g_signal_emit_by_name(popover, "closed");
+    try t.expect(c.gtk_widget_get_parent(popover) == null);
 }
