@@ -12,38 +12,44 @@ pub fn build(b: *std.Build) void {
     // pkg-config search path before any step resolves it.
     registerGuiPkgConfigPath(b);
 
-    // LLD is pinned on Linux because the self-hosted ELF linker
-    // chokes on gcc 15's `.sframe` relocs in crt1.o. On macOS the
-    // self-hosted Mach-O linker is the supported path — LLD's
-    // Mach-O port is not.
+    // Two codegen profiles. RELEASE builds what ships: the install step,
+    // `mux`, `mcp-standalone`, `mux-portable`, every dist/ script (they
+    // all pass `-Doptimize=ReleaseFast`), the benchmarks and the GUI/GL
+    // render rigs. DEV builds what only verifies: the unit-test roots,
+    // the headless smoke rigs, and the sketerm-mux, sketerm-mcp and GUI
+    // binaries those rigs drive (`dev` below).
+    //
+    // Release links with LLD on Linux: it is the linker packaging has
+    // always shipped with, and Debug through LLD fails on Arch + gcc 15
+    // (crt1.o's `.sframe` R_X86_64_PC64 relocs). The self-hosted ELF
+    // linker has no such problem: the unit tests and the dev profile
+    // link libc, GTK and GLib through it. On macOS the self-hosted Mach-O
+    // linker is the supported path; LLD's Mach-O port is not.
     const use_lld = target.result.os.tag == .linux;
 
     // Default ReleaseFast for the shipped binary. Terminals are
     // perf-sensitive and runtime safety checks have measurable cost
-    // (parser throughput, render latency). Debug builds fail to
-    // compile entirely on Arch + gcc 15 because Zig's bundled LLD
-    // can't handle gcc 15's `.sframe` section in crt1.o
-    // (R_X86_64_PC64 relocs); use `-Doptimize=ReleaseSafe` for
-    // bounds + overflow checks while developing.
+    // (parser throughput, render latency).
     const optimize_arg = b.option(
         std.builtin.OptimizeMode,
         "optimize",
-        "build mode (default ReleaseFast; Debug fails on Arch + gcc 15)",
+        "release-profile build mode (default ReleaseFast; Debug fails to link through LLD on Arch + gcc 15)",
     );
     const optimize = optimize_arg orelse .ReleaseFast;
 
     const strip_default = optimize != .Debug and optimize != .ReleaseSafe;
     const strip = b.option(bool, "strip", "strip debug info") orelse strip_default;
 
-    // LLVM spends minutes optimizing the monolithic test roots. Zig's
-    // self-hosted x86 backend compiles the same ReleaseFast suites in
-    // seconds; shipped artifacts still use LLVM. Keep an explicit parity
-    // switch for compiler-sensitive failures and unsupported hosts.
+    // LLVM spends minutes optimizing the monolithic test roots and the
+    // binaries the smoke rigs drive. Zig's self-hosted x86 backend
+    // compiles them in seconds; shipped artifacts still use LLVM. Keep an
+    // explicit parity switch for compiler-sensitive failures; it defaults
+    // on wherever `selfHostedBackend` says the self-hosted one cannot go.
     const test_llvm = b.option(
         bool,
         "test-llvm",
-        "compile unit tests with LLVM (slower; matches production codegen)",
-    ) orelse !(target.result.os.tag == .linux and target.result.cpu.arch == .x86_64);
+        "compile unit tests and smoke rigs with LLVM (slower; matches production codegen)",
+    ) orelse !selfHostedBackend(target.result);
 
     // Pre-translate the GTK+glib+freetype+stb C headers into a single
     // generated Zig module via a TranslateC step. In Zig 0.16 the
@@ -114,71 +120,68 @@ pub fn build(b: *std.Build) void {
     // without adding either library to the daemon's ELF dependencies.
     const have_dmabuf_import = target.result.os.tag == .linux and
         (b.option(bool, "dmabuf-import", "Runtime EGL/GLES import for modifier-backed dma-bufs (default on on Linux)") orelse true);
-    // Commit id + commit date for Help > About. Stable per commit so a
-    // rebuild without new commits stays fully cached; tarball builds
-    // without git degrade to "unknown".
+    // Commit id + commit date for Help > About and the daemon's `build`
+    // announce (`Conn.buildStale`). Stable per commit so a rebuild
+    // without new commits stays fully cached; tarball builds without git
+    // degrade to "unknown".
     const git_commit = runCapture(b, &.{ "git", "-C", b.build_root.path orelse ".", "describe", "--always", "--dirty" }) orelse "unknown";
     const git_date = runCapture(b, &.{ "git", "-C", b.build_root.path orelse ".", "log", "-1", "--format=%cd", "--date=format:%Y-%m-%d %H:%M" }) orelse "unknown";
-
-    const glib_opts = b.addOptions();
-    glib_opts.addOption(bool, "glib", true);
-    glib_opts.addOption([]const u8, "version", semver);
-    glib_opts.addOption([]const u8, "commit", git_commit);
-    glib_opts.addOption([]const u8, "commit_date", git_date);
-    glib_opts.addOption(bool, "winstream_sck", native_sck);
-    glib_opts.addOption(bool, "video", video.enabled);
-    glib_opts.addOption(bool, "video_av1enc", video.av1enc);
-    glib_opts.addOption(bool, "vtenc", have_vtenc);
-    glib_opts.addOption(bool, "audio_opus", have_opus);
-    glib_opts.addOption(bool, "dmabuf_import", have_dmabuf_import);
-    // WebM app recording (util/videorec.zig) links libvpx: GUI targets
-    // only. Every noglib artifact records GIF and says so in capabilities.
-    glib_opts.addOption(bool, "webm_rec", true);
-    const glib_opts_mod = glib_opts.createModule();
-    const noglib_opts = b.addOptions();
-    noglib_opts.addOption(bool, "glib", false);
-    noglib_opts.addOption([]const u8, "version", semver);
-    noglib_opts.addOption([]const u8, "commit", git_commit);
-    noglib_opts.addOption([]const u8, "commit_date", git_date);
-    noglib_opts.addOption(bool, "winstream_sck", native_sck);
-    noglib_opts.addOption(bool, "video", video.enabled);
-    noglib_opts.addOption(bool, "video_av1enc", video.av1enc);
-    noglib_opts.addOption(bool, "vtenc", have_vtenc);
-    noglib_opts.addOption(bool, "audio_opus", have_opus);
-    noglib_opts.addOption(bool, "dmabuf_import", have_dmabuf_import);
-    noglib_opts.addOption(bool, "webm_rec", false);
-    const noglib_opts_mod = noglib_opts.createModule();
+    const release_facts: OptionFacts = .{
+        .commit = git_commit,
+        .commit_date = git_date,
+        .winstream_sck = native_sck,
+        .video = video.enabled,
+        .video_av1enc = video.av1enc,
+        .vtenc = have_vtenc,
+        .audio_opus = have_opus,
+        .dmabuf_import = have_dmabuf_import,
+    };
+    const dev_facts = release_facts;
+    const release: Profile = .{
+        .optimize = optimize,
+        .strip = strip,
+        .use_llvm = null,
+        .use_lld = use_lld,
+        .sanitize_c = null,
+        .glib_opts = optionsModule(b, true, release_facts),
+        .noglib_opts = optionsModule(b, false, release_facts),
+    };
+    // Dev executables are ReleaseSafe: bounds and overflow checks for the
+    // code under test without Debug's per-allocation stack capture in
+    // DebugAllocator, which the smoke rigs' timeouts cannot afford. The C
+    // they compile builds without sanitizers, as in release: ReleaseSafe's
+    // default UBSan trap kills the GUI with SIGILL in vendored
+    // stb_image_write (`stbiw__jpg_writeBits`). The C bindings and C
+    // libraries they link stay at `-Doptimize`, and the unit-test roots
+    // take the dev backend and stamp but keep `-Doptimize` as they always
+    // have.
+    const dev: Profile = .{
+        .optimize = .ReleaseSafe,
+        .strip = false,
+        .use_llvm = test_llvm,
+        .use_lld = if (test_llvm) use_lld else false,
+        .sanitize_c = .off,
+        .glib_opts = optionsModule(b, true, dev_facts),
+        .noglib_opts = optionsModule(b, false, dev_facts),
+    };
+    const glib_opts_mod = release.glib_opts;
+    const noglib_opts_mod = release.noglib_opts;
 
     // Vendored Tree-sitter runtime + pinned upstream grammars for the
     // editor's syntax highlighting. Built once and linked into the
     // GUI-side artifacts only — see `buildTreeSitter`/`addTreeSitter`.
     const tree_sitter = buildTreeSitter(b, target, optimize, use_lld);
 
-    const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+    const bin_deps: BinDeps = .{
         .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .strip = strip,
-    });
-    configureSysDeps(b, exe_mod, cbindings_mod);
-    exe_mod.addImport("build_options", glib_opts_mod);
-    addVideo(b, exe_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-    addAgentAdapters(b, exe_mod); // `sketerm mcp`'s agent_* tools
-    addMcpToolsJson(b, exe_mod);
-    // NSAccessibility bridge (live on macOS: GTK4 has no NSAccessibility
-    // backend, so every pane hangs an element on the window's content
-    // view through a11y/nsax.zig). main.zig force-includes nsax.zig on
-    // macOS so its export callbacks are present for the shim to resolve.
-    if (native_macos) addNsaxBridge(b, exe_mod);
-    if (have_vtenc) addVtEnc(b, exe_mod); // VideoToolbox H.264 encode (macOS)
-    addTreeSitter(b, exe_mod, tree_sitter); // editor syntax highlighting (GUI only)
-
-    const exe = b.addExecutable(.{
-        .name = "sketerm",
-        .root_module = exe_mod,
-        .use_lld = use_lld,
-    });
+        .cbindings = cbindings_mod,
+        .core_cbindings = core_cbindings_mod,
+        .tree_sitter = tree_sitter,
+        .native_sck = native_sck,
+        .native_macos = native_macos,
+        .have_vtenc = have_vtenc,
+    };
+    const exe = guiExe(b, bin_deps, release);
     const install_exe = b.addInstallArtifact(exe, .{});
     b.getInstallStep().dependOn(&install_exe.step);
     // Second install of the SAME artifact as `sketerm-files`: the
@@ -207,56 +210,18 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run sketerm");
     run_step.dependOn(&run_cmd.step);
 
-    // sketerm-mux session daemon — `zig build mux`. LEAN dependency
-    // set: terminal core only (libc + fribidi + vendored stb), no
-    // GTK — the whole point is scp-ing one binary to a server. The
-    // cbindings module is imported for libc/fribidi decls; unused
-    // GTK externs are never referenced so nothing GTK gets linked.
-    const mux_mod = b.createModule(.{
-        .root_source_file = b.path("src/mux_main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .strip = strip,
-    });
-    configureCoreDeps(b, mux_mod, core_cbindings_mod);
-    mux_mod.addImport("build_options", noglib_opts_mod);
-    addVideo(b, mux_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-    if (native_sck) addSckBackend(b, mux_mod);
-    if (have_vtenc) addVtEnc(b, mux_mod); // daemon-side VideoToolbox encode (macOS)
-    const mux_exe = b.addExecutable(.{
-        .name = "sketerm-mux",
-        .root_module = mux_mod,
-        .use_lld = use_lld,
-    });
+    // sketerm-mux session daemon (`zig build mux`; see `muxExe`).
+    const mux_exe = muxExe(b, bin_deps, release);
     const install_mux = b.addInstallArtifact(mux_exe, .{});
     b.getInstallStep().dependOn(&install_mux.step);
     const mux_step = b.step("mux", "Build the sketerm-mux session daemon");
     mux_step.dependOn(&install_mux.step);
 
-    // GTK-free MCP server (`sketerm-mcp`) for hosts whose GTK is too old
-    // or absent for the GUI: the portable daemon's dependency set, so
-    // `sketerm mcp`'s headless terminal/app/web tools run anywhere
-    // sketerm-mux does. Not part of the default install; `zig build
-    // mcp-standalone`. Ship it beside sketerm-mux and sketerm-webengine,
-    // which it finds as siblings.
-    const mcp_mod = b.createModule(.{
-        .root_source_file = b.path("src/mcp_main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .strip = strip,
-    });
-    configureShippableCoreDeps(b, mcp_mod, core_cbindings_mod);
-    mcp_mod.addImport("build_options", noglib_opts_mod);
-    addVideo(b, mcp_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-    addAgentAdapters(b, mcp_mod); // the agent_* tools load the shipped adapters
-    addMcpToolsJson(b, mcp_mod);
-    const mcp_exe = b.addExecutable(.{
-        .name = "sketerm-mcp",
-        .root_module = mcp_mod,
-        .use_lld = use_lld,
-    });
+    // GTK-free MCP server (`sketerm-mcp`, see `mcpExe`) for hosts whose
+    // GTK is too old or absent for the GUI. Not part of the default
+    // install; `zig build mcp-standalone`. Ship it beside sketerm-mux and
+    // sketerm-webengine, which it finds as siblings.
+    const mcp_exe = mcpExe(b, bin_deps, release);
     const mcp_standalone_step = b.step("mcp-standalone", "Build sketerm-mcp, the GTK-free MCP server (no GUI toolchain needed)");
     mcp_standalone_step.dependOn(&b.addInstallArtifact(mcp_exe, .{}).step);
     mcp_standalone_step.dependOn(&b.addInstallDirectory(.{
@@ -264,6 +229,17 @@ pub fn build(b: *std.Build) void {
         .install_dir = .prefix,
         .install_subdir = "share/sketerm/shell-integration",
     }).step);
+
+    // Dev-profile builds of the three binaries, for the smoke rigs that
+    // drive them. smoke-mcp runs the GUI and sketerm-mux out of an
+    // install dir at the same depth as `bin/`, so their exe-relative
+    // lookups (`shellintegration.baseDir`'s `../share` and `../../data`)
+    // resolve exactly as they do for an installed build.
+    const dev_mux_exe = muxExe(b, bin_deps, dev);
+    const dev_mcp_exe = mcpExe(b, bin_deps, dev);
+    const dev_bin_dir: std.Build.InstallDir = .{ .custom = "dev-bin" };
+    const install_dev_gui = b.addInstallArtifact(guiExe(b, bin_deps, dev), .{ .dest_dir = .{ .override = dev_bin_dir } });
+    const install_dev_mux = b.addInstallArtifact(dev_mux_exe, .{ .dest_dir = .{ .override = dev_bin_dir } });
 
     // Public mux-client SDK — the supported module for OUT-OF-REPO
     // daemon clients (agent harnesses, automation). Consumers add
@@ -325,6 +301,10 @@ pub fn build(b: *std.Build) void {
     }) catch @panic("bad -Dportable-target triple");
     const portable_target = b.resolveTargetQuery(portable_query);
     const portable_cbindings = buildCoreCBindings(b, portable_target, optimize);
+    // The portable test roots below take the dev backend wherever the
+    // self-hosted one supports the portable triple.
+    const portable_dev_backend = !test_llvm and selfHostedBackend(portable_target.result);
+    const portable_test_lld = !portable_dev_backend and portable_target.result.os.tag == .linux;
     // Compile the focused test root for every portable target. This analyzes
     // both the production and fault-injected syscall adapters without trying
     // to run a cross-compiled test binary on the build host.
@@ -337,7 +317,8 @@ pub fn build(b: *std.Build) void {
     atomicwrite_portable_test_mod.addImport("cbindings", portable_cbindings);
     const atomicwrite_portable_tests = b.addTest(.{
         .root_module = atomicwrite_portable_test_mod,
-        .use_lld = portable_target.result.os.tag == .linux,
+        .use_llvm = !portable_dev_backend,
+        .use_lld = portable_test_lld,
     });
     const mux_portable_mod = b.createModule(.{
         .root_source_file = b.path("src/mux_main.zig"),
@@ -352,20 +333,18 @@ pub fn build(b: *std.Build) void {
     // zig adds no macOS SDK framework search paths — even on a Mac
     // host. A capture-capable Mac daemon is the native `zig build
     // mux`; portable stays the lowest-common-denominator artifact.
-    const portable_opts = b.addOptions();
-    portable_opts.addOption(bool, "glib", false);
-    portable_opts.addOption([]const u8, "version", semver);
-    portable_opts.addOption([]const u8, "commit", git_commit);
-    portable_opts.addOption([]const u8, "commit_date", git_date);
-    portable_opts.addOption(bool, "winstream_sck", false);
-    portable_opts.addOption(bool, "video", false);
-    portable_opts.addOption(bool, "video_av1enc", false);
-    portable_opts.addOption(bool, "vtenc", false);
-    portable_opts.addOption(bool, "audio_opus", false);
-    portable_opts.addOption(bool, "dmabuf_import", false);
-    portable_opts.addOption(bool, "webm_rec", false);
-    const portable_opts_mod = portable_opts.createModule();
-    mux_portable_mod.addImport("build_options", portable_opts_mod);
+    const portable_facts: OptionFacts = .{
+        .commit = git_commit,
+        .commit_date = git_date,
+        .winstream_sck = false,
+        .video = false,
+        .video_av1enc = false,
+        .vtenc = false,
+        .audio_opus = false,
+        .dmabuf_import = false,
+    };
+    mux_portable_mod.addImport("build_options", optionsModule(b, false, portable_facts));
+    const portable_test_facts = portable_facts;
     // The OS-specific process primitives (`platform.parentOf` and the
     // `sketerm mcp agents` walk over it) compiled for the portable target,
     // like atomicwrite above; nothing the daemon links reaches them.
@@ -376,10 +355,11 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     configureShippableCoreDeps(b, portable_test_mod, portable_cbindings);
-    portable_test_mod.addImport("build_options", portable_opts_mod);
+    portable_test_mod.addImport("build_options", optionsModule(b, false, portable_test_facts));
     const portable_tests = b.addTest(.{
         .root_module = portable_test_mod,
-        .use_lld = portable_target.result.os.tag == .linux,
+        .use_llvm = !portable_dev_backend,
+        .use_lld = portable_test_lld,
     });
     const mux_portable_exe = b.addExecutable(.{
         // Linux keeps `sketerm-mux-portable`; other OSes get a suffixed
@@ -407,24 +387,21 @@ pub fn build(b: *std.Build) void {
     const smoke_mux_mod = b.createModule(.{
         .root_source_file = b.path("src/smoke_mux.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = dev.optimize,
+        .sanitize_c = dev.sanitize_c,
         .link_libc = true,
     });
     configureCoreDeps(b, smoke_mux_mod, core_cbindings_mod);
-    smoke_mux_mod.addImport("build_options", noglib_opts_mod);
+    smoke_mux_mod.addImport("build_options", dev.noglib_opts);
     addVideo(b, smoke_mux_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, smoke_mux_mod);
     if (have_vtenc) addVtEnc(b, smoke_mux_mod);
-    const smoke_mux = b.addExecutable(.{
-        .name = "sketerm-smoke-mux",
-        .root_module = smoke_mux_mod,
-        .use_lld = use_lld,
-    });
+    const smoke_mux = dev.executable(b, "sketerm-smoke-mux", smoke_mux_mod);
     const smoke_mux_run = b.addRunArtifact(smoke_mux);
     // The ticket stage spawns real --udp-listen/--udp-connect children.
-    smoke_mux_run.addArtifactArg(mux_exe);
+    smoke_mux_run.addArtifactArg(dev_mux_exe);
     // The peer stage drives real MCP servers.
-    smoke_mux_run.addArtifactArg(mcp_exe);
+    smoke_mux_run.addArtifactArg(dev_mcp_exe);
     const smoke_mux_step = b.step("smoke-mux", "Mux daemon end-to-end smoke (headless)");
     smoke_mux_step.dependOn(&smoke_mux_run.step);
 
@@ -435,21 +412,18 @@ pub fn build(b: *std.Build) void {
     const smoke_udp_mod = b.createModule(.{
         .root_source_file = b.path("src/smoke_udp.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = dev.optimize,
+        .sanitize_c = dev.sanitize_c,
         .link_libc = true,
     });
     configureCoreDeps(b, smoke_udp_mod, core_cbindings_mod);
-    smoke_udp_mod.addImport("build_options", noglib_opts_mod);
+    smoke_udp_mod.addImport("build_options", dev.noglib_opts);
     addVideo(b, smoke_udp_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, smoke_udp_mod);
     if (have_vtenc) addVtEnc(b, smoke_udp_mod);
-    const smoke_udp = b.addExecutable(.{
-        .name = "sketerm-smoke-udp",
-        .root_module = smoke_udp_mod,
-        .use_lld = use_lld,
-    });
+    const smoke_udp = dev.executable(b, "sketerm-smoke-udp", smoke_udp_mod);
     const smoke_udp_run = b.addRunArtifact(smoke_udp);
-    smoke_udp_run.addArtifactArg(mux_exe);
+    smoke_udp_run.addArtifactArg(dev_mux_exe);
     const smoke_udp_step = b.step("smoke-udp", "UDP transport + hole-punch smoke (headless)");
     smoke_udp_step.dependOn(&smoke_udp_run.step);
 
@@ -461,19 +435,16 @@ pub fn build(b: *std.Build) void {
     const smoke_foreign_mod = b.createModule(.{
         .root_source_file = b.path("src/smoke_foreign.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = dev.optimize,
+        .sanitize_c = dev.sanitize_c,
         .link_libc = true,
     });
     configureCoreDeps(b, smoke_foreign_mod, core_cbindings_mod);
-    smoke_foreign_mod.addImport("build_options", noglib_opts_mod);
+    smoke_foreign_mod.addImport("build_options", dev.noglib_opts);
     addVideo(b, smoke_foreign_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, smoke_foreign_mod);
     if (have_vtenc) addVtEnc(b, smoke_foreign_mod);
-    const smoke_foreign = b.addExecutable(.{
-        .name = "sketerm-smoke-foreign",
-        .root_module = smoke_foreign_mod,
-        .use_lld = use_lld,
-    });
+    const smoke_foreign = dev.executable(b, "sketerm-smoke-foreign", smoke_foreign_mod);
     const smoke_foreign_run = b.addRunArtifact(smoke_foreign);
     const smoke_foreign_step = b.step("smoke-foreign", "xdg-foreign cross-connection parenting smoke (headless)");
     smoke_foreign_step.dependOn(&smoke_foreign_run.step);
@@ -486,19 +457,16 @@ pub fn build(b: *std.Build) void {
     const smoke_video_mod = b.createModule(.{
         .root_source_file = b.path("src/smoke_video.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = dev.optimize,
+        .sanitize_c = dev.sanitize_c,
         .link_libc = true,
     });
     configureCoreDeps(b, smoke_video_mod, core_cbindings_mod);
-    smoke_video_mod.addImport("build_options", noglib_opts_mod);
+    smoke_video_mod.addImport("build_options", dev.noglib_opts);
     addVideo(b, smoke_video_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, smoke_video_mod);
     if (have_vtenc) addVtEnc(b, smoke_video_mod);
-    const smoke_video = b.addExecutable(.{
-        .name = "sketerm-smoke-video",
-        .root_module = smoke_video_mod,
-        .use_lld = use_lld,
-    });
+    const smoke_video = dev.executable(b, "sketerm-smoke-video", smoke_video_mod);
     const smoke_video_run = b.addRunArtifact(smoke_video);
     const smoke_video_step = b.step("smoke-video", "Forwarded-app video streaming smoke: each codec end to end (headless, needs mpv)");
     smoke_video_step.dependOn(&smoke_video_run.step);
@@ -509,19 +477,16 @@ pub fn build(b: *std.Build) void {
     const smoke_fs_mod = b.createModule(.{
         .root_source_file = b.path("src/smoke_fs.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = dev.optimize,
+        .sanitize_c = dev.sanitize_c,
         .link_libc = true,
     });
     configureCoreDeps(b, smoke_fs_mod, core_cbindings_mod);
-    smoke_fs_mod.addImport("build_options", noglib_opts_mod);
+    smoke_fs_mod.addImport("build_options", dev.noglib_opts);
     addVideo(b, smoke_fs_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, smoke_fs_mod);
     if (have_vtenc) addVtEnc(b, smoke_fs_mod);
-    const smoke_fs = b.addExecutable(.{
-        .name = "sketerm-smoke-fs",
-        .root_module = smoke_fs_mod,
-        .use_lld = use_lld,
-    });
+    const smoke_fs = dev.executable(b, "sketerm-smoke-fs", smoke_fs_mod);
     const smoke_fs_run = b.addRunArtifact(smoke_fs);
     const smoke_fs_step = b.step("smoke-fs", "Mux file-service end-to-end smoke (headless)");
     smoke_fs_step.dependOn(&smoke_fs_run.step);
@@ -532,19 +497,16 @@ pub fn build(b: *std.Build) void {
     const smoke_fuse_mod = b.createModule(.{
         .root_source_file = b.path("src/smoke_fuse.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = dev.optimize,
+        .sanitize_c = dev.sanitize_c,
         .link_libc = true,
     });
     configureCoreDeps(b, smoke_fuse_mod, core_cbindings_mod);
-    smoke_fuse_mod.addImport("build_options", noglib_opts_mod);
+    smoke_fuse_mod.addImport("build_options", dev.noglib_opts);
     addVideo(b, smoke_fuse_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, smoke_fuse_mod);
     if (have_vtenc) addVtEnc(b, smoke_fuse_mod);
-    const smoke_fuse = b.addExecutable(.{
-        .name = "sketerm-smoke-fuse",
-        .root_module = smoke_fuse_mod,
-        .use_lld = use_lld,
-    });
+    const smoke_fuse = dev.executable(b, "sketerm-smoke-fuse", smoke_fuse_mod);
     const smoke_fuse_run = b.addRunArtifact(smoke_fuse);
     const smoke_fuse_step = b.step("smoke-fuse", "FUSE mount end-to-end smoke (headless)");
     smoke_fuse_step.dependOn(&smoke_fuse_run.step);
@@ -555,22 +517,20 @@ pub fn build(b: *std.Build) void {
     const smoke_mcp_mod = b.createModule(.{
         .root_source_file = b.path("src/smoke_mcp.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = dev.optimize,
+        .sanitize_c = dev.sanitize_c,
         .link_libc = true,
     });
     configureCoreDeps(b, smoke_mcp_mod, core_cbindings_mod);
-    smoke_mcp_mod.addImport("build_options", noglib_opts_mod);
+    smoke_mcp_mod.addImport("build_options", dev.noglib_opts);
     addVideo(b, smoke_mcp_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, smoke_mcp_mod);
     if (have_vtenc) addVtEnc(b, smoke_mcp_mod);
-    const smoke_mcp = b.addExecutable(.{
-        .name = "sketerm-smoke-mcp",
-        .root_module = smoke_mcp_mod,
-        .use_lld = use_lld,
-    });
+    const smoke_mcp = dev.executable(b, "sketerm-smoke-mcp", smoke_mcp_mod);
     const smoke_mcp_run = b.addRunArtifact(smoke_mcp);
-    smoke_mcp_run.step.dependOn(&install_exe.step);
-    smoke_mcp_run.step.dependOn(&install_mux.step);
+    smoke_mcp_run.step.dependOn(&install_dev_gui.step);
+    smoke_mcp_run.step.dependOn(&install_dev_mux.step);
+    smoke_mcp_run.addArgs(&.{ "--bin-dir", b.getInstallPath(dev_bin_dir, "") });
     smoke_mcp_run.setCwd(b.path("."));
     const smoke_mcp_step = b.step("smoke-mcp", "MCP isolation + headless-terminal smoke (headless)");
     smoke_mcp_step.dependOn(&smoke_mcp_run.step);
@@ -579,24 +539,21 @@ pub fn build(b: *std.Build) void {
     const smoke_broker_mod = b.createModule(.{
         .root_source_file = b.path("src/smoke_broker.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = dev.optimize,
+        .sanitize_c = dev.sanitize_c,
         .link_libc = true,
     });
     configureCoreDeps(b, smoke_broker_mod, core_cbindings_mod);
-    smoke_broker_mod.addImport("build_options", noglib_opts_mod);
+    smoke_broker_mod.addImport("build_options", dev.noglib_opts);
     addVideo(b, smoke_broker_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, smoke_broker_mod);
     if (have_vtenc) addVtEnc(b, smoke_broker_mod);
-    const smoke_broker = b.addExecutable(.{
-        .name = "sketerm-smoke-broker",
-        .root_module = smoke_broker_mod,
-        .use_lld = use_lld,
-    });
+    const smoke_broker = dev.executable(b, "sketerm-smoke-broker", smoke_broker_mod);
     const smoke_broker_run = b.addRunArtifact(smoke_broker);
     // The ticket stage spawns real --udp-listen/--udp-connect children.
-    smoke_broker_run.addArtifactArg(mux_exe);
+    smoke_broker_run.addArtifactArg(dev_mux_exe);
     // The peer stage drives real MCP servers.
-    smoke_broker_run.addArtifactArg(mcp_exe);
+    smoke_broker_run.addArtifactArg(dev_mcp_exe);
     const smoke_broker_step = b.step("smoke-broker", "Broker process-isolation end-to-end smoke (headless)");
     smoke_broker_step.dependOn(&smoke_broker_run.step);
 
@@ -1092,7 +1049,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     configureSysDeps(b, tests_mod, cbindings_mod);
-    tests_mod.addImport("build_options", glib_opts_mod);
+    tests_mod.addImport("build_options", dev.glib_opts);
     addVideo(b, tests_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, tests_mod);
     // Link the NSAccessibility shim so `zig build test` compiles AND
@@ -1110,8 +1067,8 @@ pub fn build(b: *std.Build) void {
     addMcpToolsJson(b, tests_mod);
     const tests = b.addTest(.{
         .root_module = tests_mod,
-        .use_llvm = test_llvm,
-        .use_lld = if (test_llvm) use_lld else false,
+        .use_llvm = dev.use_llvm,
+        .use_lld = dev.use_lld,
     });
     const run_tests = b.addRunArtifact(tests);
     const test_roots = b.addSystemCommand(&.{ "bash" });
@@ -1155,8 +1112,8 @@ pub fn build(b: *std.Build) void {
     atomicwrite_tests_mod.addImport("cbindings", core_cbindings_mod);
     const atomicwrite_tests = b.addTest(.{
         .root_module = atomicwrite_tests_mod,
-        .use_llvm = test_llvm,
-        .use_lld = if (test_llvm) use_lld else false,
+        .use_llvm = dev.use_llvm,
+        .use_lld = dev.use_lld,
     });
     const atomicwrite_test_step = b.step("test-atomicwrite", "Run atomic file replacement tests");
     atomicwrite_test_step.dependOn(&b.addRunArtifact(atomicwrite_tests).step);
@@ -1174,7 +1131,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     configureCoreDeps(b, coretests_mod, core_cbindings_mod);
-    coretests_mod.addImport("build_options", noglib_opts_mod);
+    coretests_mod.addImport("build_options", dev.noglib_opts);
     addVideo(b, coretests_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, coretests_mod);
     if (have_vtenc) addVtEnc(b, coretests_mod);
@@ -1189,8 +1146,8 @@ pub fn build(b: *std.Build) void {
     addMcpToolsJson(b, coretests_mod);
     const coretests = b.addTest(.{
         .root_module = coretests_mod,
-        .use_llvm = test_llvm,
-        .use_lld = if (test_llvm) use_lld else false,
+        .use_llvm = dev.use_llvm,
+        .use_lld = dev.use_lld,
     });
     const core_test_step = b.step("test-core", "Run the GTK-free unit-test subset (no GUI toolchain needed)");
     core_test_step.dependOn(&test_roots.step);
@@ -1204,6 +1161,136 @@ pub fn build(b: *std.Build) void {
     // step is asked for by name, and the CEF headers are only translated
     // when that distribution is already on disk.
     addCef(b, target, optimize, strip, use_lld, have_opus, core_cbindings_mod, mux_exe, mcp_exe, smoke_mcp_run, &test_roots.step, &lint_errdefer.step, &env_removal.step);
+}
+
+/// How one family of artifacts compiles and links; `build` declares the
+/// two families (release, dev) and says which artifact belongs to which.
+const Profile = struct {
+    optimize: std.builtin.OptimizeMode,
+    strip: bool,
+    /// Null leaves the backend to Zig's default for the mode (LLVM for
+    /// the release modes).
+    use_llvm: ?bool,
+    use_lld: bool,
+    /// The C sources compiled into the profile's modules (stb, codec
+    /// shims). Null is the mode's default.
+    sanitize_c: ?std.zig.SanitizeC,
+    glib_opts: *std.Build.Module,
+    noglib_opts: *std.Build.Module,
+
+    fn executable(p: Profile, b: *std.Build, name: []const u8, mod: *std.Build.Module) *std.Build.Step.Compile {
+        return b.addExecutable(.{ .name = name, .root_module = mod, .use_llvm = p.use_llvm, .use_lld = p.use_lld });
+    }
+};
+
+/// What `build_options` carries beside `glib` and the semver.
+const OptionFacts = struct {
+    commit: []const u8,
+    commit_date: []const u8,
+    winstream_sck: bool,
+    video: bool,
+    video_av1enc: bool,
+    vtenc: bool,
+    audio_opus: bool,
+    dmabuf_import: bool,
+};
+
+/// One `build_options` module. `glib` tells pty.zig whether a GLib main
+/// loop exists (GUI) or not (sketerm-mux, which must not link glib); WebM
+/// app recording (util/videorec.zig) links libvpx, so it follows `glib`
+/// and every noglib artifact records GIF and says so in capabilities.
+fn optionsModule(b: *std.Build, glib: bool, f: OptionFacts) *std.Build.Module {
+    const o = b.addOptions();
+    o.addOption(bool, "glib", glib);
+    o.addOption([]const u8, "version", semver);
+    o.addOption([]const u8, "commit", f.commit);
+    o.addOption([]const u8, "commit_date", f.commit_date);
+    o.addOption(bool, "winstream_sck", f.winstream_sck);
+    o.addOption(bool, "video", f.video);
+    o.addOption(bool, "video_av1enc", f.video_av1enc);
+    o.addOption(bool, "vtenc", f.vtenc);
+    o.addOption(bool, "audio_opus", f.audio_opus);
+    o.addOption(bool, "dmabuf_import", f.dmabuf_import);
+    o.addOption(bool, "webm_rec", glib);
+    return o.createModule();
+}
+
+/// What the GUI, sketerm-mux and sketerm-mcp are built from in either profile.
+const BinDeps = struct {
+    target: std.Build.ResolvedTarget,
+    cbindings: *std.Build.Module,
+    core_cbindings: *std.Build.Module,
+    tree_sitter: TreeSitter,
+    native_sck: bool,
+    native_macos: bool,
+    have_vtenc: bool,
+};
+
+/// The `sketerm` GUI (plus its `cli`/`ssh`/`mux`/`mcp` subcommands).
+fn guiExe(b: *std.Build, d: BinDeps, p: Profile) *std.Build.Step.Compile {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = d.target,
+        .optimize = p.optimize,
+        .sanitize_c = p.sanitize_c,
+        .link_libc = true,
+        .strip = p.strip,
+    });
+    configureSysDeps(b, mod, d.cbindings);
+    mod.addImport("build_options", p.glib_opts);
+    addVideo(b, mod); // runtime-loaded video codec shims (no-op without -Dvideo)
+    addAgentAdapters(b, mod); // `sketerm mcp`'s agent_* tools
+    addMcpToolsJson(b, mod);
+    // NSAccessibility bridge (live on macOS: GTK4 has no NSAccessibility
+    // backend, so every pane hangs an element on the window's content
+    // view through a11y/nsax.zig). main.zig force-includes nsax.zig on
+    // macOS so its export callbacks are present for the shim to resolve.
+    if (d.native_macos) addNsaxBridge(b, mod);
+    if (d.have_vtenc) addVtEnc(b, mod); // VideoToolbox H.264 encode (macOS)
+    addTreeSitter(b, mod, d.tree_sitter); // editor syntax highlighting (GUI only)
+    return p.executable(b, "sketerm", mod);
+}
+
+/// The sketerm-mux session daemon. LEAN dependency set: terminal core
+/// only (libc + fribidi + vendored stb), no GTK; the whole point is
+/// scp-ing one binary to a server. The cbindings module is imported for
+/// libc/fribidi decls; unused GTK externs are never referenced so nothing
+/// GTK gets linked.
+fn muxExe(b: *std.Build, d: BinDeps, p: Profile) *std.Build.Step.Compile {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/mux_main.zig"),
+        .target = d.target,
+        .optimize = p.optimize,
+        .sanitize_c = p.sanitize_c,
+        .link_libc = true,
+        .strip = p.strip,
+    });
+    configureCoreDeps(b, mod, d.core_cbindings);
+    mod.addImport("build_options", p.noglib_opts);
+    addVideo(b, mod); // runtime-loaded video codec shims (no-op without -Dvideo)
+    if (d.native_sck) addSckBackend(b, mod);
+    if (d.have_vtenc) addVtEnc(b, mod); // daemon-side VideoToolbox encode (macOS)
+    return p.executable(b, "sketerm-mux", mod);
+}
+
+/// The GTK-free MCP server: the portable daemon's dependency set, so
+/// `sketerm mcp`'s headless terminal/app/web tools run anywhere
+/// sketerm-mux does.
+fn mcpExe(b: *std.Build, d: BinDeps, p: Profile) *std.Build.Step.Compile {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/mcp_main.zig"),
+        .target = d.target,
+        .optimize = p.optimize,
+        .sanitize_c = p.sanitize_c,
+        .link_libc = true,
+        .strip = p.strip,
+    });
+    configureShippableCoreDeps(b, mod, d.core_cbindings);
+    mod.addImport("build_options", p.noglib_opts);
+    addVideo(b, mod); // runtime-loaded video codec shims (no-op without -Dvideo)
+    addAgentAdapters(b, mod); // the agent_* tools load the shipped adapters
+    addMcpToolsJson(b, mod);
+    return p.executable(b, "sketerm-mcp", mod);
 }
 
 /// Pinned CEF binary distribution ("minimal" distro). SINGLE source of
@@ -1955,14 +2042,17 @@ fn generateGdkShim(b: *std.Build) std.Build.LazyPath {
     return dir;
 }
 
-/// Build a libc-free helper executable for the build HOST.
-///
-/// Same trade as `test_llvm`, but for the HOST: on aarch64-macOS `-fno-llvm`
-/// dies with SIGKILL, so only an x86_64 Linux host uses the self-hosted
-/// backend + linker.
+/// Whether Zig's self-hosted backend + linker build for `t`: only x86_64
+/// Linux (on aarch64-macOS `-fno-llvm` dies with SIGKILL).
+fn selfHostedBackend(t: std.Target) bool {
+    return t.os.tag == .linux and t.cpu.arch == .x86_64;
+}
+
+/// Build a libc-free helper executable for the build HOST, on the
+/// self-hosted backend + linker where `selfHostedBackend` allows.
 fn addHostTool(b: *std.Build, name: []const u8, root: []const u8) *std.Build.Step.Compile {
     const host = b.graph.host;
-    const self_hosted = host.result.os.tag == .linux and host.result.cpu.arch == .x86_64;
+    const self_hosted = selfHostedBackend(host.result);
     return b.addExecutable(.{
         .name = name,
         .root_module = b.createModule(.{

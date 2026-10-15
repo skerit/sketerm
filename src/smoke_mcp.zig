@@ -1,6 +1,6 @@
 //! `zig build smoke-mcp` — end-to-end smoke for the MCP server's
 //! isolation model and headless terminal tools. Spawns
-//! `zig-out/bin/sketerm mcp` as a subprocess, speaks NDJSON JSON-RPC
+//! the GUI's `sketerm mcp` as a subprocess, speaks NDJSON JSON-RPC
 //! over its stdio, and asserts: the handshake + tool inventory, that a
 //! private daemon is created under an isolated runtime dir (and the
 //! shared mux.sock is NOT), that headless term tools run a real shell,
@@ -58,6 +58,12 @@ var g_rt: ?[]const u8 = null;
 /// when the smoke binary is run by hand; the install path is then the
 /// fallback.
 var g_web_bin: ?[*:0]const u8 = null;
+
+/// The GUI and sketerm-mux under test. build.zig installs dev-profile
+/// builds into a `bin/`-shaped dir and names it with `--bin-dir`; the
+/// default is the regular install, for a smoke binary run by hand.
+var g_gui_bin: [*:0]const u8 = "zig-out/bin/sketerm";
+var g_mux_bin: [*:0]const u8 = "zig-out/bin/sketerm-mux";
 
 /// The helper to drive, or null when none is built.
 fn resolveWebBin(buf: *[4096:0]u8) ?[*:0]const u8 {
@@ -494,9 +500,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // `--web-bin <path>`: the helper THIS build produced, handed over by
     // build.zig. Without it the stages fall back to the installed
     // `zig-out/bin/sketerm-webengine`.
+    // `--bin-dir <dir>`: where build.zig installed the GUI and sketerm-mux.
     for (init.args.vector, 0..) |a, i| {
-        if (std.mem.eql(u8, std.mem.span(a), "--web-bin") and i + 1 < init.args.vector.len)
-            g_web_bin = init.args.vector[i + 1];
+        if (i + 1 >= init.args.vector.len) continue;
+        const arg = std.mem.span(a);
+        if (std.mem.eql(u8, arg, "--web-bin")) g_web_bin = init.args.vector[i + 1];
+        if (std.mem.eql(u8, arg, "--bin-dir")) {
+            const dir = std.mem.span(init.args.vector[i + 1]);
+            g_gui_bin = std.fmt.allocPrintSentinel(allocator, "{s}/sketerm", .{dir}, 0) catch fail("oom");
+            g_mux_bin = std.fmt.allocPrintSentinel(allocator, "{s}/sketerm-mux", .{dir}, 0) catch fail("oom");
+        }
     }
 
     // Every daemon below this process -- the ones `sketerm mcp` autostarts,
@@ -549,9 +562,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     g_rt = rt;
     defer killDaemonsUnderRt(rt, allocator);
 
-    const exe = "zig-out/bin/sketerm";
-    if (c.access(exe, c.X_OK) != 0) fail("zig-out/bin/sketerm missing (build first)");
-    _ = c.setenv("SKETERM_MUX_BIN", "zig-out/bin/sketerm-mux", 1);
+    const exe = g_gui_bin;
+    if (c.access(exe, c.X_OK) != 0) fail("the sketerm under test is missing (build first)");
+    _ = c.setenv("SKETERM_MUX_BIN", g_mux_bin, 1);
     defer _ = unsetEnv("SKETERM_MUX_BIN");
     if (c.getenv("SKETERM_SMOKE_MCP_WEBSTARTUP_ONLY") != null) {
         var bin_buf: [4096:0]u8 = undefined;
@@ -8639,7 +8652,7 @@ fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u
     _ = c.setenv("XDG_STATE_HOME", rt.ptr, 1);
     _ = c.setenv("HOME", rt.ptr, 1);
     clearInheritedOrigin();
-    _ = c.setenv("SKETERM_MUX_BIN", "zig-out/bin/sketerm-mux", 1);
+    _ = c.setenv("SKETERM_MUX_BIN", g_mux_bin, 1);
     _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
     g_rt = rt;
     webStartupStage(allocator, exe);
@@ -11299,7 +11312,7 @@ fn startHostDaemon(rt_host: [:0]const u8) c.pid_t {
         _ = c.setenv("XDG_STATE_HOME", rt_host.ptr, 1);
         _ = c.setenv("XDG_CONFIG_HOME", rt_host.ptr, 1);
         const argv = [_:null]?[*:0]const u8{ "sketerm-mux", "--broker", null };
-        _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
+        _ = c.execv(g_mux_bin, @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     var sock_buf: [512]u8 = undefined;
@@ -11401,7 +11414,7 @@ fn routeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
     var self_buf: [4096]u8 = undefined;
     const self_exe = platform.exePath(&self_buf) orelse fail("route stage: own executable path");
     var mux_abs_buf: [4096]u8 = undefined;
-    const mux_abs = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath("zig-out/bin/sketerm-mux", &mux_abs_buf) orelse fail("zig-out/bin/sketerm-mux missing"))));
+    const mux_abs = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath(g_mux_bin, &mux_abs_buf) orelse fail("the sketerm-mux under test is missing"))));
 
     // The sub-agent binaries live where an ssh login's PATH does not look.
     const home = std.mem.span(@as([*:0]const u8, @ptrCast(c.getenv("HOME") orelse fail("no HOME"))));
@@ -11630,7 +11643,7 @@ fn startRemoteDaemon(rrt: [:0]const u8, rsock: []const u8) c.pid_t {
         _ = c.setenv("XDG_STATE_HOME", rrt.ptr, 1);
         _ = c.setenv("XDG_CONFIG_HOME", rrt.ptr, 1);
         const argv = [_:null]?[*:0]const u8{ "sketerm-mux", "--broker", null };
-        _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
+        _ = c.execv(g_mux_bin, @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     const deadline = nowMs() + 10_000;
@@ -11862,7 +11875,7 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
     const rrt = std.fmt.allocPrintSentinel(arena, "{s}/r", .{rt}, 0) catch fail("oom");
     _ = c.mkdir(rrt.ptr, 0o700);
     var mux_abs_buf: [4096]u8 = undefined;
-    const mux_abs = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath("zig-out/bin/sketerm-mux", &mux_abs_buf) orelse fail("zig-out/bin/sketerm-mux missing"))));
+    const mux_abs = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath(g_mux_bin, &mux_abs_buf) orelse fail("the sketerm-mux under test is missing"))));
     const rsock = std.fmt.allocPrint(arena, "{s}/sketerm/mux.sock", .{rrt}) catch fail("oom");
     var rpid = startRemoteDaemon(rrt, rsock);
     const down = std.fmt.allocPrintSentinel(arena, "{s}/ssh-down", .{rt}, 0) catch fail("oom");
