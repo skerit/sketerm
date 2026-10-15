@@ -15,6 +15,7 @@ const dbus = @import("dbus.zig");
 const dbusconn = @import("dbusconn.zig");
 
 const nowMs = @import("../util/clock.zig").nowMs;
+const appendJsonString = @import("../util/jsonstr.zig").append;
 
 const ATSPI_ACCESSIBLE = "org.a11y.atspi.Accessible";
 const ATSPI_REGISTRY_DEST = "org.a11y.atspi.Registry";
@@ -820,11 +821,11 @@ const Walker = struct {
         try w.appendSlice(a, "\",\"role\":");
         try printInt(w, a, role_num);
         try w.appendSlice(a, ",\"name\":");
-        try printJsonString(w, a, name);
+        try appendJsonString(a, w, name);
         try appendAccessibleId(w, a, accessible_id);
         if (desc.len > 0) {
             try w.appendSlice(a, ",\"desc\":");
-            try printJsonString(w, a, desc);
+            try appendJsonString(a, w, desc);
         }
         try w.appendSlice(a, ",\"states\":[");
         try printInt(w, a, st[0]);
@@ -1022,34 +1023,10 @@ fn printIntI(w: *std.ArrayList(u8), a: std.mem.Allocator, v: i32) !void {
 fn appendAccessibleId(w: *std.ArrayList(u8), a: std.mem.Allocator, id: []const u8) !void {
     if (id.len == 0) return;
     try w.appendSlice(a, ",\"accessible_id\":");
-    try printJsonString(w, a, id);
+    try appendJsonString(a, w, id);
 }
 
-fn printJsonString(w: *std.ArrayList(u8), a: std.mem.Allocator, s: []const u8) !void {
-    try w.append(a, '"');
-    for (s) |ch| switch (ch) {
-        '"' => try w.appendSlice(a, "\\\""),
-        '\\' => try w.appendSlice(a, "\\\\"),
-        '\n' => try w.appendSlice(a, "\\n"),
-        '\r' => try w.appendSlice(a, "\\r"),
-        '\t' => try w.appendSlice(a, "\\t"),
-        0...8, 11, 12, 14...31 => {
-            var buf: [8]u8 = undefined;
-            const e = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{ch}) catch continue;
-            try w.appendSlice(a, e);
-        },
-        else => try w.append(a, ch),
-    };
-    try w.append(a, '"');
-}
 
-test "json string escaping is well-formed" {
-    const a = std.testing.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    try printJsonString(&out, a, "a\"b\\c\n");
-    try std.testing.expectEqualStrings("\"a\\\"b\\\\c\\n\"", out.items);
-}
 
 test "AT-SPI AccessibleId is not promoted to a desktop app id" {
     const a = std.testing.allocator;

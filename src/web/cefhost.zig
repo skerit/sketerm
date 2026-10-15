@@ -6519,16 +6519,7 @@ pub fn innerJson(obj: []const u8) []const u8 {
 }
 
 pub fn jsonStr(w: *std.Io.Writer, s: []const u8) !void {
-    try w.writeByte('"');
-    for (s) |ch| switch (ch) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        '\n' => try w.writeAll("\\n"),
-        '\r' => try w.writeAll("\\r"),
-        '\t' => try w.writeAll("\\t"),
-        else => if (ch < 0x20) try w.print("\\u{x:0>4}", .{ch}) else try w.writeByte(ch),
-    };
-    try w.writeByte('"');
+    try std.json.Stringify.encodeJsonString(s, .{}, w);
 }
 
 /// The single JSON string argument of a `sketerm.sem` process message,

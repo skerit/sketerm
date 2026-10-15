@@ -31,6 +31,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const appendJsonString = @import("../util/jsonstr.zig").append;
 const rpc = @import("rpc.zig");
 const pos = @import("position.zig");
 const semantic = @import("semantic.zig");
@@ -851,28 +852,3 @@ fn boolOf(v: ?std.json.Value, dflt: bool) bool {
     };
 }
 
-/// Append `s` as a JSON string literal. Control characters below 0x20
-/// are escaped (\u00XX); everything else, including all of UTF-8, goes
-/// through verbatim — the wire is UTF-8 and escaping non-ASCII would
-/// only make the payload bigger.
-pub fn appendJsonString(alloc: Allocator, out: *std.ArrayList(u8), s: []const u8) Allocator.Error!void {
-    try out.append(alloc, '"');
-    for (s) |ch| {
-        switch (ch) {
-            '"' => try out.appendSlice(alloc, "\\\""),
-            '\\' => try out.appendSlice(alloc, "\\\\"),
-            '\n' => try out.appendSlice(alloc, "\\n"),
-            '\r' => try out.appendSlice(alloc, "\\r"),
-            '\t' => try out.appendSlice(alloc, "\\t"),
-            0x08 => try out.appendSlice(alloc, "\\b"),
-            0x0C => try out.appendSlice(alloc, "\\f"),
-            0x00...0x07, 0x0B, 0x0E...0x1F => {
-                var buf: [6]u8 = undefined;
-                const e = std.fmt.bufPrint(&buf, "\\u{X:0>4}", .{ch}) catch unreachable;
-                try out.appendSlice(alloc, e);
-            },
-            else => try out.append(alloc, ch),
-        }
-    }
-    try out.append(alloc, '"');
-}

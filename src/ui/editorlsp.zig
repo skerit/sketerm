@@ -1099,7 +1099,7 @@ pub const Manager = struct {
         const p = pos.offsetToPosition(&r.tab.doc.rope, offset, r.cn.sess.caps.encoding);
         self.scratch.clearRetainingCapacity();
         self.scratch.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":") catch return null;
-        session.appendJsonString(self.alloc, &self.scratch, r.st.sync.uri) catch return null;
+        appendJsonString(self.alloc, &self.scratch, r.st.sync.uri) catch return null;
         self.scratch.print(
             self.alloc,
             "}},\"position\":{{\"line\":{d},\"character\":{d}}}{s}}}",
@@ -1699,7 +1699,7 @@ pub const Manager = struct {
         const r = Ready{ .tab = tab, .st = st, .cn = cn };
         self.scratch.clearRetainingCapacity();
         self.scratch.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":") catch return false;
-        session.appendJsonString(self.alloc, &self.scratch, st.sync.uri) catch return false;
+        appendJsonString(self.alloc, &self.scratch, st.sync.uri) catch return false;
         self.scratch.appendSlice(self.alloc, "}}") catch return false;
         self.issue(r, .document_symbol, "textDocument/documentSymbol", self.scratch.items, OUTLINE_AUX);
         return cn.sess.hasPending(.document_symbol, tab.id);
@@ -1733,7 +1733,7 @@ pub const Manager = struct {
         defer if (query.len > 0) self.alloc.free(query);
         self.scratch.clearRetainingCapacity();
         self.scratch.appendSlice(self.alloc, "{\"query\":") catch return;
-        session.appendJsonString(self.alloc, &self.scratch, query) catch return;
+        appendJsonString(self.alloc, &self.scratch, query) catch return;
         self.scratch.appendSlice(self.alloc, "}") catch return;
         self.issue(r, .workspace_symbol, "workspace/symbol", self.scratch.items, 0);
     }
@@ -1880,7 +1880,7 @@ pub const Manager = struct {
         var extra: std.ArrayList(u8) = .empty;
         defer extra.deinit(self.alloc);
         extra.appendSlice(self.alloc, ",\"newName\":") catch return;
-        session.appendJsonString(self.alloc, &extra, new_name) catch return;
+        appendJsonString(self.alloc, &extra, new_name) catch return;
         const params = self.docPosParams(r, r.tab.sels.primary().head, extra.items) orelse return;
         self.issue(r, .rename, "textDocument/rename", params, 0);
     }
@@ -2161,7 +2161,7 @@ pub const Manager = struct {
         const enc = r.cn.sess.caps.encoding;
         self.scratch.clearRetainingCapacity();
         self.scratch.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":") catch return;
-        session.appendJsonString(self.alloc, &self.scratch, r.st.sync.uri) catch return;
+        appendJsonString(self.alloc, &self.scratch, r.st.sync.uri) catch return;
         self.scratch.appendSlice(self.alloc, "}") catch return;
         if (want_range) {
             const s = pos.offsetToPosition(&r.tab.doc.rope, sel.start(), enc);
@@ -2345,7 +2345,7 @@ pub const Manager = struct {
         const e = pos.offsetToPosition(&r.tab.doc.rope, sel.end(), enc);
         self.scratch.clearRetainingCapacity();
         self.scratch.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":") catch return;
-        session.appendJsonString(self.alloc, &self.scratch, r.st.sync.uri) catch return;
+        appendJsonString(self.alloc, &self.scratch, r.st.sync.uri) catch return;
         self.scratch.print(
             self.alloc,
             "}},\"range\":{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":{d}}}}},\"context\":{{\"diagnostics\":[",
@@ -2538,7 +2538,7 @@ pub const Manager = struct {
         const args: ?std.json.Value = if (cmd == .object) cmd.object.get("arguments") else null;
         self.scratch.clearRetainingCapacity();
         self.scratch.appendSlice(self.alloc, "{\"command\":") catch return;
-        session.appendJsonString(self.alloc, &self.scratch, name) catch return;
+        appendJsonString(self.alloc, &self.scratch, name) catch return;
         if (args) |a| {
             const txt = serializeValue(self.alloc, a) catch return;
             defer self.alloc.free(txt);
@@ -2696,7 +2696,7 @@ pub const Manager = struct {
     fn rangeParams(self: *Manager, uri: []const u8, from: u32, to: u32) bool {
         self.scratch.clearRetainingCapacity();
         self.scratch.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":") catch return false;
-        session.appendJsonString(self.alloc, &self.scratch, uri) catch return false;
+        appendJsonString(self.alloc, &self.scratch, uri) catch return false;
         self.scratch.print(
             self.alloc,
             "}},\"range\":{{\"start\":{{\"line\":{d},\"character\":0}},\"end\":{{\"line\":{d},\"character\":0}}}}}}",
@@ -2758,7 +2758,7 @@ pub const Manager = struct {
             st.sem_stale = false;
             self.scratch.clearRetainingCapacity();
             self.scratch.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":") catch return;
-            session.appendJsonString(self.alloc, &self.scratch, st.sync.uri) catch return;
+            appendJsonString(self.alloc, &self.scratch, st.sync.uri) catch return;
             self.scratch.appendSlice(self.alloc, "}") catch return;
             // A delta is only possible when the server gave us a
             // resultId for the array we are still holding.
@@ -2766,7 +2766,7 @@ pub const Manager = struct {
                 st.sem_data.valid and st.sem_data.result_id.len > 0;
             if (delta) {
                 self.scratch.appendSlice(self.alloc, ",\"previousResultId\":") catch return;
-                session.appendJsonString(self.alloc, &self.scratch, st.sem_data.result_id) catch return;
+                appendJsonString(self.alloc, &self.scratch, st.sem_data.result_id) catch return;
             }
             self.scratch.appendSlice(self.alloc, "}") catch return;
             self.issue(
@@ -3885,6 +3885,7 @@ fn firstLine(s: []const u8) []const u8 {
 }
 
 const strOf = @import("../util/jsonnum.zig").strOf;
+const appendJsonString = @import("../util/jsonstr.zig").append;
 
 const TextDocumentVersion = union(enum) {
     unversioned,
