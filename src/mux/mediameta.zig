@@ -47,7 +47,7 @@ const std = @import("std");
 // doc.version         PDF header version
 //
 // Keys only the job process fills, from its external-probe fallback
-// (see fsjob.zig): media.codec, doc.pages, doc.title, doc.author,
+// (see jobs/media.zig): media.codec, doc.pages, doc.title, doc.author,
 // doc.producer, doc.page_size.
 
 pub const Kind = enum {

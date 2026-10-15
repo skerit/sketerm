@@ -2,7 +2,7 @@
 //! record parsing, directory rollup, the display decision and the
 //! per-root refresh cache.
 //!
-//! GTK-free on purpose — the daemon's `git_status` job (`mux/fsjob.zig`)
+//! GTK-free on purpose — the daemon's `git_status` job (`mux/jobs/git.zig`)
 //! scans `git status --porcelain=v2 --branch --ignored -z` with the
 //! `Scanner` below, and the UI side (`src/ui/browser/gitstat.zig`) only
 //! ships records in and reads badges out. Every rule is therefore
@@ -434,7 +434,7 @@ pub const Row = struct {
 };
 
 /// Hard ceiling on folded entries. The daemon caps its record stream
-/// (see `mux/fsjob.zig`); times a path depth this is the memory the
+/// (see `mux/jobs/git.zig`); times a path depth this is the memory the
 /// overlay can ever hold, and a pathological tree stops growing it
 /// rather than the browser growing without bound.
 pub const MAX_ENTRIES: usize = 20000;

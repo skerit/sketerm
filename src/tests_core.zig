@@ -191,6 +191,17 @@ comptime {
     _ = @import("mux/drmdev.zig");
     _ = @import("mux/disk_usage.zig");
     _ = @import("mux/fsjob.zig");
+    _ = @import("mux/jobs/archive.zig");
+    _ = @import("mux/jobs/common.zig");
+    _ = @import("mux/jobs/copy.zig");
+    _ = @import("mux/jobs/filetools.zig");
+    _ = @import("mux/jobs/git.zig");
+    _ = @import("mux/jobs/hash.zig");
+    _ = @import("mux/jobs/media.zig");
+    _ = @import("mux/jobs/preview.zig");
+    _ = @import("mux/jobs/search.zig");
+    _ = @import("mux/jobs/trash.zig");
+    _ = @import("mux/jobs/tree.zig");
     _ = @import("mux/crosscopy.zig");
     _ = @import("mux/fs_boundary.zig");
     _ = @import("mux/fsjournal.zig");

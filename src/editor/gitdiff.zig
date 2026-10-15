@@ -4,7 +4,7 @@
 //!
 //! The GUI never touches the disk and never runs a process, so the
 //! committed content of a file cannot be read here. What produces the
-//! marks is the daemon's `git_diff` fs job (`mux/fsjob.zig
+//! marks is the daemon's `git_diff` fs job (`mux/jobs/git.zig
 //! runGitDiff`), which runs
 //!
 //!     git diff -U0 --no-color --no-ext-diff HEAD -- <name>

@@ -11,7 +11,7 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
-const fsjob = @import("../../mux/fsjob.zig");
+const search_job = @import("../../mux/jobs/search.zig");
 
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
@@ -288,8 +288,8 @@ pub const CompareCtx = struct {
         while (it.next()) |p_raw| {
             const p = std.mem.trim(u8, p_raw, " ");
             if (p.len == 0) continue;
-            if (fsjob.nameMatches(p, rel)) return true;
-            if (fsjob.nameMatches(p, std.fs.path.basename(rel))) return true;
+            if (search_job.nameMatches(p, rel)) return true;
+            if (search_job.nameMatches(p, std.fs.path.basename(rel))) return true;
         }
         return false;
     }

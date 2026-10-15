@@ -6,7 +6,7 @@ const std = @import("std");
 const c = @import("../../c.zig").c;
 const browser_model = @import("../../filebrowser/model.zig");
 const clock = @import("../../util/clock.zig");
-const fsjob = @import("../../mux/fsjob.zig");
+const search_job = @import("../../mux/jobs/search.zig");
 const grouping = @import("../../filebrowser/grouping.zig");
 const profile = @import("../../util/profile.zig");
 const searchmod = @import("search.zig");
@@ -1808,7 +1808,7 @@ pub fn loadFileColors(self: *BrowserView) void {
 
 pub fn fileColorFor(self: *BrowserView, name: []const u8) ?*const [7]u8 {
     for (self.file_colors.items) |*fc| {
-        if (fsjob.nameMatches(fc.glob, name)) return &fc.color;
+        if (search_job.nameMatches(fc.glob, name)) return &fc.color;
     }
     return null;
 }

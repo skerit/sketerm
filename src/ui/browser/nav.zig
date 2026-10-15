@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
-const fsjob = @import("../../mux/fsjob.zig");
+const search_job = @import("../../mux/jobs/search.zig");
 const input = @import("../input.zig");
 const places_mod = @import("../../filebrowser/places.zig");
 
@@ -1486,7 +1486,7 @@ pub fn selectPatternDirs(self: *BrowserView, tab: *BTab, pattern: []const u8, in
             const owned = arena.allocator().dupe(u8, path) catch continue;
             const match = matches.getOrPut(arena.allocator(), owned) catch continue;
             if (!match.found_existing) match.value_ptr.* = false;
-            match.value_ptr.* = match.value_ptr.* or fsjob.nameMatches(pattern, entry.name);
+            match.value_ptr.* = match.value_ptr.* or search_job.nameMatches(pattern, entry.name);
         }
     }
     // The new selection is decided against the OLD one, so it is
