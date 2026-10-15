@@ -123,7 +123,10 @@ pub fn build(b: *std.Build) void {
     // Commit id + commit date for Help > About and the daemon's `build`
     // announce (`Conn.buildStale`). Stable per commit so a rebuild
     // without new commits stays fully cached; tarball builds without git
-    // degrade to "unknown".
+    // degrade to "unknown". Only the RELEASE profile is stamped: every
+    // artifact imports it, so a stamped dev profile recompiled every test
+    // and smoke unit after each commit. Dev artifacts carry `DEV_STAMP`
+    // (no test asserts a real one) unless `-Dstamp=true`.
     const git_commit = runCapture(b, &.{ "git", "-C", b.build_root.path orelse ".", "describe", "--always", "--dirty" }) orelse "unknown";
     const git_date = runCapture(b, &.{ "git", "-C", b.build_root.path orelse ".", "log", "-1", "--format=%cd", "--date=format:%Y-%m-%d %H:%M" }) orelse "unknown";
     const release_facts: OptionFacts = .{
@@ -136,7 +139,11 @@ pub fn build(b: *std.Build) void {
         .audio_opus = have_opus,
         .dmabuf_import = have_dmabuf_import,
     };
-    const dev_facts = release_facts;
+    var dev_facts = release_facts;
+    if (!(b.option(bool, "stamp", "stamp the git commit into dev-profile artifacts too (unit tests, smoke rigs)") orelse false)) {
+        dev_facts.commit = DEV_STAMP;
+        dev_facts.commit_date = DEV_STAMP;
+    }
     const release: Profile = .{
         .optimize = optimize,
         .strip = strip,
@@ -344,7 +351,9 @@ pub fn build(b: *std.Build) void {
         .dmabuf_import = false,
     };
     mux_portable_mod.addImport("build_options", optionsModule(b, false, portable_facts));
-    const portable_test_facts = portable_facts;
+    var portable_test_facts = portable_facts;
+    portable_test_facts.commit = dev_facts.commit;
+    portable_test_facts.commit_date = dev_facts.commit_date;
     // The OS-specific process primitives (`platform.parentOf` and the
     // `sketerm mcp agents` walk over it) compiled for the portable target,
     // like atomicwrite above; nothing the daemon links reaches them.
@@ -1182,6 +1191,9 @@ const Profile = struct {
         return b.addExecutable(.{ .name = name, .root_module = mod, .use_llvm = p.use_llvm, .use_lld = p.use_lld });
     }
 };
+
+/// The commit and commit date dev-profile artifacts carry instead of git's.
+const DEV_STAMP = "dev";
 
 /// What `build_options` carries beside `glib` and the semver.
 const OptionFacts = struct {
