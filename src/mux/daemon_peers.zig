@@ -36,8 +36,6 @@ const Worker = dmod.Worker;
 
 /// Rigs override the mail TTL in milliseconds (config is in hours).
 pub const TTL_ENV = "SKETERM_MUX_PEER_TTL_MS";
-/// Rigs override this host's name in peer addresses (default: gethostname).
-pub const HOST_ENV = "SKETERM_MUX_PEER_HOST";
 /// The TTL sweep runs at most this often (monotonic ms).
 pub const SWEEP_EVERY_MS: i64 = 1000;
 
@@ -430,10 +428,7 @@ fn ensure(d: *Daemon) ?*peermail.Store {
     defer if (dir) |p| d.allocator.free(p);
     if (dir == null) log.warn("peermail: no state directory; mailboxes are kept in memory only", .{});
     var host_buf: [256]u8 = undefined;
-    const host: []const u8 = env.nonEmpty(HOST_ENV) orelse if (c.gethostname(&host_buf, host_buf.len) == 0)
-        std.mem.sliceTo(&host_buf, 0)
-    else
-        "";
+    const host = @import("../ipc/peeraddr.zig").selfHost(&host_buf);
     var cfg = Config.load(d.allocator);
     defer cfg.deinit();
     // A hub or a call-in member, never both.

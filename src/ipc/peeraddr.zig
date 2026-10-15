@@ -9,6 +9,8 @@
 //! know what the hub calls it.
 
 const std = @import("std");
+const c = @import("../c.zig").c;
+const env = @import("../util/env.zig");
 
 /// The longest name.
 pub const NAME_MAX = 64;
@@ -21,6 +23,16 @@ pub const ANON_PREFIX = "anon-";
 pub const ANON_CHARS = 4;
 /// The longest formatted address.
 pub const ADDRESS_MAX = HOST_MAX + 1 + NAME_MAX;
+/// Rigs override this host's name in peer addresses (default: gethostname).
+pub const HOST_ENV = "SKETERM_MUX_PEER_HOST";
+
+/// The host name this daemon announces in peer addresses, into `buf`;
+/// empty when it has none.
+pub fn selfHost(buf: []u8) []const u8 {
+    if (env.nonEmpty(HOST_ENV)) |h| return h;
+    if (c.gethostname(buf.ptr, buf.len) != 0) return "";
+    return std.mem.sliceTo(buf, 0);
+}
 
 pub const Error = error{ Empty, TooLong, BadChar, LeadingDot };
 

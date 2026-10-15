@@ -18,6 +18,7 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const mcpproc = @import("smoke/mcpproc.zig");
 const daemon_peers = @import("mux/daemon_peers.zig");
+const peeraddr = @import("ipc/peeraddr.zig");
 const peermail = @import("mux/peermail.zig");
 const muxclient = @import("mux/client.zig");
 const nowMs = @import("util/clock.zig").nowMs;
@@ -765,7 +766,7 @@ fn startFedDaemon(arena: std.mem.Allocator, h: *const FedHost, mux_bin: [*:0]con
         _ = c.setenv("XDG_CONFIG_HOME", h.cfg.ptr, 1);
         _ = c.setenv(daemon_peers.TTL_ENV, FED_TTL_TEXT, 1);
         if (ssh) |s| _ = c.setenv("SKETERM_SSH", s, 1) else _ = envutil.unset("SKETERM_SSH");
-        if (host) |s| _ = c.setenv(daemon_peers.HOST_ENV, s, 1) else _ = envutil.unset(daemon_peers.HOST_ENV);
+        if (host) |s| _ = c.setenv(peeraddr.HOST_ENV, s, 1) else _ = envutil.unset(peeraddr.HOST_ENV);
         const argv = [_:null]?[*:0]const u8{ "sketerm-mux", "--broker", null };
         _ = c.execv(mux_bin, @ptrCast(@constCast(&argv)));
         c._exit(127);

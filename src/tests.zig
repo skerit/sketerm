@@ -40,6 +40,8 @@ comptime {
     _ = @import("ipc/mcp_hook.zig");
     _ = @import("ipc/mcp_setup.zig");
     _ = @import("ipc/peer_cli.zig");
+    _ = @import("ipc/peer_setup.zig");
+    _ = @import("config_edit.zig");
     _ = @import("ipc/agentglance.zig");
     _ = @import("ipc/agentpush.zig");
     _ = @import("ipc/agentindex.zig");

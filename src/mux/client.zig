@@ -1415,7 +1415,8 @@ pub const Conn = struct {
         return conn;
     }
 
-    fn validSshHost(host: []const u8) bool {
+    /// An ssh destination that cannot be read as an option.
+    pub fn validSshHost(host: []const u8) bool {
         return host.len > 0 and host[0] != '-';
     }
 

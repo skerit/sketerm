@@ -26,6 +26,7 @@ const peerclient = @import("../mux/peerclient.zig");
 const agentwait = @import("agentwait.zig");
 const mcp_hook = @import("mcp_hook.zig");
 const peermail = peerclient.peermail;
+const peer_setup = @import("peer_setup.zig");
 
 /// The argv word that selects this command (`sketerm peer`, `sketerm mcp peer`).
 pub const SUBCOMMAND = "peer";
@@ -33,7 +34,7 @@ pub const SUBCOMMAND = "peer";
 pub const APP_DEFAULT = "cli";
 /// The name when no `--name` is given (the precedence's explicit rule).
 pub const ENV_NAME = "SKETERM_PEER_NAME";
-const REPLY_MS: i64 = 10_000;
+pub const REPLY_MS: i64 = 10_000;
 /// A one-shot read takes what arrives until this long passes with nothing.
 const READ_QUIET_MS: i64 = 300;
 const RECONNECT = Backoff{ .min_ms = 1_000, .max_ms = 60_000 };
@@ -331,6 +332,11 @@ pub const HELP =
     \\       sketerm peer send --name NAME [--json] [--reply-to ID] TO [TEXT]
     \\       sketerm peer read --name NAME [--json] [--follow]
     \\       sketerm peer subject [--name NAME] [TEXT | --clear]
+    \\       sketerm peer hub add NAME [--host SSH_TARGET] [--inbound] [--dry-run]
+    \\       sketerm peer hub remove NAME [--dry-run]
+    \\       sketerm peer join HUB [--host SSH_TARGET] [--dry-run]
+    \\       sketerm peer leave [--dry-run]
+    \\       sketerm peer status
     \\       (--app APP on send and read: the app the peer registers as, default cli)
     \\
     \\Takes part in peer messaging (the peer_* tools of `sketerm mcp`) from any
@@ -356,9 +362,22 @@ pub const HELP =
     \\session by its address). The daemon keeps it with the address, across
     \\server restarts.
     \\
+    \\hub add, hub remove, join and leave set up federation (peers on other
+    \\hosts) by editing config.conf in place, keeping every other line and
+    \\comment. hub add makes this daemon the hub and links [domain.NAME]:
+    \\dialed at SSH_TARGET (default NAME, an existing host is kept), or with
+    \\--inbound a member that calls in. hub remove unlinks it. join makes this
+    \\daemon a call-in member of the hub HUB, dialed at SSH_TARGET (default
+    \\HUB), and prints the hub add line to run on the hub; leave undoes it.
+    \\A daemon is never hub and member at once. --dry-run prints the changes
+    \\without writing them. The daemon reads these keys only when it starts:
+    \\restart it (no sessions attached) afterwards. status prints this host's
+    \\role, its federated domains and, from the daemon, each link's state.
+    \\
     \\Exit status: 0 done, 1 the daemon could not be reached, the name is held
-    \\by another live peer, a send was refused, or no server or peer was found
-    \\for subject; 2 bad usage (a refused subject too).
+    \\by another live peer, a send was refused, no server or peer was found
+    \\for subject, or a federation edit was refused (hub and member at once,
+    \\no such domain); 2 bad usage (a refused subject, name or host too).
     \\
 ;
 
@@ -384,15 +403,24 @@ fn fail(comptime fmt: []const u8, args: anytype) u8 {
     return 1;
 }
 
+/// Every verb of `sketerm peer`, from both verb enums.
+const UNKNOWN_VERB = blk: {
+    const names = std.meta.fieldNames(Verb).* ++ std.meta.fieldNames(peer_setup.Verb).*;
+    var s: []const u8 = "peer: say one of";
+    for (names, 0..) |n, i| s = s ++ (if (i == 0) " " else ", ") ++ n;
+    break :blk s ++ " (see --help)\n";
+};
+
 /// `sketerm peer ...`.
 /// @return the process exit status.
 pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
+    if (peer_setup.claims(args)) return peer_setup.cli(allocator, args);
     const o = Cli.parse(args, env.nonEmpty(ENV_NAME)) catch |err| {
         say(2, switch (err) {
             error.UnknownFlag => "peer: unknown flag (see --help)\n",
             error.MissingValue => "peer: flag needs a value\n",
             error.ExtraArgument => "peer: too many arguments (see --help)\n",
-            error.UnknownVerb => "peer: say list, send, read or subject (see --help)\n",
+            error.UnknownVerb => UNKNOWN_VERB,
             error.NoName => "peer: --name NAME (or SKETERM_PEER_NAME) is required: the address this program is reached at\n",
             error.NoAddress => "peer: send needs the address to send to\n",
             error.BadName => "peer: the name must be 1-64 of A-Za-z0-9._- (no host)\n",
@@ -516,7 +544,7 @@ fn ownPeer(allocator: std.mem.Allocator, arena: std.mem.Allocator, own: []const 
     return null;
 }
 
-const LinkError = error{ Unreachable, NoPeers, NameTaken, NoAnswer };
+pub const LinkError = error{ Unreachable, NoPeers, NameTaken, NoAnswer };
 
 fn linkError(e: LinkError) []const u8 {
     return switch (e) {
@@ -528,12 +556,12 @@ fn linkError(e: LinkError) []const u8 {
 }
 
 /// One connection to the per-user daemon.
-const Link = struct {
+pub const Link = struct {
     allocator: std.mem.Allocator,
     conn: *muxclient.Conn,
     peer: peerclient.Peer,
 
-    fn open(allocator: std.mem.Allocator) LinkError!Link {
+    pub fn open(allocator: std.mem.Allocator) LinkError!Link {
         const conn = allocator.create(muxclient.Conn) catch return error.Unreachable;
         conn.* = muxclient.Conn.connectLocalAutostartAt(allocator, null) catch {
             allocator.destroy(conn);
@@ -547,7 +575,7 @@ const Link = struct {
         return l;
     }
 
-    fn close(self: *Link) void {
+    pub fn close(self: *Link) void {
         self.peer.deinit();
         self.conn.deinit();
         self.allocator.destroy(self.conn);

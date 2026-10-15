@@ -1994,10 +1994,14 @@ pub const Config = struct {
     pub fn peerHubDomain(self: *const Config) error{ HubAndCallin, NoSuchDomain }!?*const Domain {
         if (self.peer_hub_domain.len == 0) return null;
         if (self.peer_hub) return error.HubAndCallin;
-        for (self.domains.items) |*d| {
-            if (std.mem.eql(u8, d.name, self.peer_hub_domain)) return if (d.host.len == 0) error.NoSuchDomain else d;
-        }
-        return error.NoSuchDomain;
+        const d = self.domainNamed(self.peer_hub_domain) orelse return error.NoSuchDomain;
+        return if (d.host.len == 0) error.NoSuchDomain else d;
+    }
+
+    /// The `[domain.<name>]` section, or null.
+    pub fn domainNamed(self: *const Config, name: []const u8) ?*const Domain {
+        for (self.domains.items) |*d| if (std.mem.eql(u8, d.name, name)) return d;
+        return null;
     }
 };
 
@@ -2070,6 +2074,26 @@ pub fn resolveConfigPath(allocator: std.mem.Allocator) ![]u8 {
     return error.NoConfigPath;
 }
 
+/// One config.conf line as `parseInto` reads it: the one line grammar,
+/// shared with the line-preserving editor in `config_edit.zig`.
+pub const ConfLine = union(enum) {
+    /// Empty, whitespace or a `#` comment.
+    blank,
+    /// `[inside]`, the inside trimmed.
+    section: []const u8,
+    entry: struct { key: []const u8, value: []const u8 },
+    /// No `=`: warned and skipped.
+    malformed,
+
+    pub fn of(raw: []const u8) ConfLine {
+        const line = trim(stripComment(raw));
+        if (line.len == 0) return .blank;
+        if (line.len >= 2 and line[0] == '[' and line[line.len - 1] == ']') return .{ .section = trim(line[1 .. line.len - 1]) };
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse return .malformed;
+        return .{ .entry = .{ .key = trim(line[0..eq]), .value = trim(line[eq + 1 ..]) } };
+    }
+};
+
 fn parseInto(cfg: *Config, body: []const u8) !void {
     const arena = cfg.arena.?.allocator();
     var lines = std.mem.splitScalar(u8, body, '\n');
@@ -2095,15 +2119,15 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
     defer if (scratch) |*s| s.deinit();
     while (lines.next()) |raw| {
         lineno += 1;
-        const line = trim(stripComment(raw));
-        if (line.len == 0) continue;
+        const parsed = ConfLine.of(raw);
+        if (parsed == .blank) continue;
 
         // Section header: [platform.<name>], [profile.<name>],
         // [domain.<name>], [lsp.<name>], [mcp] or [mcp.<name>]. An
         // unknown section logs a warning and behaves as no-section
         // pass-through, so a future section does not strip user data.
-        if (line.len >= 2 and line[0] == '[' and line[line.len - 1] == ']') {
-            const inside = trim(line[1 .. line.len - 1]);
+        if (parsed == .section) {
+            const inside = parsed.section;
             current_settings = null;
             current_profile_name = "";
             current_domain = null;
@@ -2195,12 +2219,13 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
             continue;
         }
 
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse {
-            warnConfigAt(lineno, "expected key = value", .{});
-            continue;
+        const key, const value = switch (parsed) {
+            .entry => |e| .{ e.key, e.value },
+            else => {
+                warnConfigAt(lineno, "expected key = value", .{});
+                continue;
+            },
         };
-        const key = trim(line[0..eq]);
-        const value = trim(line[eq + 1 ..]);
         if (current_platform) |sec| {
             const stored: ?RawKv = blk: {
                 const k = arena.dupe(u8, key) catch break :blk null;
