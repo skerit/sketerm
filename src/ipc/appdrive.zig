@@ -2406,6 +2406,13 @@ pub const App = struct {
         // the source underneath. Motion at 40 ms therefore turned every
         // file-row drag into a rubber-band selection, which read as a
         // broken file manager until GTK's own source was consulted.
+        //
+        // The gap counts from the press REACHING the app, not from its
+        // send: the daemon encodes frames on the loop that applies seat
+        // input, so a press queued behind a slow encode was applied in
+        // one batch with the motions sent 160 ms later.
+        // A stalled daemon still gets the gesture, release included.
+        self.awaitIntentsApplied(10_000) catch |err| if (err != Error.Timeout) return err;
         self.pumpFor(if (expect_dnd) 160 else 40);
         const dist = @max(@abs(x2 - x1), @abs(y2 - y1));
         const steps: u32 = @intFromFloat(std.math.clamp(dist / 16.0, 8.0, 40.0));
@@ -2493,8 +2500,14 @@ pub const App = struct {
         if (self.exited) return Error.NotConnected;
         self.conn.sendFrame(.app_a11y, payload) catch return Error.NotConnected;
         // The reply may take a moment (the daemon walks the bus).
-        // recvFrameFor, not recvFrame: a half-arrived frame from a
-        // stalled daemon must time out, not block forever.
+        return self.awaitReply(.app_a11y_tree, timeout_ms);
+    }
+
+    /// Pump frames until the daemon's `want` reply arrives, handling
+    /// every other frame normally; recvFrameFor, so a half-arrived
+    /// frame from a stalled daemon times out instead of blocking.
+    /// @return the reply's payload; caller owns it.
+    fn awaitReply(self: *App, want: wire.FrameType, timeout_ms: i64) Error![]u8 {
         const deadline = nowMs() + timeout_ms;
         while (nowMs() < deadline) {
             const f = self.conn.recvFrameFor(100) catch |err| switch (err) {
@@ -2502,12 +2515,20 @@ pub const App = struct {
                 else => return Error.NotConnected,
             };
             defer f.deinit(self.allocator);
-            if (f.ftype == .app_a11y_tree)
-                return self.allocator.dupe(u8, f.payload) catch Error.OutOfMemory;
-            // Any other frame (events, chan data) is handled normally.
+            if (f.ftype == want) return self.allocator.dupe(u8, f.payload) catch Error.OutOfMemory;
             self.handleFrame(f.ftype, f.payload);
         }
         return Error.Timeout;
+    }
+
+    /// Block until the daemon has applied every intent sent so far. It
+    /// answers this connection's frames in arrival order and applies a
+    /// seat intent as it reads it, so its reply to a later `.list`
+    /// proves the intents reached the app.
+    fn awaitIntentsApplied(self: *App, timeout_ms: i64) Error!void {
+        if (self.exited) return Error.NotConnected;
+        self.conn.sendFrame(.list, "") catch return Error.NotConnected;
+        self.allocator.free(try self.awaitReply(.welcome, timeout_ms));
     }
 
     /// Ask the daemon to attach a debugger to this session's child and
@@ -2526,18 +2547,7 @@ pub const App = struct {
         const payload = std.fmt.bufPrint(&pbuf, "{{\"op\":\"backtrace\",\"timeout_ms\":{d}}}", .{debugger_ms}) catch
             return Error.OutOfMemory;
         self.conn.sendFrame(.app_debug, payload) catch return Error.NotConnected;
-        const deadline = nowMs() + timeout_ms;
-        while (nowMs() < deadline) {
-            const f = self.conn.recvFrameFor(100) catch |err| switch (err) {
-                error.Timeout => continue,
-                else => return Error.NotConnected,
-            };
-            defer f.deinit(self.allocator);
-            if (f.ftype == .app_debug_data)
-                return self.allocator.dupe(u8, f.payload) catch Error.OutOfMemory;
-            self.handleFrame(f.ftype, f.payload);
-        }
-        return Error.Timeout;
+        return self.awaitReply(.app_debug_data, timeout_ms);
     }
 
     // ── clipboard ───────────────────────────────────────────────
