@@ -5437,10 +5437,20 @@ const PolicyPeer = struct {
     reply: ?proto.EvNetPolicy = null,
     before_ack_create: bool = false,
     answered: bool = false,
+    /// The frame it waits for arrived (every action sets it, `answered`
+    /// only the ones that reply), so a test can tell a helper that never
+    /// saw the request from the engine timing out on it.
+    saw_request: bool = false,
+
+    /// Bound on waiting for the request: only a hang guard. It used to be
+    /// 2 s from the thread's start, under the engine's own 5 s budget, so
+    /// a loaded runner whose helper gave up first turned `disappear` into
+    /// the engine's `PolicyAckTimeout`.
+    const WAIT_GUARD_MS: i64 = 4 * SEND_TIMEOUT_MS;
 
     fn run(self: *PolicyPeer) void {
         var buf: [65536]u8 = undefined;
-        const deadline = clock.nowMs() + 2000;
+        const deadline = clock.nowMs() + WAIT_GUARD_MS;
         while (clock.nowMs() < deadline) {
             const n = c.recv(self.peer, &buf, buf.len, c.MSG_PEEK | c.MSG_DONTWAIT);
             if (n <= 0) {
@@ -5464,6 +5474,7 @@ const PolicyPeer = struct {
                     serial = req.serial;
                 }
                 if (serial != self.serial) continue;
+                self.saw_request = true;
                 var ev = self.reply orelse proto.EvNetPolicy{
                     .view = view,
                     .serial = serial,
@@ -6158,6 +6169,7 @@ test "rejected lost and missing initial policy ACKs never create an unpoliced br
             else => unreachable,
         }, opened);
         try std.testing.expectEqual(@as(usize, 0), pair.eng.views.items.len);
+        try std.testing.expect(helper.saw_request);
         try std.testing.expect(!helper.before_ack_create);
         var buf: [16384]u8 = undefined;
         var reader = proto.Reader.init(pair.drain(&buf));
@@ -6226,6 +6238,7 @@ test "rejected missing and disappearing update ACKs close only the affected view
         const thread = try std.Thread.spawn(.{}, PolicyPeer.run, .{&helper});
         const updated = pair.eng.tightenViewPolicy(id, &.{ .max_requests = 10 });
         thread.join();
+        try std.testing.expect(helper.saw_request);
         try std.testing.expectError(switch (action) {
             .reject, .create_failed => error.PolicyRefused,
             .timeout => error.PolicyAckTimeout,
