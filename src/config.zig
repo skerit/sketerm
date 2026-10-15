@@ -221,10 +221,8 @@ fn parseCodepoint(text: []const u8) !u32 {
     return v;
 }
 
-/// What activating a hint does. `open` hands URLs to the desktop and
-/// existing files to the editor; `command` runs `HintRule.command`
-/// with {match} substituted.
-pub const HintAction = enum { open, copy, paste, select, command };
+/// What activating a hint does; `command` runs `HintRule.command` with {match} substituted.
+pub const HintAction = @import("hint_action.zig").Action;
 
 /// One user-defined hint rule, from `hint.<name>.*` lines. The
 /// pattern is a POSIX extended regular expression matched against
@@ -811,9 +809,8 @@ pub const ScrollbarMode = enum { never, auto, always };
 /// Monitor edge a quake window is meant to drop from.
 pub const QuakeEdge = enum { top, bottom, left, right };
 
-/// File-browser listing view modes (mirrors filebrowser/model.zig's
-/// ViewMode; config keeps its own enum so the parser has no UI dep).
-pub const FilesView = enum { details, compact, icons, miller };
+/// File-browser listing view modes, parsed by name.
+pub const FilesView = @import("filebrowser/model.zig").ViewMode;
 
 /// How the Viewer plays a video that lives on a remote host. `auto`
 /// measures the link against the file's bitrate and plays the original
@@ -4278,6 +4275,14 @@ test "config: hint rules parse, keep file order and round-trip" {
     try std.testing.expectEqualStrings("ip", cfg.hint_rules.items[1].name);
     try std.testing.expectEqual(HintAction.paste, cfg.hint_rules.items[1].action);
     try std.testing.expectEqualStrings("[A-Z]+-[0-9]+", cfg.hint_rules.items[0].pattern);
+}
+
+test "config: files_default_view parses every browser view mode by name" {
+    inline for (std.meta.fields(FilesView)) |f| {
+        var cfg = try Config.loadFromBytes(std.testing.allocator, "files_default_view = " ++ f.name ++ "\n");
+        defer cfg.deinit();
+        try std.testing.expectEqual(@field(FilesView, f.name), cfg.files_default_view);
+    }
 }
 
 test "config: an unknown hint action leaves the rule on its safe default" {

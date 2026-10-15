@@ -89,7 +89,7 @@ pub fn openHints(self: *Window) void {
     const pane = self.focusedPane() orelse return;
     const hints_mod = @import("hints.zig");
 
-    // Translate the config's rules into the scanner's own type. The
+    // Hand the config's rules to the scanner. The
     // strings are borrowed for the length of the scan only; matches
     // keep their own copies, so replacing the config arena while hint
     // mode is open cannot dangle them.
@@ -99,13 +99,7 @@ pub fn openHints(self: *Window) void {
         if (hr.pattern.len == 0) continue;
         rules.append(self.allocator, .{
             .pattern = hr.pattern,
-            .action = switch (hr.action) {
-                .open => .open,
-                .copy => .copy,
-                .paste => .paste,
-                .select => .select,
-                .command => .command,
-            },
+            .action = hr.action,
             .command = hr.command,
         }) catch return;
     }

@@ -3036,19 +3036,41 @@ fn hintFieldChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
     rctx.parent.ev();
 }
 
+/// Hint-action combo rows in display order; the combo index maps through this table, never an ordinal.
+const hint_action_rows = [_]struct { action: config_mod.HintAction, label: [*:0]const u8 }{
+    .{ .action = .open, .label = "Open (URL to the desktop, file to the editor)" },
+    .{ .action = .copy, .label = "Copy to clipboard" },
+    .{ .action = .paste, .label = "Paste into the pane" },
+    .{ .action = .select, .label = "Select" },
+    .{ .action = .command, .label = "Run the command below" },
+};
+
+const hint_action_labels = blk: {
+    var labels: [hint_action_rows.len:null]?[*:0]const u8 = undefined;
+    for (hint_action_rows, 0..) |r, i| labels[i] = r.label;
+    break :blk labels;
+};
+
+comptime {
+    for (std.enums.values(config_mod.HintAction)) |a| {
+        var n: usize = 0;
+        for (hint_action_rows) |r| if (r.action == a) {
+            n += 1;
+        };
+        if (n != 1) @compileError("hint_action_rows must list every HintAction exactly once: " ++ @tagName(a));
+    }
+}
+
 fn addHintActionRow(exp: *c.AdwExpanderRow, ctx: *Ctx, name: []const u8, action: config_mod.HintAction) void {
-    const items = c.gtk_string_list_new(&[_:null]?[*:0]const u8{
-        "Open (URL to the desktop, file to the editor)",
-        "Copy to clipboard",
-        "Paste into the pane",
-        "Select",
-        "Run the command below",
-    });
+    const items = c.gtk_string_list_new(&hint_action_labels);
     const row = c.adw_combo_row_new();
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Action");
     c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
     c.g_object_unref(items);
-    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), @intFromEnum(action));
+    const initial: c_uint = for (hint_action_rows, 0..) |r, i| {
+        if (r.action == action) break @intCast(i);
+    } else 0;
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), initial);
     const actx = ctx.allocator.create(HintActionCtx) catch return;
     actx.* = .{ .allocator = ctx.allocator, .parent = ctx, .name = name };
     _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&hintActionSelected), @ptrCast(actx), @ptrCast(cast.destroyCtx(HintActionCtx)), c.G_CONNECT_DEFAULT);
@@ -3058,7 +3080,9 @@ fn addHintActionRow(exp: *c.AdwExpanderRow, ctx: *Ctx, name: []const u8, action:
 fn hintActionSelected(row: *c.AdwComboRow, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
     const actx = cast.userData(HintActionCtx, user);
     const rule = actx.parent.cfg.findHintRule(actx.name) orelse return;
-    rule.action = std.enums.fromInt(config_mod.HintAction, c.adw_combo_row_get_selected(row)) orelse return;
+    const idx = c.adw_combo_row_get_selected(row);
+    if (idx >= hint_action_rows.len) return;
+    rule.action = hint_action_rows[idx].action;
     actx.parent.ev();
 }
 

@@ -17,9 +17,7 @@ const url_scan = @import("../grid/url_scan.zig");
 
 pub const Kind = enum { url, path, hash, custom };
 
-/// What activating a match does. Mirrors `config.HintAction`; kept
-/// separate so this module stays independent of the config type.
-pub const Action = enum { open, copy, paste, select, command };
+pub const Action = @import("../hint_action.zig").Action;
 
 /// A user-defined rule: a POSIX extended regular expression plus what
 /// to do with what it matches. Scanned before the built-in scanners,

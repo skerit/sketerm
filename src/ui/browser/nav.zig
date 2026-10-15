@@ -179,12 +179,7 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     // after newTab and wins over everything).
     self.installViewGestures(tab, page);
     if (self.ownerWindow()) |win| {
-        tab.view_mode = switch (win.config.files_default_view) {
-            .details => .details,
-            .compact => .compact,
-            .icons => .icons,
-            .miller => .miller,
-        };
+        tab.view_mode = win.config.files_default_view;
         tab.show_hidden = win.config.files_show_hidden;
     }
     self.applyFolderMemory(tab);
