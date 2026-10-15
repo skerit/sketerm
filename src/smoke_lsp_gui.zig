@@ -34,6 +34,7 @@
 //! Nothing is ever killed by process name (CLAUDE.md).
 
 const std = @import("std");
+const bindir = @import("smoke/bindir.zig");
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const unsetEnv = @import("util/env.zig").unset;
@@ -660,10 +661,11 @@ fn pumpFor(app: *appdrive.App, ms: i64) void {
     while (spent < ms) : (spent += 20) _ = app.pumpOnce(20);
 }
 
-pub fn main() u8 {
+pub fn main(init: std.process.Init.Minimal) u8 {
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
+    if (!bindir.init(init.args.vector)) return 1;
     g_alloc = allocator;
 
     if (platform.is_macos) {
@@ -710,11 +712,10 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
 
     // Absolute stub path: the config's `command` is resolved by the
     // GUI, whose cwd we do not control.
-    var cwd_buf: [4096]u8 = undefined;
-    const cwd = c.getcwd(&cwd_buf, cwd_buf.len) orelse return fail("getcwd", .{});
-    var stub_buf: [4200]u8 = undefined;
-    const stub_path = std.fmt.bufPrint(&stub_buf, "{s}/zig-out/bin/sketerm-lsp-stub", .{std.mem.span(cwd)}) catch
-        return fail("stub path", .{});
+    var stub_buf: [4096]u8 = undefined;
+    const stub_raw = c.realpath(bindir.path(.@"sketerm-lsp-stub"), &stub_buf) orelse
+        return fail("the lsp stub under test is missing (zig build lsp-stub)", .{});
+    const stub_path = std.mem.span(@as([*:0]const u8, @ptrCast(stub_raw)));
     const plan = pickPlan(stub_path);
     say("server: {s} ({s})", .{ plan.command, if (plan.real_server) "real" else "scripted stub" });
 
@@ -764,8 +765,8 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
     if (mux_pid < 0) return fail("mux fork", .{});
     if (mux_pid == 0) {
         platform.dieWithParent();
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm-mux", "--broker", null };
-        _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.@"sketerm-mux"), "--broker", null };
+        _ = c.execv(bindir.path(.@"sketerm-mux"), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     daemon_pid = mux_pid;
@@ -791,7 +792,7 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
         const rrt = std.fmt.bufPrintZ(&rrt_buf, "{s}/r", .{rt}) catch return fail("remote rt path", .{});
         _ = c.mkdir(rrt.ptr, 0o700);
         var mux_abs_buf: [4096]u8 = undefined;
-        const mux_abs_raw = c.realpath("zig-out/bin/sketerm-mux", &mux_abs_buf) orelse return fail("realpath sketerm-mux", .{});
+        const mux_abs_raw = c.realpath(bindir.path(.@"sketerm-mux"), &mux_abs_buf) orelse return fail("realpath sketerm-mux", .{});
         const mux_abs = std.mem.span(@as([*:0]const u8, @ptrCast(mux_abs_raw)));
         const rmt_pid = c.fork();
         if (rmt_pid < 0) return fail("remote mux fork", .{});
@@ -803,8 +804,8 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
             // On this leg the REMOTE daemon spawns the stub, so the
             // didOpen report env must travel with it, not the GUI.
             _ = c.setenv("SKETERM_LSP_STUB_REPORT", report_path.ptr, 1);
-            const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm-mux", "--broker", null };
-            _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
+            const argv = [_:null]?[*:0]const u8{ bindir.path(.@"sketerm-mux"), "--broker", null };
+            _ = c.execv(bindir.path(.@"sketerm-mux"), @ptrCast(@constCast(&argv)));
             c._exit(127);
         }
         remote_mux_pid = rmt_pid;
@@ -884,8 +885,8 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
         // why a server did not attach when the rig fails.
         _ = c.setenv("SKETERM_LSP_DEBUG", "1", 1);
         _ = c.setenv("SKETERM_LSP_STUB_REPORT", report_path.ptr, 1);
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "edit", doc_spec.ptr, null };
-        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "edit", doc_spec.ptr, null };
+        _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     child_pid = pid;
@@ -1392,9 +1393,22 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
         const before_a = app.snapshotRgba(win_id, null) catch return fail("snapshot", .{});
         defer allocator.free(before_a.px);
         app.pressKey(win_id, "Return") catch {};
-        pumpFor(app, 2500);
-        if (popupCount(app) > popups_before_actions)
+        // The list closes once the server's edit round trip lands; a fixed
+        // 2.5 s pump missed it with the ReleaseSafe dev GUI and a real clangd.
+        var closed = false;
+        spent = 0;
+        while (spent < 8_000) : (spent += 200) {
+            pumpFor(app, 200);
+            if (popupCount(app) <= popups_before_actions) {
+                closed = true;
+                break;
+            }
+        }
+        if (!closed) {
+            savePng(app, win_id, shot("code-action-stuck.png"));
             return fail("the code-action list stayed open after applying", .{});
+        }
+        pumpFor(app, 500);
         const after_a = app.snapshotRgba(win_id, null) catch return fail("snapshot", .{});
         defer allocator.free(after_a.px);
         var moved: usize = 0;

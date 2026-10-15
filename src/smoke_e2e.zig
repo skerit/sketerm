@@ -21,6 +21,7 @@
 //! and the real-input stage is skipped (documented gap).
 
 const std = @import("std");
+const bindir = @import("smoke/bindir.zig");
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const unsetEnv = @import("util/env.zig").unset;
@@ -464,10 +465,11 @@ fn runCli(allocator: std.mem.Allocator, argv: []const []const u8) CliResult {
     return .{ .code = code, .out = cap.finish(allocator) };
 }
 
-pub fn main() u8 {
+pub fn main(init: std.process.Init.Minimal) u8 {
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
+    if (!bindir.init(init.args.vector)) return 1;
 
     // The remote-watch stage hands THIS binary to agent_open as Claude
     // Code; started as one, it is a fake of it and nothing else.
@@ -550,8 +552,8 @@ pub fn main() u8 {
     if (mux_pid < 0) return fail("mux fork");
     if (mux_pid == 0) {
         platform.dieWithParent();
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm-mux", "--broker", null };
-        _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.@"sketerm-mux"), "--broker", null };
+        _ = c.execv(bindir.path(.@"sketerm-mux"), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     daemon_pid = mux_pid;
@@ -620,7 +622,7 @@ pub fn main() u8 {
     _ = c.mkdir(rrt.ptr, 0o700);
     {
         var mux_abs_buf: [4096]u8 = undefined;
-        const mux_abs_raw = c.realpath("zig-out/bin/sketerm-mux", &mux_abs_buf) orelse return fail("realpath sketerm-mux");
+        const mux_abs_raw = c.realpath(bindir.path(.@"sketerm-mux"), &mux_abs_buf) orelse return fail("realpath sketerm-mux");
         const mux_abs = std.mem.span(@as([*:0]const u8, @ptrCast(mux_abs_raw)));
         var asset_seed_buf: [512]u8 = undefined;
         const asset_seed = std.fmt.bufPrintZ(&asset_seed_buf, "{s}/panel-asset.png", .{rrt}) catch
@@ -647,8 +649,8 @@ pub fn main() u8 {
             // Its own data home, so ITS trash is not the local one
             // (FILES_REMOTE_TRASH tells them apart).
             _ = c.setenv("XDG_DATA_HOME", rrt.ptr, 1);
-            const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm-mux", null };
-            _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
+            const argv = [_:null]?[*:0]const u8{ bindir.path(.@"sketerm-mux"), null };
+            _ = c.execv(bindir.path(.@"sketerm-mux"), @ptrCast(@constCast(&argv)));
             c._exit(127);
         }
         _ = c.close(asset_fd);
@@ -840,8 +842,8 @@ pub fn main() u8 {
             // The remote web watch reads the face's encoded-frame facts.
             _ = c.setenv("SKETERM_WEB_STATS", "1", 1);
         }
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--no-save", if (debug_events) "--debug-events" else null, null };
-        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "--no-save", if (debug_events) "--debug-events" else null, null };
+        _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     child_pid = pid;
@@ -3577,8 +3579,8 @@ fn spawnIsolatedMcp(allocator: std.mem.Allocator, fake_log: ?[*:0]const u8) ?Mcp
             _ = c.setenv(FAKE_AGENT_ENV, "1", 1);
             _ = c.setenv(FAKE_AGENT_LOG_ENV, path, 1);
         }
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "mcp", "--no-record", null };
-        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "mcp", "--no-record", null };
+        _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     _ = c.close(in_pipe[0]);
@@ -3718,7 +3720,7 @@ fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
     const img_path = std.fmt.bufPrintZ(&img_buf, "{s}/chip-fixture.png", .{g_rt}) catch return "fixture image path";
     if (!writeSolidPng(allocator, img_path.ptr, 0xff, 0x00, 0xff)) return "could not write the fixture image";
     var bin_buf: [4096]u8 = undefined;
-    const bin = c.realpath("zig-out/bin/sketerm", &bin_buf) orelse return "could not resolve zig-out/bin/sketerm";
+    const bin = c.realpath(bindir.path(.sketerm), &bin_buf) orelse return "could not resolve the sketerm under test";
     var launch_buf: [8192]u8 = undefined;
     const launch = std.fmt.bufPrint(
         &launch_buf,
@@ -4935,8 +4937,8 @@ fn restoreStage(
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
         _ = c.setenv("SKETERM_VERIFY_TREE", "1", 1);
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--restore", "--no-save", null };
-        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "--restore", "--no-save", null };
+        _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     restore_pid = pid;
@@ -7347,8 +7349,8 @@ fn viewerMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const
         _ = unsetEnv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "view", img_path.ptr, null };
-        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "view", img_path.ptr, null };
+        _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     viewer_pid = pid;
@@ -7545,8 +7547,8 @@ fn castPlaybackStage(
         // teardown) aborts the child; the clean-exit assertion below
         // then turns log noise into a red stage.
         _ = c.setenv("G_DEBUG", "fatal-criticals", 1);
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "play", cast_path.ptr, null };
-        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "play", cast_path.ptr, null };
+        _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     cast_pid = pid;
@@ -8070,8 +8072,8 @@ fn viewerReuseStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: [:0]co
         _ = unsetEnv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "view", &specs[0], &specs[1], &specs[2], null };
-        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "view", &specs[0], &specs[1], &specs[2], null };
+        _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     vcast_pid = pid;
@@ -8221,11 +8223,11 @@ fn viewerCastStage(
         // the WIFEXITED(0) check at window close makes that a failure.
         _ = c.setenv("G_DEBUG", "fatal-criticals", 1);
         if (have_video) {
-            const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "view", img_path.ptr, cast_path.ptr, txt_path.ptr, bin_path.ptr, vid_path.ptr, null };
-            _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+            const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "view", img_path.ptr, cast_path.ptr, txt_path.ptr, bin_path.ptr, vid_path.ptr, null };
+            _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         } else {
-            const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "view", img_path.ptr, cast_path.ptr, txt_path.ptr, bin_path.ptr, null };
-            _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+            const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "view", img_path.ptr, cast_path.ptr, txt_path.ptr, bin_path.ptr, null };
+            _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         }
         c._exit(127);
     }
@@ -8515,8 +8517,8 @@ fn launchRenameFiles(
         // A rig must never meet the first-run tour: it covers the
         // listing and eats the clicks meant for it (welcome.zig).
         _ = c.setenv("SKETERM_WELCOME", "0", 1);
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "files", dir.ptr, null };
-        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "files", dir.ptr, null };
+        _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     renamefiles_pid = pid;
@@ -8664,8 +8666,8 @@ fn secondGuiBrowserStage(
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
         _ = c.setenv("SKETERM_WELCOME", "0", 1);
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "web", url.ptr, null };
-        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "web", url.ptr, null };
+        _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     web2_pid = pid;
@@ -8777,8 +8779,8 @@ fn respawnRemoteMux(rt: []const u8) bool {
         _ = c.setenv("XDG_STATE_HOME", rrt.ptr, 1);
         _ = c.setenv("XDG_CONFIG_HOME", rrt.ptr, 1);
         _ = c.setenv("XDG_DATA_HOME", rrt.ptr, 1);
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm-mux", null };
-        _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.@"sketerm-mux"), null };
+        _ = c.execv(bindir.path(.@"sketerm-mux"), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     remote_mux_pid = pid;
@@ -9030,7 +9032,7 @@ fn waitPathState(path: [:0]const u8, exists: bool, timeout_ms: i64, app: *appdri
     return false;
 }
 
-/// Fork+exec `zig-out/bin/sketerm <args...>` as one of the suite's
+/// Fork+exec the sketerm under test (`bindir`) with `<args...>` as one of the suite's
 /// identities on the rig display, under `app_id`. Returns the pid; the
 /// caller kills it by exact pid.
 fn spawnSketermChild(app_id: [*:0]const u8, wl: [*:0]const u8, args: []const [*:0]const u8) c.pid_t {
@@ -9046,12 +9048,12 @@ fn spawnSketermChild(app_id: [*:0]const u8, wl: [*:0]const u8, args: []const [*:
         _ = c.setenv("GTK_A11Y", "none", 1);
         _ = c.setenv("SKETERM_WELCOME", "0", 1);
         var argv: [12]?[*:0]const u8 = @splat(null);
-        argv[0] = "zig-out/bin/sketerm";
+        argv[0] = bindir.path(.sketerm);
         for (args, 0..) |a, i| {
             if (i + 1 >= argv.len - 1) break;
             argv[i + 1] = a;
         }
-        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     return pid;
@@ -10828,8 +10830,8 @@ fn quickLookStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const 
         // A rig must never meet the first-run tour: it covers the
         // listing and eats the clicks meant for it (welcome.zig).
         _ = c.setenv("SKETERM_WELCOME", "0", 1);
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "files", dir.ptr, null };
-        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "files", dir.ptr, null };
+        _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     qlfiles_pid = pid;
@@ -12888,8 +12890,8 @@ const McpChild = struct {
                 // No --shared and no --socket: panel delivery must use only
                 // the inherited origin, while app/term/fs state stays on the
                 // MCP server's lazily started private daemon.
-                const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "mcp", null };
-                _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+                const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "mcp", null };
+                _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
             } else {
                 // The harness may itself have been launched from inside a
                 // sketerm pane. This child is explicitly testing legacy direct
@@ -12900,9 +12902,9 @@ const McpChild = struct {
                 // --shared skips the private daemon entirely (no second
                 // mux to clean up); --socket points it at THIS GUI.
                 const argv = [_:null]?[*:0]const u8{
-                    "zig-out/bin/sketerm", "mcp", "--shared", "--socket", socket.ptr, null,
+                    bindir.path(.sketerm), "mcp", "--shared", "--socket", socket.ptr, null,
                 };
-                _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+                _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
             }
             c._exit(127);
         }
@@ -14897,8 +14899,8 @@ fn themeSingletonStage(
         _ = c.setenv("SKETERM_ASSISTANTS_TICK_MS", "100", 1);
         // ...and a tick that walks a window past beginDestroy aborts.
         _ = c.setenv("SKETERM_VERIFY_WINDOW_TEARDOWN", "1", 1);
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--no-save", null };
-        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "--no-save", null };
+        _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     theme_pid = pid;
@@ -16399,8 +16401,8 @@ fn deadKeyStage(allocator: std.mem.Allocator, rt: []const u8, mux_sock: []const 
         _ = c.setenv("SKETERM_VERIFY_TREE", "1", 1);
         // Same hermeticity rule as the primary GUI child above.
         _ = c.setenv("GTK_A11Y", "none", 1);
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--no-save", null };
-        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "--no-save", null };
+        _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     dk_pid = pid;
@@ -17850,8 +17852,8 @@ fn quakeLinkOrder(allocator: std.mem.Allocator, rt: []const u8) ?[]const u8 {
         platform.dieWithParent();
         _ = c.setenv("LD_DEBUG", "libs", 1);
         _ = c.setenv("LD_DEBUG_OUTPUT", out.ptr, 1);
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--version", null };
-        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "--version", null };
+        _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     if (!waitExit(pid, 20_000)) {
@@ -18315,8 +18317,8 @@ fn startFakeHostDaemon(host_rt: [:0]const u8, log_path: [:0]const u8) ?c.pid_t {
         // Agent sessions this daemon spawns run the fake.
         _ = c.setenv(FAKE_AGENT_ENV, "1", 1);
         _ = c.setenv(FAKE_AGENT_LOG_ENV, log_path.ptr, 1);
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm-mux", "--broker", null };
-        _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.@"sketerm-mux"), "--broker", null };
+        _ = c.execv(bindir.path(.@"sketerm-mux"), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     var waited: u32 = 0;
@@ -18344,8 +18346,8 @@ fn spawnHostMcp(allocator: std.mem.Allocator, host_rt: [:0]const u8, path_env: [
         _ = c.setenv("PATH", path_env.ptr, 1);
         _ = c.setenv(FAKE_AGENT_ENV, "1", 1);
         _ = c.setenv(FAKE_AGENT_LOG_ENV, log_path.ptr, 1);
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "mcp", "--no-record", null };
-        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "mcp", "--no-record", null };
+        _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     _ = c.close(in_pipe[0]);
@@ -18910,7 +18912,7 @@ const FakeHosts = struct {
 
     fn start(arena: std.mem.Allocator, rt: []const u8) ?FakeHosts {
         var mux_abs_buf: [4096]u8 = undefined;
-        const mux_abs = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath("zig-out/bin/sketerm-mux", &mux_abs_buf) orelse return null)));
+        const mux_abs = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath(bindir.path(.@"sketerm-mux"), &mux_abs_buf) orelse return null)));
         const host_rt = [2][:0]const u8{
             std.fmt.allocPrintSentinel(arena, "{s}/ha", .{rt}, 0) catch return null,
             std.fmt.allocPrintSentinel(arena, "{s}/hb", .{rt}, 0) catch return null,

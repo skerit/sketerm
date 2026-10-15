@@ -237,16 +237,32 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "share/sketerm/shell-integration",
     }).step);
 
-    // Dev-profile builds of the three binaries, for the smoke rigs that
-    // drive them. smoke-mcp runs the GUI and sketerm-mux out of an
-    // install dir at the same depth as `bin/`, so their exe-relative
-    // lookups (`shellintegration.baseDir`'s `../share` and `../../data`)
-    // resolve exactly as they do for an installed build.
+    // Dev-profile builds of the binaries the smoke rigs drive. Rigs that
+    // exec them by path get them installed into `dev-bin`, at the same
+    // depth as `bin/`, so their exe-relative lookups
+    // (`shellintegration.baseDir`'s `../share` and `../../data`) resolve
+    // exactly as they do for an installed build; see `DevBins`.
     const dev_mux_exe = muxExe(b, bin_deps, dev);
     const dev_mcp_exe = mcpExe(b, bin_deps, dev);
     const dev_bin_dir: std.Build.InstallDir = .{ .custom = "dev-bin" };
-    const install_dev_gui = b.addInstallArtifact(guiExe(b, bin_deps, dev), .{ .dest_dir = .{ .override = dev_bin_dir } });
-    const install_dev_mux = b.addInstallArtifact(dev_mux_exe, .{ .dest_dir = .{ .override = dev_bin_dir } });
+    // Scripted stub language server — `sketerm-lsp-stub`. A REAL
+    // process speaking the LSP base protocol over stdio, so the smoke
+    // rigs exercise spawn + pipes + framing without depending on zls or
+    // clangd being installed on the build host. Core dependency set:
+    // it must stay as GTK-free as the protocol code it tests.
+    const lsp_stub_mod = dev.module(b, target, "src/lsp_stub.zig");
+    configureCoreDeps(b, lsp_stub_mod, core_cbindings_mod);
+    lsp_stub_mod.addImport("build_options", dev.noglib_opts);
+    addVideo(b, lsp_stub_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
+    const dev_bins: DevBins = .{
+        .dir = dev_bin_dir,
+        .gui = &b.addInstallArtifact(guiExe(b, bin_deps, dev), .{ .dest_dir = .{ .override = dev_bin_dir } }).step,
+        .mux = &b.addInstallArtifact(dev_mux_exe, .{ .dest_dir = .{ .override = dev_bin_dir } }).step,
+        .mcp = &b.addInstallArtifact(dev_mcp_exe, .{ .dest_dir = .{ .override = dev_bin_dir } }).step,
+        .lsp_stub = &b.addInstallArtifact(dev.executable(b, "sketerm-lsp-stub", lsp_stub_mod), .{ .dest_dir = .{ .override = dev_bin_dir } }).step,
+    };
+    const lsp_stub_step = b.step("lsp-stub", "Build the scripted stub language server the smoke rigs drive (into zig-out/dev-bin)");
+    lsp_stub_step.dependOn(dev_bins.lsp_stub);
 
     // Public mux-client SDK — the supported module for OUT-OF-REPO
     // daemon clients (agent harnesses, automation). Consumers add
@@ -393,13 +409,7 @@ pub fn build(b: *std.Build) void {
     mux_portable_step.dependOn(&b.addInstallArtifact(mux_portable_exe, .{}).step);
 
     // Mux end-to-end smoke — `zig build smoke-mux` (headless).
-    const smoke_mux_mod = b.createModule(.{
-        .root_source_file = b.path("src/smoke_mux.zig"),
-        .target = target,
-        .optimize = dev.optimize,
-        .sanitize_c = dev.sanitize_c,
-        .link_libc = true,
-    });
+    const smoke_mux_mod = dev.module(b, target, "src/smoke_mux.zig");
     configureCoreDeps(b, smoke_mux_mod, core_cbindings_mod);
     smoke_mux_mod.addImport("build_options", dev.noglib_opts);
     addVideo(b, smoke_mux_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
@@ -418,13 +428,7 @@ pub fn build(b: *std.Build) void {
     // (headless). Drives the REAL bootstrap: fake ssh execs the built
     // sketerm-mux --udp-listen against an isolated in-process daemon,
     // including a wrong-announced-port stage only the punch survives.
-    const smoke_udp_mod = b.createModule(.{
-        .root_source_file = b.path("src/smoke_udp.zig"),
-        .target = target,
-        .optimize = dev.optimize,
-        .sanitize_c = dev.sanitize_c,
-        .link_libc = true,
-    });
+    const smoke_udp_mod = dev.module(b, target, "src/smoke_udp.zig");
     configureCoreDeps(b, smoke_udp_mod, core_cbindings_mod);
     smoke_udp_mod.addImport("build_options", dev.noglib_opts);
     addVideo(b, smoke_udp_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
@@ -441,13 +445,7 @@ pub fn build(b: *std.Build) void {
     // cross-connection parenting, revocation (surface death AND
     // vanished exporter, both through the idle-brain sweep), reattach
     // replay, session-scoped handles, modality.
-    const smoke_foreign_mod = b.createModule(.{
-        .root_source_file = b.path("src/smoke_foreign.zig"),
-        .target = target,
-        .optimize = dev.optimize,
-        .sanitize_c = dev.sanitize_c,
-        .link_libc = true,
-    });
+    const smoke_foreign_mod = dev.module(b, target, "src/smoke_foreign.zig");
     configureCoreDeps(b, smoke_foreign_mod, core_cbindings_mod);
     smoke_foreign_mod.addImport("build_options", dev.noglib_opts);
     addVideo(b, smoke_foreign_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
@@ -463,13 +461,7 @@ pub fn build(b: *std.Build) void {
     // negotiated codec (lossless reference, legacy bool -> H.264, H.264,
     // AV1): tiles arrive in exactly that codec and decode to the
     // reference colours. Skips cleanly without -Dvideo or mpv.
-    const smoke_video_mod = b.createModule(.{
-        .root_source_file = b.path("src/smoke_video.zig"),
-        .target = target,
-        .optimize = dev.optimize,
-        .sanitize_c = dev.sanitize_c,
-        .link_libc = true,
-    });
+    const smoke_video_mod = dev.module(b, target, "src/smoke_video.zig");
     configureCoreDeps(b, smoke_video_mod, core_cbindings_mod);
     smoke_video_mod.addImport("build_options", dev.noglib_opts);
     addVideo(b, smoke_video_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
@@ -483,13 +475,7 @@ pub fn build(b: *std.Build) void {
     // File-service smoke — `zig build smoke-fs` (headless). Daemon
     // thread + fsdrive client: listings, live view deltas, verbs,
     // ranged read/write, monolith AND broker mode.
-    const smoke_fs_mod = b.createModule(.{
-        .root_source_file = b.path("src/smoke_fs.zig"),
-        .target = target,
-        .optimize = dev.optimize,
-        .sanitize_c = dev.sanitize_c,
-        .link_libc = true,
-    });
+    const smoke_fs_mod = dev.module(b, target, "src/smoke_fs.zig");
     configureCoreDeps(b, smoke_fs_mod, core_cbindings_mod);
     smoke_fs_mod.addImport("build_options", dev.noglib_opts);
     addVideo(b, smoke_fs_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
@@ -503,13 +489,7 @@ pub fn build(b: *std.Build) void {
     // FUSE-mount smoke — `zig build smoke-fuse` (headless; SKIPs
     // where fusermount3 / /dev/fuse is unavailable). Daemon thread +
     // fsmount serve thread + kernel-visible file ops.
-    const smoke_fuse_mod = b.createModule(.{
-        .root_source_file = b.path("src/smoke_fuse.zig"),
-        .target = target,
-        .optimize = dev.optimize,
-        .sanitize_c = dev.sanitize_c,
-        .link_libc = true,
-    });
+    const smoke_fuse_mod = dev.module(b, target, "src/smoke_fuse.zig");
     configureCoreDeps(b, smoke_fuse_mod, core_cbindings_mod);
     smoke_fuse_mod.addImport("build_options", dev.noglib_opts);
     addVideo(b, smoke_fuse_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
@@ -521,15 +501,9 @@ pub fn build(b: *std.Build) void {
     smoke_fuse_step.dependOn(&smoke_fuse_run.step);
 
     // MCP isolation + headless-terminal smoke — `zig build smoke-mcp`.
-    // Spawns `zig-out/bin/sketerm mcp` and drives it over stdio; only
+    // Spawns the dev GUI's `sketerm mcp` and drives it over stdio; only
     // needs /bin/sh (no display / GUI apps / a11y bus).
-    const smoke_mcp_mod = b.createModule(.{
-        .root_source_file = b.path("src/smoke_mcp.zig"),
-        .target = target,
-        .optimize = dev.optimize,
-        .sanitize_c = dev.sanitize_c,
-        .link_libc = true,
-    });
+    const smoke_mcp_mod = dev.module(b, target, "src/smoke_mcp.zig");
     configureCoreDeps(b, smoke_mcp_mod, core_cbindings_mod);
     smoke_mcp_mod.addImport("build_options", dev.noglib_opts);
     addVideo(b, smoke_mcp_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
@@ -537,21 +511,13 @@ pub fn build(b: *std.Build) void {
     if (have_vtenc) addVtEnc(b, smoke_mcp_mod);
     const smoke_mcp = dev.executable(b, "sketerm-smoke-mcp", smoke_mcp_mod);
     const smoke_mcp_run = b.addRunArtifact(smoke_mcp);
-    smoke_mcp_run.step.dependOn(&install_dev_gui.step);
-    smoke_mcp_run.step.dependOn(&install_dev_mux.step);
-    smoke_mcp_run.addArgs(&.{ "--bin-dir", b.getInstallPath(dev_bin_dir, "") });
+    dev_bins.drive(b, smoke_mcp_run, &.{ dev_bins.gui, dev_bins.mux });
     smoke_mcp_run.setCwd(b.path("."));
     const smoke_mcp_step = b.step("smoke-mcp", "MCP isolation + headless-terminal smoke (headless)");
     smoke_mcp_step.dependOn(&smoke_mcp_run.step);
 
     // Broker (process-isolation) smoke — `zig build smoke-broker` (headless).
-    const smoke_broker_mod = b.createModule(.{
-        .root_source_file = b.path("src/smoke_broker.zig"),
-        .target = target,
-        .optimize = dev.optimize,
-        .sanitize_c = dev.sanitize_c,
-        .link_libc = true,
-    });
+    const smoke_broker_mod = dev.module(b, target, "src/smoke_broker.zig");
     configureCoreDeps(b, smoke_broker_mod, core_cbindings_mod);
     smoke_broker_mod.addImport("build_options", dev.noglib_opts);
     addVideo(b, smoke_broker_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
@@ -638,24 +604,15 @@ pub fn build(b: *std.Build) void {
 
     // Headless image-render smoke — `zig build smoke-image`.
     if (has_egl) {
-    const smoke_mod = b.createModule(.{
-        .root_source_file = b.path("src/smoke_image.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
+    const smoke_mod = dev.module(b, target, "src/smoke_image.zig");
     // image_pass imports c.zig which @cIncludes gtk/gtk.h etc, so we
     // need every system header path. Reuse the same set as the main
     // exe.
     configureSysDeps(b, smoke_mod, cbindings_mod);
-    smoke_mod.addImport("build_options", glib_opts_mod);
+    smoke_mod.addImport("build_options", dev.glib_opts);
     addVideo(b, smoke_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     smoke_mod.linkSystemLibrary("EGL", .{});
-    const smoke = b.addExecutable(.{
-        .name = "sketerm-smoke-image",
-        .root_module = smoke_mod,
-        .use_lld = use_lld,
-    });
+    const smoke = dev.executable(b, "sketerm-smoke-image", smoke_mod);
     const smoke_run = b.addRunArtifact(smoke);
     const smoke_step = b.step("smoke-image", "Headless GL image render check");
     smoke_step.dependOn(&smoke_run.step);
@@ -667,24 +624,14 @@ pub fn build(b: *std.Build) void {
     // own compositor. Drives it over the remote-control socket AND over
     // a real seat (keys/clicks + pixel assertions). No Xvfb — X11
     // changes GTK's input-method behaviour and produces false greens.
-    const smoke_e2e_mod = b.createModule(.{
-        .root_source_file = b.path("src/smoke_e2e.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
+    const smoke_e2e_mod = dev.module(b, target, "src/smoke_e2e.zig");
     configureSysDeps(b, smoke_e2e_mod, cbindings_mod);
-    smoke_e2e_mod.addImport("build_options", glib_opts_mod);
+    smoke_e2e_mod.addImport("build_options", dev.glib_opts);
     addVideo(b, smoke_e2e_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-    const smoke_e2e = b.addExecutable(.{
-        .name = "sketerm-smoke-e2e",
-        .root_module = smoke_e2e_mod,
-        .use_lld = use_lld,
-    });
+    const smoke_e2e = dev.executable(b, "sketerm-smoke-e2e", smoke_e2e_mod);
     const smoke_e2e_run = b.addRunArtifact(smoke_e2e);
-    // It execs the canonical GUI and daemon from zig-out/bin.
-    smoke_e2e_run.step.dependOn(&install_exe.step);
-    smoke_e2e_run.step.dependOn(&install_mux.step);
+    // It execs the GUI and daemon.
+    dev_bins.drive(b, smoke_e2e_run, &.{ dev_bins.gui, dev_bins.mux });
     smoke_e2e_run.setCwd(b.path("."));
     const smoke_e2e_step = b.step("smoke-e2e", "End-to-end GUI smoke on sketerm's own compositor (headless, no X)");
     smoke_e2e_step.dependOn(&smoke_e2e_run.step);
@@ -692,20 +639,11 @@ pub fn build(b: *std.Build) void {
     // Remote-playback smoke — `zig build smoke-stream` (headless, no
     // display): daemon thread + the viewer's remotestream GObject driven
     // as giostreamsrc drives it, both transcode and raw modes.
-    const smoke_stream_mod = b.createModule(.{
-        .root_source_file = b.path("src/smoke_stream.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
+    const smoke_stream_mod = dev.module(b, target, "src/smoke_stream.zig");
     configureSysDeps(b, smoke_stream_mod, cbindings_mod);
-    smoke_stream_mod.addImport("build_options", glib_opts_mod);
+    smoke_stream_mod.addImport("build_options", dev.glib_opts);
     addVideo(b, smoke_stream_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-    const smoke_stream = b.addExecutable(.{
-        .name = "sketerm-smoke-stream",
-        .root_module = smoke_stream_mod,
-        .use_lld = use_lld,
-    });
+    const smoke_stream = dev.executable(b, "sketerm-smoke-stream", smoke_stream_mod);
     const smoke_stream_run = b.addRunArtifact(smoke_stream);
     const smoke_stream_step = b.step("smoke-stream", "Remote video playback stream smoke: daemon transcode spool + GIO stream (headless)");
     smoke_stream_step.dependOn(&smoke_stream_run.step);
@@ -713,6 +651,8 @@ pub fn build(b: *std.Build) void {
     // Browser measurement rig — `zig build measure-web`. Same display-
     // session recipe as smoke-e2e, plus a fractional viewer scale, for
     // the hover-latency and sharpness numbers (src/web_measure.zig).
+    // Release profile on purpose, like the benchmarks: the latency it
+    // reports is the shipped GUI's, not a ReleaseSafe dev build's.
     {
         const wm_mod = b.createModule(.{
             .root_source_file = b.path("src/web_measure.zig"),
@@ -743,23 +683,13 @@ pub fn build(b: *std.Build) void {
     // typescript-language-server when it is on PATH, else the scripted
     // sketerm-lsp-stub. Asserts diagnostics render and that the
     // completion / hover popups actually open, with screenshots.
-    const smoke_lsp_mod = b.createModule(.{
-        .root_source_file = b.path("src/smoke_lsp_gui.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
+    const smoke_lsp_mod = dev.module(b, target, "src/smoke_lsp_gui.zig");
     configureSysDeps(b, smoke_lsp_mod, cbindings_mod);
-    smoke_lsp_mod.addImport("build_options", glib_opts_mod);
+    smoke_lsp_mod.addImport("build_options", dev.glib_opts);
     addVideo(b, smoke_lsp_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-    const smoke_lsp = b.addExecutable(.{
-        .name = "sketerm-smoke-lsp-gui",
-        .root_module = smoke_lsp_mod,
-        .use_lld = use_lld,
-    });
+    const smoke_lsp = dev.executable(b, "sketerm-smoke-lsp-gui", smoke_lsp_mod);
     const smoke_lsp_run = b.addRunArtifact(smoke_lsp);
-    smoke_lsp_run.step.dependOn(&install_exe.step);
-    smoke_lsp_run.step.dependOn(&install_mux.step);
+    dev_bins.drive(b, smoke_lsp_run, &.{ dev_bins.gui, dev_bins.mux, dev_bins.lsp_stub });
     smoke_lsp_run.setCwd(b.path("."));
     const smoke_lsp_step = b.step("smoke-lsp-gui", "Drive the real editor GUI against a real language server (headless, no X)");
     smoke_lsp_step.dependOn(&smoke_lsp_run.step);
@@ -768,23 +698,13 @@ pub fn build(b: *std.Build) void {
     // smoke-lsp-gui; plays an MCP server through the registry's own
     // writer and asserts the pane titlebar chip, the tab badge and the
     // chip's popover follow its record (src/smoke_agents_gui.zig).
-    const smoke_agents_mod = b.createModule(.{
-        .root_source_file = b.path("src/smoke_agents_gui.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
+    const smoke_agents_mod = dev.module(b, target, "src/smoke_agents_gui.zig");
     configureSysDeps(b, smoke_agents_mod, cbindings_mod);
-    smoke_agents_mod.addImport("build_options", glib_opts_mod);
+    smoke_agents_mod.addImport("build_options", dev.glib_opts);
     addVideo(b, smoke_agents_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-    const smoke_agents = b.addExecutable(.{
-        .name = "sketerm-smoke-agents-gui",
-        .root_module = smoke_agents_mod,
-        .use_lld = use_lld,
-    });
+    const smoke_agents = dev.executable(b, "sketerm-smoke-agents-gui", smoke_agents_mod);
     const smoke_agents_run = b.addRunArtifact(smoke_agents);
-    smoke_agents_run.step.dependOn(&install_exe.step);
-    smoke_agents_run.step.dependOn(&install_mux.step);
+    dev_bins.drive(b, smoke_agents_run, &.{ dev_bins.gui, dev_bins.mux });
     smoke_agents_run.setCwd(b.path("."));
     const smoke_agents_step = b.step("smoke-agents-gui", "Sub-agent titlebar chip, tab badge and popover on the real GUI, once per colour theme (headless, no X)");
     smoke_agents_step.dependOn(&smoke_agents_run.step);
@@ -798,23 +718,13 @@ pub fn build(b: *std.Build) void {
     // pins GTK_A11Y=none so its GUI children can never register on the
     // user's live a11y bus. SKIPs where the bus tooling is absent.
     if (!native_macos) {
-        const smoke_atspi_mod = b.createModule(.{
-            .root_source_file = b.path("src/smoke_atspi.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
+        const smoke_atspi_mod = dev.module(b, target, "src/smoke_atspi.zig");
         configureSysDeps(b, smoke_atspi_mod, cbindings_mod);
-        smoke_atspi_mod.addImport("build_options", glib_opts_mod);
+        smoke_atspi_mod.addImport("build_options", dev.glib_opts);
         addVideo(b, smoke_atspi_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-        const smoke_atspi = b.addExecutable(.{
-            .name = "sketerm-smoke-atspi",
-            .root_module = smoke_atspi_mod,
-            .use_lld = use_lld,
-        });
+        const smoke_atspi = dev.executable(b, "sketerm-smoke-atspi", smoke_atspi_mod);
         const smoke_atspi_run = b.addRunArtifact(smoke_atspi);
-        smoke_atspi_run.step.dependOn(&install_exe.step);
-        smoke_atspi_run.step.dependOn(&install_mux.step);
+        dev_bins.drive(b, smoke_atspi_run, &.{ dev_bins.gui, dev_bins.mux });
         smoke_atspi_run.setCwd(b.path("."));
         const smoke_atspi_step = b.step("smoke-atspi", "Terminal-pane AT-SPI accessibility smoke on a private a11y bus (headless, no X)");
         smoke_atspi_step.dependOn(&smoke_atspi_run.step);
@@ -827,20 +737,11 @@ pub fn build(b: *std.Build) void {
     // names, extents and incremental updates. SKIPs where the bus
     // tooling is absent.
     if (!native_macos) {
-        const smoke_webax_mod = b.createModule(.{
-            .root_source_file = b.path("src/smoke_webax.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
+        const smoke_webax_mod = dev.module(b, target, "src/smoke_webax.zig");
         configureSysDeps(b, smoke_webax_mod, cbindings_mod);
-        smoke_webax_mod.addImport("build_options", glib_opts_mod);
+        smoke_webax_mod.addImport("build_options", dev.glib_opts);
         addVideo(b, smoke_webax_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-        const smoke_webax = b.addExecutable(.{
-            .name = "sketerm-smoke-webax",
-            .root_module = smoke_webax_mod,
-            .use_lld = use_lld,
-        });
+        const smoke_webax = dev.executable(b, "sketerm-smoke-webax", smoke_webax_mod);
         const smoke_webax_run = b.addRunArtifact(smoke_webax);
         smoke_webax_run.setCwd(b.path("."));
         const smoke_webax_step = b.step("smoke-webax", "Web-page AT-SPI projection smoke on a private a11y bus (no CEF, no GUI)");
@@ -851,7 +752,9 @@ pub fn build(b: *std.Build) void {
     // real SketermTermView through the AX selectors VoiceOver uses and
     // asserts they match a known screen (incl. an astral char, so the
     // codepoint→UTF-16 translation is checked end-to-end). Native macOS
-    // only: it links the ObjC accessibility shim + a test probe.
+    // only: it links the ObjC accessibility shim + a test probe. Still
+    // the release profile: no Linux host can run it to prove a move,
+    // and the self-hosted backend cannot build for aarch64-macOS.
     if (native_macos) {
         const smoke_a11y_mod = b.createModule(.{
             .root_source_file = b.path("src/smoke_a11y_macos.zig"),
@@ -883,14 +786,9 @@ pub fn build(b: *std.Build) void {
     // border were rendered. Catches regressions in the instanced
     // cell pipeline + multi-page atlas.
     if (has_egl) {
-    const smoke_cell_mod = b.createModule(.{
-        .root_source_file = b.path("src/smoke_cell.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
+    const smoke_cell_mod = dev.module(b, target, "src/smoke_cell.zig");
     configureSysDeps(b, smoke_cell_mod, cbindings_mod);
-    smoke_cell_mod.addImport("build_options", glib_opts_mod);
+    smoke_cell_mod.addImport("build_options", dev.glib_opts);
     addVideo(b, smoke_cell_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     smoke_cell_mod.linkSystemLibrary("EGL", .{});
     // The shipped CRT shader, embedded so the smoke test compiles
@@ -909,11 +807,7 @@ pub fn build(b: *std.Build) void {
     smoke_cell_mod.addAnonymousImport("zfast_crt_glsl", .{
         .root_source_file = b.path("data/shaders/zfast-crt.glsl"),
     });
-    const smoke_cell = b.addExecutable(.{
-        .name = "sketerm-smoke-cell",
-        .root_module = smoke_cell_mod,
-        .use_lld = use_lld,
-    });
+    const smoke_cell = dev.executable(b, "sketerm-smoke-cell", smoke_cell_mod);
     const smoke_cell_run = b.addRunArtifact(smoke_cell);
     const smoke_cell_step = b.step("smoke-cell", "Headless GL cell-pipeline render check");
     smoke_cell_step.dependOn(&smoke_cell_run.step);
@@ -950,49 +844,16 @@ pub fn build(b: *std.Build) void {
     // asserts the readback FBO retains translucency. Plan-v3 had
     // this gating C; added retroactively as regression coverage.
     if (has_egl) {
-    const smoke_trans_mod = b.createModule(.{
-        .root_source_file = b.path("src/smoke_transparency.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
+    const smoke_trans_mod = dev.module(b, target, "src/smoke_transparency.zig");
     configureSysDeps(b, smoke_trans_mod, cbindings_mod);
-    smoke_trans_mod.addImport("build_options", glib_opts_mod);
+    smoke_trans_mod.addImport("build_options", dev.glib_opts);
     addVideo(b, smoke_trans_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     smoke_trans_mod.linkSystemLibrary("EGL", .{});
-    const smoke_trans = b.addExecutable(.{
-        .name = "sketerm-smoke-transparency",
-        .root_module = smoke_trans_mod,
-        .use_lld = use_lld,
-    });
+    const smoke_trans = dev.executable(b, "sketerm-smoke-transparency", smoke_trans_mod);
     const smoke_trans_run = b.addRunArtifact(smoke_trans);
     const smoke_trans_step = b.step("smoke-transparency", "Headless GL bg-alpha render check");
     smoke_trans_step.dependOn(&smoke_trans_run.step);
     }
-
-    // Scripted stub language server — `sketerm-lsp-stub`. A REAL
-    // process speaking the LSP base protocol over stdio, so the smoke
-    // rig exercises spawn + pipes + framing without depending on zls or
-    // clangd being installed on the build host. Core dependency set:
-    // it must stay as GTK-free as the protocol code it tests.
-    const lsp_stub_mod = b.createModule(.{
-        .root_source_file = b.path("src/lsp_stub.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    configureCoreDeps(b, lsp_stub_mod, core_cbindings_mod);
-    lsp_stub_mod.addImport("build_options", noglib_opts_mod);
-    addVideo(b, lsp_stub_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-    const lsp_stub = b.addExecutable(.{
-        .name = "sketerm-lsp-stub",
-        .root_module = lsp_stub_mod,
-        .use_lld = use_lld,
-    });
-    const install_lsp_stub = b.addInstallArtifact(lsp_stub, .{});
-    const lsp_stub_step = b.step("lsp-stub", "Build the scripted stub language server used by the tests");
-    lsp_stub_step.dependOn(&install_lsp_stub.step);
-    smoke_lsp_run.step.dependOn(&install_lsp_stub.step);
 
     // Headless editor-pipeline smoke — `zig build smoke-editor`.
     // Renders a real Document through editor_font itemization +
@@ -1000,26 +861,17 @@ pub fn build(b: *std.Build) void {
     // asserting itemization, bidi order, hit testing, cache
     // invalidation, and rendered selection/caret pixels.
     if (has_egl) {
-    const smoke_editor_mod = b.createModule(.{
-        .root_source_file = b.path("src/smoke_editor.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
+    const smoke_editor_mod = dev.module(b, target, "src/smoke_editor.zig");
     configureSysDeps(b, smoke_editor_mod, cbindings_mod);
-    smoke_editor_mod.addImport("build_options", glib_opts_mod);
+    smoke_editor_mod.addImport("build_options", dev.glib_opts);
     addVideo(b, smoke_editor_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     smoke_editor_mod.linkSystemLibrary("EGL", .{});
     addTreeSitter(b, smoke_editor_mod, tree_sitter);
-    const smoke_editor = b.addExecutable(.{
-        .name = "sketerm-smoke-editor",
-        .root_module = smoke_editor_mod,
-        .use_lld = use_lld,
-    });
+    const smoke_editor = dev.executable(b, "sketerm-smoke-editor", smoke_editor_mod);
     const smoke_editor_run = b.addRunArtifact(smoke_editor);
     // The LSP stage spawns the stub server by path; building it first
     // is what makes `zig build smoke-editor` self-contained.
-    smoke_editor_run.step.dependOn(&install_lsp_stub.step);
+    dev_bins.drive(b, smoke_editor_run, &.{dev_bins.lsp_stub});
     const smoke_editor_step = b.step("smoke-editor", "Headless editor text pipeline render check");
     smoke_editor_step.dependOn(&smoke_editor_run.step);
     }
@@ -1028,24 +880,15 @@ pub fn build(b: *std.Build) void {
     // Compiles every shader under a GL 3.3 core context: the macOS
     // GDK path, provable on a Linux box via Mesa's EGL desktop-GL.
     if (has_egl) {
-    const smoke_core_mod = b.createModule(.{
-        .root_source_file = b.path("src/smoke_gl_core.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
+    const smoke_core_mod = dev.module(b, target, "src/smoke_gl_core.zig");
     configureSysDeps(b, smoke_core_mod, cbindings_mod);
-    smoke_core_mod.addImport("build_options", glib_opts_mod);
+    smoke_core_mod.addImport("build_options", dev.glib_opts);
     addVideo(b, smoke_core_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     smoke_core_mod.linkSystemLibrary("EGL", .{});
     smoke_core_mod.addAnonymousImport("crt_glsl", .{
         .root_source_file = b.path("data/shaders/crt.glsl"),
     });
-    const smoke_core = b.addExecutable(.{
-        .name = "sketerm-smoke-gl-core",
-        .root_module = smoke_core_mod,
-        .use_lld = use_lld,
-    });
+    const smoke_core = dev.executable(b, "sketerm-smoke-gl-core", smoke_core_mod);
     const smoke_core_run = b.addRunArtifact(smoke_core);
     const smoke_core_step = b.step("smoke-gl-core", "Compile all shaders under desktop GL 3.3 core (macOS GL path)");
     smoke_core_step.dependOn(&smoke_core_run.step);
@@ -1169,7 +1012,7 @@ pub fn build(b: *std.Build) void {
     // step, the binary distribution is never downloaded unless the fetch
     // step is asked for by name, and the CEF headers are only translated
     // when that distribution is already on disk.
-    addCef(b, target, optimize, strip, use_lld, have_opus, core_cbindings_mod, mux_exe, mcp_exe, smoke_mcp_run, &test_roots.step, &lint_errdefer.step, &env_removal.step);
+    addCef(b, target, optimize, strip, use_lld, have_opus, core_cbindings_mod, dev, dev_mux_exe, dev_bins, smoke_mcp_run, &test_roots.step, &lint_errdefer.step, &env_removal.step);
 }
 
 /// How one family of artifacts compiles and links; `build` declares the
@@ -1189,6 +1032,34 @@ const Profile = struct {
 
     fn executable(p: Profile, b: *std.Build, name: []const u8, mod: *std.Build.Module) *std.Build.Step.Compile {
         return b.addExecutable(.{ .name = name, .root_module = mod, .use_llvm = p.use_llvm, .use_lld = p.use_lld });
+    }
+
+    /// A libc-linked module for one of the profile's executables.
+    fn module(p: Profile, b: *std.Build, target: std.Build.ResolvedTarget, root: []const u8) *std.Build.Module {
+        return b.createModule(.{
+            .root_source_file = b.path(root),
+            .target = target,
+            .optimize = p.optimize,
+            .sanitize_c = p.sanitize_c,
+            .link_libc = true,
+            .strip = p.strip,
+        });
+    }
+};
+
+/// The dev-profile binaries installed into `dir` for the rigs that exec
+/// them by path (`src/smoke/bindir.zig`), one install step each.
+const DevBins = struct {
+    dir: std.Build.InstallDir,
+    gui: *std.Build.Step,
+    mux: *std.Build.Step,
+    mcp: *std.Build.Step,
+    lsp_stub: *std.Build.Step,
+
+    /// Name `dir` on `run`'s argv (`--bin-dir`) and install `needs` first.
+    fn drive(d: DevBins, b: *std.Build, run: *std.Build.Step.Run, needs: []const *std.Build.Step) void {
+        for (needs) |s| run.step.dependOn(s);
+        run.addArgs(&.{ "--bin-dir", b.getInstallPath(d.dir, "") });
     }
 };
 
@@ -1240,14 +1111,7 @@ const BinDeps = struct {
 
 /// The `sketerm` GUI (plus its `cli`/`ssh`/`mux`/`mcp` subcommands).
 fn guiExe(b: *std.Build, d: BinDeps, p: Profile) *std.Build.Step.Compile {
-    const mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = d.target,
-        .optimize = p.optimize,
-        .sanitize_c = p.sanitize_c,
-        .link_libc = true,
-        .strip = p.strip,
-    });
+    const mod = p.module(b, d.target, "src/main.zig");
     configureSysDeps(b, mod, d.cbindings);
     mod.addImport("build_options", p.glib_opts);
     addVideo(b, mod); // runtime-loaded video codec shims (no-op without -Dvideo)
@@ -1269,14 +1133,7 @@ fn guiExe(b: *std.Build, d: BinDeps, p: Profile) *std.Build.Step.Compile {
 /// libc/fribidi decls; unused GTK externs are never referenced so nothing
 /// GTK gets linked.
 fn muxExe(b: *std.Build, d: BinDeps, p: Profile) *std.Build.Step.Compile {
-    const mod = b.createModule(.{
-        .root_source_file = b.path("src/mux_main.zig"),
-        .target = d.target,
-        .optimize = p.optimize,
-        .sanitize_c = p.sanitize_c,
-        .link_libc = true,
-        .strip = p.strip,
-    });
+    const mod = p.module(b, d.target, "src/mux_main.zig");
     configureCoreDeps(b, mod, d.core_cbindings);
     mod.addImport("build_options", p.noglib_opts);
     addVideo(b, mod); // runtime-loaded video codec shims (no-op without -Dvideo)
@@ -1289,14 +1146,7 @@ fn muxExe(b: *std.Build, d: BinDeps, p: Profile) *std.Build.Step.Compile {
 /// `sketerm mcp`'s headless terminal/app/web tools run anywhere
 /// sketerm-mux does.
 fn mcpExe(b: *std.Build, d: BinDeps, p: Profile) *std.Build.Step.Compile {
-    const mod = b.createModule(.{
-        .root_source_file = b.path("src/mcp_main.zig"),
-        .target = d.target,
-        .optimize = p.optimize,
-        .sanitize_c = p.sanitize_c,
-        .link_libc = true,
-        .strip = p.strip,
-    });
+    const mod = p.module(b, d.target, "src/mcp_main.zig");
     configureShippableCoreDeps(b, mod, d.core_cbindings);
     mod.addImport("build_options", p.noglib_opts);
     addVideo(b, mod); // runtime-loaded video codec shims (no-op without -Dvideo)
@@ -1376,8 +1226,11 @@ fn addCef(
     use_lld: bool,
     have_opus: bool,
     core_cbindings_mod: *std.Build.Module,
-    mux_exe: *std.Build.Step.Compile,
-    mcp_exe: *std.Build.Step.Compile,
+    /// The rigs, their sketerm-mux/sketerm-mcp and the helper's unit
+    /// tests build on it; the helper itself is release (`web` installs it).
+    dev: Profile,
+    dev_mux_exe: *std.Build.Step.Compile,
+    dev_bins: DevBins,
     smoke_mcp_run: *std.Build.Step.Run,
     test_roots: *std.Build.Step,
     lint_errdefer: *std.Build.Step,
@@ -1804,7 +1657,8 @@ fn addCef(
     });
     const web_tests = b.addTest(.{
         .root_module = web_mod,
-        .use_lld = use_lld,
+        .use_llvm = dev.use_llvm,
+        .use_lld = dev.use_lld,
     });
     test_web_step.dependOn(&b.addRunArtifact(web_tests).step);
     // Installed by the `web` step only — never by `b.installArtifact`,
@@ -1838,16 +1692,14 @@ fn addCef(
     if (smoke_untrusted_step) |step| {
         const smoke = b.addSystemCommand(&.{"bash"});
         smoke.addFileArg(b.path("dist/test-web-untrusted-netns.sh"));
-        smoke.addArg("--bin-dir");
-        smoke.addDirectoryArg(mcp_exe.getEmittedBin().dirname());
+        dev_bins.drive(b, smoke, &.{ dev_bins.mcp, dev_bins.mux });
         smoke.addArg("--helper");
         smoke.addArtifactArg(web_exe);
         smoke.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
         smoke.has_side_effects = true;
         const acks = b.addSystemCommand(&.{ "python3", "-B" });
         acks.addFileArg(b.path("dist/test-web-untrusted-acks.py"));
-        acks.addArg("--bin-dir");
-        acks.addDirectoryArg(mcp_exe.getEmittedBin().dirname());
+        dev_bins.drive(b, acks, &.{ dev_bins.mcp, dev_bins.mux });
         acks.addArg("--helper");
         acks.addArtifactArg(web_exe);
         acks.has_side_effects = true;
@@ -1879,23 +1731,14 @@ fn addCef(
     // as a client: handshake, memfd paint, trusted click, typing,
     // resize, popup request, history, clean shutdown. CEF-gated like
     // everything else here, and never reachable from the default step.
-    const smoke_web_mod = b.createModule(.{
-        .root_source_file = b.path("src/smoke_web.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
+    const smoke_web_mod = dev.module(b, target, "src/smoke_web.zig");
     smoke_web_mod.addImport("cbindings", core_cbindings_mod);
     // The encoded-frames stage decodes what the helper sends exactly as
     // the GUI does (pixcodec regions, vcodec tiles).
     smoke_web_mod.addImport("build_options", web_opts_mod);
     addZstd(b, smoke_web_mod);
     addVideo(b, smoke_web_mod);
-    const smoke_web = b.addExecutable(.{
-        .name = "sketerm-smoke-web",
-        .root_module = smoke_web_mod,
-        .use_lld = use_lld,
-    });
+    const smoke_web = dev.executable(b, "sketerm-smoke-web", smoke_web_mod);
     const smoke_web_run = b.addRunArtifact(smoke_web);
     if (is_mac_cef) {
         // The loose executable cannot run on macOS (no bundle, so no
@@ -1906,7 +1749,7 @@ fn addCef(
     } else smoke_web_run.addArtifactArg(web_exe);
     // The remote-helper stage spawns a private sketerm-mux and asks IT
     // to launch the helper over a bridged byte channel.
-    smoke_web_run.addArtifactArg(mux_exe);
+    smoke_web_run.addArtifactArg(dev_mux_exe);
     // Stage 35b's real-extension fixture. Passed as a PATH, not a
     // dependency: the file may legitimately be absent (the stage then
     // reports itself skipped), and making the smoke step depend on the
@@ -1931,6 +1774,7 @@ fn addCef(
     // Same shape as the smoke rig (a real helper on a private short
     // socket) because the number that matters is an END-TO-END one: a
     // microbenchmark of the registry would measure the wrong half.
+    // Release profile, like every benchmark.
     const bench_wreq_mod = b.createModule(.{
         .root_source_file = b.path("src/bench_webreq.zig"),
         .target = target,

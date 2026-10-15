@@ -14,6 +14,7 @@
 //! document deliberately full of astral-plane characters.
 
 const std = @import("std");
+const bindir = @import("smoke/bindir.zig");
 const c = @import("c.zig").c;
 const Document = @import("editor/document.zig").Document;
 const tr = @import("editor/transaction.zig");
@@ -259,7 +260,7 @@ pub fn stage(alloc: std.mem.Allocator) !?u8 {
 /// the capability is seen, the request is answered, and the answer
 /// contains ONLY tokens inside the window asked for.
 fn rangeOnlyStage(alloc: std.mem.Allocator) !?u8 {
-    const exe = "zig-out/bin/sketerm-lsp-stub";
+    const exe = std.mem.span(bindir.path(.@"sketerm-lsp-stub"));
     if (c.access(exe, c.X_OK) != 0) return null;
     var h = Harness{
         .alloc = alloc,
@@ -322,7 +323,7 @@ fn rangeOnlyStage(alloc: std.mem.Allocator) !?u8 {
 }
 
 fn runOnce(alloc: std.mem.Allocator, utf8: bool) !?u8 {
-    const exe = "zig-out/bin/sketerm-lsp-stub";
+    const exe = std.mem.span(bindir.path(.@"sketerm-lsp-stub"));
     if (c.access(exe, c.X_OK) != 0) {
         std.debug.print("smoke-editor: NOTE — {s} missing; LSP stage skipped\n", .{exe});
         return null;

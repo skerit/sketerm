@@ -24,6 +24,7 @@
 //! Everything created here is destroyed by exact pid / session name.
 
 const std = @import("std");
+const bindir = @import("smoke/bindir.zig");
 const c = @import("c.zig").c;
 const unsetEnv = @import("util/env.zig").unset;
 const platform = @import("util/platform.zig");
@@ -386,10 +387,11 @@ fn stateHolds(want: Want, shot: appdrive.App.RgbaShot) bool {
     return true;
 }
 
-pub fn main() u8 {
+pub fn main(init: std.process.Init.Minimal) u8 {
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
+    if (!bindir.init(init.args.vector)) return 1;
     g_alloc = allocator;
 
     if (platform.is_macos) {
@@ -421,8 +423,8 @@ pub fn main() u8 {
     if (mux_pid < 0) return fail("mux fork", .{});
     if (mux_pid == 0) {
         platform.dieWithParent();
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm-mux", "--broker", null };
-        _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.@"sketerm-mux"), "--broker", null };
+        _ = c.execv(bindir.path(.@"sketerm-mux"), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     daemon_pid = mux_pid;
@@ -467,8 +469,8 @@ pub fn main() u8 {
         _ = c.setenv("GTK_A11Y", "none", 1);
         _ = c.setenv("SKETERM_WELCOME", "0", 1);
         g_theme.apply();
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", null };
-        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), null };
+        _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
     child_pid = pid;

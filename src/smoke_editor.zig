@@ -7,6 +7,7 @@
 //! on PASS; writes zig-out/smoke-editor.png for visual inspection.
 
 const std = @import("std");
+const bindir = @import("smoke/bindir.zig");
 const c = @import("c.zig").c;
 const unsetEnv = @import("util/env.zig").unset;
 const gl = @import("render/gl.zig");
@@ -329,10 +330,11 @@ const HL_SRC =
 
 const nowNs = @import("util/clock.zig").nowNs;
 
-pub fn main() !u8 {
+pub fn main(init: std.process.Init.Minimal) !u8 {
     var gpa: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    if (!bindir.init(init.args.vector)) return 1;
 
     // --- EGL surfaceless context (same pattern as smoke-cell) ---
     _ = eglboot.surfaceless(.gles3) catch |e| {
