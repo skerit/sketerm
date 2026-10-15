@@ -598,6 +598,17 @@ fn waitPopupFor(app: *appdrive.App, base: usize, budget_ms: i64) bool {
     return false;
 }
 
+/// Keep the pointer still for `budget_ms` of real time and report whether
+/// a popup stayed up throughout (the count never fell back to `base`).
+fn popupHeldFor(app: *appdrive.App, base: usize, budget_ms: i64) bool {
+    const t0 = clock.nowMs();
+    while (clock.nowMs() - t0 < budget_ms) {
+        pumpFor(app, 100);
+        if (popupCount(app) <= base) return false;
+    }
+    return true;
+}
+
 /// Poll the window until `want` shows up in at least `need` pixels.
 fn waitForColor(
     app: *appdrive.App,
@@ -1118,6 +1129,10 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
         savePopupPng(app, shot("dwell-hover-popup.png"));
         pumpFor(app, 400);
         savePng(app, win_id, shot("dwell-hover.png"));
+        // A still pointer must keep its hover: three dwell delays is
+        // room for a close-and-re-ask loop to show its closed half.
+        if (!popupHeldFor(app, popups_before_dwell, 1_500))
+            return fail("the dwell hover closed under a still pointer (a re-ask loop?)", .{});
         say("PASS mouse-dwell hover -> zig-out/smoke-lsp-gui{s}-dwell-hover.png", .{g_leg});
     }
     app.pressKey(win_id, "Escape") catch {};

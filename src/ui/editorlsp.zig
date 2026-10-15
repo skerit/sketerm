@@ -480,6 +480,8 @@ pub const Manager = struct {
     dwell_timer: c_uint = 0,
     dwell_x: f64 = 0,
     dwell_y: f64 = 0,
+    /// Whether `dwell_x`/`dwell_y` hold a position the pointer reported.
+    dwell_placed: bool = false,
     /// Byte offset the last dwell request was made for — a pointer
     /// wandering within one word must not re-ask.
     dwell_offset: usize = std.math.maxInt(usize),
@@ -2977,6 +2979,12 @@ pub const Manager = struct {
     /// request — a motion event stream is hundreds of events per second
     /// and one request each would flood the server.
     pub fn onPointerMoved(self: *Manager, x: f64, y: f64) void {
+        // GTK re-emits motion at the unchanged position whenever the
+        // widgets under a still pointer re-lay out (a popover mapping,
+        // a repaint), so treating it as motion closed every dwell hover
+        // and re-asked it in an endless loop.
+        if (self.dwell_placed and x == self.dwell_x and y == self.dwell_y) return;
+        self.dwell_placed = true;
         self.dwell_x = x;
         self.dwell_y = y;
         if (self.hover.open and self.hover.at != null) {
