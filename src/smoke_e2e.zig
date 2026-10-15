@@ -6972,11 +6972,12 @@ fn offloadPolicyStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:
     const sent = roundtrip(allocator, sock, animate) orelse return "offload redraw command failed";
     defer allocator.free(sent);
     // A wall-clock budget for 600 frames measured the build, not the
-    // offload: the dev-profile daemon processes this 1000x614 damage at
-    // ~3 frames/s (174 in 60 s at load 2, its main thread at 100% CPU),
-    // so the stage fails on a STALL instead (no frame for 10 s), under a
-    // cap no healthy profile reaches.
-    const cap = clock.nowMs() + 600_000;
+    // offload: the dev-profile daemon (self-hosted codegen) filters this
+    // full-width damage at ~4 frames/s, where the release daemon does
+    // ~12. The stage fails on a STALL instead (no frame for 10 s), under
+    // a cap no healthy profile reaches.
+    const redraw_started = clock.nowMs();
+    const cap = redraw_started + 600_000;
     var last_frames = mainWin(app).frames;
     var last_progress = clock.nowMs();
     while (mainWin(app).frames - start < 600) {
@@ -6991,6 +6992,7 @@ fn offloadPolicyStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:
         if (expectOffload(allocator, app, 1, 2)) |why| return why;
         _ = app.pumpOnce(20);
     }
+    say(whyf("offload redraw: 600 frames in {d} ms", .{clock.nowMs() - redraw_started}));
     const stop_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-keys\",\"pane\":{d},\"data\":\"ctrl+c\"}}\n", .{panes[1]}) catch return "offload stop format";
     const stopped = roundtrip(allocator, sock, stop_req) orelse return "offload redraw stop failed";
     defer allocator.free(stopped);

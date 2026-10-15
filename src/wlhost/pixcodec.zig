@@ -60,7 +60,7 @@ pub const Filter = enum(u8) {
 
 // ─── PNG predictors ─────────────────────────────────────────────
 
-fn paethPredictor(a: u8, b: u8, c: u8) u8 {
+inline fn paethPredictor(a: u8, b: u8, c: u8) u8 {
     const ia: i32 = a;
     const ib: i32 = b;
     const ic: i32 = c;
@@ -73,17 +73,20 @@ fn paethPredictor(a: u8, b: u8, c: u8) u8 {
     return c;
 }
 
-/// Predicted value for byte `i` from its already-available neighbours.
-/// Missing neighbours (first row / first column) read as 0, per PNG.
-fn predict(filter: Filter, buf: []const u8, i: usize, stride: usize) u8 {
-    const col = i % stride;
-    const left: u8 = if (col >= bpp) buf[i - bpp] else 0;
-    const above: u8 = if (i >= stride) buf[i - stride] else 0;
-    const upleft: u8 = if (col >= bpp and i >= stride) buf[i - stride - bpp] else 0;
+/// Predicted value for byte `x` of row `cur`, given `up`, the row above
+/// (ignored without `has_up`); missing neighbours read as 0, per PNG.
+/// Row-wise with the filter comptime because the filters run over every
+/// damaged byte on the daemon's poll loop: a per-byte `i % stride` and
+/// filter switch cost a third of each encode.
+inline fn predictAt(comptime filter: Filter, comptime has_up: bool, cur: []const u8, up: []const u8, x: usize) u8 {
     return switch (filter) {
-        .sub => left,
-        .up => above,
-        .paeth => paethPredictor(left, above, upleft),
+        .sub => if (x >= bpp) cur[x - bpp] else 0,
+        .up => if (has_up) up[x] else 0,
+        .paeth => paethPredictor(
+            if (x >= bpp) cur[x - bpp] else 0,
+            if (has_up) up[x] else 0,
+            if (has_up and x >= bpp) up[x - bpp] else 0,
+        ),
         else => 0,
     };
 }
@@ -92,63 +95,103 @@ fn effStride(buf_len: usize, row_stride: usize) usize {
     return if (row_stride == 0) buf_len else row_stride;
 }
 
-/// Forward filter, IN PLACE. Walks right-to-left so each predictor reads
-/// ORIGINAL neighbours (all at smaller indices, not yet rewritten).
+fn Row(comptime Bytes: type) type {
+    return struct { cur: Bytes, up: []const u8 };
+}
+
+/// The row starting at `start` (the last may be short) and the row above it.
+fn rowAt(buf: anytype, stride: usize, start: usize) Row(@TypeOf(buf)) {
+    const cur = buf[start..@min(start + stride, buf.len)];
+    return .{ .cur = cur, .up = if (start >= stride) buf[start - stride ..][0..cur.len] else &.{} };
+}
+
+/// Forward filter, IN PLACE. Bottom row first, each right-to-left, so
+/// every predictor reads ORIGINAL neighbours (not yet rewritten).
 fn applyFilter(filter: Filter, buf: []u8, row_stride: usize) void {
-    if (filter == .none or buf.len == 0) return;
-    const stride = effStride(buf.len, row_stride);
-    var i: usize = buf.len;
-    while (i > 0) {
-        i -= 1;
-        buf[i] -%= predict(filter, buf, i, stride);
+    if (buf.len == 0) return;
+    switch (filter) {
+        inline .sub, .up, .paeth => |f| {
+            const stride = effStride(buf.len, row_stride);
+            var start = (buf.len - 1) / stride * stride;
+            while (true) : (start -= stride) {
+                const row = rowAt(buf, stride, start);
+                if (start == 0) return filterRow(f, false, row.cur, row.up);
+                filterRow(f, true, row.cur, row.up);
+            }
+        },
+        else => {},
     }
 }
 
-/// Inverse filter, IN PLACE. Walks left-to-right so each predictor reads
-/// already-RECONSTRUCTED neighbours.
+fn filterRow(comptime filter: Filter, comptime has_up: bool, cur: []u8, up: []const u8) void {
+    var x = cur.len;
+    while (x > 0) {
+        x -= 1;
+        cur[x] -%= predictAt(filter, has_up, cur, up, x);
+    }
+}
+
+/// Inverse filter, IN PLACE. Top row first, each left-to-right, so every
+/// predictor reads already-RECONSTRUCTED neighbours.
 fn unapplyFilter(filter: Filter, buf: []u8, row_stride: usize) Error!void {
     switch (filter) {
         .none => return,
-        .sub, .up, .paeth => {},
+        inline .sub, .up, .paeth => |f| {
+            if (buf.len == 0) return;
+            const stride = effStride(buf.len, row_stride);
+            var start: usize = 0;
+            while (start < buf.len) : (start += stride) {
+                const row = rowAt(buf, stride, start);
+                if (start == 0) unfilterRow(f, false, row.cur, row.up) else unfilterRow(f, true, row.cur, row.up);
+            }
+        },
         else => return Error.UnknownFilter,
     }
-    if (buf.len == 0) return;
-    const stride = effStride(buf.len, row_stride);
-    var i: usize = 0;
-    while (i < buf.len) : (i += 1) {
-        buf[i] +%= predict(filter, buf, i, stride);
-    }
 }
 
-/// PNG minimum-sum-of-absolute-differences score for a filter: the sum
-/// of min(v, 256-v) over the would-be filtered bytes (small deltas are
-/// cheap to entropy-code). Reads `buf` without mutating it.
-fn filterCost(filter: Filter, buf: []const u8, stride: usize) u64 {
-    var sum: u64 = 0;
-    var i: usize = 0;
-    while (i < buf.len) : (i += 1) {
-        const f: u8 = buf[i] -% predict(filter, buf, i, stride);
-        const fu: u16 = f;
-        sum += @min(fu, 256 - fu);
-    }
-    return sum;
+fn unfilterRow(comptime filter: Filter, comptime has_up: bool, cur: []u8, up: []const u8) void {
+    for (0..cur.len) |x| cur[x] +%= predictAt(filter, has_up, cur, up, x);
 }
 
-/// Pick the filter whose MSAD score is lowest. Four cheap scoring passes,
-/// no compression — the actual zstd pass runs once, on the winner.
+/// The filters `pickFilter` scores, in tie-break order (the first wins).
+const candidates = [_]Filter{ .none, .sub, .up, .paeth };
+
+/// PNG minimum-sum-of-absolute-differences score of one filtered byte:
+/// min(v, 256-v), since small deltas are cheap to entropy-code.
+inline fn msad(residual: u8) u64 {
+    const r: u16 = residual;
+    return @min(r, 256 - r);
+}
+
+/// Every candidate's MSAD score in ONE pass over `buf`, read-only.
+fn filterCosts(buf: []const u8, stride: usize) [candidates.len]u64 {
+    var sums: [candidates.len]u64 = @splat(0);
+    var start: usize = 0;
+    while (start < buf.len) : (start += stride) {
+        const row = rowAt(buf, stride, start);
+        if (start == 0) rowCosts(false, row.cur, row.up, &sums) else rowCosts(true, row.cur, row.up, &sums);
+    }
+    return sums;
+}
+
+fn rowCosts(comptime has_up: bool, cur: []const u8, up: []const u8, sums: *[candidates.len]u64) void {
+    var s = sums.*;
+    for (cur, 0..) |v, x| {
+        inline for (candidates, 0..) |f, k| s[k] += msad(v -% predictAt(f, has_up, cur, up, x));
+    }
+    sums.* = s;
+}
+
+/// Pick the filter whose MSAD score is lowest. One scoring pass, no
+/// compression — the actual zstd pass runs once, on the winner.
 fn pickFilter(buf: []const u8, row_stride: usize) Filter {
     if (buf.len == 0) return .none;
-    const stride = effStride(buf.len, row_stride);
-    var best: Filter = .none;
-    var best_cost = filterCost(.none, buf, stride);
-    inline for (.{ Filter.sub, Filter.up, Filter.paeth }) |f| {
-        const cost = filterCost(f, buf, stride);
-        if (cost < best_cost) {
-            best_cost = cost;
-            best = f;
-        }
+    const costs = filterCosts(buf, effStride(buf.len, row_stride));
+    var best: usize = 0;
+    for (costs[1..], 1..) |cost, k| {
+        if (cost < costs[best]) best = k;
     }
-    return best;
+    return candidates[best];
 }
 
 // ─── encode / decode ────────────────────────────────────────────
@@ -260,9 +303,16 @@ pub fn decodeBody(body: Body, dst: []u8) Error!void {
 
 const t = std.testing;
 
-test "every filter round-trips in place (incl. partial last row)" {
+test "every filter writes the PNG residuals, then round-trips in place (incl. partial last row)" {
     const a = t.allocator;
-    inline for (.{ Filter.sub, Filter.up, Filter.paeth }) |filter| {
+    // The wire format: residuals as PNG defines them (bpp 4, stride 8,
+    // missing neighbours 0), pinned so a faster filter loop cannot drift.
+    const Case = struct { filter: Filter, filtered: [28]u8 };
+    inline for (.{
+        Case{ .filter = .sub, .filtered = .{ 10, 20, 30, 40, 5, 5, 5, 5, 11, 21, 31, 41, 88, 67, 46, 25, 50, 60, 70, 80, 2, 2, 2, 2, 1, 2, 3, 4 } },
+        Case{ .filter = .up, .filtered = .{ 10, 20, 30, 40, 15, 25, 35, 45, 1, 1, 1, 1, 84, 63, 42, 21, 39, 39, 39, 39, 209, 230, 251, 16, 207, 198, 189, 180 } },
+        Case{ .filter = .paeth, .filtered = .{ 10, 20, 30, 40, 5, 5, 5, 5, 1, 1, 1, 1, 84, 63, 42, 21, 39, 39, 39, 39, 209, 230, 251, 2, 207, 198, 189, 180 } },
+    }) |case| {
         var buf = [_]u8{
             10, 20, 30, 40, 15, 25, 35, 45,
             11, 21, 31, 41, 99, 88, 77, 66,
@@ -271,8 +321,9 @@ test "every filter round-trips in place (incl. partial last row)" {
         };
         const orig = try a.dupe(u8, &buf);
         defer a.free(orig);
-        applyFilter(filter, &buf, 8);
-        try unapplyFilter(filter, &buf, 8);
+        applyFilter(case.filter, &buf, 8);
+        try t.expectEqualSlices(u8, &case.filtered, &buf);
+        try unapplyFilter(case.filter, &buf, 8);
         try t.expectEqualSlices(u8, orig, &buf);
     }
 }
