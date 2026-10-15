@@ -22868,3 +22868,34 @@ Terminals:
   SIGKILL to the foreground process group through a new daemon frame,
   `fg_signal` (37/100, capability `fg_signal`). On plain ssh it sends
   ^C, then ^\. It reports which step worked.
+
+## 2026-10-15: peer messaging between assistants' sessions (phase 1a)
+
+Every `sketerm mcp` is now a peer: it registers one connection with the
+per-user daemon under an address (`--name`, `SKETERM_PEER_NAME`, the pane
+session, else a minted non-durable `anon-xxxx`), and `peer_list`,
+`peer_send` and `peer_read` let assistants on one host message each other
+with identity stamped by the daemon. The broker keeps the mailboxes
+(`src/mux/peermail.zig`, frames 38-41/101-104 behind the welcome flag
+`peers`, handlers in `daemon_peers.zig`): a message leaves its mailbox only
+when the recipient's server acknowledges it, durable mailboxes persist
+under the state home, and mail past `peer_mail_ttl_hours` expires into an
+event for its sender and an `expired_while_away` entry for the recipient's
+next server. A sender always learns the outcome (`delivered`, `queued`,
+`refused` with a reason, later `expired`).
+
+Delivery reuses the agent push routes rather than adding one: the Claude
+Code channel line and the `agent-wait --server` follower the opencode
+plugin runs (which now also follows after a `peer_*` call) both carry
+`agentpush.composePeer`'s text, and each item is handed out once by
+whichever route or `peer_read` takes it first.
+
+`src/smoke_peers.zig` proves it against a running broker in both
+smoke-mux and smoke-broker: real `sketerm-mcp` servers reach the rig
+broker through an isolated runtime dir whose `sketerm/mux.sock` links to
+the rig socket, and walk live delivery read once, queued mail across a
+server restart, the refusals, an anon address gone, TTL expiry on both
+sides, the follower route and the channel route. smoke-mcp's stdio driver
+moved to `src/smoke/mcpproc.zig` so all three rigs share it, and
+`peerclient.nextPush(.., 0)` now also takes frames already buffered on the
+connection, which the MCP server's drain relied on a 1 ms wait for.
