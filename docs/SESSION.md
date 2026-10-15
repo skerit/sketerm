@@ -22966,3 +22966,28 @@ or `off`. Unit tests drive a hub and a member through JSON; the smoke
 peer stage gained a federation section (two exec'd daemons, a fake ssh
 cut by pid and restored, TTL expiry across the link), and the rig's
 broker now reads an isolated config.
+
+## 2026-10-15: a user-set subject per peer
+
+`peer_list` showed who a peer is but not what it works on, and Claude
+Code's terminal titles say little. A peer now carries a subject the user
+sets: `sketerm peer subject "TEXT"` inside the session (its own servers,
+found by the ancestry walk `sketerm mcp hook` uses; the line is an
+`agentwait.Presence` with `subject`), `--name NAME` for any address, or
+the pane menu's Set Subject…. No tool writes it. The rule (200 bytes of
+UTF-8, no control characters) has one home, `peermail.checkSubject`.
+
+The broker owns it, keyed by address: `RegisterReq.subject` (null keeps
+it, "" clears it) is sent once by the server after the user set it, so a
+value set elsewhere is never overwritten; a durable address persists it
+in `<address>.meta.json`. `PeerInfo.subject`, `Deliver.sender_subject`
+and the presence relay carry it; the composer, the list formatter and
+the CLI print it. The GUI path is new frame `peer_subject` (44, reply
+`peer_subject_reply` 106, welcome flag `peer_subject`): on an attached
+session the worker hands it to the broker (control `'P'`), which finds
+the peer whose process runs below the session's child
+(`daemon_peers.peerInTree`) and pushes each worker its session's peer
+(control `'S'`, then `session_meta` `peer`). The pane and tab title show
+the subject in place of the OSC title. Unit tests cover the store,
+persistence, refusals, the relay, the formatter, the composer, the CLI
+parser and the pane lookup; the smoke peer stage gained section j.

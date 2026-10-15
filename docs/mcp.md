@@ -2941,6 +2941,39 @@ line, for a web server that spawns the follower and reads its stdout:
 {"kind":"event","id":"m-7d2c9a1b","outcome":"expired","to":"Qq","queued_ms":21600000}
 ```
 
+### Subject
+
+A peer's subject says what the session works on, in the user's words. The
+user sets it; no MCP tool writes it, and the server instructions tell
+assistants so. It is at most 200 bytes of UTF-8 without control
+characters (no newlines or tabs); anything else is refused.
+
+- Inside a session: `sketerm peer subject "template links"` (in Claude
+  Code: `! sketerm peer subject "template links"`). It finds its own
+  session's servers by the ancestry walk `sketerm mcp hook` uses, posts
+  the subject on their waiter sockets (a `presence` line with `subject`),
+  and prints `subject of Arcana: template links`. `--clear` removes it;
+  no argument prints the current one alone. Exit 1 when no server is
+  found in the process's ancestry.
+- For any peer by address: `sketerm peer subject --name webapp "..."`, for
+  a `read --follow` program or a session reached from elsewhere.
+  `SKETERM_PEER_NAME` never redirects a subject; only `--name` does.
+- From the sketerm GUI: the pane menu's Pane > Set Subject… names the peer
+  whose process runs in that pane's process tree (insensitive when none
+  does). Empty clears it.
+
+The broker keeps the subject with the address, not the connection: a
+durable address keeps it across server restarts and daemon restarts
+(`<address>.meta.json` beside its mailbox); an `anon-` peer has it while
+it lives. It shows in `peer_list` (`subject`, text and JSON, and in
+`sketerm peer list`), in the header of the sender's messages
+(`Peer message from Arcana (claude-code on h, /w, idle; subject: template
+links). ...`, `meta.sender_subject`, the CLI's `sender_subject`), across
+federation with the rest of the presence, and as the sketerm tab and pane
+title in place of the app's own OSC title until it is cleared (a manual
+pane title or a covering face still wins). `capabilities.peers.subject`
+says the daemon keeps subjects (welcome flag `peer_subject`).
+
 ### Federation
 
 Peers on other hosts are reached through ONE hub, the daemon of the host

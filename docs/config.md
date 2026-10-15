@@ -682,7 +682,7 @@ tab_tree_prev reload_config launch_app app_windows
 goto_tab_1 goto_tab_2 goto_tab_3 goto_tab_4 goto_tab_5
 goto_tab_6 goto_tab_7 goto_tab_8 goto_tab_9
 duplicate_tab detach_tab configure_shader shader_preset_pick
-shader_pick shader_clear apply_profile set_pane_title screenshot_pane
+shader_pick shader_clear apply_profile set_pane_title set_peer_subject screenshot_pane
 record_session record_session_stop upload_file download_file
 mux_rename mux_kill files_browse_here files_open_app show_scrollback
 new_durable_tab new_browser_tab new_browser_split new_web_tab
