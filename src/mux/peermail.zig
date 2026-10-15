@@ -239,7 +239,10 @@ pub const RelayKind = enum {
 };
 
 /// `peer_hub_relay` / `peer_member_relay` body; which fields are set
-/// follows `kind`.
+/// follows `kind`. No wall time crosses a link: every time travels as an
+/// age on the sender's clock and is rebased on the receiver's (`RelayAge`),
+/// so hosts with skewed clocks agree on ages and TTLs. `peers` and `hosts`
+/// carry `last_seen_ms` as such an age.
 pub const Relay = struct {
     kind: RelayKind,
     id: []const u8 = "",
@@ -247,17 +250,40 @@ pub const Relay = struct {
     to: []const u8 = "",
     /// `event`: the address the event is for.
     owner: []const u8 = "",
-    sent_ms: i64 = 0,
+    /// `mail`: ms since it was sent, at the sending broker.
+    age_ms: i64 = 0,
     text: []const u8 = "",
     reply_to: ?[]const u8 = null,
     outcome: PeerOutcome = .delivered,
     reason: ?RefuseReason = null,
     to_state: ?PeerState = null,
+    /// `event`: how long the message waited (already a duration).
     queued_ms: i64 = 0,
     /// `stored`: whether `id` named a message or an event.
     of: Item.Kind = .message,
     peers: []const PeerInfo = &.{},
     hosts: []const HostInfo = &.{},
+};
+
+/// The one rule for times on a relay: an age out, a local time back in;
+/// the link's transit time is ignored. A negative age is read as 0.
+const RelayAge = struct {
+    fn of(now: i64, at_ms: i64) i64 {
+        return @max(0, now - at_ms);
+    }
+
+    fn at(now: i64, age_ms: i64) i64 {
+        return now - @max(0, age_ms);
+    }
+
+    /// A `last_seen_ms` of 0 (never) travels as -1, so an age of 0 stays "just now".
+    fn seenAgo(now: i64, seen_ms: i64) i64 {
+        return if (seen_ms == 0) -1 else of(now, seen_ms);
+    }
+
+    fn seenAt(now: i64, ago_ms: i64) i64 {
+        return if (ago_ms < 0) 0 else at(now, ago_ms);
+    }
 };
 
 // --------------------------------------------------------------- store
@@ -746,7 +772,7 @@ pub const Store = struct {
             .reply_to = msg.reply_to,
         });
         try self.appendItem(r.box, s);
-        if (r.conn != 0 and self.relayItem(r, s)) {
+        if (r.conn != 0 and self.relayItem(r, s, now)) {
             try self.addPending(id, waiter, r.conn, now);
             return .{ .id = id, .outcome = .queued, .deferred = true };
         }
@@ -960,7 +986,7 @@ pub const Store = struct {
         const r = self.routeByConn(conn) orelse return error.NotLinked;
         r.last_seen_ms = now;
         switch (rl.kind) {
-            .presence => try self.takePresence(r, rl),
+            .presence => try self.takePresence(r, rl, now),
             .mail => try self.takeMail(r, rl, now),
             .event => self.takeEvent(r, rl, now),
             .stored => self.takeStored(r, rl, now),
@@ -974,7 +1000,7 @@ pub const Store = struct {
         if (!self.presence_dirty) return;
         self.presence_dirty = false;
         for (self.routes.items) |r| {
-            if (r.conn != 0) self.sendPresence(r) catch self.warnf("peermail: out of memory relaying presence to {s}", .{r.host});
+            if (r.conn != 0) self.sendPresence(r, now) catch self.warnf("peermail: out of memory relaying presence to {s}", .{r.host});
         }
     }
 
@@ -984,7 +1010,7 @@ pub const Store = struct {
         r.last_seen_ms = now;
         self.presence_dirty = true;
         for (r.box.items.items) |s| {
-            if (s.delivered_to != conn) _ = self.relayItem(r, s);
+            if (s.delivered_to != conn) _ = self.relayItem(r, s, now);
         }
     }
 
@@ -997,7 +1023,7 @@ pub const Store = struct {
         self.answerPending(.{ .route_conn = old });
     }
 
-    fn takePresence(self: *Store, r: *Route, rl: Relay) error{OutOfMemory}!void {
+    fn takePresence(self: *Store, r: *Route, rl: Relay, now: i64) error{OutOfMemory}!void {
         _ = r.arena.reset(.free_all);
         r.peers = &.{};
         r.hosts = &.{};
@@ -1015,7 +1041,7 @@ pub const Store = struct {
                 .state = p.state,
                 .durable = p.durable,
                 .live = p.live,
-                .last_seen_ms = p.last_seen_ms,
+                .last_seen_ms = RelayAge.seenAt(now, p.last_seen_ms),
                 .pending = p.pending,
                 .name_taken = p.name_taken,
                 .facts = if (p.facts) |f| try cloneJson(a, f) else null,
@@ -1029,7 +1055,7 @@ pub const Store = struct {
         r.peers = peers;
         if (!self.hub) {
             const hosts = try a.alloc(HostInfo, @min(rl.hosts.len, PRESENCE_PEERS_MAX));
-            for (rl.hosts[0..hosts.len], hosts) |h, *o| o.* = .{ .host = try a.dupe(u8, h.host), .link = h.link, .last_seen_ms = h.last_seen_ms };
+            for (rl.hosts[0..hosts.len], hosts) |h, *o| o.* = .{ .host = try a.dupe(u8, h.host), .link = h.link, .last_seen_ms = RelayAge.seenAt(now, h.last_seen_ms) };
             r.hosts = hosts;
         }
         // The hub passes every host's peers on to the others.
@@ -1060,7 +1086,7 @@ pub const Store = struct {
             .id = rl.id,
             .from = .{ .address = self.inAddr(&fb, r, rl.from.address), .host = rl.from.host, .cwd = rl.from.cwd, .app = rl.from.app, .pid = rl.from.pid },
             .to = self.inAddr(&tb, r, rl.to),
-            .sent_ms = rl.sent_ms,
+            .sent_ms = RelayAge.at(now, rl.age_ms),
             .text = rl.text,
             .reply_to = rl.reply_to,
         }, .{ .link = r.conn }, now, &idb);
@@ -1101,7 +1127,7 @@ pub const Store = struct {
         }
     }
 
-    fn sendPresence(self: *Store, r: *Route) error{OutOfMemory}!void {
+    fn sendPresence(self: *Store, r: *Route, now: i64) error{OutOfMemory}!void {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const a = arena_state.allocator();
@@ -1110,7 +1136,7 @@ pub const Store = struct {
         var hosts: std.ArrayList(HostInfo) = .empty;
         if (self.hub) for (self.routes.items) |o| {
             if (o == r) continue;
-            try hosts.append(a, .{ .host = o.name, .link = o.link, .last_seen_ms = o.last_seen_ms });
+            try hosts.append(a, .{ .host = o.name, .link = o.link, .last_seen_ms = RelayAge.seenAgo(now, o.last_seen_ms) });
             for (o.peers) |p| {
                 var e = p;
                 e.link = linkOf(o, null);
@@ -1120,12 +1146,13 @@ pub const Store = struct {
         for (peers.items) |*p| {
             var b: [peeraddr.ADDRESS_MAX]u8 = undefined;
             p.address = try a.dupe(u8, self.outAddr(&b, r, p.address));
+            p.last_seen_ms = RelayAge.seenAgo(now, p.last_seen_ms);
         }
         _ = self.emit.call(r.conn, .{ .relay = .{ .kind = .presence, .peers = peers.items, .hosts = hosts.items } });
     }
 
     /// Relay one outbound item on `r`'s live link.
-    fn relayItem(self: *Store, r: *Route, s: *Stored) bool {
+    fn relayItem(self: *Store, r: *Route, s: *Stored, now: i64) bool {
         const it = &s.item;
         var fb: [peeraddr.ADDRESS_MAX]u8 = undefined;
         var tb: [peeraddr.ADDRESS_MAX]u8 = undefined;
@@ -1135,7 +1162,7 @@ pub const Store = struct {
                 .id = it.id,
                 .from = .{ .address = self.outAddr(&fb, r, it.from.address), .host = it.from.host, .cwd = it.from.cwd, .app = it.from.app, .pid = it.from.pid },
                 .to = self.outAddr(&tb, r, it.to),
-                .sent_ms = it.sent_ms,
+                .age_ms = RelayAge.of(now, it.sent_ms),
                 .text = it.text,
                 .reply_to = it.reply_to,
             },
@@ -1502,7 +1529,7 @@ pub const Store = struct {
             return self.warnf("peer event {s} dropped: out of memory", .{ev.id});
         };
         if (remote) |r| {
-            if (r.conn != 0) _ = self.relayItem(r, s);
+            if (r.conn != 0) _ = self.relayItem(r, s, now);
         } else if (self.livePeer(box.address)) |p| {
             if (self.push(p.conn, s, now)) s.delivered_to = p.conn;
         }
@@ -1742,6 +1769,7 @@ const Rec = struct {
         to: []const u8 = "",
         queued: bool = false,
         age_ms: i64 = 0,
+        queued_ms: i64 = 0,
         text: []const u8 = "",
         from: []const u8 = "",
         sender_state: ?PeerState = null,
@@ -1768,7 +1796,7 @@ const Rec = struct {
         for (self.dead.items) |d| if (d == conn) return false;
         const g: Got = switch (out) {
             .deliver => |d| .{ .conn = conn, .kind = .deliver, .id = a.dupe(u8, d.id) catch "", .to = a.dupe(u8, d.to) catch "", .queued = d.queued, .age_ms = d.age_ms, .text = a.dupe(u8, d.text) catch "", .from = a.dupe(u8, d.from.address) catch "", .sender_state = d.sender_state },
-            .event => |e| .{ .conn = conn, .kind = .event, .id = a.dupe(u8, e.id) catch "", .outcome = e.outcome, .reason = e.reason, .to = a.dupe(u8, e.to) catch "" },
+            .event => |e| .{ .conn = conn, .kind = .event, .id = a.dupe(u8, e.id) catch "", .outcome = e.outcome, .reason = e.reason, .to = a.dupe(u8, e.to) catch "", .queued_ms = e.queued_ms },
             .reply => |r| .{ .conn = conn, .kind = .reply, .id = a.dupe(u8, r.id) catch "", .outcome = r.outcome, .reason = r.reason, .to_state = r.to_state, .req = r.req },
             .relay => |r| .{ .conn = conn, .kind = .relay, .id = a.dupe(u8, r.id) catch "", .relay = r.kind, .outcome = r.outcome, .reason = r.reason },
             .warn => |w| .{ .conn = conn, .kind = .warn, .text = a.dupe(u8, w) catch "" },
@@ -2151,7 +2179,8 @@ const HUB_LINK: u32 = 0x8000_0001;
 const MEMBER_LINK: u32 = 50;
 
 /// A hub and one member wired together through JSON (the relay bodies
-/// round-trip as on the wire); `up` false drops what is sent.
+/// round-trip as on the wire); `up` false drops what is sent. Every `now`
+/// is the hub's clock; the member's runs `skew` ms ahead of it.
 const Net = struct {
     hub_rec: Rec,
     mem_rec: Rec,
@@ -2161,6 +2190,7 @@ const Net = struct {
     hub_link: u32 = HUB_LINK,
     mem_link: u32 = MEMBER_LINK,
     queue: std.ArrayList(struct { to_hub: bool, json: []u8 }) = .empty,
+    skew: i64 = 0,
 
     fn init(net: *Net, dir: ?[]const u8) !void {
         net.* = .{ .hub_rec = Rec.init(), .mem_rec = Rec.init() };
@@ -2179,7 +2209,7 @@ const Net = struct {
 
     fn connect(net: *Net, now: i64) !void {
         net.up = true;
-        try net.mem.uplinkUp(net.mem_link, .{ .host = "hub", .as = "box" }, now);
+        try net.mem.uplinkUp(net.mem_link, .{ .host = "hub", .as = "box" }, now + net.skew);
         net.hub.linkUp("box", net.hub_link, now);
     }
 
@@ -2187,7 +2217,7 @@ const Net = struct {
     fn cut(net: *Net, now: i64) void {
         net.up = false;
         net.hub.connGone(net.hub_link, now);
-        net.mem.connGone(net.mem_link, now);
+        net.mem.connGone(net.mem_link, now + net.skew);
         for (net.queue.items) |f| t.allocator.free(f.json);
         net.queue.clearRetainingCapacity();
         net.hub_link += 1;
@@ -2219,15 +2249,15 @@ const Net = struct {
     /// Deliver everything in flight (and what it causes), both ways.
     fn pump(net: *Net, now: i64) !void {
         net.hub.tick(now);
-        net.mem.tick(now);
+        net.mem.tick(now + net.skew);
         while (net.queue.items.len > 0) {
             const f = net.queue.orderedRemove(0);
             defer t.allocator.free(f.json);
             const parsed = try std.json.parseFromSlice(Relay, t.allocator, f.json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            if (f.to_hub) try net.hub.relayIn(net.hub_link, parsed.value, now) else try net.mem.relayIn(net.mem_link, parsed.value, now);
+            if (f.to_hub) try net.hub.relayIn(net.hub_link, parsed.value, now) else try net.mem.relayIn(net.mem_link, parsed.value, now + net.skew);
             net.hub.tick(now);
-            net.mem.tick(now);
+            net.mem.tick(now + net.skew);
         }
     }
 };
@@ -2302,44 +2332,69 @@ test "federation: presence and mail cross the hub both ways under host-qualified
     try t.expectEqual(PeerOutcome.delivered, (try net.mem.send(1, .{ .to = "box/bob", .text = "local" }, 300, &idb)).outcome);
 }
 
-test "federation: a dropped link queues host_unreachable and delivers once when it is back" {
+test "federation: a dropped link queues host_unreachable and delivers once when it is back, across skewed clocks" {
     var net: Net = undefined;
     try net.init(null);
     defer net.deinit();
+    // The member's clock is three hours ahead of the hub's: every time
+    // below is right on the clock of the broker that reports it.
+    const S: i64 = 3 * 3600_000;
+    net.skew = S;
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try net.hub.register(1, reg("Zenit", true), 0);
-    try net.mem.register(1, reg("alice", true), 0);
-    try net.connect(0);
-    try net.pump(0);
-    // 1. The link drops: the remote peer stays listed, link down.
+    try net.hub.register(1, reg("Zenit", true), 50);
+    try net.mem.register(1, reg("alice", true), S + 50);
+    try net.connect(100);
+    try net.pump(100);
+    // 1. Relayed presence: each side reads the other's last_seen on its own clock.
+    try t.expectEqual(@as(i64, 50), (listed(&net.hub, a, "box/alice") orelse return error.TestUnexpectedResult).last_seen_ms);
+    try t.expectEqual(S + 50, (listed(&net.mem, a, "hub/Zenit") orelse return error.TestUnexpectedResult).last_seen_ms);
+    // 2. The link drops: the remote peer stays listed, link down.
     net.cut(1000);
     try t.expectEqual(@as(?PeerLink, .down), (listed(&net.hub, a, "box/alice") orelse return error.TestUnexpectedResult).link);
     try t.expectEqual(@as(?PeerLink, .down), (listed(&net.mem, a, "hub/Zenit") orelse return error.TestUnexpectedResult).link);
-    // 2. A send now is queued with the reason, answered at once.
+    // 3. A send now is queued with the reason, answered at once.
     var idb: [ID_LEN]u8 = undefined;
-    const r = try net.mem.send(1, .{ .to = "hub/Zenit", .text = "while down" }, 1100, &idb);
+    const r = try net.mem.send(1, .{ .to = "hub/Zenit", .text = "while down" }, S + 1100, &idb);
     try t.expectEqual(PeerOutcome.queued, r.outcome);
     try t.expectEqual(@as(?RefuseReason, .host_unreachable), r.reason);
     try t.expect(!r.deferred);
-    // 3. Back up: delivered once, with its age; the outbound box empties.
+    // 4. Back up: delivered once, with its age on the member's clock; the
+    // outbound box empties.
     try net.connect(3000);
     try net.pump(3000);
     try t.expectEqual(@as(usize, 1), net.hub_rec.count(1, .deliver));
     const d = lastOf(&net.hub_rec, 1, .deliver) orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(i64, 1900), d.age_ms);
     try t.expectEqual(@as(usize, 0), net.mem.uplink().?.box.items.items.len);
-    // 4. A redelivery of the same id (its `stored` answer lost) is
+    // 5. A redelivery of the same id (its `stored` answer lost) is
     // recognised: answered again, never delivered twice.
-    const again = Relay{ .kind = .mail, .id = d.id, .from = .{ .address = "alice" }, .to = "hub/Zenit", .text = "while down", .sent_ms = 1100 };
+    const again = Relay{ .kind = .mail, .id = d.id, .from = .{ .address = "alice" }, .to = "hub/Zenit", .text = "while down", .age_ms = 2000 };
     try net.hub.relayIn(net.hub_link, again, 3100);
     try net.pump(3100);
     try t.expectEqual(@as(usize, 1), net.hub_rec.count(1, .deliver));
-    // 5. A send in flight when the link drops is answered queued.
-    const r3 = try net.mem.send(1, .{ .req = 4, .to = "hub/Zenit", .text = "in flight" }, 3200, &idb);
+    // 6. Mail queued on the hub for an offline name expires a TTL after it
+    // was sent on the hub's clock, and the event's wait crosses back as is.
+    // (Zenit acks first, so only Qq's mail can expire.)
+    try t.expectEqual(@as(usize, 1), net.hub.ack(1, &.{d.id}));
+    try net.hub.register(2, reg("Qq", true), 3100);
+    net.hub.deregister(2, 3100);
+    _ = try net.mem.send(1, .{ .to = "hub/Qq", .text = "later" }, S + 3150, &idb);
+    try net.pump(3150);
+    net.hub.sweep(3150 + 10_000 - 1);
+    try net.pump(3150 + 10_000 - 1);
+    try t.expect(lastOf(&net.mem_rec, 1, .event) == null);
+    net.hub.sweep(3150 + 10_000);
+    try net.pump(3150 + 10_000);
+    const ex = lastOf(&net.mem_rec, 1, .event) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(PeerOutcome.expired, ex.outcome);
+    try t.expectEqualStrings("hub/Qq", ex.to);
+    try t.expectEqual(@as(i64, 10_000), ex.queued_ms);
+    // 7. A send in flight when the link drops is answered queued.
+    const r3 = try net.mem.send(1, .{ .req = 4, .to = "hub/Zenit", .text = "in flight" }, S + 13_200, &idb);
     try t.expect(r3.deferred);
-    net.cut(3300);
+    net.cut(13_300);
     const rep = lastOf(&net.mem_rec, 1, .reply) orelse return error.TestUnexpectedResult;
     try t.expectEqual(PeerOutcome.queued, rep.outcome);
     try t.expectEqual(@as(?RefuseReason, .host_unreachable), rep.reason);

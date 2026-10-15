@@ -2971,7 +2971,13 @@ whose config says so; every other daemon is dialed, never dials.
   box/Qq was refused there: ...`). A dropped link keeps that host's peers
   listed with their last state and `link: down`; a host whose daemon
   predates federation is listed `unsupported` and refused
-  `federation_unavailable`. Ages use each daemon's own clock.
+  `federation_unavailable`.
+- **Clocks**: no wall-clock time crosses a link. A relayed message
+  carries its age at the sending daemon, a relayed peer or host its
+  "seen N ms ago", an event how long the message waited; the receiving
+  daemon rebases each on its own clock (the link's transit time is
+  ignored). So hosts with skewed clocks still agree on ages, and a
+  message's TTL always runs on the clock of the daemon holding it.
 - **Trust**: the links are the hub's own SSH (or UDP/Tor) connections; no
   new credential exists. A daemon accepts `peer_hub_hello` only from the
   far end of a link dialed into its host (`sketerm-mux --proxy` or a UDP
