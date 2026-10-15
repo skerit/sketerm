@@ -357,7 +357,7 @@ fn fileRead(arena: std.mem.Allocator, fs: *fsdrive.Fs, args: std.json.Value) ![]
     const off: u64 = @intCast(@max(0, argInt(args, "offset") orelse 0));
     const want: u32 = @intCast(std.math.clamp(argInt(args, "length") orelse 262_144, 1, 2_097_152));
     var data: std.ArrayList(u8) = .empty;
-    defer data.deinit(arena);
+    defer data.deinit(fs.allocator);
     const info = fs.read(path, off, want, &data) catch |err| return fsFail(arena, fs, "read", err);
     const textual = std.unicode.utf8ValidateSlice(data.items) and
         std.mem.indexOfScalar(u8, data.items, 0) == null;
@@ -697,4 +697,30 @@ test "fs failures carry the code their cause deserves" {
     try t.expectEqual(ErrCode.io_failed, fsErrCode(fsdrive.Error.FsOpFailed, "permission denied"));
     try t.expect(!ErrCode.not_found.retryable());
     try t.expect(ErrCode.timeout.retryable());
+}
+
+test "file_read frees the bytes it read" {
+    const t = std.testing;
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair));
+    var fs = fsdrive.Fs.initConn(t.allocator, .{ .allocator = t.allocator, .fd = pair[0] });
+    defer fs.deinit();
+    var peer = muxclient.Conn{ .allocator = t.allocator, .fd = pair[1] };
+    defer peer.deinit();
+    // The daemon's answer, queued ahead of the request it answers.
+    const req = fs.next_req;
+    var data: [17]u8 = undefined;
+    std.mem.writeInt(u32, data[0..4], req, .little);
+    std.mem.writeInt(u64, data[4..12], 0, .little);
+    @memcpy(data[12..], "hello");
+    try peer.sendFrame(.fs_data, &data);
+    var reply_buf: [96]u8 = undefined;
+    try peer.sendFrame(.fs_reply, try std.fmt.bufPrint(&reply_buf, "{{\"req\":{d},\"ok\":true,\"size\":5,\"eof\":true}}", .{req}));
+
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"path\":\"/tmp/hello\"}", .{});
+    const result = try fileRead(arena, &fs, args);
+    try t.expect(std.mem.indexOf(u8, result, "hello") != null);
 }

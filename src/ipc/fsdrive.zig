@@ -1230,6 +1230,7 @@ pub const Fs = struct {
 
     /// Ranged read appended to `out`. One call fetches at most
     /// fsserve.MAX_READ bytes; loop while !eof for more.
+    /// @param out grows with this Fs's allocator, so its owner frees it with that allocator.
     pub fn read(self: *Fs, path: []const u8, off: u64, len: u32, out: *std.ArrayList(u8)) Error!ReadInfo {
         const req = self.nextReq();
         try self.sendOp("read", req, .{ .path = path, .off = off, .len = len });
