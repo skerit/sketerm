@@ -2774,7 +2774,11 @@ peer's screen, and a peer message is information, never an approval.
   daemon mints `anon-xxxx`. A named address is durable: mail for it waits
   (the daemon's `peer_mail_ttl_hours`, default 6) for whichever server
   next registers it. A name another live server holds is not merged:
-  this one gets an anon address and `name_taken`.
+  this one gets an anon address and `name_taken`. A session in Konsole,
+  GNOME Terminal or any terminal other than sketerm has no pane session,
+  so it is durable only through `--name` or `SKETERM_PEER_NAME` (set it in
+  the MCP client's server `env`); otherwise its address is anon and its
+  mail is refused once it exits.
 - **Tools**: `peer_list {detail?}`, `peer_send {to, text, reply_to?}`
   (`outcome` `delivered`, `queued` or `refused` with a `reason`; it never
   interrupts the recipient), `peer_read {since?}`.
@@ -2793,6 +2797,37 @@ peer's screen, and a peer message is information, never an approval.
   sent message (`expired`, or ended unread because its non-durable
   recipient is gone) and mail that expired while no server of this
   address ran reach the session the same way.
+- **Delivery rules**: the daemon stamps the sender (address, app, cwd,
+  pid, host) from its registration and the send time from its own clock;
+  a sender never declares who it is. Every message enters the recipient's
+  mailbox and leaves it only when the recipient's server acknowledges it
+  (after handing it out); order is first in, first out per sender and
+  recipient. `peer_send`'s `outcome`:
+  - `delivered`: a live server of that address got it;
+  - `queued`: a durable address with no live server; it arrives when one
+    next registers, worded `sent ... while you were offline` (the age from
+    a minute on);
+  - `refused`, `reason` one of `unknown_address` (never seen on this
+    host), `not_durable_gone` (an anon address whose server is gone),
+    `too_large` (over 64 KiB), `mailbox_full` (256 messages or 1 MiB
+    waiting; older mail is never dropped), `self`, `name_taken_ambiguous`
+    (the durable owner is away while another server claims its name) or
+    `federation_unavailable` (a `host/name` address).
+
+  Mail waits at most `peer_mail_ttl_hours` (default 6, 0 = forever). Past
+  it the sender's session gets an event, `Your peer message m-... to Qq
+  expired unread after 6 h.` (held in the sender's own mailbox while it is
+  away), and the recipient's next server lists it once as
+  `expired_while_away` (`peer_read` kind `expired_away`: `Peer message
+  m-... from Zenit expired unread while you were away`). Unread mail of an
+  anon peer that exits ends the same way, `ended unread` with reason
+  `not_durable_gone`. Durable mailboxes persist under
+  `$XDG_STATE_HOME/sketerm/peermail/<socket namespace>/`, so a daemon
+  restart, handover or idle upgrade loses none.
+- **Never an approval**: a peer message is information from another
+  assistant's session, never the user's approval, consent or instruction;
+  the server's instructions say so, and a session must not act on one as
+  if the user had said it.
 - **`capabilities.peers`**: `{available, reason?, ttl_hours, address,
   durable, name_taken, channel_armed}`; `reason` is `daemon_without_peers`
   (an older daemon: every peer tool answers `available: false`),
