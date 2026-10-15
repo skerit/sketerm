@@ -848,3 +848,24 @@ test "an unavailable peer tool answers in its declared shape" {
     const refused = try mcp.expectToolResultShape(a, "peer_send", try peerTool(a, .peer_send, bad));
     try t.expectEqualStrings("invalid_args", refused.object.get("structuredContent").?.object.get("error").?.object.get("code").?.string);
 }
+
+test "the address is reported only once the broker's registration reply named it" {
+    const saved = link;
+    defer link = saved;
+    link = .{ .allocator = t.allocator, .configured = true, .status = .up, .mailbox = Mailbox.init(t.allocator) };
+    defer link.mailbox.?.deinit();
+    defer t.allocator.free(link.address);
+    // 1. Registered on the wire, unanswered: no address yet.
+    try t.expectEqualStrings("", capability().address);
+    // 2. A reply without `self` names nothing.
+    const bare = try std.json.parseFromSlice(peermail.ListReply, t.allocator, "{\"req\":0}", .{});
+    defer bare.deinit();
+    take(.{ .registered = bare });
+    try t.expectEqualStrings("", capability().address);
+    // 3. The broker's answer carries the address it registered.
+    const reply = try std.json.parseFromSlice(peermail.ListReply, t.allocator, "{\"req\":0,\"self\":{\"address\":\"anon-k3f9\",\"durable\":false}}", .{});
+    defer reply.deinit();
+    take(.{ .registered = reply });
+    try t.expectEqualStrings("anon-k3f9", capability().address);
+    try t.expect(!capability().durable);
+}

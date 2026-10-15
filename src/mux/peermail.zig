@@ -588,17 +588,16 @@ pub const Store = struct {
     /// connection holds is NOT shared: this one gets a minted anon address
     /// and `name_taken`. Push its pending mail with `flush` afterwards, once
     /// the caller has answered the registration.
+    /// AIDEV-NOTE: an empty address re-sent by the same connection (a
+    /// presence update, `clientInfo`) keeps the anon address minted first;
+    /// minting again would retire an address the client already reported.
     pub fn register(self: *Store, conn: u32, req: RegisterReq, now: i64) Error!void {
-        var anon_buf: [peeraddr.ANON_PREFIX.len + peeraddr.ANON_CHARS]u8 = undefined;
-        var taken_buf: [peeraddr.ANON_PREFIX.len + peeraddr.ANON_CHARS]u8 = undefined;
-        const requested = if (req.address.len == 0) try self.mintAnon(&anon_buf) else req.address;
-        const addr = peeraddr.Address.parse(requested) catch return error.BadAddress;
-        if (addr.host != null) return error.BadAddress;
-        const durable = req.durable and !addr.isAnon();
-
+        // Empty = mint an anon address (never durable).
+        const asked: ?peeraddr.Address = if (req.address.len == 0) null else peeraddr.Address.parse(req.address) catch return error.BadAddress;
+        if (asked) |a| if (a.host != null) return error.BadAddress;
         if (self.peerIndex(conn)) |i| {
             const p = self.peers.items[i];
-            if (std.mem.eql(u8, p.requested, requested) and p.asked_durable == req.durable) {
+            if (std.mem.eql(u8, p.requested, req.address) and p.asked_durable == req.durable) {
                 try self.updatePeer(p, req, now);
                 self.presence_dirty = true;
                 return;
@@ -606,6 +605,11 @@ pub const Store = struct {
             // A changed address is a new registration on this connection.
             self.deregister(conn, now);
         }
+
+        var anon_buf: [peeraddr.ANON_PREFIX.len + peeraddr.ANON_CHARS]u8 = undefined;
+        var taken_buf: [peeraddr.ANON_PREFIX.len + peeraddr.ANON_CHARS]u8 = undefined;
+        const requested = if (req.address.len == 0) try self.mintAnon(&anon_buf) else req.address;
+        const durable = req.durable and if (asked) |a| !a.isAnon() else false;
 
         var name_taken = false;
         var effective: []const u8 = requested;
@@ -642,7 +646,7 @@ pub const Store = struct {
             .last_seen_ms = now,
         };
         errdefer self.allocator.free(p.address);
-        p.requested = try self.allocator.dupe(u8, requested);
+        p.requested = try self.allocator.dupe(u8, req.address);
         errdefer self.allocator.free(p.requested);
         p.app = try self.allocator.dupe(u8, req.app);
         errdefer self.allocator.free(p.app);
@@ -1998,6 +2002,36 @@ test "a non-durable peer that leaves: its unread mail becomes events, later send
     try t.expectEqual(@as(?RefuseReason, .not_durable_gone), (try sendText(&s, 1, "anon-k3f9", "x", 500, &idb)).reason);
     // 3. The event sits in the sender's mailbox until acked.
     try t.expectEqual(@as(usize, 1), s.ack(1, &.{id}));
+}
+
+test "a minted anon address survives its connection's re-registrations; an address never registered is unknown" {
+    var rec = Rec.init();
+    defer rec.deinit();
+    var s = try Store.init(t.allocator, .{ .emit = rec.emit() });
+    defer s.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var idb: [ID_LEN]u8 = undefined;
+    try s.register(1, reg("Zenit", true), 0);
+    // 1. No address asked: the broker mints one, never durable.
+    try s.register(2, reg("", false), 10);
+    const first = (try s.selfInfo(a, 2)).?;
+    const minted = try a.dupe(u8, first.address);
+    try t.expect(std.mem.startsWith(u8, minted, peeraddr.ANON_PREFIX));
+    try t.expect(!first.durable);
+    // 2. The same connection registers again (clientInfo, then presence):
+    // the address the client was told stays its address.
+    try s.register(2, .{ .app = "claude-code", .pid = 42, .state = .working }, 20);
+    try s.register(2, .{ .app = "claude-code", .pid = 42, .state = .idle, .model = "Opus" }, 30);
+    try t.expectEqualStrings(minted, (try s.selfInfo(a, 2)).?.address);
+    try t.expectEqual(@as(usize, 2), (try s.list(a)).len);
+    // 3. Mail to it, sent after those re-registrations, is delivered.
+    const r = try sendText(&s, 1, minted, "to the anon peer", 40, &idb);
+    try t.expectEqual(PeerOutcome.delivered, r.outcome);
+    try t.expectEqual(@as(usize, 1), rec.count(2, .deliver));
+    // 4. An anon address the broker never handed out is unknown, not gone.
+    try t.expectEqual(@as(?RefuseReason, .unknown_address), (try sendText(&s, 1, "anon-never-minted", "x", 50, &idb)).reason);
 }
 
 test "TTL expiry: the recipient keeps a tombstone, an offline sender finds the event on its return" {
