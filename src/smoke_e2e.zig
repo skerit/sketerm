@@ -63,11 +63,20 @@ const DEADKEY_SESSION = "e2e-deadkey";
 /// behind past this, because the daemon reaps a session with no
 /// attached viewer.
 const DISPLAY_TTL = "900";
-/// The remote daemon alone inherits this descriptor. A panel whose logical
-/// image path is `/proc/self/fd/900` therefore cannot render by opening the
+/// The remote daemon alone runs with this directory as its cwd, and its
+/// session workers inherit it across fork (inherited descriptors do not
+/// survive: a worker closes every broker fd). A panel whose logical image
+/// path is `/proc/self/cwd/<name>` therefore cannot render by opening the
 /// path in the GUI process; it has to hydrate through the remote mux worker.
-const REMOTE_PANEL_ASSET_FD: c_int = 900;
-const REMOTE_PANEL_ASSET_PATH = "/proc/self/fd/900";
+const REMOTE_PANEL_ASSET_DIR = "remote-asset-cwd";
+const REMOTE_PANEL_ASSET_NAME = "panel-asset.png";
+const REMOTE_PANEL_ASSET_PATH = "/proc/self/cwd/" ++ REMOTE_PANEL_ASSET_NAME;
+
+/// `name` in the fake remote daemon's cwd, as this process opens it; an
+/// empty `name` is the directory itself.
+fn remotePanelAssetFile(buf: []u8, name: []const u8) ?[:0]const u8 {
+    return std.fmt.bufPrintZ(buf, "{s}/r/" ++ REMOTE_PANEL_ASSET_DIR ++ "/{s}", .{ g_rt, name }) catch null;
+}
 
 var child_pid: c.pid_t = 0;
 var daemon_pid: c.pid_t = 0;
@@ -624,25 +633,28 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var mux_abs_buf: [4096]u8 = undefined;
         const mux_abs_raw = c.realpath(bindir.path(.@"sketerm-mux"), &mux_abs_buf) orelse return fail("realpath sketerm-mux");
         const mux_abs = std.mem.span(@as([*:0]const u8, @ptrCast(mux_abs_raw)));
-        var asset_seed_buf: [512]u8 = undefined;
-        const asset_seed = std.fmt.bufPrintZ(&asset_seed_buf, "{s}/panel-asset.png", .{rrt}) catch
-            return fail("remote panel asset seed path");
-        if (!writeSolidPng(allocator, asset_seed.ptr, 0x20, 0x80, 0xff))
-            return fail("remote panel asset seed write");
-        const asset_fd = c.open(asset_seed.ptr, c.O_RDWR);
-        if (asset_fd < 0) return fail("remote panel asset seed open");
-        const rmt_pid = c.fork();
-        if (rmt_pid < 0) {
-            _ = c.close(asset_fd);
-            return fail("remote mux fork");
+        var asset_dir_buf: [600]u8 = undefined;
+        const asset_dir = remotePanelAssetFile(&asset_dir_buf, "") orelse
+            return fail("remote panel asset directory path");
+        if (c.mkdir(asset_dir.ptr, 0o700) != 0) return fail("remote panel asset directory");
+        var asset_buf: [600]u8 = undefined;
+        const asset = remotePanelAssetFile(&asset_buf, REMOTE_PANEL_ASSET_NAME) orelse
+            return fail("remote panel asset path");
+        if (!writeSolidPng(allocator, asset.ptr, 0x20, 0x80, 0xff))
+            return fail("remote panel asset write");
+        // Four more names for the same tiny inode (the five-image check).
+        for (1..5) |i| {
+            var name_buf: [32]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "panel-asset-{d}.png", .{i}) catch return fail("remote panel asset link name");
+            var link_buf: [600]u8 = undefined;
+            const link = remotePanelAssetFile(&link_buf, name) orelse return fail("remote panel asset link path");
+            if (c.link(asset.ptr, link.ptr) != 0) return fail("remote panel asset link");
         }
+        const rmt_pid = c.fork();
+        if (rmt_pid < 0) return fail("remote mux fork");
         if (rmt_pid == 0) {
             platform.dieWithParent();
-            for (0..5) |i| {
-                if (c.dup2(asset_fd, REMOTE_PANEL_ASSET_FD + @as(c_int, @intCast(i))) < 0) c._exit(126);
-            }
-            if (asset_fd < REMOTE_PANEL_ASSET_FD or asset_fd >= REMOTE_PANEL_ASSET_FD + 5)
-                _ = c.close(asset_fd);
+            if (c.chdir(asset_dir.ptr) != 0) c._exit(126);
             _ = c.setenv("XDG_RUNTIME_DIR", rrt.ptr, 1);
             _ = c.setenv("XDG_STATE_HOME", rrt.ptr, 1);
             _ = c.setenv("XDG_CONFIG_HOME", rrt.ptr, 1);
@@ -653,7 +665,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             _ = c.execv(bindir.path(.@"sketerm-mux"), @ptrCast(@constCast(&argv)));
             c._exit(127);
         }
-        _ = c.close(asset_fd);
         remote_mux_pid = rmt_pid;
         var rsock_buf: [512]u8 = undefined;
         const rsock = std.fmt.bufPrintZ(&rsock_buf, "{s}/sketerm/mux.sock", .{rrt}) catch return fail("remote sock path");
@@ -663,10 +674,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             rwaited += 1;
             if (rwaited > 100) return fail("private remote mux socket never appeared (5s)");
         }
-        // The daemon and its future session workers retain the inode through
-        // fd 900. Removing the name makes the process-relative logical path
-        // the only way to read it and prevents a direct local-file fallback.
-        if (c.unlink(asset_seed.ptr) != 0) return fail("remote panel asset unlink");
 
         var ssh_path_buf: [300:0]u8 = undefined;
         const ssh_path = std.fmt.bufPrintZ(&ssh_path_buf, "{s}/fake-ssh", .{rt}) catch return fail("fake ssh path");
@@ -13682,8 +13689,8 @@ fn mcpPanelStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
 }
 
 /// Remote MCP origin -> remote daemon -> fake SSH GUI attachment -> native
-/// panel cache. The logical source exists only as fd 900 in the remote daemon
-/// and its workers, so GTK cannot accidentally pass by opening it itself.
+/// panel cache. The logical source resolves only under the remote daemon's
+/// cwd (REMOTE_PANEL_ASSET_DIR), so GTK cannot accidentally pass by opening it.
 fn remotePanelAssetStage(
     allocator: std.mem.Allocator,
     app: *appdrive.App,
@@ -13692,11 +13699,11 @@ fn remotePanelAssetStage(
 ) ?[]const u8 {
     const session = "remote-panel-assets";
 
-    var gui_fd_buf: [64]u8 = undefined;
-    const gui_fd_path = std.fmt.bufPrintZ(&gui_fd_buf, "/proc/{d}/fd/{d}", .{ child_pid, REMOTE_PANEL_ASSET_FD }) catch
-        return "formatting the GUI asset-fd probe failed";
-    if (c.access(gui_fd_path.ptr, c.F_OK) == 0)
-        return "the GUI unexpectedly inherited the remote-only panel asset descriptor";
+    var gui_view_buf: [128]u8 = undefined;
+    const gui_view = std.fmt.bufPrintZ(&gui_view_buf, "/proc/{d}/cwd/" ++ REMOTE_PANEL_ASSET_NAME, .{child_pid}) catch
+        return "formatting the GUI asset-path probe failed";
+    if (c.access(gui_view.ptr, c.F_OK) == 0)
+        return "the GUI can open the remote-only panel asset path itself";
 
     var owner = muxclient.Conn.connectSsh(allocator, "localhost") catch
         return "could not connect to the fake-SSH daemon for the remote panel stage";
@@ -13972,7 +13979,7 @@ fn remotePanelAssetStage(
         return "closing the remote selective panel failed";
 
     if (!m.startCall("ui_show",
-        \\{"name":"remote-asset","session":"remote-panel-assets","target":"window","document":{"title":"Remote asset","root":"img","components":{"img":{"type":"image","src":"/proc/self/fd/900","caption":"remote blue"}}}}
+        \\{"name":"remote-asset","session":"remote-panel-assets","target":"window","document":{"title":"Remote asset","root":"img","components":{"img":{"type":"image","src":"/proc/self/cwd/panel-asset.png","caption":"remote blue"}}}}
     )) return "could not start remote asset ui_show";
     _ = c.usleep(250_000);
     const probe_started = clock.nowMs();
@@ -14019,9 +14026,9 @@ fn remotePanelAssetStage(
         return "the remote-only blue image never rendered in the GUI panel";
 
     if (!rewriteRemotePanelAsset(allocator, 0xf0, 0x30, 0x60))
-        return "could not rewrite the remote daemon's panel asset descriptor";
+        return "could not rewrite the remote daemon's panel asset";
     const patched = m.call("ui_patch",
-        \\{"name":"remote-asset","session":"remote-panel-assets","patch":[{"op":"set","id":"img","component":{"type":"image","src":"/proc/self/fd/900","caption":"remote red"}}]}
+        \\{"name":"remote-asset","session":"remote-panel-assets","patch":[{"op":"set","id":"img","component":{"type":"image","src":"/proc/self/cwd/panel-asset.png","caption":"remote red"}}]}
     , 45_000) orelse return "same-path remote asset ui_patch timed out";
     if (mcpHas(patched, "isError")) return "same-path remote asset ui_patch returned an error";
     if (!mcpHas(patched, "\"asset_failures\":0") or
@@ -14071,10 +14078,10 @@ fn remotePanelAssetStage(
 
     // Five tiny unique logical paths once failed at the fifth image because
     // four concurrent reads pessimistically reserved 4x16 MiB forever. All
-    // descriptors name the same tiny inode, so actual-byte scheduling must let
+    // five names link the same tiny inode, so actual-byte scheduling must let
     // the fifth read proceed after the first completion.
     const five = m.call("ui_show",
-        \\{"name":"remote-asset","session":"remote-panel-assets","target":"window","document":{"title":"Five tiny","root":"root","components":{"root":{"type":"column","children":["i0","i1","i2","i3","i4"]},"i0":{"type":"image","src":"/proc/self/fd/900"},"i1":{"type":"image","src":"/proc/self/fd/901"},"i2":{"type":"image","src":"/proc/self/fd/902"},"i3":{"type":"image","src":"/proc/self/fd/903"},"i4":{"type":"image","src":"/proc/self/fd/904"}}}}
+        \\{"name":"remote-asset","session":"remote-panel-assets","target":"window","document":{"title":"Five tiny","root":"root","components":{"root":{"type":"column","children":["i0","i1","i2","i3","i4"]},"i0":{"type":"image","src":"/proc/self/cwd/panel-asset.png"},"i1":{"type":"image","src":"/proc/self/cwd/panel-asset-1.png"},"i2":{"type":"image","src":"/proc/self/cwd/panel-asset-2.png"},"i3":{"type":"image","src":"/proc/self/cwd/panel-asset-3.png"},"i4":{"type":"image","src":"/proc/self/cwd/panel-asset-4.png"}}}}
     , 45_000) orelse return "five-tiny remote asset ui_show timed out";
     if (mcpHas(five, "isError") or
         !mcpHas(five, "\"asset_failures\":0") or
@@ -14094,11 +14101,11 @@ fn remotePanelAssetStage(
     const zero_live = panelRelayCall(allocator, &requester, 0x703, get_loaded_req) orelse
         return "panel-get after zero-image patch timed out";
     defer allocator.free(zero_live);
-    if (std.mem.indexOf(u8, zero_live, "/proc/self/fd/") != null)
+    if (std.mem.indexOf(u8, zero_live, "/proc/self/cwd/") != null)
         return "zero-image patch left image paths in the committed document";
 
     const restored = m.call("ui_show",
-        \\{"name":"remote-asset","session":"remote-panel-assets","target":"window","document":{"title":"Remote asset","root":"img","components":{"img":{"type":"image","src":"/proc/self/fd/900","caption":"restored red"}}}}
+        \\{"name":"remote-asset","session":"remote-panel-assets","target":"window","document":{"title":"Remote asset","root":"img","components":{"img":{"type":"image","src":"/proc/self/cwd/panel-asset.png","caption":"restored red"}}}}
     , 45_000) orelse return "restoring the remote image after zero-image patch timed out";
     if (mcpHas(restored, "isError") or
         !mcpHas(restored, "\"asset_failures\":0"))
@@ -14126,7 +14133,7 @@ fn remotePanelAssetStage(
         return "could not enlarge the remote panel asset past its byte limit";
     const oversized_started = clock.nowMs();
     const oversized = m.call("ui_patch",
-        \\{"name":"remote-asset","session":"remote-panel-assets","patch":[{"op":"set","id":"img","component":{"type":"image","src":"/proc/self/fd/900","caption":"too large"}}]}
+        \\{"name":"remote-asset","session":"remote-panel-assets","patch":[{"op":"set","id":"img","component":{"type":"image","src":"/proc/self/cwd/panel-asset.png","caption":"too large"}}]}
     , 45_000) orelse return "oversized remote asset ui_patch timed out";
     if (clock.nowMs() - oversized_started > 15_000)
         return "oversized remote asset refusal exceeded its bounded fast path";
@@ -14140,10 +14147,10 @@ fn remotePanelAssetStage(
         return "oversized remote asset did not return an explicit per-path warning";
     }
 
-    const missing_path = "/proc/self/fd/901";
+    const missing_path = "/proc/self/cwd/missing-asset.png";
     const missing_started = clock.nowMs();
     const missing = m.call("ui_patch",
-        \\{"name":"remote-asset","session":"remote-panel-assets","patch":[{"op":"set","id":"img","component":{"type":"image","src":"/proc/self/fd/901","caption":"missing remote"}}]}
+        \\{"name":"remote-asset","session":"remote-panel-assets","patch":[{"op":"set","id":"img","component":{"type":"image","src":"/proc/self/cwd/missing-asset.png","caption":"missing remote"}}]}
     , 45_000) orelse return "missing remote asset ui_patch timed out";
     if (clock.nowMs() - missing_started > 10_000)
         return "missing remote asset warning exceeded its bounded fast path";
@@ -14181,7 +14188,7 @@ fn remotePanelAssetStage(
     if (!rewriteRemotePanelAsset(allocator, 0x10, 0xd0, 0x70))
         return "could not restore a valid image for origin-teardown coverage";
     const repatched = m.call("ui_patch",
-        \\{"name":"remote-asset","session":"remote-panel-assets","patch":[{"op":"set","id":"cmp","component":{"type":"image","src":"/proc/self/fd/900","caption":"before teardown"}}]}
+        \\{"name":"remote-asset","session":"remote-panel-assets","patch":[{"op":"set","id":"cmp","component":{"type":"image","src":"/proc/self/cwd/panel-asset.png","caption":"before teardown"}}]}
     , 30_000) orelse return "the pre-teardown patch timed out";
     if (mcpHas(repatched, "isError"))
         return "the pre-teardown patch failed";
@@ -15281,12 +15288,12 @@ fn themeSingletonStage(
     return expectNoPhantomToplevels(allocator, app);
 }
 
-/// A solid-colour PNG for the image_compare sides. Two visibly
+/// A 160x120 PNG of one opaque colour, owned by the caller. Two visibly
 /// different images make "the split moved" a real pixel assertion.
-fn writeSolidPng(allocator: std.mem.Allocator, path: [*:0]const u8, r: u8, g: u8, b: u8) bool {
+fn solidPng(allocator: std.mem.Allocator, r: u8, g: u8, b: u8) ?[]u8 {
     const w: u32 = 160;
     const h: u32 = 120;
-    const rgba = allocator.alloc(u8, w * h * 4) catch return false;
+    const rgba = allocator.alloc(u8, w * h * 4) catch return null;
     defer allocator.free(rgba);
     var i: usize = 0;
     while (i < rgba.len) : (i += 4) {
@@ -15295,33 +15302,23 @@ fn writeSolidPng(allocator: std.mem.Allocator, path: [*:0]const u8, r: u8, g: u8
         rgba[i + 2] = b;
         rgba[i + 3] = 0xff;
     }
-    const png = @import("util/png.zig").encodeRgba(allocator, rgba, w, h) catch return false;
+    return @import("util/png.zig").encodeRgba(allocator, rgba, w, h) catch null;
+}
+
+fn writeSolidPng(allocator: std.mem.Allocator, path: [*:0]const u8, r: u8, g: u8, b: u8) bool {
+    const png = solidPng(allocator, r, g, b) orelse return false;
     defer allocator.free(png);
     writePng(path, png);
     return true;
 }
 
-/// Rewrite the unlinked PNG inherited by the fake remote daemon. Opening the
-/// broker's concrete proc path reaches the same inode every worker inherited,
-/// while the panel's logical `/proc/self/fd/900` remains process-relative.
+/// Rewrite the fake remote daemon's panel asset in place, so every name
+/// linked to its inode reads the new bytes.
 fn rewriteRemotePanelAsset(allocator: std.mem.Allocator, r: u8, g: u8, b: u8) bool {
-    const w: u32 = 160;
-    const h: u32 = 120;
-    const rgba = allocator.alloc(u8, w * h * 4) catch return false;
-    defer allocator.free(rgba);
-    var i: usize = 0;
-    while (i < rgba.len) : (i += 4) {
-        rgba[i] = r;
-        rgba[i + 1] = g;
-        rgba[i + 2] = b;
-        rgba[i + 3] = 0xff;
-    }
-    const png = @import("util/png.zig").encodeRgba(allocator, rgba, w, h) catch return false;
+    const png = solidPng(allocator, r, g, b) orelse return false;
     defer allocator.free(png);
-
-    var path_buf: [96]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/fd/{d}", .{ remote_mux_pid, REMOTE_PANEL_ASSET_FD }) catch
-        return false;
+    var path_buf: [600]u8 = undefined;
+    const path = remotePanelAssetFile(&path_buf, REMOTE_PANEL_ASSET_NAME) orelse return false;
     const file = c.fopen(path.ptr, "wb") orelse return false;
     const written = c.fwrite(png.ptr, 1, png.len, file) == png.len;
     const flushed = c.fflush(file) == 0;
@@ -15331,9 +15328,8 @@ fn rewriteRemotePanelAsset(allocator: std.mem.Allocator, r: u8, g: u8, b: u8) bo
 }
 
 fn resizeRemotePanelAsset(size: usize) bool {
-    var path_buf: [96]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/fd/{d}", .{ remote_mux_pid, REMOTE_PANEL_ASSET_FD }) catch
-        return false;
+    var path_buf: [600]u8 = undefined;
+    const path = remotePanelAssetFile(&path_buf, REMOTE_PANEL_ASSET_NAME) orelse return false;
     const fd = c.open(path.ptr, c.O_WRONLY | c.O_CLOEXEC);
     if (fd < 0) return false;
     defer _ = c.close(fd);
