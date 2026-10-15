@@ -16681,10 +16681,11 @@ fn wsConfig(buf: []u8, close_buttons: bool, font_size: u32) ?[]const u8 {
 
 fn wsMainWindow(app: *appdrive.App) ?u32 {
     _ = app.drainLive(500);
-    for (app.windows.items) |w| {
-        if (!w.popup) return w.id;
-    }
-    return null;
+    // Not the first non-popup in the list: that is swap-removed, so after
+    // an earlier stage closed a window it can be any leftover toplevel
+    // (rigwin.zig), not the one a stage's dialog lands on.
+    const w = rigwin.mainWindow(app) orelse return null;
+    return w.id;
 }
 
 fn wsAction(allocator: std.mem.Allocator, sock_path: [:0]const u8, name: []const u8, pane: ?u32) bool {
@@ -16872,8 +16873,13 @@ fn captureSaveStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]
     if (c.geteuid() != 0) {
         const pick = capturePicker(allocator, app, sock, 1) orelse return "capture: open denied picker";
         if (!capturePickPath(app, pick, denied)) return "capture: accept denied destination";
-        if (!viewerWaitOcr(allocator, app, main_win, "Could not save file", 12_000))
-            return "capture: failed save produced no visible error";
+        if (!viewerWaitOcr(allocator, app, main_win, "Could not save file", 12_000)) {
+            if (app.screenshotPng(main_win, 0, null, 0)) |shot| {
+                defer allocator.free(shot.png);
+                writePng("zig-out/smoke-e2e-capture-denied.png", shot.png);
+            } else |_| {}
+            return "capture: failed save produced no visible error (zig-out/smoke-e2e-capture-denied.png)";
+        }
         if (c.access(denied.ptr, c.F_OK) == 0) return "capture: unexpected file in read-only directory";
         app.pressKey(main_win, "Enter") catch return "capture: dismiss save error";
         _ = app.waitIdle(200, 4_000);
@@ -16885,9 +16891,18 @@ fn captureSaveStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]
     const pick = capturePicker(allocator, app, sock, 1) orelse return "capture: open successful picker";
     if (!capturePickPath(app, pick, good)) return "capture: accept successful destination";
     {
-        const bytes = readFileAlloc(allocator, good) orelse return "capture: PNG never written";
-        defer allocator.free(bytes);
-        if (!std.mem.startsWith(u8, bytes, "\x89PNG\r\n\x1a\n")) return "capture: output is not a PNG";
+        // The capture is rendered and written after the picker is gone
+        // (savebytes.zig, an atomic replace), so a single read right after
+        // the picker closed raced a slower build's write.
+        var bytes: ?[]u8 = null;
+        const deadline = clock.nowMs() + 10_000;
+        while (bytes == null and clock.nowMs() < deadline) {
+            bytes = readFileAlloc(allocator, good);
+            if (bytes == null) pumpFor(app, 100);
+        }
+        const png = bytes orelse return "capture: PNG never written";
+        defer allocator.free(png);
+        if (!std.mem.startsWith(u8, png, "\x89PNG\r\n\x1a\n")) return "capture: output is not a PNG";
     }
     // Accepting an old picker after a new pane is created must not capture
     // that new pane, including when its allocator reused the old address.
