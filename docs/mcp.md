@@ -2950,6 +2950,8 @@ Any program is a peer through `sketerm peer` (also `sketerm mcp peer`, and
   While it follows, a line `{"to":"Zenit","text":"...","reply_to":"m-..."}`
   on its stdin is sent from NAME (a second `send --name NAME` would find
   the name taken), answered with a `{"kind":"sent",...}` line.
+- `sketerm peer hub add|remove NAME`, `join HUB`, `leave`, `status`: set
+  up federation by editing config.conf ("Federation" below).
 
 `NAME` may come from `SKETERM_PEER_NAME`. With `--json` each item is one
 line, for a web server that spawns the follower and reads its stdout:
@@ -3004,6 +3006,18 @@ whose config says so; every other daemon is dialed by it, or calls in
   transport (SSH, UDP or Tor, as `sketerm mux <name>` would connect) and
   redials a dropped one after 2 s, doubling up to 60 s. Nothing is
   configured on the other hosts.
+- **Setup**: `sketerm peer hub add NAME [--host SSH_TARGET]` makes this
+  daemon the hub and links `[domain.NAME]` (setting `peer_hub = true`,
+  `peers = true` and `host`, default NAME; an existing `host` is kept
+  unless `--host` is given); `sketerm peer hub remove NAME` removes the
+  domain's `peers` and `peer_link` and keeps the rest of its section.
+  Both edit config.conf in place, every other line and comment kept, print
+  what changed (`already set up` when nothing did; `--dry-run` writes
+  nothing), and refuse a config that sets `peer_hub_domain`. The daemon
+  reads these keys only when it starts: restart it with no sessions
+  attached. `sketerm peer status` prints this host's role (hub, member or
+  off), its federated domains with their `peer_link`, and the daemon's
+  live link states (`peer_list` `hosts`).
 - **Addresses**: on the hub a remote peer is `<domain>/<name>`; on a
   linked host the hub's own peers are `<hub host name>/<name>` and the
   other linked hosts' are `<domain>/<name>`. A host's own name in an
@@ -3067,6 +3081,15 @@ exactly as on a hub-dialed link.
   [domain.archdev]
   host = archdev
   ```
+
+- **Setup**: on the member, `sketerm peer join archdev [--host
+  SSH_TARGET]` sets `peer_hub_domain = archdev` and `[domain.archdev]
+  host` (default the hub's name, an existing one kept) and prints the
+  line to run on the hub, `sketerm peer hub add aeor --inbound`, with
+  this host's name as its daemon announces it (`gethostname`, or
+  `SKETERM_MUX_PEER_HOST`). `sketerm peer leave` clears
+  `peer_hub_domain`. `join` refuses a config with `peer_hub = true`, and
+  `hub add` one with `peer_hub_domain`. Restart each daemon afterwards.
 
 - **Handshake**: the member sends `peer_member_hello` with its own host
   name; the hub accepts it only from a `[domain.<that host>] peers =

@@ -21,6 +21,22 @@ your own Agent subagents. Unit tests cover the merge cases and a temp-dir run
 through an injected `claude`; a manual run against a temp config dir with a stub
 `claude` on PATH showed the merge, then "already set up".
 
+## 2026-10-16: one-command peer federation setup
+
+`sketerm peer hub add NAME [--host T] [--inbound]`, `hub remove NAME`,
+`join HUB [--host T]`, `leave` and `status` set up federation without
+hand-editing config.conf. No writer kept the user's lines (`Config.save`
+regenerates the file), so `config_edit.zig` edits single keys in place
+through the parser's own line grammar (`ConfLine`, now shared with
+`parseInto`); every edit is re-parsed and refused when another line (a
+`[platform.*]` section) still overrides it. Hub and member stay exclusive,
+names go through `peeraddr.validHost`, hosts through the mux client's
+ssh-host check. `join` prints the `hub add <host> --inbound` line, with the
+host from `peeraddr.selfHost` (moved there from the daemon). The daemon reads
+these keys only at start, so each command says to restart it. Unit tests
+cover the edits on in-memory text; a temp `XDG_CONFIG_HOME` run checked the
+files.
+
 ## 2026-10-14: live input updates the recorded-motion origin
 
 The live pointer path paused idle drift without updating `View.motion_ptr`.
