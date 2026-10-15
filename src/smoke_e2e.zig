@@ -10462,7 +10462,12 @@ fn filesSelectionBugsStage(
     app.pressKey(child.win, "ctrl+i") catch return "files selection: ctrl+i failed";
     pumpRenameFor(app, 500);
     app.typeText(null, "ZA") catch return "files selection: typing the filter failed";
-    pumpRenameFor(app, 1_200);
+    // KEEPME leaving the listing is the filter having applied: ZAAROW
+    // already reads before it does, at the row it is about to leave.
+    if (!waitOcrCountIn(allocator, app, child.win, "KEEPME", 0, 0, 15_000)) {
+        viewerShot(allocator, app, child.win, "files-sel-nofilter");
+        return "files selection: the ZA filter never narrowed the listing";
+    }
     const zaa_row = ocrRowCenter(allocator, app, child.win, "ZAAROW", 10_000) orelse {
         viewerShot(allocator, app, child.win, "files-sel-nofilter");
         return "files selection: the filtered listing shows no ZAAROW row";
@@ -10494,7 +10499,6 @@ fn filesSelectionBugsStage(
     // listing, where Escape is the type-ahead reset. Toggling the
     // filter bar off is what clears the filter.
     app.pressKey(child.win, "ctrl+i") catch return "files selection: clearing the filter failed";
-    pumpRenameFor(app, 800);
     if (!viewerWaitOcr(allocator, app, child.win, "KEEPME", 15_000))
         return "files selection: the unfiltered listing never came back";
     const keep_row = ocrRowCenter(allocator, app, child.win, "KEEPME", 10_000) orelse
@@ -10506,7 +10510,12 @@ fn filesSelectionBugsStage(
     app.pressKey(child.win, "ctrl+i") catch return "files selection: ctrl+i failed";
     pumpRenameFor(app, 500);
     app.typeText(null, "KEEPME") catch return "files selection: typing the second filter failed";
-    pumpRenameFor(app, 1_500);
+    // TARGET, not DEEPER: the sidebar's Recent list can name DEEPER
+    // from an earlier stage, and a file never sits there.
+    if (!waitOcrCountIn(allocator, app, child.win, "TARGET", 0, 0, 15_000)) {
+        viewerShot(allocator, app, child.win, "files-sel-nokeep");
+        return "files selection: the KEEPME filter never narrowed the listing";
+    }
     const keep_only = ocrRowCenter(allocator, app, child.win, "KEEPME", 10_000) orelse {
         viewerShot(allocator, app, child.win, "files-sel-nokeep");
         return "files selection: the narrowed listing shows no KEEPME row";
@@ -10537,7 +10546,12 @@ fn filesSelectionBugsStage(
     // the link, so the dialog used to offer -- and grant -- rwxrwxrwx
     // on the target.
     app.pressKey(child.win, "ctrl+i") catch return "files selection: clearing the filter failed";
-    pumpRenameFor(app, 800);
+    // TARGET coming back is the bar having closed: a Ctrl+I that lands
+    // outside the face leaves the KEEPME filter, and the listing empty.
+    if (!waitOcrCountIn(allocator, app, child.win, "TARGET", 1, std.math.maxInt(usize), 40_000)) {
+        viewerShot(allocator, app, child.win, "files-sel-filterstuck");
+        return "files selection: Ctrl+I after the menu's Move to Trash did not clear the filter";
+    }
     // One OCR pass over this listing costs seconds, so a mid-repaint
     // frame can eat a short budget whole: settle first, then allow
     // several frames' worth of attempts.
@@ -10574,7 +10588,6 @@ fn filesSelectionBugsStage(
         viewerShot(allocator, app, link_menu, "files-sel-linkmenu");
         return "files selection: the link's menu has no Properties";
     }
-    pumpRenameFor(app, 2_500);
     const props_win = blk: {
         const deadline = clock.nowMs() + 15_000;
         while (clock.nowMs() < deadline) {
@@ -10611,10 +10624,14 @@ fn filesSelectionBugsStage(
     app.pressKey(child.win, "ctrl+c") catch return "files selection: ctrl+c failed";
     pumpRenameFor(app, 400);
     app.clickEx(child.win, nested_row.x, nested_row.y, 1, 60, 2) catch return "files selection: opening DEEPER failed";
-    pumpRenameFor(app, 2_500);
+    // The empty DEEPER has no TARGET row (Recent cannot be read for
+    // DEEPER itself: it may already list the folder).
+    if (!waitOcrCountIn(allocator, app, child.win, "TARGET", 0, 0, 15_000)) {
+        viewerShot(allocator, app, child.win, "files-sel-nodeeper");
+        return "files selection: double-clicking DEEPER did not open it";
+    }
     app.pressKey(child.win, "ctrl+v") catch return "files selection: ctrl+v failed";
-    pumpRenameFor(app, 4_000);
-    if (c.access(nested_twin.ptr, c.F_OK) == 0) {
+    if (waitPathState(nested_twin, true, 4_000, app)) {
         viewerShot(allocator, app, child.win, "files-sel-selfpaste");
         return "files selection: a folder pasted into itself copied into itself";
     }
@@ -10623,8 +10640,7 @@ fn filesSelectionBugsStage(
     // strip reported a failed operation. (The refusal sentence itself
     // is on the dim status line, which tesseract does not read at this
     // size -- the strip's own text is the legible half.)
-    pumpRenameFor(app, 3_000);
-    if ((ocrCount(allocator, app, child.win, "failed") orelse 0) != 0) {
+    if (waitOcrCountIn(allocator, app, child.win, "failed", 1, std.math.maxInt(usize), 3_000)) {
         viewerShot(allocator, app, child.win, "files-sel-selfpaste-msg");
         return "files selection: pasting a folder into itself still submitted a job that failed";
     }
