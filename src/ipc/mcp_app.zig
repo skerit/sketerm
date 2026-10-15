@@ -4865,21 +4865,6 @@ pub fn applyDebugWrap(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8)
 
 // ── Capabilities preflight ────────────────────────────────────────
 
-/// PATH search; arena-owned absolute path or null.
-pub fn findExecutable(arena: std.mem.Allocator, exe: []const u8) ?[]const u8 {
-    const path_env = c.getenv("PATH") orelse return null;
-    var it = std.mem.splitScalar(u8, std.mem.span(@as([*:0]const u8, @ptrCast(path_env))), ':');
-    while (it.next()) |dir| {
-        if (dir.len == 0) continue;
-        var buf: [4096]u8 = undefined;
-        const full_z = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, exe }) catch continue;
-        if (c.access(full_z.ptr, c.X_OK) == 0) {
-            return arena.dupe(u8, full_z) catch null;
-        }
-    }
-    return null;
-}
-
 /// Basename-prefix match for the Chromium family (incl. Electron).
 pub fn chromiumFamily(arg0: []const u8) bool {
     const base = std.fs.path.basename(arg0);

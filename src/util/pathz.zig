@@ -144,23 +144,37 @@ pub fn isDir(path: []const u8) bool {
     return c.stat(z.ptr, &st) == 0 and (st.st_mode & c.S_IFMT) == c.S_IFDIR;
 }
 
-/// Whether `name` resolves to an executable through `$PATH`.
+/// The executable `name` resolves to, NUL-terminated in `buf`: `name` itself when it contains a '/', otherwise
+/// the first `$PATH` entry holding it. Only a regular file passing X_OK counts; a searchable directory never does.
 ///
 /// Empty `$PATH` entries are SKIPPED rather than read as ".": every
 /// caller is probing for an optional helper binary, and picking one up
 /// out of the current directory is not what any of them mean.
-pub fn executableOnPath(name: []const u8) bool {
-    const path_env = c.getenv("PATH") orelse return false;
+pub fn findExecutable(buf: []u8, name: []const u8) ?[:0]const u8 {
+    if (name.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, name, '/') != null) {
+        const z = std.fmt.bufPrintZ(buf, "{s}", .{name}) catch return null;
+        return if (isExecutableFile(z)) z else null;
+    }
+    const path_env = c.getenv("PATH") orelse return null;
     var it = std.mem.splitScalar(u8, std.mem.span(@as([*:0]const u8, @ptrCast(path_env))), ':');
     while (it.next()) |dir| {
         if (dir.len == 0) continue;
-        var z: [4096:0]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&z, "{s}/{s}", .{ dir, name }) catch continue;
-        var st: c.struct_stat = undefined;
-        if (c.access(p.ptr, c.X_OK) == 0 and c.stat(p.ptr, &st) == 0 and
-            (st.st_mode & c.S_IFMT) == c.S_IFREG) return true;
+        const z = std.fmt.bufPrintZ(buf, "{s}/{s}", .{ dir, name }) catch continue;
+        if (isExecutableFile(z)) return z;
     }
-    return false;
+    return null;
+}
+
+fn isExecutableFile(z: [:0]const u8) bool {
+    var st: c.struct_stat = undefined;
+    return c.access(z.ptr, c.X_OK) == 0 and c.stat(z.ptr, &st) == 0 and (st.st_mode & c.S_IFMT) == c.S_IFREG;
+}
+
+/// Whether `name` resolves to an executable, by `findExecutable`'s rules.
+pub fn executableOnPath(name: []const u8) bool {
+    var buf: [4096]u8 = undefined;
+    return findExecutable(&buf, name) != null;
 }
 
 /// A `mkdtemp` scratch directory for tests, removed whole by `remove`.
@@ -328,7 +342,7 @@ test "isDir tells a directory from a file and a missing path" {
     try std.testing.expect(!isDir("/nonexistent-sketerm-path"));
 }
 
-test "executableOnPath finds a real binary and misses a made-up one" {
+test "findExecutable: PATH entries, direct paths, and never a directory" {
     var saved: @import("env.zig").Saved = .{};
     saved.take("PATH") catch return error.SkipZigTest;
     defer saved.restore();
@@ -348,6 +362,17 @@ test "executableOnPath finds a real binary and misses a made-up one" {
     try std.testing.expect(c.setenv("PATH", path_env.ptr, 1) == 0);
     try std.testing.expect(executableOnPath("sketerm-fake-tool"));
     try std.testing.expect(!executableOnPath("sketerm-no-such-tool"));
+    try std.testing.expect(!executableOnPath("/nonexistent/path/binary"));
+    try std.testing.expect(!executableOnPath(""));
+    var found: [4096]u8 = undefined;
+    try std.testing.expectEqualStrings(bin, findExecutable(&found, "sketerm-fake-tool").?);
+    // A name with a '/' is checked as given, never searched along PATH.
+    try std.testing.expectEqualStrings(bin, findExecutable(&found, bin).?);
+    try std.testing.expect(findExecutable(&found, "bin/sketerm-fake-tool") == null);
+    try std.testing.expect(findExecutable(&found, td.path()) == null);
+    // Too small a buffer for the joined path is a miss, not a truncated hit.
+    var tiny: [8]u8 = undefined;
+    try std.testing.expect(findExecutable(&tiny, "sketerm-fake-tool") == null);
 
     // Non-executable file on PATH is not a hit.
     try std.testing.expect(c.chmod(bin.ptr, 0o644) == 0);
@@ -357,6 +382,7 @@ test "executableOnPath finds a real binary and misses a made-up one" {
     try std.testing.expect(c.unlink(bin.ptr) == 0);
     try std.testing.expect(c.mkdir(bin.ptr, 0o755) == 0);
     try std.testing.expect(!executableOnPath("sketerm-fake-tool"));
+    try std.testing.expect(findExecutable(&found, bin) == null);
 
     // Empty PATH: nothing resolves, and "." is not consulted.
     try std.testing.expect(c.setenv("PATH", "", 1) == 0);

@@ -276,50 +276,11 @@ pub fn spawnSock(
     return .{ .pid = pid, .fd = pair[0], .err_fd = errp[0] };
 }
 
-/// Full path `command` resolves to, or null. Caller frees.
-pub fn resolveOnPath(alloc: std.mem.Allocator, command: []const u8) ?[]u8 {
-    if (command.len == 0) return null;
-    if (std.mem.indexOfScalar(u8, command, '/') != null) {
-        const z = alloc.dupeZ(u8, command) catch return null;
-        defer alloc.free(z);
-        if (c.access(z.ptr, c.X_OK) != 0) return null;
-        return alloc.dupe(u8, command) catch null;
-    }
-    const path = @import("../util/profile.zig").getenv("PATH") orelse return null;
-    var it = std.mem.tokenizeScalar(u8, path, ':');
-    while (it.next()) |dir| {
-        var buf: [4096]u8 = undefined;
-        const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, command }) catch continue;
-        if (c.access(full.ptr, c.X_OK) == 0) return alloc.dupe(u8, full) catch null;
-    }
-    return null;
-}
-
 /// `servers.ExistsFn` against this host's filesystem: does `<dir>/<name>` exist?
 pub fn rootMarkerExists(_: ?*anyopaque, dir: []const u8, name: []const u8) bool {
     var buf: [4096]u8 = undefined;
     const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, name }) catch return false;
     return c.access(full.ptr, c.F_OK) == 0;
-}
-
-/// Whether `command` resolves on PATH (or is an existing absolute
-/// path). Used to skip a server SILENTLY when it is not installed —
-/// the one place we can tell "not configured" from "not present".
-pub fn onPath(alloc: std.mem.Allocator, command: []const u8) bool {
-    if (command.len == 0) return false;
-    if (std.mem.indexOfScalar(u8, command, '/') != null) {
-        const z = alloc.dupeZ(u8, command) catch return false;
-        defer alloc.free(z);
-        return c.access(z.ptr, c.X_OK) == 0;
-    }
-    const path = @import("../util/profile.zig").getenv("PATH") orelse return false;
-    var it = std.mem.tokenizeScalar(u8, path, ':');
-    while (it.next()) |dir| {
-        var buf: [4096]u8 = undefined;
-        const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, command }) catch continue;
-        if (c.access(full.ptr, c.X_OK) == 0) return true;
-    }
-    return false;
 }
 
 // ======================================================================
@@ -335,13 +296,6 @@ test "proc: splitArgs tokenizes on whitespace" {
     try testing.expectEqual(@as(usize, 2), list.items.len);
     try testing.expectEqualStrings("--background-index", list.items[0]);
     try testing.expectEqualStrings("--log=error", list.items[1]);
-}
-
-test "proc: onPath finds a standard binary and rejects nonsense" {
-    try testing.expect(onPath(testing.allocator, "sh"));
-    try testing.expect(!onPath(testing.allocator, "sketerm-no-such-binary-xyz"));
-    try testing.expect(!onPath(testing.allocator, ""));
-    try testing.expect(!onPath(testing.allocator, "/nonexistent/path/binary"));
 }
 
 test "proc: spawn round-trips bytes through a child's stdio" {

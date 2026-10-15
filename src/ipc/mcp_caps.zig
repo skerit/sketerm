@@ -15,7 +15,7 @@ const Res = mcp.Res;
 const Tuning = mcp.Tuning;
 const UI_CAPABILITY_PROBE_MS = mcp_ui.UI_CAPABILITY_PROBE_MS;
 const UiTransport = mcp_ui.UiTransport;
-const findExecutable = mcp_app.findExecutable;
+const pathz = @import("../util/pathz.zig");
 const recDir = mcp_term.recDir;
 const run = mcp.run;
 const uiStoreScope = mcp_ui.uiStoreScope;
@@ -32,7 +32,8 @@ fn webHelperPath(arena: std.mem.Allocator) ?[]const u8 {
     if (@import("../web/findbin.zig").find(&buf)) |p| {
         return arena.dupe(u8, std.mem.span(p)) catch null;
     }
-    return findExecutable(arena, "sketerm-webengine");
+    if (pathz.findExecutable(&buf, "sketerm-webengine")) |p| return arena.dupe(u8, p) catch null;
+    return null;
 }
 
 /// The preflight: what this server can actually do right now. Facts
@@ -169,7 +170,6 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.text("app_read_text/app_wait_text need libtesseract — install tesseract + tesseract-data-eng on THIS machine");
     // Rootless X11 for app sessions is a daemon-host fact; the private
     // daemon runs on this host, so PATH here is the answer for it.
-    const pathz = @import("../util/pathz.zig");
     const xwl_ok = pathz.executableOnPath("Xwayland") and pathz.executableOnPath("xwayland-satellite");
     try res.fact("app_xwayland", xwl_ok);
     const webm_ok = @import("../util/videorec.zig").available;
@@ -440,8 +440,8 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     else
         try res.textf("web: {s} backend", .{web_backend});
 
-    try res.fact("ssh", findExecutable(arena, "ssh") != null);
-    try res.fact("scp", findExecutable(arena, "scp") != null);
+    try res.fact("ssh", pathz.executableOnPath("ssh"));
+    try res.fact("scp", pathz.executableOnPath("scp"));
     {
         var cfg = @import("../config.zig").Config.load(arena);
         defer cfg.deinit();
@@ -451,7 +451,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     try res.fact("ssh_connect_timeout_s", @import("../mux/sshroute.zig").CONNECT_TIMEOUT_SECS);
     try res.fact("scp_put_targets", @as(u32, mcp_term.MAX_TARGETS));
     try res.fact("file_sync", headless_terms);
-    try res.fact("file_sync_local_rsync", @import("../util/pathz.zig").executableOnPath("rsync"));
+    try res.fact("file_sync_local_rsync", pathz.executableOnPath("rsync"));
     try res.fact("mux_tor", true);
     try res.text("mux Tor transport: supported via tor:<ssh-alias>; forced SOCKS5 remote DNS, with no UDP or direct fallback");
     if (mcp_term.rec_state.enabled) {
@@ -538,7 +538,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     {
         const mcp_agent = @import("mcp_agent.zig");
         const agents_ok = mcp_agent.available();
-        const agent_ssh = agents_ok and findExecutable(arena, "ssh") != null;
+        const agent_ssh = agents_ok and pathz.executableOnPath("ssh");
         try res.fact("agents", agents_ok);
         try res.fact("agent_ssh", agent_ssh);
         try res.fact("agent_open_args_env", agents_ok);

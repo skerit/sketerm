@@ -63,18 +63,11 @@ pub const DebugJob = struct {
     }
 };
 
-/// First of `names` that resolves to an executable on PATH. Returns a
+/// First of `names` that resolves to an executable on PATH, by `pathz.findExecutable`'s rules. Returns a
 /// NUL-terminated absolute path in `buf`.
 fn whichBin(names: []const []const u8, buf: []u8) ?[:0]const u8 {
-    const path = c.getenv("PATH") orelse return null;
-    const path_s = std.mem.span(path);
     for (names) |name| {
-        var it = std.mem.splitScalar(u8, path_s, ':');
-        while (it.next()) |dir| {
-            if (dir.len == 0) continue;
-            const full = std.fmt.bufPrintZ(buf, "{s}/{s}", .{ dir, name }) catch continue;
-            if (c.access(full.ptr, c.X_OK) == 0) return full;
-        }
+        if (@import("../util/pathz.zig").findExecutable(buf, name)) |full| return full;
     }
     return null;
 }

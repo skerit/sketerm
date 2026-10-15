@@ -6498,7 +6498,7 @@ pub const Daemon = struct {
         }
         for (req.servers) |srv| {
             if (srv.command.len == 0) continue;
-            if (!lsp_proc.onPath(self.allocator, srv.command)) continue;
+            if (!pathz.executableOnPath(srv.command)) continue;
             const root = lsp_servers.findRoot(req.dir, srv.root_files, lsp_proc.rootMarkerExists, null);
             var argv: std.ArrayList([]const u8) = .empty;
             defer argv.deinit(self.allocator);

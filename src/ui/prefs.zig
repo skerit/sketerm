@@ -20,7 +20,6 @@ const config_mod = @import("../config.zig");
 const TabPosition = @import("../config.zig").TabPosition;
 const editor_theme = @import("../editor/theme.zig");
 const ecmd = @import("../editor/commands.zig");
-const lsp_proc = @import("../lsp/proc.zig");
 
 // Forward-declare the Window pointer type. We can't import window.zig
 // directly without creating a cycle, so we receive it as anyopaque and
@@ -1981,7 +1980,7 @@ fn buildLspGroup(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
         var title_z: [256]u8 = undefined;
         c.adw_preferences_group_set_title(@ptrCast(@alignCast(sub)), (markupEscape(&title_z, name) catch MARKUP_TOO_LONG).ptr);
         var desc: [256:0]u8 = undefined;
-        const installed = lsp_proc.onPath(ctx.allocator, srv.command);
+        const installed = @import("../util/pathz.zig").executableOnPath(srv.command);
         const d = std.fmt.bufPrintZ(&desc, "{s}  —  {s}", .{
             if (srv.languages.len > 0) srv.languages else "no languages",
             if (installed) "installed" else "not found on PATH",

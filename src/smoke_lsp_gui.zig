@@ -40,7 +40,7 @@ const unsetEnv = @import("util/env.zig").unset;
 const platform = @import("util/platform.zig");
 const appdrive = @import("ipc/appdrive.zig");
 const clock = @import("util/clock.zig");
-const proc = @import("lsp/proc.zig");
+const pathz = @import("util/pathz.zig");
 
 const TTL = "240";
 
@@ -276,9 +276,9 @@ const ZIG_BODY =
 /// coverage of the config's `init_options` pass-through.
 var ts_init_buf: [4400]u8 = undefined;
 
-fn tsInitOptions(allocator: std.mem.Allocator) []const u8 {
-    const full = proc.resolveOnPath(allocator, "typescript-language-server") orelse return "";
-    defer allocator.free(full);
+fn tsInitOptions() []const u8 {
+    var exe_buf: [4096]u8 = undefined;
+    const full = pathz.findExecutable(&exe_buf, "typescript-language-server") orelse return "";
     // <prefix>/node_modules/.bin/typescript-language-server
     //   -> <prefix>/node_modules/typescript/lib
     const bin_dir = std.fs.path.dirname(full) orelse return "";
@@ -329,7 +329,7 @@ const ZLS_BODY =
 /// Which server the rig drives: `SKETERM_SMOKE_LSP` forces one
 /// (ts|clangd|zls|stub|stub-utf8); otherwise the first installed real server
 /// wins, the scripted stub last.
-fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
+fn pickPlan(stub_path: []const u8) Plan {
     const forced: []const u8 = if (c.getenv("SKETERM_SMOKE_LSP")) |v| std.mem.span(v) else "";
     const want = struct {
         forced: []const u8,
@@ -340,12 +340,12 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
             return self.forced.len == 0;
         }
     }{ .forced = forced };
-    if (want.is("ts") or (want.auto() and proc.onPath(allocator, "typescript-language-server"))) {
+    if (want.is("ts") or (want.auto() and pathz.executableOnPath("typescript-language-server"))) {
         return .{
             .name = "tsserver",
             .command = "typescript-language-server",
             .args = "--stdio",
-            .init_options = tsInitOptions(allocator),
+            .init_options = tsInitOptions(),
             .languages = "typescript,typescriptreact,javascript,javascriptreact",
             .root_files = "tsconfig.json,package.json,.git",
             .file = "main.ts",
@@ -361,7 +361,7 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
             .real_server = true,
         };
     }
-    if (want.is("clangd") or (want.auto() and proc.onPath(allocator, "clangd"))) {
+    if (want.is("clangd") or (want.auto() and pathz.executableOnPath("clangd"))) {
         // Same command/args/root_files as the servers.zig BUILT-IN
         // definition, so a drift there fails here.
         return .{
@@ -385,7 +385,7 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
             .real_server = true,
         };
     }
-    if (want.is("zls") or (want.auto() and proc.onPath(allocator, "zls"))) {
+    if (want.is("zls") or (want.auto() and pathz.executableOnPath("zls"))) {
         return .{
             .name = "zls",
             .command = "zls",
@@ -702,7 +702,7 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
     _ = c.setenv("XDG_STATE_HOME", rt.ptr, 1);
     _ = unsetEnv("SKETERM_SOCKET");
     _ = unsetEnv("SKETERM_SSH");
-    defer @import("util/pathz.zig").removeTree(rt);
+    defer pathz.removeTree(rt);
     // Isolated XDG_CONFIG_HOME races pango/fontconfig into heap
     // corruption unless the cache is warmed first (memory:
     // isolated-xdg-fontconfig-crash).
@@ -715,7 +715,7 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
     var stub_buf: [4200]u8 = undefined;
     const stub_path = std.fmt.bufPrint(&stub_buf, "{s}/zig-out/bin/sketerm-lsp-stub", .{std.mem.span(cwd)}) catch
         return fail("stub path", .{});
-    const plan = pickPlan(allocator, stub_path);
+    const plan = pickPlan(stub_path);
     say("server: {s} ({s})", .{ plan.command, if (plan.real_server) "real" else "scripted stub" });
 
     // Project directory + document.

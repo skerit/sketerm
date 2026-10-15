@@ -629,8 +629,8 @@ pub const Manager = struct {
     }
 
     fn commandInstalled(ctx: ?*anyopaque, command: []const u8) bool {
-        const self = cast.userData(Manager, ctx);
-        return @import("../lsp/proc.zig").onPath(self.alloc, command);
+        _ = ctx;
+        return @import("../util/pathz.zig").executableOnPath(command);
     }
 
     /// `cn` finished initializing: open every document of this face that
