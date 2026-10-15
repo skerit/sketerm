@@ -19,6 +19,7 @@
 const std = @import("std");
 const c = @import("cbindings");
 const pathz = @import("pathz.zig");
+const xdg = @import("xdg.zig");
 
 pub const Error = error{ OpenFailed, ReadFailed, StreamTooLong, OutOfMemory };
 
@@ -49,6 +50,14 @@ pub fn cappedAlloc(allocator: std.mem.Allocator, path: []const u8, cap: usize) !
 /// `cappedAlloc` for callers with nothing to say about a failure.
 pub fn capped(allocator: std.mem.Allocator, path: []const u8, cap: usize) ?[]u8 {
     return cappedAlloc(allocator, path, cap) catch null;
+}
+
+/// A user config file `<xdg config dir>/<rel>`, read through `capped`.
+/// @return null when no config directory can be named, or the file is absent, unreadable or over `cap`.
+pub fn userConfig(allocator: std.mem.Allocator, rel: []const u8, cap: usize) ?[]u8 {
+    var buf: [4096]u8 = undefined;
+    const path = xdg.configPath(&buf, rel) orelse return null;
+    return capped(allocator, path, cap);
 }
 
 /// Whole file into memory via seek + one read.
@@ -177,6 +186,31 @@ test "cappedAlloc rejects excess bytes before allocating them" {
     const empty = try cappedAlloc(failing.allocator(), empty_path, 0);
     defer failing.allocator().free(empty);
     try t.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "userConfig reads under XDG_CONFIG_HOME, refuses over-cap files and a missing config dir" {
+    const env = @import("env.zig");
+    const td = pathz.TempDir.make("readfile-usercfg") orelse return error.SkipZigTest;
+    defer td.remove();
+    var dir_buf: [4096:0]u8 = undefined;
+    const dir = try std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm", .{td.path()});
+    try t.expect(c.mkdir(dir.ptr, 0o700) == 0);
+    var buf: [4096:0]u8 = undefined;
+    _ = try writeTemp(dir, "x.conf", "a = b\n", &buf);
+    var saved_cfg: env.Saved = .{};
+    try saved_cfg.override("XDG_CONFIG_HOME", td.pathZ());
+    defer saved_cfg.restore();
+    var saved_home: env.Saved = .{};
+    try saved_home.take("HOME");
+    defer saved_home.restore();
+
+    const got = userConfig(t.allocator, "x.conf", 64).?;
+    defer t.allocator.free(got);
+    try t.expectEqualStrings("a = b\n", got);
+    try t.expect(userConfig(t.allocator, "x.conf", 3) == null);
+    try t.expect(userConfig(t.allocator, "absent.conf", 64) == null);
+    _ = env.unset("XDG_CONFIG_HOME");
+    try t.expect(userConfig(t.allocator, "x.conf", 64) == null);
 }
 
 test "json: round-trips, ignores unknown fields, nulls on garbage" {

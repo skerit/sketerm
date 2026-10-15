@@ -26,8 +26,7 @@ const c = @import("../c.zig").c;
 const cast_play = @import("../mux/cast_play.zig");
 const globMatch = @import("../util/glob.zig").matchName;
 const paths = @import("paths.zig");
-const pathz = @import("../util/pathz.zig");
-const profile = @import("../util/profile.zig");
+const readfile = @import("../util/readfile.zig");
 const shellquote = @import("../util/shellquote.zig");
 
 pub const Output = enum { text, image };
@@ -107,28 +106,12 @@ fn builtinFor(name: []const u8) Handler {
     };
 }
 
-pub fn configPath(buf: []u8) ?[]const u8 {
-    if (profile.getenv("XDG_CONFIG_HOME")) |xc|
-        return std.fmt.bufPrint(buf, "{s}/sketerm/previewers.conf", .{xc}) catch null;
-    if (profile.getenv("HOME")) |home|
-        return std.fmt.bufPrint(buf, "{s}/.config/sketerm/previewers.conf", .{home}) catch null;
-    return null;
-}
-
 /// Load the user rules; an absent or unreadable file means "built-ins
 /// only", never an error the browser has to handle.
 pub fn load(allocator: std.mem.Allocator) Rules {
     var rules = Rules{ .arena = std.heap.ArenaAllocator.init(allocator) };
-    var path_buf: [4096]u8 = undefined;
-    const path = configPath(&path_buf) orelse return rules;
-    var z: [4096]u8 = undefined;
-    const pz = pathz.pathZ(&z, path) catch return rules;
-    const fp = c.fopen(pz, "rb") orelse return rules;
-    defer _ = c.fclose(fp);
-    var bytes: [64 * 1024]u8 = undefined;
-    const n = c.fread(&bytes, 1, bytes.len, fp);
-    if (n == 0) return rules;
-    rules.list = parse(rules.arena.allocator(), bytes[0..n]) catch &.{};
+    const bytes = readfile.userConfig(rules.arena.allocator(), "previewers.conf", 64 * 1024) orelse return rules;
+    rules.list = parse(rules.arena.allocator(), bytes) catch &.{};
     return rules;
 }
 

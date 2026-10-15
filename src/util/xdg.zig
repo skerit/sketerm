@@ -40,6 +40,14 @@ pub fn configDir(buf: []u8) ?[]const u8 {
     return null;
 }
 
+/// `<config dir>/<rel>` into `buf`.
+/// @return null when no config directory can be named or `buf` is too small.
+pub fn configPath(buf: []u8, rel: []const u8) ?[]const u8 {
+    var dir_buf: [4096]u8 = undefined;
+    const dir = configDir(&dir_buf) orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ dir, rel }) catch null;
+}
+
 /// The user's sketerm data directory (`$XDG_DATA_HOME/sketerm`, else
 /// `$HOME/.local/share/sketerm`), without a trailing slash.
 /// @return null when neither variable names a directory.
