@@ -5,8 +5,13 @@
 //! (`connectLocalAutostartAt(null)`): an isolated `XDG_RUNTIME_DIR` whose
 //! `sketerm/mux.sock` is a symlink to the rig socket, so no server can
 //! reach the user's own daemon. `prepare` runs before the rig forks its
-//! broker: the broker reads the mail TTL (`SKETERM_MUX_PEER_TTL_MS`) and
-//! its mailbox directory (`XDG_STATE_HOME`) when it starts.
+//! broker: the broker reads the mail TTL (`SKETERM_MUX_PEER_TTL_MS`), its
+//! mailbox directory (`XDG_STATE_HOME`) and its config (`XDG_CONFIG_HOME`,
+//! isolated so a developer's `peer_hub` never makes a rig broker dial)
+//! when it starts.
+//!
+//! `runFederation` is the phase 2 stage: two more isolated daemons, exec'd
+//! from the built sketerm-mux, one the hub, linked through a fake ssh.
 
 const std = @import("std");
 const c = @import("c.zig").c;
@@ -15,6 +20,7 @@ const daemon_peers = @import("mux/daemon_peers.zig");
 const nowMs = @import("util/clock.zig").nowMs;
 const atomicwrite = @import("util/atomicwrite.zig");
 const readfile = @import("util/readfile.zig");
+const envutil = @import("util/env.zig");
 const facts = @import("agent/facts.zig");
 
 fn fail(comptime msg: []const u8) noreturn {
@@ -54,6 +60,7 @@ pub fn prepare() void {
     mkdirOrFail(st);
     mkdirOrFail(cfg);
     _ = c.setenv("XDG_STATE_HOME", st.ptr, 1);
+    _ = c.setenv("XDG_CONFIG_HOME", cfg.ptr, 1);
     _ = c.setenv(daemon_peers.TTL_ENV, TTL_TEXT, 1);
     prepared = true;
 }
@@ -627,4 +634,237 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
     bob2.closeStdinWait();
     alice.closeStdinWait();
     std.debug.print("smoke: peers stage ok ({d} ms)\n", .{nowMs() - started});
+}
+
+// ── federation ───────────────────────────────────────────────────
+
+/// The federation daemons' mail TTL: past one link cut and redial, short
+/// enough to wait out.
+const FED_TTL_MS: i64 = 8_000;
+const FED_TTL_TEXT = "8000";
+/// The hub's name for the member host.
+const FED_DOMAIN = "fedbox";
+
+/// One isolated daemon's directories.
+const FedHost = struct {
+    rt: [:0]const u8,
+    st: [:0]const u8,
+    cfg: [:0]const u8,
+
+    fn make(arena: std.mem.Allocator, root: []const u8, name: []const u8) FedHost {
+        const base = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ root, name }, 0) catch fail("oom");
+        mkdirOrFail(base);
+        const h = FedHost{
+            .rt = std.fmt.allocPrintSentinel(arena, "{s}/rt", .{base}, 0) catch fail("oom"),
+            .st = std.fmt.allocPrintSentinel(arena, "{s}/st", .{base}, 0) catch fail("oom"),
+            .cfg = std.fmt.allocPrintSentinel(arena, "{s}/cfg", .{base}, 0) catch fail("oom"),
+        };
+        mkdirOrFail(h.rt);
+        mkdirOrFail(h.st);
+        mkdirOrFail(h.cfg);
+        mkdirOrFail(std.fmt.allocPrintSentinel(arena, "{s}/sketerm", .{h.cfg}, 0) catch fail("oom"));
+        return h;
+    }
+
+    fn env(self: *const FedHost, arena: std.mem.Allocator, name: [*:0]const u8) []const [2][*:0]const u8 {
+        const out = arena.alloc([2][*:0]const u8, 4) catch fail("oom");
+        out[0] = .{ "XDG_RUNTIME_DIR", self.rt.ptr };
+        out[1] = .{ "XDG_STATE_HOME", self.st.ptr };
+        out[2] = .{ "XDG_CONFIG_HOME", self.cfg.ptr };
+        out[3] = .{ "SKETERM_PEER_NAME", name };
+        return out;
+    }
+
+    fn server(self: *const FedHost, allocator: std.mem.Allocator, arena: std.mem.Allocator, exe: [*:0]const u8, name: [*:0]const u8) Mcp {
+        return Mcp.spawnWith(allocator, exe, .{ .extra = &.{"--no-record"}, .unset_env = &UNSET, .set_env = self.env(arena, name) });
+    }
+};
+
+/// Exec `mux_bin --broker` under `h`'s directories (and `ssh`, the fake
+/// ssh, when set); wait for its socket. @return its pid.
+fn startFedDaemon(arena: std.mem.Allocator, h: *const FedHost, mux_bin: [*:0]const u8, ssh: ?[*:0]const u8) c.pid_t {
+    const sock = std.fmt.allocPrintSentinel(arena, "{s}/sketerm/mux.sock", .{h.rt}, 0) catch fail("oom");
+    const pid = c.fork();
+    if (pid < 0) fail("fork a federation daemon");
+    if (pid == 0) {
+        for (UNSET) |k| _ = envutil.unset(k);
+        _ = c.setenv("XDG_RUNTIME_DIR", h.rt.ptr, 1);
+        _ = c.setenv("XDG_STATE_HOME", h.st.ptr, 1);
+        _ = c.setenv("XDG_CONFIG_HOME", h.cfg.ptr, 1);
+        _ = c.setenv(daemon_peers.TTL_ENV, FED_TTL_TEXT, 1);
+        if (ssh) |s| _ = c.setenv("SKETERM_SSH", s, 1) else _ = envutil.unset("SKETERM_SSH");
+        const argv = [_:null]?[*:0]const u8{ "sketerm-mux", "--broker", null };
+        _ = c.execv(mux_bin, @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    const deadline = nowMs() + 10_000;
+    while (c.access(sock.ptr, c.F_OK) != 0) {
+        if (nowMs() > deadline) fail("a federation daemon's socket never appeared");
+        _ = c.usleep(50_000);
+    }
+    return pid;
+}
+
+/// SIGTERM the daemon `pid` this stage started, reap it (SIGKILL after 10 s).
+fn stopFedDaemon(pid: c.pid_t) void {
+    _ = c.kill(pid, c.SIGTERM);
+    const deadline = nowMs() + 10_000;
+    var st: c_int = 0;
+    while (nowMs() < deadline) {
+        if (c.waitpid(pid, &st, c.WNOHANG) == pid) return;
+        _ = c.usleep(50_000);
+    }
+    _ = c.kill(pid, c.SIGKILL);
+    _ = c.waitpid(pid, &st, 0);
+}
+
+fn writeFileOrFail(path: [:0]const u8, body: []const u8, mode: c_uint) void {
+    atomicwrite.writeFile(path, body, 0o600) catch fail("write a federation file");
+    if (c.chmod(path.ptr, mode) != 0) fail("chmod a federation file");
+}
+
+/// Poll `m`'s peer_list until `address` is listed with `link` (null: any).
+fn awaitListed(m: *Mcp, arena: std.mem.Allocator, address: []const u8, link: ?[]const u8, budget_ms: i64, comptime what: []const u8) std.json.ObjectMap {
+    const deadline = nowMs() + budget_ms;
+    while (nowMs() < deadline) {
+        if (listed(m, arena, address, what)) |p| {
+            const l = if (p.get("link")) |v| v.string else "";
+            if (link == null or std.mem.eql(u8, l, link.?)) return p;
+        }
+        _ = c.usleep(200_000);
+    }
+    std.debug.print("{s}: {s} never listed (link {s})\n", .{ what, address, link orelse "any" });
+    fail(what ++ ": the federated peer never showed as expected");
+}
+
+/// Federation end to end: a hub daemon (`peer_hub`, `[domain.fedbox]
+/// peers = true`) dials a member daemon through a fake ssh that execs the
+/// real `sketerm-mux --proxy`; one MCP server on each side (plus a durable
+/// member name that left) exercise presence, mail both ways with reply
+/// routing, a cut link with mail queued in between, far refusals and TTL
+/// expiry across the link.
+pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
+    if (!prepared) fail("prepare() must run before the federation stage");
+    const started = nowMs();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const mux_bin: [*:0]const u8 = c.getenv("SKETERM_MUX_BIN") orelse fail("the rig must export SKETERM_MUX_BIN (the built sketerm-mux)");
+    const root = std.mem.sliceTo(&root_buf, 0);
+    const hub = FedHost.make(arena, root, "fh");
+    const mem = FedHost.make(arena, root, "fm");
+    var host_buf: [256]u8 = undefined;
+    if (c.gethostname(&host_buf, host_buf.len) != 0) fail("gethostname");
+    const hub_host = std.mem.sliceTo(&host_buf, 0);
+    if (std.mem.eql(u8, hub_host, FED_DOMAIN)) fail("this machine is called " ++ FED_DOMAIN ++ ", the stage's member domain");
+
+    // The fake ssh: refuses while `link-down` exists, else records its pid
+    // and becomes the member host's `sketerm-mux --proxy`.
+    const down = std.fmt.allocPrintSentinel(arena, "{s}/link-down", .{root}, 0) catch fail("oom");
+    const pid_file = std.fmt.allocPrint(arena, "{s}/link.pid", .{root}) catch fail("oom");
+    const ssh = std.fmt.allocPrintSentinel(arena, "{s}/fake-fed-ssh", .{root}, 0) catch fail("oom");
+    writeFileOrFail(ssh, std.fmt.allocPrint(arena,
+        \\#!/bin/sh
+        \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
+        \\[ -e '{s}' ] && exit 255
+        \\echo $$ > '{s}.tmp' && mv '{s}.tmp' '{s}'
+        \\export XDG_RUNTIME_DIR='{s}' XDG_STATE_HOME='{s}' XDG_CONFIG_HOME='{s}'
+        \\exec '{s}' --proxy
+        \\
+    , .{ down, pid_file, pid_file, pid_file, mem.rt, mem.st, mem.cfg, std.mem.span(mux_bin) }) catch fail("oom"), 0o700);
+    writeFileOrFail(std.fmt.allocPrintSentinel(arena, "{s}/sketerm/config.conf", .{hub.cfg}, 0) catch fail("oom"),
+        "peer_hub = true\n\n[domain." ++ FED_DOMAIN ++ "]\nhost = " ++ FED_DOMAIN ++ "\ntransport = ssh\npeers = true\n", 0o600);
+
+    const mem_pid = startFedDaemon(arena, &mem, mux_bin, null);
+    const hub_pid = startFedDaemon(arena, &hub, mux_bin, ssh.ptr);
+    const zed_on_mem = std.fmt.allocPrint(arena, "{s}/zed", .{hub_host}) catch fail("oom");
+    const mia_on_hub = FED_DOMAIN ++ "/mia";
+
+    // 1. mike registers on the member and leaves: a durable name there.
+    {
+        var mike = mem.server(allocator, arena, exe, "mike");
+        mike.initialize();
+        expectStr(registered(&mike, arena, "f1. mike"), "address", "mike", "f1. mike's address");
+        mike.closeStdinWait();
+    }
+    var zed = hub.server(allocator, arena, exe, "zed");
+    zed.initialize();
+    var mia = mem.server(allocator, arena, exe, "mia");
+    mia.initialize();
+    // 2. Each side's capabilities name its part; each lists the other's
+    //    peer under its host, via that host, link up.
+    expectStr(registered(&zed, arena, "f2. zed"), "federation", "hub", "f2. zed federation");
+    _ = registered(&mia, arena, "f2. mia");
+    {
+        const p = awaitListed(&zed, arena, mia_on_hub, "up", 60_000, "f2. zed lists mia");
+        expectStr(p, "via_host", FED_DOMAIN, "f2. via_host on the hub");
+        const q = awaitListed(&mia, arena, zed_on_mem, "up", 20_000, "f2. mia lists zed");
+        expectStr(q, "via_host", hub_host, "f2. via_host on the member");
+        const caps = call(&mia, arena, "capabilities", "{}", "f2. mia capabilities");
+        expectStr((caps.get("peers") orelse fail("f2. no peers")).object, "federation", "member", "f2. mia federation");
+    }
+    std.debug.print("smoke: peers: federation presence on both sides ok\n", .{});
+
+    // 3. mia -> zed: delivered; zed reads it from fedbox/mia and replies to
+    //    that address; mia reads the reply from <hub>/zed.
+    {
+        expectStr(send(&mia, arena, zed_on_mem, "ping across", "f3. send"), "outcome", "delivered", "f3. outcome");
+        const it = readOne(&zed, arena, 10_000, "f3. zed peer_read");
+        expectStr(it, "from", mia_on_hub, "f3. from");
+        expectStr(it, "text", "ping across", "f3. text");
+        contains(str(it, "content", "f3."), "Reply with peer_send to \"" ++ mia_on_hub ++ "\"", "f3. reply hint");
+        const args = std.fmt.allocPrint(arena, "{{\"to\":\"{s}\",\"text\":\"pong back\",\"reply_to\":\"{s}\"}}", .{ mia_on_hub, str(it, "id", "f3.") }) catch fail("oom");
+        expectStr(call(&zed, arena, "peer_send", args, "f3. reply"), "outcome", "delivered", "f3. reply outcome");
+        const back = readOne(&mia, arena, 10_000, "f3. mia peer_read");
+        expectStr(back, "from", zed_on_mem, "f3. reply from");
+        expectStr(back, "reply_to", str(it, "id", "f3."), "f3. reply_to");
+    }
+    std.debug.print("smoke: peers: federation mail both ways with reply routing ok\n", .{});
+
+    // 4. The link is cut (the fake ssh's proxy, by its exact pid) and kept
+    //    down: mia stays listed with link down; a send is queued
+    //    host_unreachable; restored, it arrives once.
+    {
+        writeFileOrFail(down, "", 0o600);
+        const pid_text = readfile.capped(arena, pid_file, 64) orelse fail("f4. the fake ssh left no pid");
+        const link_pid = std.fmt.parseInt(c.pid_t, std.mem.trim(u8, pid_text, " \n"), 10) catch fail("f4. the fake ssh pid is not a number");
+        if (c.kill(link_pid, c.SIGTERM) != 0) fail("f4. could not stop the link's proxy");
+        _ = awaitListed(&zed, arena, mia_on_hub, "down", 20_000, "f4. zed lists mia down");
+        const r = send(&zed, arena, mia_on_hub, "sent while the link was down", "f4. send");
+        expectStr(r, "outcome", "queued", "f4. outcome");
+        expectStr(r, "reason", "host_unreachable", "f4. reason");
+        if (c.unlink(down.ptr) != 0) fail("f4. could not restore the link");
+        const it = readOne(&mia, arena, 90_000, "f4. mia peer_read after the link is back");
+        expectStr(it, "text", "sent while the link was down", "f4. text");
+        expectStr(it, "from", zed_on_mem, "f4. from");
+        if (it.get("age_s") == null) fail("f4. the delivery has no age");
+        expectNothing(&mia, arena, "f4. delivered once");
+        _ = awaitListed(&zed, arena, mia_on_hub, "up", 20_000, "f4. zed lists mia up again");
+    }
+    std.debug.print("smoke: peers: federation link cut, queued, restored, delivered once ok\n", .{});
+
+    // 5. A name the member does not know: the far broker's refusal comes
+    //    back as the answer, both ways; an unknown host is refused on the hub.
+    expectRefused(&zed, arena, FED_DOMAIN ++ "/Nobody", "?", "unknown_address", "f5. unknown far name");
+    expectRefused(&mia, arena, "nohost/x", "?", "unknown_address", "f5. unknown host via the hub");
+    expectRefused(&zed, arena, "nohost/x", "?", "unknown_address", "f5. unknown host on the hub");
+
+    // 6. zed -> fedbox/mike (away): queued over there; past the TTL the
+    //    expiry event crosses back to zed.
+    {
+        const r = send(&zed, arena, FED_DOMAIN ++ "/mike", "you will not read this", "f6. send");
+        expectStr(r, "outcome", "queued", "f6. outcome");
+        const sent_at = nowMs();
+        const ev = readOne(&zed, arena, FED_TTL_MS + daemon_peers.SWEEP_EVERY_MS + 10_000, "f6. zed's expiry event");
+        if (nowMs() - sent_at < FED_TTL_MS - 500) fail("f6. the expiry came before the TTL");
+        expectStr(ev, "outcome", "expired", "f6. event outcome");
+        expectStr(ev, "to", FED_DOMAIN ++ "/mike", "f6. event to");
+    }
+    std.debug.print("smoke: peers: federation TTL expiry reaches the sender across the link ok\n", .{});
+
+    mia.closeStdinWait();
+    zed.closeStdinWait();
+    stopFedDaemon(hub_pid);
+    stopFedDaemon(mem_pid);
+    std.debug.print("smoke: peers federation stage ok ({d} ms)\n", .{nowMs() - started});
 }

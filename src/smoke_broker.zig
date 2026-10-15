@@ -421,6 +421,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // Peer messaging between real MCP servers (shared stage, also run by
     // smoke-mux).
     @import("smoke_peers.zig").run(allocator, sock_path, mcp_bin);
+    // Peer federation: two more isolated daemons, a hub and a member.
+    @import("smoke_peers.zig").runFederation(allocator, mcp_bin);
 
     // ── clean shutdown ──
     //
