@@ -2620,6 +2620,21 @@ fn webViewIds(resp: []const u8, pane: u32, out: []u32) usize {
     return n;
 }
 
+/// Poll `web-list` until `pane` shows `view`. A seat key and the IPC that
+/// reads its effect are separate channels, so one read after a quiet
+/// window raced a key still queued under load.
+fn waitActiveWebView(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, pane: u32, view: u32, timeout_ms: i64) bool {
+    const deadline = clock.nowMs() + timeout_ms;
+    while (true) {
+        if (roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n")) |r| {
+            defer allocator.free(r);
+            if (activeWebView(r, pane) == view) return true;
+        }
+        if (clock.nowMs() >= deadline) return false;
+        pumpFor(app, 200);
+    }
+}
+
 /// The view id of the page `pane` is SHOWING — the row that reports
 /// `"visible":true`. 0 when the reply names none.
 fn activeWebView(resp: []const u8, pane: u32) u32 {
@@ -2935,13 +2950,19 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     if (roundtrip(allocator, sock_path, initial_web_focus)) |r| allocator.free(r) else return "web focus roundtrip failed before the closed-sidebar tree check";
     _ = app.waitIdle(200, 4_000);
     app.pressKey(null, tree_prev_key) catch return "injecting tab_tree_prev failed with the sidebar closed";
-    _ = app.waitIdle(300, 5_000);
     {
-        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
-            return "list roundtrip failed after the closed-sidebar tree step";
-        defer allocator.free(r);
-        if (selectedTabFirstPane(r) == closed_tab)
-            return "with the sidebar closed, tab_tree_prev did not step through WINDOW tabs";
+        // Polled, as `waitActiveWebView`: the key and this read are
+        // separate channels.
+        const deadline = clock.nowMs() + 10_000;
+        while (true) {
+            const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+                return "list roundtrip failed after the closed-sidebar tree step";
+            defer allocator.free(r);
+            if (selectedTabFirstPane(r) != closed_tab) break;
+            if (clock.nowMs() >= deadline)
+                return "with the sidebar closed, tab_tree_prev did not step through WINDOW tabs";
+            pumpFor(app, 200);
+        }
     }
     {
         const r = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse
@@ -3052,14 +3073,8 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
 
     // Stepping the tree must move the PAGE...
     app.pressKey(null, tree_prev_key) catch return "injecting tab_tree_prev failed";
-    _ = app.waitIdle(300, 5_000);
-    {
-        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse
-            return "web-list roundtrip failed after tab_tree_prev";
-        defer allocator.free(r);
-        if (activeWebView(r, web_pane) != parent_view)
-            return "tab_tree_prev did not step to the other PAGE of the browser";
-    }
+    if (!waitActiveWebView(allocator, app, sock_path, web_pane, parent_view, 10_000))
+        return "tab_tree_prev did not step to the other PAGE of the browser";
     // ...and must NOT have moved the window's tab selection.
     {
         const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
@@ -3089,11 +3104,7 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         app.click(win_id, chip.x, chip.y, 1) catch return "clicking the selected sidebar row failed";
         _ = app.waitIdle(200, 4_000);
         app.pressKey(null, tree_next_key) catch return "injecting tab_tree_next from a focused sidebar row failed";
-        _ = app.waitIdle(300, 5_000);
-        const r2 = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse
-            return "web-list roundtrip failed after expand";
-        defer allocator.free(r2);
-        if (activeWebView(r2, web_pane) != child_view)
+        if (!waitActiveWebView(allocator, app, sock_path, web_pane, child_view, 10_000))
             return "expanding did not make the child page reachable again";
     }
 
