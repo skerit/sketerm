@@ -7854,7 +7854,7 @@ fn viewerWaitOcr(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, 
             for ([_]i32{ 6, 11 }) |psm| {
                 const res = ocr.recognize(arena.allocator(), px, shot.w * scale, shot.h * scale, .{ .psm = psm }) catch continue;
                 if (res.text.len > recognized.len) recognized = res.text;
-                if (std.mem.indexOf(u8, res.text, needle) != null) {
+                if (ocr.shows(res.text, needle)) {
                     found = true;
                     break :outer;
                 }
@@ -7862,10 +7862,11 @@ fn viewerWaitOcr(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, 
         }
         if (found) return true;
         const res = .{ .text = recognized };
-        // Failure forensics: the last round before the deadline keeps
-        // what was actually on screen, so "the OCR never saw X" can be
-        // told apart from "the window showed something else".
-        if (clock.nowMs() + 300 >= deadline) {
+        // Failure forensics: a round that ends past the deadline is the
+        // last, and keeps what was actually on screen, so "the OCR never
+        // saw X" can be told apart from "the window showed something
+        // else". A round can take seconds, so no margin predicts it.
+        if (clock.nowMs() >= deadline) {
             const n = @min(res.text.len, 400);
             _ = c.fprintf(platform.stderr(), "smoke-e2e: OCR timed out on '%.*s'; recognized: [%.*s]\n", @as(c_int, @intCast(needle.len)), needle.ptr, @as(c_int, @intCast(n)), res.text.ptr);
             // Dump the EXACT buffer handed to tesseract. Comparing it

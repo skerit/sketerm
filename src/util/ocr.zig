@@ -56,6 +56,28 @@ pub const Options = struct {
 // and the same frame inverted reads "- -". Both through the same
 // tesseract build, the pixels otherwise identical.
 
+/// Whether recognized `text` shows `needle`, spacing aside: tesseract
+/// drops and invents spaces in small UI fonts (a Files strip's "Trashed
+/// 1 item" reads as "Trashed 1item" at 1x and 2x, in both page modes).
+pub fn shows(text: []const u8, needle: []const u8) bool {
+    for (0..text.len) |start| {
+        var t = start;
+        var n: usize = 0;
+        while (n < needle.len) {
+            if (std.ascii.isWhitespace(needle[n])) {
+                n += 1;
+                continue;
+            }
+            while (t < text.len and std.ascii.isWhitespace(text[t])) t += 1;
+            if (t >= text.len or text[t] != needle[n]) break;
+            t += 1;
+            n += 1;
+        }
+        if (n == needle.len) return true;
+    }
+    return false;
+}
+
 /// Mean luma (0..255, Rec. 601) of a tightly packed RGBA image,
 /// sampled on a stride so a 4K window costs a fraction of a frame.
 /// Unlike `toGray` this IGNORES alpha, so a frame with transparent
@@ -430,6 +452,13 @@ test "recognize reads synthetic rendered text (skips without tesseract)" {
     defer res.deinit(a);
     // Blocky strokes OCR loosely; just require an H to have been seen.
     try std.testing.expect(std.mem.indexOfScalar(u8, res.text, 'H') != null);
+}
+
+test "shows ignores the spacing OCR gets wrong, nothing else" {
+    try std.testing.expect(shows("O Trashed 1item -", "Trashed 1 item"));
+    try std.testing.expect(shows("Tras hed 1 item", "Trashed 1 item"));
+    try std.testing.expect(!shows("O Trashed Titem", "Trashed 1 item"));
+    try std.testing.expect(!shows("Trashed", "Trashed 1 item"));
 }
 
 test "meanLuma separates a dark page from a light one" {
