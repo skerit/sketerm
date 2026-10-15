@@ -5,6 +5,7 @@
 //! keymap. US-QWERTY only; non-ASCII needs the clipboard-paste path.
 
 const std = @import("std");
+const keychord = @import("../util/keychord.zig");
 
 /// xkb modifier mask bits under the pc105 keymaps.
 pub const Mods = struct {
@@ -96,39 +97,43 @@ pub fn charKey(ch: u8) ?Key {
     };
 }
 
-const named = [_]struct { name: []const u8, code: u32 }{
-    .{ .name = "enter", .code = KEY_ENTER },
-    .{ .name = "return", .code = KEY_ENTER },
-    .{ .name = "tab", .code = 15 },
-    .{ .name = "escape", .code = KEY_ESC },
-    .{ .name = "esc", .code = KEY_ESC },
-    .{ .name = "backspace", .code = 14 },
-    .{ .name = "space", .code = KEY_SPACE },
-    .{ .name = "up", .code = 103 },
-    .{ .name = "down", .code = 108 },
-    .{ .name = "left", .code = 105 },
-    .{ .name = "right", .code = 106 },
-    .{ .name = "home", .code = 102 },
-    .{ .name = "end", .code = 107 },
-    .{ .name = "pageup", .code = 104 },
-    .{ .name = "pagedown", .code = 109 },
-    .{ .name = "insert", .code = 110 },
-    .{ .name = "delete", .code = 111 },
-    .{ .name = "menu", .code = 127 },
-};
-
-/// Non-character key by name (lowercase); f1..f12 included.
-pub fn namedKey(name: []const u8) ?u32 {
-    for (named) |n| {
-        if (std.mem.eql(u8, n.name, name)) return n.code;
-    }
-    if (name.len >= 2 and name.len <= 3 and name[0] == 'f') {
-        const num = std.fmt.parseInt(u8, name[1..], 10) catch return null;
-        if (num >= 1 and num <= 10) return 59 + @as(u32, num) - 1;
-        if (num == 11) return 87;
-        if (num == 12) return 88;
-    }
-    return null;
+/// The evdev keycode of a named key; f1..f10 are contiguous, f11/f12 are not.
+fn namedCode(n: keychord.Named) u32 {
+    return switch (n) {
+        .enter => KEY_ENTER,
+        .tab => 15,
+        .escape => KEY_ESC,
+        .backspace => 14,
+        .space => KEY_SPACE,
+        .delete => 111,
+        .insert => 110,
+        .home => 102,
+        .end => 107,
+        .page_up => 104,
+        .page_down => 109,
+        .up => 103,
+        .down => 108,
+        .left => 105,
+        .right => 106,
+        .menu => 127,
+        .caps_lock => 58,
+        .shift => KEY_LEFTSHIFT,
+        .ctrl => KEY_LEFTCTRL,
+        .alt => KEY_LEFTALT,
+        .super => KEY_LEFTMETA,
+        .f1 => 59,
+        .f2 => 60,
+        .f3 => 61,
+        .f4 => 62,
+        .f5 => 63,
+        .f6 => 64,
+        .f7 => 65,
+        .f8 => 66,
+        .f9 => 67,
+        .f10 => 68,
+        .f11 => 87,
+        .f12 => 88,
+    };
 }
 
 pub const Chord = struct {
@@ -139,40 +144,27 @@ pub const Chord = struct {
     ch: ?u8 = null,
 };
 
-/// "ctrl+shift+t", "alt+F4", "enter", "ctrl+c" → mods + evdev key.
+/// "ctrl+shift+t", "alt+F4", "enter", "ctrl+c" → mods + evdev key, per util/keychord.zig's grammar.
+/// Only a US-QWERTY ASCII character is a character key here.
 pub fn parseChord(spec: []const u8) ?Chord {
+    const parsed = keychord.parse(spec) catch return null;
     var mods = Mods{};
-    var it = std.mem.splitScalar(u8, spec, '+');
-    var last: ?[]const u8 = null;
-    while (it.next()) |part| {
-        var lower_buf: [24]u8 = undefined;
-        if (part.len == 0 or part.len > lower_buf.len) return null;
-        const lower = std.ascii.lowerString(&lower_buf, part);
-        if (std.mem.eql(u8, lower, "ctrl") or std.mem.eql(u8, lower, "control")) {
-            mods.ctrl = true;
-        } else if (std.mem.eql(u8, lower, "alt") or std.mem.eql(u8, lower, "meta") or std.mem.eql(u8, lower, "option")) {
-            mods.alt = true;
-        } else if (std.mem.eql(u8, lower, "shift")) {
-            mods.shift = true;
-        } else if (std.mem.eql(u8, lower, "super") or std.mem.eql(u8, lower, "cmd") or std.mem.eql(u8, lower, "win")) {
-            mods.super = true;
-        } else {
-            if (last != null) return null; // two non-modifier parts
-            last = part;
-        }
+    var it = parsed.mods.iterator();
+    while (it.next()) |m| switch (m) {
+        .shift => mods.shift = true,
+        .ctrl => mods.ctrl = true,
+        .alt => mods.alt = true,
+        .super => mods.super = true,
+    };
+    switch (parsed.key) {
+        .named => |n| return .{ .mods = mods, .key = .{ .code = namedCode(n) } },
+        .char => |text| {
+            if (text.len != 1) return null;
+            const k = charKey(text[0]) orelse return null;
+            if (k.shift) mods.shift = true;
+            return .{ .mods = mods, .key = .{ .code = k.code }, .ch = text[0] };
+        },
     }
-    const key_part = last orelse return null;
-    var lower_buf: [24]u8 = undefined;
-    if (key_part.len > lower_buf.len) return null;
-    const lower = std.ascii.lowerString(&lower_buf, key_part);
-    if (namedKey(lower)) |code| return .{ .mods = mods, .key = .{ .code = code } };
-    if (key_part.len == 1) {
-        const k = charKey(key_part[0]) orelse return null;
-        var m = mods;
-        if (k.shift) m.shift = true;
-        return .{ .mods = m, .key = .{ .code = k.code }, .ch = key_part[0] };
-    }
-    return null;
 }
 
 // ─── tests ──────────────────────────────────────────────────────
@@ -206,4 +198,19 @@ test "parseChord handles modifiers, named keys and case" {
     try t.expect(parseChord("ctrl+") == null);
     try t.expect(parseChord("ctrl+a+b") == null);
     try t.expectEqual(@as(u32, 1 | 4), parseChord("ctrl+shift+t").?.mods.bits());
+
+    // Both page-key spellings, meta as Super, and a literal plus.
+    try t.expectEqual(@as(u32, 104), parseChord("pgup").?.key.code);
+    try t.expectEqual(@as(u32, 104), parseChord("page_up").?.key.code);
+    try t.expectEqual(@as(u32, 109), parseChord("PgDn").?.key.code);
+    try t.expectEqual(@as(u32, 64), parseChord("meta+t").?.mods.bits());
+    try t.expectEqual(@as(u32, 8), parseChord("option+t").?.mods.bits());
+    const plus = parseChord("ctrl++").?;
+    try t.expectEqual(@as(u32, 13), plus.key.code);
+    try t.expect(plus.mods.ctrl and plus.mods.shift);
+    try t.expectEqual(@as(?u8, '+'), plus.ch);
+    try t.expectEqual(@as(u32, 13), parseChord("+").?.key.code);
+    // A modifier alone is its own key.
+    try t.expectEqual(KEY_LEFTMETA, parseChord("super").?.key.code);
+    try t.expect(parseChord("\xc3\xa9") == null);
 }

@@ -3,36 +3,30 @@
 //! sequences; kitty-keyboard-protocol apps still see the legacy
 //! encoding (fine for driving CLIs/TUIs remotely).
 //!
-//! Chord grammar: `[mod+]*key`, mods `ctrl`/`alt`/`shift` (aliases
-//! `control`, `meta`, `c`, `a`, `m`, `s`). Keys: named specials
-//! (enter, tab, escape, up, f1..f12, …) or a single literal
-//! character. A chord string holds whitespace-separated chords:
-//! "ctrl+c up up enter".
+//! Names and grammar are util/keychord.zig's. Super (`meta`, `cmd`)
+//! rides only the CSI forms (modifier bit 8, as xterm and kitty
+//! number it); a chord the legacy encoding has no bytes for is
+//! refused with UnsupportedModifier rather than sent without it.
 
 const std = @import("std");
+const keychord = @import("../util/keychord.zig");
 
-pub const Error = error{ UnknownKey, OutOfMemory };
+pub const Error = keychord.Error || error{ UnsupportedModifier, OutOfMemory };
 
-const Mods = struct {
-    ctrl: bool = false,
-    alt: bool = false,
-    shift: bool = false,
+/// xterm modifier parameter: 1 + shift(1) + alt(2) + ctrl(4) + super(8).
+fn modParam(mods: keychord.Mods) u8 {
+    var p: u8 = 1;
+    var it = mods.iterator();
+    while (it.next()) |m| p += switch (m) {
+        .shift => 1,
+        .alt => 2,
+        .ctrl => 4,
+        .super => 8,
+    };
+    return p;
+}
 
-    /// xterm modifier parameter: 1 + shift(1) + alt(2) + ctrl(4).
-    fn param(self: Mods) u8 {
-        var p: u8 = 1;
-        if (self.shift) p += 1;
-        if (self.alt) p += 2;
-        if (self.ctrl) p += 4;
-        return p;
-    }
-
-    fn any(self: Mods) bool {
-        return self.ctrl or self.alt or self.shift;
-    }
-};
-
-/// CSI-encoded special key: `esc [ <num> ~` style (`tilde` set) or
+/// CSI-encoded special key: `esc [ <num> ~` style (`num` set) or
 /// `esc [ 1 ; m <letter>` / `esc O <letter>` style.
 const Special = struct {
     /// Final letter for letter-form keys ('A' for up), 0 for tilde-form.
@@ -45,127 +39,35 @@ const Special = struct {
     always_ss3: bool = false,
 };
 
-fn specialFor(name: []const u8) ?Special {
-    const eql = std.ascii.eqlIgnoreCase;
-    if (eql(name, "up")) return .{ .letter = 'A', .ss3_in_app = true };
-    if (eql(name, "down")) return .{ .letter = 'B', .ss3_in_app = true };
-    if (eql(name, "right")) return .{ .letter = 'C', .ss3_in_app = true };
-    if (eql(name, "left")) return .{ .letter = 'D', .ss3_in_app = true };
-    if (eql(name, "home")) return .{ .letter = 'H', .ss3_in_app = true };
-    if (eql(name, "end")) return .{ .letter = 'F', .ss3_in_app = true };
-    if (eql(name, "insert")) return .{ .num = 2 };
-    if (eql(name, "delete") or eql(name, "del")) return .{ .num = 3 };
-    if (eql(name, "pageup") or eql(name, "pgup")) return .{ .num = 5 };
-    if (eql(name, "pagedown") or eql(name, "pgdn")) return .{ .num = 6 };
-    if (eql(name, "f1")) return .{ .letter = 'P', .always_ss3 = true };
-    if (eql(name, "f2")) return .{ .letter = 'Q', .always_ss3 = true };
-    if (eql(name, "f3")) return .{ .letter = 'R', .always_ss3 = true };
-    if (eql(name, "f4")) return .{ .letter = 'S', .always_ss3 = true };
-    if (eql(name, "f5")) return .{ .num = 15 };
-    if (eql(name, "f6")) return .{ .num = 17 };
-    if (eql(name, "f7")) return .{ .num = 18 };
-    if (eql(name, "f8")) return .{ .num = 19 };
-    if (eql(name, "f9")) return .{ .num = 20 };
-    if (eql(name, "f10")) return .{ .num = 21 };
-    if (eql(name, "f11")) return .{ .num = 23 };
-    if (eql(name, "f12")) return .{ .num = 24 };
-    return null;
+/// One byte, Alt as an ESC prefix; Shift and Ctrl have no legacy form here and are dropped.
+fn plain(out: *std.ArrayList(u8), allocator: std.mem.Allocator, mods: keychord.Mods, byte: u8) Error!void {
+    if (mods.contains(.super)) return Error.UnsupportedModifier;
+    if (mods.contains(.alt)) try out.append(allocator, 0x1b);
+    try out.append(allocator, byte);
 }
 
-fn isMod(seg: []const u8, out: *Mods) bool {
-    const eql = std.ascii.eqlIgnoreCase;
-    if (eql(seg, "ctrl") or eql(seg, "control") or eql(seg, "c")) {
-        out.ctrl = true;
-        return true;
-    }
-    if (eql(seg, "alt") or eql(seg, "meta") or eql(seg, "m") or eql(seg, "a")) {
-        out.alt = true;
-        return true;
-    }
-    if (eql(seg, "shift") or eql(seg, "s")) {
-        out.shift = true;
-        return true;
-    }
-    return false;
+fn special(out: *std.ArrayList(u8), allocator: std.mem.Allocator, mods: keychord.Mods, sp: Special, app_cursor: bool) Error!void {
+    var buf: [16]u8 = undefined;
+    const any = mods.count() != 0;
+    const s = blk: {
+        if (sp.num != 0) {
+            // Tilde form: esc [ <num> [;mod] ~
+            if (any) break :blk std.fmt.bufPrint(&buf, "\x1b[{d};{d}~", .{ sp.num, modParam(mods) }) catch unreachable;
+            break :blk std.fmt.bufPrint(&buf, "\x1b[{d}~", .{sp.num}) catch unreachable;
+        }
+        // Modified letter form is always CSI 1;m<letter>.
+        if (any) break :blk std.fmt.bufPrint(&buf, "\x1b[1;{d}{c}", .{ modParam(mods), sp.letter }) catch unreachable;
+        if (sp.always_ss3 or (sp.ss3_in_app and app_cursor))
+            break :blk std.fmt.bufPrint(&buf, "\x1bO{c}", .{sp.letter}) catch unreachable;
+        break :blk std.fmt.bufPrint(&buf, "\x1b[{c}", .{sp.letter}) catch unreachable;
+    };
+    try out.appendSlice(allocator, s);
 }
 
-/// Encode one chord ("ctrl+c", "enter", "shift+tab") into `out`.
-pub fn encodeChord(out: *std.ArrayList(u8), allocator: std.mem.Allocator, chord: []const u8, app_cursor: bool) Error!void {
-    var mods: Mods = .{};
-    var key: []const u8 = chord;
-
-    // Peel `mod+` prefixes. A trailing '+' after a mod means the key
-    // IS '+' ("ctrl++"); a bare "+" chord is the literal plus key.
-    while (std.mem.indexOfScalar(u8, key, '+')) |plus| {
-        if (plus == 0 or plus == key.len - 1) break; // literal-plus forms
-        if (!isMod(key[0..plus], &mods)) break; // "some+thing" that isn't a mod
-        key = key[plus + 1 ..];
-    }
-    if (key.len == 0) return Error.UnknownKey;
-
-    const eql = std.ascii.eqlIgnoreCase;
-
-    // Simple named keys (modifier-insensitive forms first).
-    if (eql(key, "enter") or eql(key, "return") or eql(key, "cr")) {
-        if (mods.alt) try out.append(allocator, 0x1b);
-        try out.append(allocator, '\r');
-        return;
-    }
-    if (eql(key, "escape") or eql(key, "esc")) {
-        if (mods.alt) try out.append(allocator, 0x1b);
-        try out.append(allocator, 0x1b);
-        return;
-    }
-    if (eql(key, "tab")) {
-        if (mods.shift) {
-            try out.appendSlice(allocator, "\x1b[Z");
-        } else {
-            if (mods.alt) try out.append(allocator, 0x1b);
-            try out.append(allocator, '\t');
-        }
-        return;
-    }
-    if (eql(key, "space")) {
-        if (mods.ctrl) {
-            // Ctrl+Space = NUL.
-            if (mods.alt) try out.append(allocator, 0x1b);
-            try out.append(allocator, 0x00);
-        } else {
-            if (mods.alt) try out.append(allocator, 0x1b);
-            try out.append(allocator, ' ');
-        }
-        return;
-    }
-    if (eql(key, "backspace") or eql(key, "bs")) {
-        if (mods.alt) try out.append(allocator, 0x1b);
-        try out.append(allocator, 0x7f);
-        return;
-    }
-
-    if (specialFor(key)) |sp| {
-        var buf: [16]u8 = undefined;
-        const s = blk: {
-            if (sp.num != 0) {
-                // Tilde form: esc [ <num> [;mod] ~
-                if (mods.any())
-                    break :blk std.fmt.bufPrint(&buf, "\x1b[{d};{d}~", .{ sp.num, mods.param() }) catch unreachable;
-                break :blk std.fmt.bufPrint(&buf, "\x1b[{d}~", .{sp.num}) catch unreachable;
-            }
-            // Modified letter form is always CSI 1;m<letter>.
-            if (mods.any())
-                break :blk std.fmt.bufPrint(&buf, "\x1b[1;{d}{c}", .{ mods.param(), sp.letter }) catch unreachable;
-            if (sp.always_ss3 or (sp.ss3_in_app and app_cursor))
-                break :blk std.fmt.bufPrint(&buf, "\x1bO{c}", .{sp.letter}) catch unreachable;
-            break :blk std.fmt.bufPrint(&buf, "\x1b[{c}", .{sp.letter}) catch unreachable;
-        };
-        try out.appendSlice(allocator, s);
-        return;
-    }
-
-    // Literal single character (possibly multi-byte UTF-8).
-    const seq_len = std.unicode.utf8ByteSequenceLength(key[0]) catch return Error.UnknownKey;
-    if (seq_len != key.len) return Error.UnknownKey;
-    if (mods.ctrl) {
+/// A literal character (possibly multi-byte UTF-8); Ctrl maps the C0 set.
+fn literal(out: *std.ArrayList(u8), allocator: std.mem.Allocator, mods: keychord.Mods, key: []const u8) Error!void {
+    if (mods.contains(.super)) return Error.UnsupportedModifier;
+    if (mods.contains(.ctrl)) {
         if (key.len != 1) return Error.UnknownKey;
         const ch = std.ascii.toLower(key[0]);
         const byte: u8 = switch (ch) {
@@ -179,17 +81,61 @@ pub fn encodeChord(out: *std.ArrayList(u8), allocator: std.mem.Allocator, chord:
             '?' => 0x7f,
             else => return Error.UnknownKey,
         };
-        if (mods.alt) try out.append(allocator, 0x1b);
-        try out.append(allocator, byte);
-        return;
+        return plain(out, allocator, mods, byte);
     }
-    if (mods.alt) try out.append(allocator, 0x1b);
+    if (mods.contains(.alt)) try out.append(allocator, 0x1b);
     try out.appendSlice(allocator, key);
+}
+
+/// Encode one chord ("ctrl+c", "enter", "shift+tab") into `out`.
+pub fn encodeChord(out: *std.ArrayList(u8), allocator: std.mem.Allocator, chord: []const u8, app_cursor: bool) Error!void {
+    const parsed = try keychord.parse(chord);
+    const mods = parsed.mods;
+    const name = switch (parsed.key) {
+        .char => |text| return literal(out, allocator, mods, text),
+        .named => |n| n,
+    };
+    const sp: Special = switch (name) {
+        .enter => return plain(out, allocator, mods, '\r'),
+        .escape => return plain(out, allocator, mods, 0x1b),
+        .backspace => return plain(out, allocator, mods, 0x7f),
+        .space => return plain(out, allocator, mods, if (mods.contains(.ctrl)) 0x00 else ' '),
+        .tab => {
+            if (!mods.contains(.shift)) return plain(out, allocator, mods, '\t');
+            if (mods.contains(.super)) return Error.UnsupportedModifier;
+            return out.appendSlice(allocator, "\x1b[Z");
+        },
+        .up => .{ .letter = 'A', .ss3_in_app = true },
+        .down => .{ .letter = 'B', .ss3_in_app = true },
+        .right => .{ .letter = 'C', .ss3_in_app = true },
+        .left => .{ .letter = 'D', .ss3_in_app = true },
+        .home => .{ .letter = 'H', .ss3_in_app = true },
+        .end => .{ .letter = 'F', .ss3_in_app = true },
+        .insert => .{ .num = 2 },
+        .delete => .{ .num = 3 },
+        .page_up => .{ .num = 5 },
+        .page_down => .{ .num = 6 },
+        .f1 => .{ .letter = 'P', .always_ss3 = true },
+        .f2 => .{ .letter = 'Q', .always_ss3 = true },
+        .f3 => .{ .letter = 'R', .always_ss3 = true },
+        .f4 => .{ .letter = 'S', .always_ss3 = true },
+        .f5 => .{ .num = 15 },
+        .f6 => .{ .num = 17 },
+        .f7 => .{ .num = 18 },
+        .f8 => .{ .num = 19 },
+        .f9 => .{ .num = 20 },
+        .f10 => .{ .num = 21 },
+        .f11 => .{ .num = 23 },
+        .f12 => .{ .num = 24 },
+        // No byte encoding: a held modifier, Caps Lock and Menu are not PTY input.
+        .menu, .caps_lock, .shift, .ctrl, .alt, .super => return Error.UnknownKey,
+    };
+    return special(out, allocator, mods, sp, app_cursor);
 }
 
 /// Encode a whitespace-separated chord list ("ctrl+c up enter").
 pub fn encode(out: *std.ArrayList(u8), allocator: std.mem.Allocator, chords: []const u8, app_cursor: bool) Error!void {
-    var it = std.mem.tokenizeAny(u8, chords, " \t\n");
+    var it = keychord.chords(chords);
     while (it.next()) |chord| try encodeChord(out, allocator, chord, app_cursor);
 }
 
@@ -209,6 +155,7 @@ test "named keys" {
     try expectEnc("backspace", false, "\x7f");
     try expectEnc("delete", false, "\x1b[3~");
     try expectEnc("pageup pagedown", false, "\x1b[5~\x1b[6~");
+    try expectEnc("pgup pgdn page_up page_down", false, "\x1b[5~\x1b[6~\x1b[5~\x1b[6~");
     try expectEnc("f1", false, "\x1bOP");
     try expectEnc("f5", false, "\x1b[15~");
     try expectEnc("f12", false, "\x1b[24~");
@@ -237,7 +184,20 @@ test "alt prefixes and literals" {
     try expectEnc("a", false, "a");
     try expectEnc("+", false, "+");
     try expectEnc("é", false, "é");
+    try expectEnc("alt++", false, "\x1b+");
     try expectEnc("ctrl+c up up enter", false, "\x03\x1b[A\x1b[A\r");
+}
+
+test "meta is Super: CSI forms carry modifier bit 8, legacy bytes refuse it" {
+    try expectEnc("meta+up", false, "\x1b[1;9A");
+    try expectEnc("super+shift+delete", false, "\x1b[3;10~");
+    try expectEnc("cmd+f1", false, "\x1b[1;9P");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try std.testing.expectError(Error.UnsupportedModifier, encode(&out, a, "meta+x", false));
+    try std.testing.expectError(Error.UnsupportedModifier, encode(&out, a, "meta+enter", false));
+    try std.testing.expectError(Error.UnsupportedModifier, encode(&out, a, "meta+shift+tab", false));
 }
 
 test "unknown keys rejected" {
@@ -246,4 +206,8 @@ test "unknown keys rejected" {
     defer out.deinit(a);
     try std.testing.expectError(Error.UnknownKey, encode(&out, a, "bogus_key", false));
     try std.testing.expectError(Error.UnknownKey, encode(&out, a, "ctrl+ä", false));
+    try std.testing.expectError(Error.UnknownKey, encode(&out, a, "shift", false));
+    try std.testing.expectError(Error.UnknownModifier, encode(&out, a, "c+x", false));
+    // A literal plus has no C0 control byte.
+    try std.testing.expectError(Error.UnknownKey, encode(&out, a, "ctrl++", false));
 }

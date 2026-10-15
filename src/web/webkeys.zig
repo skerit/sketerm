@@ -2,14 +2,14 @@
 //! keys by NAME (the MCP `web_key` tool) rather than from a real GTK
 //! event. std + protocol only, usable from every target.
 //!
-//! A chord is `[mod+]*key`: mods are ctrl/control, shift, alt, meta,
-//! super/cmd; the key is a named non-printable (the names `keymap.zig`
-//! maps on the helper side) or a single character. The wire carries the
-//! XKB keysym exactly as the GUI would: Latin-1 characters are their
-//! own keysym, anything else is `0x01000000 | codepoint`.
+//! Names and grammar are util/keychord.zig's (`meta` is Super). The
+//! wire carries the XKB keysym exactly as the GUI would: Latin-1
+//! characters are their own keysym, anything else is
+//! `0x01000000 | codepoint`.
 
 const std = @import("std");
 const proto = @import("protocol.zig");
+const keychord = @import("../util/keychord.zig");
 
 pub const Chord = struct {
     keysym: u32,
@@ -25,86 +25,74 @@ pub const Chord = struct {
     }
 };
 
-const Named = struct { name: []const u8, keysym: u32 };
+pub const Error = keychord.Error;
 
-/// The names accepted case-insensitively. Aliases sit beside their
-/// canonical entry; every keysym here is in the helper's keymap table.
-const NAMED = [_]Named{
-    .{ .name = "enter", .keysym = 0xff0d },
-    .{ .name = "return", .keysym = 0xff0d },
-    .{ .name = "tab", .keysym = 0xff09 },
-    .{ .name = "escape", .keysym = 0xff1b },
-    .{ .name = "esc", .keysym = 0xff1b },
-    .{ .name = "backspace", .keysym = 0xff08 },
-    .{ .name = "delete", .keysym = 0xffff },
-    .{ .name = "del", .keysym = 0xffff },
-    .{ .name = "insert", .keysym = 0xff63 },
-    .{ .name = "home", .keysym = 0xff50 },
-    .{ .name = "end", .keysym = 0xff57 },
-    .{ .name = "pageup", .keysym = 0xff55 },
-    .{ .name = "page_up", .keysym = 0xff55 },
-    .{ .name = "pagedown", .keysym = 0xff56 },
-    .{ .name = "page_down", .keysym = 0xff56 },
-    .{ .name = "up", .keysym = 0xff52 },
-    .{ .name = "down", .keysym = 0xff54 },
-    .{ .name = "left", .keysym = 0xff51 },
-    .{ .name = "right", .keysym = 0xff53 },
-    .{ .name = "arrowup", .keysym = 0xff52 },
-    .{ .name = "arrowdown", .keysym = 0xff54 },
-    .{ .name = "arrowleft", .keysym = 0xff51 },
-    .{ .name = "arrowright", .keysym = 0xff53 },
-    .{ .name = "space", .keysym = ' ' },
-    // The modifiers as keys of their own, for a caller that HOLDS one
-    // (a down edge now, the up later) rather than chording it.
-    .{ .name = "shift", .keysym = 0xffe1 },
-    .{ .name = "control", .keysym = 0xffe3 },
-    .{ .name = "ctrl", .keysym = 0xffe3 },
-    .{ .name = "alt", .keysym = 0xffe9 },
-    .{ .name = "meta", .keysym = 0xffeb },
-    .{ .name = "super", .keysym = 0xffeb },
-    .{ .name = "capslock", .keysym = 0xffe5 },
-};
-
-pub const Error = error{ UnknownKey, UnknownModifier, EmptyChord };
+fn bitFor(m: keychord.Mod) u32 {
+    return switch (m) {
+        .ctrl => proto.mod_ctrl,
+        .shift => proto.mod_shift,
+        .alt => proto.mod_alt,
+        .super => proto.mod_super,
+    };
+}
 
 /// The `proto.mod_*` bit a modifier name stands for, any case.
 pub fn modBit(name: []const u8) ?u32 {
-    const eq = std.ascii.eqlIgnoreCase;
-    if (eq(name, "ctrl") or eq(name, "control")) return proto.mod_ctrl;
-    if (eq(name, "shift")) return proto.mod_shift;
-    if (eq(name, "alt")) return proto.mod_alt;
-    if (eq(name, "meta") or eq(name, "super") or eq(name, "cmd")) return proto.mod_super;
-    return null;
+    return bitFor(keychord.modFor(name) orelse return null);
+}
+
+/// The keysym of a named key; every one is in the helper's keymap table (web/keymap.zig), which has no Menu.
+fn namedKeysym(n: keychord.Named) ?u32 {
+    return switch (n) {
+        .enter => 0xff0d,
+        .tab => 0xff09,
+        .escape => 0xff1b,
+        .backspace => 0xff08,
+        .delete => 0xffff,
+        .insert => 0xff63,
+        .home => 0xff50,
+        .end => 0xff57,
+        .page_up => 0xff55,
+        .page_down => 0xff56,
+        .up => 0xff52,
+        .down => 0xff54,
+        .left => 0xff51,
+        .right => 0xff53,
+        .space => ' ',
+        .shift => 0xffe1,
+        .ctrl => 0xffe3,
+        .alt => 0xffe9,
+        .super => 0xffeb,
+        .caps_lock => 0xffe5,
+        .menu => null,
+        .f1 => 0xffbe,
+        .f2 => 0xffbf,
+        .f3 => 0xffc0,
+        .f4 => 0xffc1,
+        .f5 => 0xffc2,
+        .f6 => 0xffc3,
+        .f7 => 0xffc4,
+        .f8 => 0xffc5,
+        .f9 => 0xffc6,
+        .f10 => 0xffc7,
+        .f11 => 0xffc8,
+        .f12 => 0xffc9,
+    };
 }
 
 /// One `mod+key` chord. A single character stands for itself; a
 /// bare-shift chord over a printable produces that character's text
 /// (the caller writes the character they mean, "?" not "shift+/").
 pub fn parseChord(spec: []const u8) Error!Chord {
+    const parsed = try keychord.parse(spec);
     var mods: u32 = 0;
-    var rest = spec;
-    while (std.mem.indexOfScalar(u8, rest, '+')) |plus| {
-        // A trailing '+' means the KEY is '+' ("ctrl++" or a bare "+").
-        if (plus + 1 == rest.len) break;
-        mods |= modBit(rest[0..plus]) orelse return error.UnknownModifier;
-        rest = rest[plus + 1 ..];
-    }
-    if (rest.len == 0) return error.EmptyChord;
-
-    for (&NAMED) |n| {
-        if (std.ascii.eqlIgnoreCase(rest, n.name)) return .{ .keysym = n.keysym, .mods = mods };
-    }
-    // F1..F12.
-    if ((rest[0] == 'f' or rest[0] == 'F') and rest.len >= 2 and rest.len <= 3) {
-        if (std.fmt.parseInt(u8, rest[1..], 10)) |num| {
-            if (num >= 1 and num <= 12) return .{ .keysym = 0xffbe + @as(u32, num) - 1, .mods = mods };
-        } else |_| {}
-    }
-    // A single character (one codepoint).
-    const view = std.unicode.Utf8View.init(rest) catch return error.UnknownKey;
-    var it = view.iterator();
-    const cp = it.nextCodepoint() orelse return error.UnknownKey;
-    if (it.nextCodepoint() != null) return error.UnknownKey;
+    var it = parsed.mods.iterator();
+    while (it.next()) |m| mods |= bitFor(m);
+    const text = switch (parsed.key) {
+        .named => |n| return .{ .keysym = namedKeysym(n) orelse return error.UnknownKey, .mods = mods },
+        .char => |s| s,
+    };
+    const cp = std.unicode.utf8Decode(text) catch return error.UnknownKey;
     var chord = Chord{
         .keysym = if (cp < 0x100) @as(u32, cp) else 0x01000000 | @as(u32, cp),
         .mods = mods,
@@ -112,7 +100,7 @@ pub fn parseChord(spec: []const u8) Error!Chord {
     // Text rides only when the chord actually types: ctrl/alt chords
     // and control characters carry none (the helper maps the keysym).
     if (mods & (proto.mod_ctrl | proto.mod_alt) == 0 and cp >= 0x20 and cp != 0x7f) {
-        chord.text_len = @intCast(std.unicode.utf8Encode(@intCast(cp), &chord.text) catch 0);
+        chord.text_len = @intCast(std.unicode.utf8Encode(cp, &chord.text) catch 0);
     }
     return chord;
 }
@@ -120,7 +108,7 @@ pub fn parseChord(spec: []const u8) Error!Chord {
 /// Whitespace-separated chords, filled into `out`; returns how many.
 pub fn parseKeys(spec: []const u8, out: []Chord) Error!usize {
     var n: usize = 0;
-    var it = std.mem.tokenizeAny(u8, spec, " \t\n");
+    var it = keychord.chords(spec);
     while (it.next()) |tok| {
         if (n == out.len) break;
         out[n] = try parseChord(tok);
@@ -168,4 +156,14 @@ test "webkeys parses named keys, chords and characters" {
     var chords: [8]Chord = undefined;
     try t.expectEqual(@as(usize, 3), try parseKeys("Tab Tab Enter", &chords));
     try t.expectError(error.EmptyChord, parseKeys("   ", &chords));
+
+    // Both page-key spellings, meta as Super, and a literal plus alone.
+    try t.expectEqual(@as(u32, 0xff55), (try parseChord("pgup")).keysym);
+    try t.expectEqual(@as(u32, 0xff56), (try parseChord("PgDn")).keysym);
+    try t.expectEqual(@as(u32, 0xff56), (try parseChord("page_down")).keysym);
+    try t.expectEqual(proto.mod_super, (try parseChord("meta+a")).mods);
+    try t.expectEqual(proto.mod_super, modBit("cmd").?);
+    try t.expectEqual(proto.mod_alt, modBit("option").?);
+    try t.expectEqualStrings("+", (try parseChord("+")).textSlice());
+    try t.expectError(error.UnknownKey, parseChord("menu"));
 }

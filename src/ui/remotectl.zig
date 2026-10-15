@@ -590,7 +590,8 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         var bytes: std.ArrayList(u8) = .empty;
         defer bytes.deinit(allocator);
         @import("../ipc/keys.zig").encode(&bytes, allocator, data, pane.terminal.screen.app_cursor_keys) catch |err| switch (err) {
-            error.UnknownKey => return ipc_protocol.writeErr(out, allocator, .invalid_request, "unknown key chord"),
+            error.UnknownKey, error.UnknownModifier, error.EmptyChord => return ipc_protocol.writeErr(out, allocator, .invalid_request, "unknown key chord"),
+            error.UnsupportedModifier => return ipc_protocol.writeErr(out, allocator, .invalid_request, "the terminal has no encoding for that modifier on that key (super/meta rides only arrows, home/end, insert/delete, page keys and F-keys)"),
             error.OutOfMemory => return err,
         };
         pane.terminal.writeUserInput(bytes.items);
