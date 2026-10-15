@@ -2,13 +2,20 @@
 //! a remote pixel surface (a forwarded Wayland surface in the daemon's
 //! `Native.videoCommit`, a captured macOS window in winstream/sck.zig).
 //!
-//! A `Surface` holds a churn tracker (util/churn.zig), a lazily opened
-//! vcodec encoder, the codec it was opened for, a latch for a codec whose
-//! open failed, the pending-keyframe flag and the tile seq. A frame goes
-//! out as ONE whole-surface video tile only when the surface is hot AND
-//! photographic (util/content.zig) AND a codec is available AND both
-//! dims are even; everything else is the caller's lossless route, for
-//! which `Lossless` encodes damaged rects through pixcodec.
+//! `Heat` is a surface's churn tracker (util/churn.zig); `Stream` is one
+//! tile stream: a lazily opened vcodec encoder, the codec it was opened
+//! for, a latch for a codec whose open failed, the pending-keyframe flag
+//! and the tile seq. `Surface` pairs one of each for a source with one
+//! buffer stream. A frame goes out as ONE whole-surface video tile only
+//! when the surface is hot AND photographic (util/content.zig) AND a
+//! codec is available AND both dims are even; everything else is the
+//! caller's lossless route, for which `Lossless` encodes damaged rects
+//! through pixcodec.
+//!
+//! A Wayland client rotates its buffers over several wl_shm pools, and
+//! the wire decodes each pool's tiles with that pool's own decoder, so
+//! the daemon keeps one Stream per (surface, pool) but ONE Heat per
+//! surface: hotness is the surface's, and a pool must not warm up again.
 //!
 //! How an encoder is opened is the caller's `Opener` (the negotiated
 //! codec through `vcodec.Encoder.init`, or VideoToolbox on macOS), so
@@ -59,10 +66,42 @@ pub const Verdict = union(enum) {
     open_failed: struct { codec: vcodec.Codec, err: anyerror },
 };
 
-pub const Surface = struct {
+/// A surface's churn, across every buffer and pool it commits.
+pub const Heat = struct {
+    churn: churn.Tracker,
+    w: i32,
+    h: i32,
+
+    pub fn init(allocator: std.mem.Allocator, w: i32, h: i32) !Heat {
+        const tracker = try churn.Tracker.init(allocator, @intCast(@max(w, 0)), @intCast(@max(h, 0)), .{});
+        return .{ .churn = tracker, .w = w, .h = h };
+    }
+
+    pub fn deinit(self: *Heat) void {
+        self.churn.deinit();
+        self.* = undefined;
+    }
+
+    pub fn noteDamage(self: *Heat, x: i32, y: i32, w: i32, h: i32) void {
+        self.churn.noteDamage(x, y, w, h);
+    }
+
+    pub fn endFrame(self: *Heat) void {
+        self.churn.endFrame();
+    }
+
+    /// Cheap pre-check before the caller gathers whole-surface pixels:
+    /// a codec is available, the dims are codable and the surface is hot.
+    pub fn wantsPixels(self: *const Heat, codec: ?vcodec.Codec) bool {
+        if (codec == null or !sizeOk(self.w, self.h)) return false;
+        return self.churn.hot(0, 0, self.w, self.h);
+    }
+};
+
+/// One tile stream: what a viewer's decoder for it has seen.
+pub const Stream = struct {
     allocator: std.mem.Allocator,
     open: Opener,
-    churn: churn.Tracker,
     enc: ?vcodec.Encoder = null,
     /// The codec `enc` was opened FOR, which is what a codec switch is
     /// judged against (the stub encoder reports `.stub` for any request).
@@ -75,42 +114,25 @@ pub const Surface = struct {
     seq: u32 = 0,
     needs_kf: bool = true,
 
-    pub fn init(allocator: std.mem.Allocator, open: Opener, w: i32, h: i32) !Surface {
-        const tracker = try churn.Tracker.init(allocator, @intCast(@max(w, 0)), @intCast(@max(h, 0)), .{});
-        return .{ .allocator = allocator, .open = open, .churn = tracker, .w = w, .h = h };
+    pub fn init(allocator: std.mem.Allocator, open: Opener, w: i32, h: i32) Stream {
+        return .{ .allocator = allocator, .open = open, .w = w, .h = h };
     }
 
-    pub fn deinit(self: *Surface) void {
-        self.churn.deinit();
+    pub fn deinit(self: *Stream) void {
         if (self.enc) |*e| e.deinit();
         self.* = undefined;
     }
 
-    pub fn noteDamage(self: *Surface, x: i32, y: i32, w: i32, h: i32) void {
-        self.churn.noteDamage(x, y, w, h);
-    }
-
-    pub fn endFrame(self: *Surface) void {
-        self.churn.endFrame();
-    }
-
     /// The next tile must be self-contained (a viewer reattached, or a
     /// previous tile never reached the viewers).
-    pub fn forceKeyframe(self: *Surface) void {
+    pub fn forceKeyframe(self: *Stream) void {
         self.needs_kf = true;
-    }
-
-    /// Cheap pre-check before the caller gathers whole-surface pixels:
-    /// a codec is available, the dims are codable and the surface is hot.
-    pub fn wantsPixels(self: *const Surface, codec: ?vcodec.Codec) bool {
-        if (codec == null or !sizeOk(self.w, self.h)) return false;
-        return self.churn.hot(0, 0, self.w, self.h);
     }
 
     /// Route this frame: append ONE whole-surface tile of `codec` to `out`
     /// when `pixels` (tight BGRA, `w*h*4`) look photographic and an
     /// encoder is available, else leave `out` untouched.
-    pub fn encode(self: *Surface, out: *std.ArrayList(u8), codec: vcodec.Codec, pixels: []const u8) Verdict {
+    pub fn encode(self: *Stream, out: *std.ArrayList(u8), codec: vcodec.Codec, pixels: []const u8) Verdict {
         if (!content.looksPhotographic(pixels, .{})) return .lossless;
 
         // The codec moved (a viewer joined or left): reopen, and the new
@@ -153,6 +175,41 @@ pub const Surface = struct {
         };
         self.seq +%= 1;
         return .{ .video = .{ .keyframe = res.keyframe, .opened = opened } };
+    }
+};
+
+/// A source with one buffer stream (a captured window, a web view): its Heat and its Stream.
+pub const Surface = struct {
+    heat: Heat,
+    stream: Stream,
+
+    pub fn init(allocator: std.mem.Allocator, open: Opener, w: i32, h: i32) !Surface {
+        return .{ .heat = try Heat.init(allocator, w, h), .stream = Stream.init(allocator, open, w, h) };
+    }
+
+    pub fn deinit(self: *Surface) void {
+        self.heat.deinit();
+        self.stream.deinit();
+    }
+
+    pub fn noteDamage(self: *Surface, x: i32, y: i32, w: i32, h: i32) void {
+        self.heat.noteDamage(x, y, w, h);
+    }
+
+    pub fn endFrame(self: *Surface) void {
+        self.heat.endFrame();
+    }
+
+    pub fn forceKeyframe(self: *Surface) void {
+        self.stream.forceKeyframe();
+    }
+
+    pub fn wantsPixels(self: *const Surface, codec: ?vcodec.Codec) bool {
+        return self.heat.wantsPixels(codec);
+    }
+
+    pub fn encode(self: *Surface, out: *std.ArrayList(u8), codec: vcodec.Codec, pixels: []const u8) Verdict {
+        return self.stream.encode(out, codec, pixels);
     }
 };
 
@@ -252,7 +309,7 @@ fn photo(px: *[W * H * 4]u8) void {
 
 fn heat(s: *Surface, frames: usize) void {
     for (0..frames) |_| {
-        s.noteDamage(0, 0, s.w, s.h);
+        s.noteDamage(0, 0, s.heat.w, s.heat.h);
         s.endFrame();
     }
 }
@@ -268,7 +325,7 @@ test "a cold surface stays lossless" {
     defer s.deinit();
     heat(&s, 3); // one frame short of hot
     try t.expect(!s.wantsPixels(.h264));
-    try t.expect(s.enc == null);
+    try t.expect(s.stream.enc == null);
 }
 
 test "a hot photographic surface sends a keyframe tile, then deltas" {
@@ -287,14 +344,14 @@ test "a hot photographic surface sends a keyframe tile, then deltas" {
     var tile = try onlyTile(out.items);
     try t.expectEqual(@as(u32, 0), tile.seq);
     try t.expectEqual(@as(i32, W), tile.w);
-    try t.expect(!s.needs_kf);
+    try t.expect(!s.stream.needs_kf);
 
     out.clearRetainingCapacity();
     const v2 = s.encode(&out, .h264, &px);
     try t.expect(!v2.video.opened);
     tile = try onlyTile(out.items);
     try t.expectEqual(@as(u32, 1), tile.seq);
-    try t.expect(!s.needs_kf);
+    try t.expect(!s.stream.needs_kf);
 }
 
 test "a flat hot surface stays lossless and opens no encoder" {
@@ -308,7 +365,7 @@ test "a flat hot surface stays lossless and opens no encoder" {
     try t.expect(s.wantsPixels(.h264));
     try t.expectEqual(Verdict.lossless, s.encode(&out, .h264, &px));
     try t.expectEqual(@as(usize, 0), out.items.len);
-    try t.expect(s.enc == null);
+    try t.expect(s.stream.enc == null);
 }
 
 test "odd dims never want pixels" {
@@ -330,11 +387,11 @@ test "a codec switch reopens the encoder and forces a keyframe" {
     heat(&s, 4);
     _ = s.encode(&out, .h264, &px);
     _ = s.encode(&out, .h264, &px);
-    try t.expect(!s.needs_kf);
+    try t.expect(!s.stream.needs_kf);
     out.clearRetainingCapacity();
     const v = s.encode(&out, .av1, &px);
     try t.expect(v.video.opened);
-    try t.expectEqual(vcodec.Codec.av1, s.enc_codec);
+    try t.expectEqual(vcodec.Codec.av1, s.stream.enc_codec);
     // The seq keeps counting across the reopen.
     try t.expectEqual(@as(u32, 2), (try onlyTile(out.items)).seq);
 }
@@ -366,11 +423,38 @@ test "forceKeyframe requests a keyframe on the next tile" {
     defer out.deinit(t.allocator);
     heat(&s, 4);
     _ = s.encode(&out, .h264, &px);
-    try t.expect(!s.needs_kf);
+    try t.expect(!s.stream.needs_kf);
     s.forceKeyframe();
-    try t.expect(s.needs_kf);
+    try t.expect(s.stream.needs_kf);
     _ = s.encode(&out, .h264, &px);
-    try t.expect(!s.needs_kf);
+    try t.expect(!s.stream.needs_kf);
+}
+
+test "one Heat serves every pool stream of a surface: a new pool needs no warm-up" {
+    var h = try Heat.init(t.allocator, W, H);
+    defer h.deinit();
+    var px: [W * H * 4]u8 = undefined;
+    photo(&px);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(t.allocator);
+    // 1. A client rotating four pools: the surface is hot after four frames in total, not four per pool.
+    var pools: [4]Stream = undefined;
+    for (&pools) |*p| p.* = Stream.init(t.allocator, openStub, W, H);
+    defer for (&pools) |*p| p.deinit();
+    for (0..4) |_| {
+        h.noteDamage(0, 0, W, H);
+        h.endFrame();
+    }
+    try t.expect(h.wantsPixels(.h264));
+    // 2. Each pool's first tile opens its own stream at seq 0; the next frame on a pool is that stream's seq 1.
+    for (&pools) |*p| {
+        out.clearRetainingCapacity();
+        try t.expect(p.encode(&out, .h264, &px).video.opened);
+        try t.expectEqual(@as(u32, 0), (try onlyTile(out.items)).seq);
+    }
+    out.clearRetainingCapacity();
+    try t.expect(!pools[0].encode(&out, .h264, &px).video.opened);
+    try t.expectEqual(@as(u32, 1), (try onlyTile(out.items)).seq);
 }
 
 test "Lossless.encodeRect packs a sub-rect tight and round-trips" {

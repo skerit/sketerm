@@ -2274,17 +2274,20 @@ pub const Native = struct {
     /// Per-channel scratch keeps the previous LINEAR capture intact until
     /// both DMA_BUF_SYNC brackets and the row copy have succeeded.
     dmabuf_scratch: std.ArrayList(u8) = .empty,
-    /// Per-surface lossy-video state (only populated under
-    /// build_options.video): a churn tracker + a fixed-resolution
-    /// encoder, keyed by (surface id, POOL id) — `videoKey`. Hot,
-    /// photographic surfaces route through here to pool_vtile instead of
-    /// the lossless pool_update_c. The pool is part of the key because
-    /// every receiver (old GUIs included) keeps ONE decoder per pool: a
-    /// surface whose buffers live in different pools (mpv's wlshm output
-    /// uses one pool per buffer) must feed each pool a self-consistent
-    /// stream, or every other frame references a picture that decoder
-    /// never saw.
-    vstate: std.AutoHashMapUnmanaged(u64, surfenc.Surface) = .empty,
+    /// Per-pool lossy-video streams (only populated under
+    /// build_options.video): a fixed-resolution encoder, keyed by
+    /// (surface id, POOL id) — `videoKey`. Hot, photographic surfaces
+    /// route through here to pool_vtile instead of the lossless
+    /// pool_update_c. The pool is part of the key because every receiver
+    /// (old GUIs included) keeps ONE decoder per pool: a surface whose
+    /// buffers live in different pools (mpv's wlshm output uses one pool
+    /// per buffer) must feed each pool a self-consistent stream, or every
+    /// other frame references a picture that decoder never saw.
+    vstate: std.AutoHashMapUnmanaged(u64, surfenc.Stream) = .empty,
+    /// Per-SURFACE churn, shared by all of `vstate`'s pool streams of that
+    /// surface: keyed per pool, each buffer had to warm up on its own, and
+    /// a client that allocates more pools under load stayed lossless.
+    vheat: std.AutoHashMapUnmanaged(u32, surfenc.Heat) = .empty,
     /// Scratch reused across commits: tight full-surface BGRA, and the
     /// encoded vcodec tile blob.
     vscratch: std.ArrayList(u8) = .empty,
@@ -2525,6 +2528,9 @@ pub const Native = struct {
         var vit = self.vstate.valueIterator();
         while (vit.next()) |v| v.deinit();
         self.vstate.deinit(self.allocator);
+        var hit = self.vheat.valueIterator();
+        while (hit.next()) |v| v.deinit();
+        self.vheat.deinit(self.allocator);
         self.skipped.deinit(self.allocator);
         self.vscratch.deinit(self.allocator);
         self.vblob.deinit(self.allocator);
@@ -2545,9 +2551,16 @@ pub const Native = struct {
         return (@as(u64, surface) << 32) | pool;
     }
 
-    /// Drop every video stream of a destroyed surface or reclaimed pool
-    /// (a reused pool id then starts a fresh stream with a keyframe).
+    /// Drop every video stream of a destroyed surface (and its churn) or
+    /// reclaimed pool (a reused pool id then starts a fresh stream with a
+    /// keyframe).
     pub fn dropVideo(nv: *Native, comptime by: enum { surface, pool }, id: u32) void {
+        if (by == .surface) {
+            if (nv.vheat.fetchRemove(id)) |kv| {
+                var h = kv.value;
+                h.deinit();
+            }
+        }
         var again = true;
         while (again) {
             again = false;
@@ -2585,21 +2598,27 @@ pub const Native = struct {
         const tight = uw * 4;
         if (base + (uh - 1) * stride + tight > mirror.size) return false; // whole surface must fit
 
+        // Advance the SURFACE's churn with this commit's damage (full-width rows), whichever pool holds the buffer.
+        const hop = try nv.vheat.getOrPut(nv.allocator, cm.surface);
+        if (!hop.found_existing or hop.value_ptr.w != w or hop.value_ptr.h != h) {
+            if (hop.found_existing) hop.value_ptr.deinit();
+            hop.value_ptr.* = surfenc.Heat.init(nv.allocator, w, h) catch {
+                _ = nv.vheat.remove(cm.surface);
+                return false;
+            };
+        }
+        const heat = hop.value_ptr;
+        heat.noteDamage(0, @intCast(y0), w, @intCast(y1 - y0));
+        heat.endFrame();
+        if (!heat.wantsPixels(codec)) return false;
+
         const key = videoKey(cm.surface, cm.info.pool);
         const gop = try nv.vstate.getOrPut(nv.allocator, key);
         if (!gop.found_existing or gop.value_ptr.w != w or gop.value_ptr.h != h) {
             if (gop.found_existing) gop.value_ptr.deinit();
-            gop.value_ptr.* = surfenc.Surface.init(nv.allocator, surfenc.openNegotiated, w, h) catch {
-                _ = nv.vstate.remove(key);
-                return false;
-            };
+            gop.value_ptr.* = surfenc.Stream.init(nv.allocator, surfenc.openNegotiated, w, h);
         }
         const vs = gop.value_ptr;
-
-        // Advance churn with this commit's damage (full-width rows).
-        vs.noteDamage(0, @intCast(y0), w, @intCast(y1 - y0));
-        vs.endFrame();
-        if (!vs.wantsPixels(codec)) return false;
 
         // Extract the whole surface tightly (drop stride padding).
         try nv.vscratch.resize(nv.allocator, uw * uh * 4);

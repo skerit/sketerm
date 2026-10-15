@@ -97,7 +97,7 @@ pub const Stream = struct {
         self.damage.addAll(rects);
         if (self.codec == null) return;
         if (self.surf) |s| {
-            if (s.w != w or s.h != h) self.dropSurface();
+            if (s.heat.w != w or s.heat.h != h) self.dropSurface();
         }
         if (self.surf == null) {
             // A fresh surface opens its encoder at a keyframe; failing to
@@ -143,7 +143,7 @@ pub const Stream = struct {
     fn cutVideo(self: *Stream, out: *proto.Outbox, view: u32, gen: u32, pixels: []const u8, w: u16, h: u16) bool {
         const cd = self.codec orelse return false;
         const s = &(self.surf orelse return false);
-        if (s.w != w or s.h != h or !s.wantsPixels(cd)) return false;
+        if (s.heat.w != w or s.heat.h != h or !s.wantsPixels(cd)) return false;
         self.tile.clearRetainingCapacity();
         switch (s.encode(&self.tile, cd, pixels)) {
             .lossless => return false,

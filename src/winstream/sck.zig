@@ -332,7 +332,7 @@ pub const Source = struct {
             var sh: i32 = 0;
             var slen: usize = 0;
             const snap = sketerm_sck_snapshot(self.ctx, e.key_ptr.*, &sw, &sh, &slen) orelse continue;
-            if (sw != vs.enc.w or sh != vs.enc.h) continue; // resized mid-poll -> lossless
+            if (sw != vs.enc.heat.w or sh != vs.enc.heat.h) continue; // resized mid-poll -> lossless
             self.vblob.clearRetainingCapacity();
             switch (vs.enc.encode(&self.vblob, .h264, snap[0..slen])) {
                 .video => {},
@@ -425,7 +425,7 @@ pub const Source = struct {
         if (comptime !have_vtenc) return null;
         if (!surfenc.sizeOk(w, h)) return null;
         const gop = self.vstate.getOrPut(self.allocator, win) catch return null;
-        if (!gop.found_existing or gop.value_ptr.enc.w != w or gop.value_ptr.enc.h != h) {
+        if (!gop.found_existing or gop.value_ptr.enc.heat.w != w or gop.value_ptr.enc.heat.h != h) {
             if (gop.found_existing) gop.value_ptr.deinit();
             const enc = surfenc.Surface.init(self.allocator, surfenc.openVtoolbox, w, h) catch {
                 _ = self.vstate.remove(win);
