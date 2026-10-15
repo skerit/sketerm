@@ -106,7 +106,7 @@ pub fn clientReadable(self: *Daemon, cl: *Client) void {
 
 pub fn clientWritable(self: *Daemon, cl: *Client) void {
     cl.writePending();
-    if (cl.dead) return;
+    if (cl.dead or cl.write_closed) return;
     // Events were withheld while this client was backlogged; it has
     // caught up, so hand it a fresh snapshot (stamped with the
     // current seq) and resume streaming. Sent even for an exited
@@ -595,6 +595,55 @@ test "quit_idle retires an idle daemon in one step and refuses a busy one" {
     try t.expect(d.running);
     reply = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
     try t.expect(std.mem.indexOf(u8, reply.frame.payload, "\"ok\":false") != null);
+}
+
+test "a frame the peer sent before closing is still served after a write to it fails" {
+    // The interleaving smoke-mux's app-flag stage hit: the daemon writes
+    // the snapshot, the client reads it, sends `kill` and closes; the
+    // daemon's next write (the snapshot's tail) fails EPIPE before it
+    // polls the client readable. Dying there dropped the queued `kill`.
+    const t = std.testing;
+    const a = t.allocator;
+    platform.ignoreSigpipe();
+    var fds: [2]c_int = undefined;
+    try t.expect(c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) == 0);
+    defer _ = c.close(fds[0]);
+    try t.expect(c.fcntl(fds[0], c.F_SETFL, @as(c_int, c.O_NONBLOCK)) == 0);
+    var empty: [0]u8 = .{};
+    var d = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    defer d.clients.deinit(a);
+    var cl = Client{ .allocator = a, .fd = fds[0], .id = 1, .proto = wire.PROTO_VERSION };
+    defer cl.rbuf.deinit(a);
+    defer cl.wbuf.deinit(a);
+    defer cl.audio_wbuf.deinit(a);
+    try d.clients.append(a, &cl);
+
+    // 1. The peer's last frame is in flight, and the peer is gone.
+    var last: std.ArrayList(u8) = .empty;
+    defer last.deinit(a);
+    try wire.appendFrame(&last, a, .quit_idle, "");
+    try t.expectEqual(@as(isize, @intCast(last.items.len)), c.write(fds[1], last.items.ptr, last.items.len));
+    _ = c.close(fds[1]);
+
+    // 2. Output still queued for it fails to write: the client lives on,
+    // holding nothing more to send.
+    cl.queueFrame(.events, "tail");
+    cl.writePending();
+    try t.expect(!cl.dead);
+    try t.expect(cl.write_closed);
+    try t.expectEqual(@as(usize, 0), cl.queuedBytes());
+
+    // 3. Its input is still read and served: the idle daemon retires.
+    try t.expect(d.running);
+    clientReadable(&d, &cl);
+    try t.expect(!d.running);
+    try t.expect(!cl.dead);
+    // A reply to a reader that is gone is dropped, not queued.
+    try t.expectEqual(@as(usize, 0), cl.queuedBytes());
+
+    // 4. The end of its input is what ends it.
+    clientReadable(&d, &cl);
+    try t.expect(cl.dead);
 }
 
 /// Bytes the session's child echoed within `ms` (empty = it got nothing).

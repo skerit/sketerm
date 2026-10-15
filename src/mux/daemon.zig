@@ -763,6 +763,13 @@ pub const Client = struct {
     normal_bytes_written: u64 = 0,
     attached: ?*Session = null,
     dead: bool = false,
+    /// The peer can no longer read (a write failed EPIPE/ECONNRESET), but
+    /// what it sent before closing is still queued for us: output is
+    /// dropped from now on and the client dies only when its input ends.
+    /// Dying on the failed write instead lost a frame the peer wrote just
+    /// before closing, such as a `kill` sent while the snapshot's tail
+    /// was still being written.
+    write_closed: bool = false,
     /// `Daemon.reap` phase 1 has run this client's one-shot detach and
     /// committed to freeing it at the end of the CURRENT reap. Phase 2
     /// sweeps every collection holding a raw `*Client` before phase 3
@@ -916,6 +923,7 @@ pub const Client = struct {
     /// Queue one complete frame while leaving allocation-failure policy to the caller.
     fn tryQueueFrameIn(self: *Client, out: *std.ArrayList(u8), ftype: wire.FrameType, payload: []const u8) bool {
         if (self.dead) return false;
+        if (self.write_closed) return true;
         wire.appendFrame(out, self.allocator, ftype, payload) catch return false;
         if (self.queuedBytes() > MAX_WBUF) {
             self.dead = true;
@@ -980,7 +988,7 @@ pub const Client = struct {
             self.compactWritten(&self.audio_wbuf, audio_sent);
         }
         var calls: usize = 0;
-        while (!self.dead and normal_sent + audio_sent < WRITE_BUDGET and calls < WRITE_CALL_BUDGET) : (calls += 1) {
+        while (!self.dead and !self.write_closed and normal_sent + audio_sent < WRITE_BUDGET and calls < WRITE_CALL_BUDGET) : (calls += 1) {
             if (!self.startWriteFrame(normal_sent, audio_sent)) break;
             const audio = self.write_lane == .audio;
             const out = if (audio) self.audio_wbuf.items[audio_sent..] else self.wbuf.items[normal_sent..];
@@ -990,6 +998,12 @@ pub const Client = struct {
                 switch (std.posix.errno(n_raw)) {
                     .INTR => continue,
                     .AGAIN => {},
+                    .PIPE, .CONNRESET => {
+                        // Cleared buffers: nothing is left to compact.
+                        self.closeWrites();
+                        normal_sent = 0;
+                        audio_sent = 0;
+                    },
                     else => self.dead = true,
                 }
                 break;
@@ -1012,6 +1026,16 @@ pub const Client = struct {
                 self.write_frame_started = false;
             }
         }
+    }
+
+    /// The peer stopped reading: drop everything queued for it.
+    fn closeWrites(self: *Client) void {
+        self.write_closed = true;
+        self.write_lane = .none;
+        self.write_frame_left = 0;
+        self.write_frame_started = false;
+        self.wbuf.clearRetainingCapacity();
+        self.audio_wbuf.clearRetainingCapacity();
     }
 
     fn compactWritten(self: *Client, out: *std.ArrayList(u8), sent: usize) void {
