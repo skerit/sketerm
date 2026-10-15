@@ -16871,6 +16871,22 @@ fn capturePickPath(app: *appdrive.App, pick: u32, path: []const u8) bool {
     return waitToplevelGone(app, pick, 10_000);
 }
 
+/// Null once a capture PNG lands at `path` within 10 s, else why not. The
+/// rig learns that the picker closed over the display channel, not from
+/// the write, so the file is polled with a bound rather than read once.
+fn waitCapturePng(allocator: std.mem.Allocator, app: *appdrive.App, path: [:0]const u8) ?[]const u8 {
+    var bytes: ?[]u8 = null;
+    const deadline = clock.nowMs() + 10_000;
+    while (bytes == null and clock.nowMs() < deadline) {
+        bytes = readFileAlloc(allocator, path);
+        if (bytes == null) pumpFor(app, 100);
+    }
+    const png = bytes orelse return "capture: PNG never written";
+    defer allocator.free(png);
+    if (!std.mem.startsWith(u8, png, "\x89PNG\r\n\x1a\n")) return "capture: output is not a PNG";
+    return null;
+}
+
 /// Exercise capture saving and stale-picker identity through the real GUI.
 fn captureSaveStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, rt: []const u8) ?[]const u8 {
     const main_win = wsMainWindow(app) orelse return "capture: no GUI window";
@@ -16902,20 +16918,7 @@ fn captureSaveStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]
     defer _ = c.unlink(good.ptr);
     const pick = capturePicker(allocator, app, sock, 1) orelse return "capture: open successful picker";
     if (!capturePickPath(app, pick, good)) return "capture: accept successful destination";
-    {
-        // The capture is rendered and written after the picker is gone
-        // (savebytes.zig, an atomic replace), so a single read right after
-        // the picker closed raced a slower build's write.
-        var bytes: ?[]u8 = null;
-        const deadline = clock.nowMs() + 10_000;
-        while (bytes == null and clock.nowMs() < deadline) {
-            bytes = readFileAlloc(allocator, good);
-            if (bytes == null) pumpFor(app, 100);
-        }
-        const png = bytes orelse return "capture: PNG never written";
-        defer allocator.free(png);
-        if (!std.mem.startsWith(u8, png, "\x89PNG\r\n\x1a\n")) return "capture: output is not a PNG";
-    }
+    if (waitCapturePng(allocator, app, good)) |why| return why;
     // Accepting an old picker after a new pane is created must not capture
     // that new pane, including when its allocator reused the old address.
     const target = wsNewTab(allocator, sock) orelse return "capture: create closing pane";
@@ -16927,6 +16930,15 @@ fn captureSaveStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]
     const stale = std.fmt.bufPrintZ(&stale_buf, "{s}/capture-stale.png", .{rt}) catch return "capture: stale path";
     defer _ = c.unlink(stale.ptr);
     if (!capturePickPath(app, stale_pick, stale)) return "capture: accept stale pane picker";
+    // A stale pick is dropped silently, so a missing file proves nothing
+    // until the GUI has provably handled the pick. A capture of a live
+    // pane accepted after it, through the same main loop, is that proof.
+    var after_buf: [600:0]u8 = undefined;
+    const after = std.fmt.bufPrintZ(&after_buf, "{s}/capture-after-stale.png", .{rt}) catch return "capture: control path";
+    defer _ = c.unlink(after.ptr);
+    const after_pick = capturePicker(allocator, app, sock, 1) orelse return "capture: open picker after the stale pick";
+    if (!capturePickPath(app, after_pick, after)) return "capture: accept the picker after the stale pick";
+    if (waitCapturePng(allocator, app, after)) |why| return why;
     if (c.access(stale.ptr, c.F_OK) == 0) return "capture: closed pane picker captured a replacement pane";
     if (!wsFocus(allocator, sock, 1)) return "capture: GUI stopped responding after stale pick";
     return null;
