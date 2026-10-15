@@ -390,7 +390,12 @@ fn choiceButtonStyled(self: *BrowserView, box: *c.GtkWidget, label: [*:0]const u
 /// Build the decision popover once; the head item's details are filled
 /// in (and refilled) by refreshDialog.
 fn showDialog(self: *BrowserView) void {
-    if (self.conflicts.popover != null) return refreshDialog(self);
+    // Open already: a conflict joined the queue's TAIL, so only the
+    // heading's count changed and the head's buttons stay as they are.
+    if (self.conflicts.popover != null) {
+        if (head(self)) |item| refreshDetails(self, item);
+        return;
+    }
     const item = head(self) orelse return;
     if (!self.tabAlive(item.tab)) return dropHead(self);
 
@@ -438,8 +443,15 @@ fn showDialog(self: *BrowserView) void {
 }
 
 fn refreshDialog(self: *BrowserView) void {
-    const detail = self.conflicts.detail_box orelse return;
     const item = head(self) orelse return;
+    refreshDetails(self, item);
+    refreshButtons(self, item);
+}
+
+/// The heading, both sides' rows and the verdict; never the buttons,
+/// which the thumbnail tick must not rebuild under a click in flight.
+fn refreshDetails(self: *BrowserView, item: *Item) void {
+    const detail = self.conflicts.detail_box orelse return;
     while (c.gtk_widget_get_first_child(detail)) |child| {
         c.gtk_box_remove(@ptrCast(detail), child);
     }
@@ -462,7 +474,6 @@ fn refreshDialog(self: *BrowserView) void {
     c.gtk_widget_add_css_class(verdict, "dim-label");
     c.gtk_widget_set_margin_top(verdict, 6);
     c.gtk_box_append(@ptrCast(detail), verdict);
-    refreshButtons(self, item);
 }
 
 /// Only the verbs that can actually run for THIS item are rendered.
@@ -517,7 +528,7 @@ fn onThumbTick(user: ?*anyopaque) callconv(.c) c.gboolean {
         self.conflicts.thumb_tick = 0;
         return 0;
     }
-    refreshDialog(self);
+    if (head(self)) |item| refreshDetails(self, item);
     return 1;
 }
 
