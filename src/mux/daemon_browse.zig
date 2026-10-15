@@ -4,42 +4,12 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
-const log = @import("log.zig");
 const wire = @import("wire.zig");
-const platform = @import("../util/platform.zig");
-const selfexec = @import("selfexec.zig");
-const fsserve = @import("fsserve.zig");
-const fsjob = @import("fsjob.zig");
-const daemon_fsjobs = @import("daemon_fsjobs.zig");
-const pulse = @import("pulse.zig");
-const snapshot = @import("snapshot.zig");
 const dmod = @import("daemon.zig");
 const Daemon = dmod.Daemon;
 const Client = dmod.Client;
-const Worker = dmod.Worker;
 const Session = dmod.Session;
-const Channel = dmod.Channel;
-const Upload = dmod.Upload;
-const Download = dmod.Download;
-const FsView = dmod.FsView;
-const SpawnReq = dmod.SpawnReq;
-const AttachReq = dmod.AttachReq;
-const WorkerReady = dmod.WorkerReady;
-const WorkerMeta = dmod.WorkerMeta;
-const WorkerPush = dmod.WorkerPush;
-const nowMs = @import("../util/clock.zig").nowMs;
 const cwdOfPid = dmod.cwdOfPid;
-const pathZ = @import("../util/pathz.zig").pathZ;
-const version = @import("../version.zig");
-const cast_rec = @import("cast.zig");
-const opuscodec = @import("opuscodec.zig");
-const build_options = @import("build_options");
-const wsproto = @import("../winstream/proto.zig");
-const wallMs = @import("../util/clock.zig").wallMs;
-const webstore = @import("webstore.zig");
-const webprofiles = @import("../ipc/webprofiles.zig");
-const webfindbin = @import("../web/findbin.zig");
-const capabilities = @import("capabilities.zig");
 
 // === Remote directory browse (file_list) ===================
 // Lets the GUI offer a "remote file picker" without the user
