@@ -432,7 +432,8 @@ pub fn writeSelection(arena: std.mem.Allocator, res: *Res, recs: []const output.
         // What was handed out before is never repeated: one pointer.
         if (s.earlier) |x| {
             try w.print("\nearlier in job {d}: [{d}] {s}, ", .{ s.job, x.id, @tagName(x.kind) });
-            if (x.chars >= 1000) try w.print("{d}.{d}k chars", .{ x.chars / 1000, x.chars % 1000 / 100 }) else try w.print("{d} chars", .{x.chars});
+            var nb: [24]u8 = undefined;
+            try w.print("{s} chars", .{@import("../util/numtext.zig").count(&nb, x.chars)});
             try w.writeAll(", returned before");
             if (s.returned_before > 1) try w.print(" (with {d} more)", .{s.returned_before - 1});
         }

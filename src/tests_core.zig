@@ -282,6 +282,7 @@ comptime {
     _ = @import("smoke/bindir.zig");
     _ = @import("smoke/headful_audit.zig");
     _ = @import("util/jsonnum.zig");
+    _ = @import("util/numtext.zig");
     _ = @import("util/jsonstr.zig");
     _ = @import("web/resource.zig");
     _ = @import("util/spinlock.zig");

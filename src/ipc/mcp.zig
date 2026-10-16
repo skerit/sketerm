@@ -1659,6 +1659,18 @@ pub const Res = struct {
         try self.sc.writer.writeAll(json);
     }
 
+    /// Machine data that is not prose (base64 bytes): a fact, plus `note`
+    /// in the text lane when the facts lane carries it, else the data
+    /// itself behind a `--- name ---` divider, since a text-mode reader
+    /// has no other lane to find it in.
+    pub fn bulk(self: *Res, name: []const u8, data: []const u8, note: []const u8) !void {
+        try self.fact(name, data);
+        switch (result_mode) {
+            .structured => try self.text(note),
+            .text => try self.textf("--- {s} ---\n{s}", .{ name, data }),
+        }
+    }
+
     /// Free-form line for the text lane only.
     pub fn text(self: *Res, line: []const u8) !void {
         const w = try self.textLine();
@@ -2666,6 +2678,17 @@ test "text mode: no structuredContent, no outputSchema, the error code in the te
     try t.expectEqual(@as(usize, 2), content.len);
     try t.expectEqualStrings("3 things", content[0].object.get("text").?.string);
     try t.expectEqualStrings("image", content[1].object.get("type").?.string);
+    // Bytes the facts lane would carry ride the text lane's divider instead.
+    var b = Res.init(arena);
+    try b.bulk("base64", "QUJD", "bytes are in structuredContent.base64");
+    try t.expect(std.mem.indexOf(u8, try b.finish(), "--- base64 ---\\nQUJD") != null);
+    result_mode = .structured;
+    var bs = Res.init(arena);
+    try bs.bulk("base64", "QUJD", "bytes are in structuredContent.base64");
+    const bout = try bs.finish();
+    try t.expect(std.mem.indexOf(u8, bout, "\"text\":\"bytes are in structuredContent.base64\"") != null);
+    try t.expect(std.mem.indexOf(u8, bout, "\"structuredContent\":{\"base64\":\"QUJD\"}") != null);
+    result_mode = .text;
 
     const nf = (try std.json.parseFromSliceLeaky(std.json.Value, arena, try errRes(arena, .not_found, "no web view with id 4"), .{})).object;
     try t.expect(nf.get("isError").?.bool);

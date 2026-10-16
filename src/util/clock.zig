@@ -109,6 +109,79 @@ pub fn isoTime(iso: []const u8) []const u8 {
     return if (iso.len == ISO_LEN) iso[11..19] else "";
 }
 
+/// How a `span` or an `ago` reads: "3 minutes" or "3m".
+pub const SpanStyle = enum { long, short };
+
+/// A duration in its largest unit the span overshoots (90 s is still
+/// seconds, 90 min still minutes), so a list never shows "1 minutes"
+/// rounding noise; negative reads as 0.
+pub fn span(buf: []u8, ms: i64, style: SpanStyle) []const u8 {
+    const secs = @divTrunc(@max(ms, 0), 1000);
+    if (secs < 90) return unit(buf, secs, "s", "second", style);
+    const mins = @divTrunc(secs, 60);
+    if (mins < 90) return unit(buf, mins, "m", "minute", style);
+    const hours = @divTrunc(mins, 60);
+    if (hours < 48) return unit(buf, hours, "h", "hour", style);
+    const days = @divTrunc(hours, 24);
+    if (days < 14) return unit(buf, days, "d", "day", style);
+    const weeks = @divTrunc(days, 7);
+    if (weeks < 9) return unit(buf, weeks, "w", "week", style);
+    const months = @divTrunc(days, 30);
+    if (months < 24) return unit(buf, months, "mo", "month", style);
+    return unit(buf, @divTrunc(days, 365), "y", "year", style);
+}
+
+fn unit(buf: []u8, n: i64, short: []const u8, long: []const u8, style: SpanStyle) []const u8 {
+    return switch (style) {
+        .short => std.fmt.bufPrint(buf, "{d}{s}", .{ n, short }),
+        .long => std.fmt.bufPrint(buf, "{d} {s}{s}", .{ n, long, if (n == 1) "" else "s" }),
+    } catch "a while";
+}
+
+/// How long before `now_ms` the wall time `then_ms` was ("3 minutes ago",
+/// "3m ago"): "just now" under 90 s or for a time after now, and empty
+/// for 0 (never), which must not read as "56 years ago".
+pub fn ago(buf: []u8, now_ms: i64, then_ms: i64, style: SpanStyle) []const u8 {
+    if (then_ms <= 0) return "";
+    if (now_ms - then_ms < 90_000) return "just now";
+    var b: [32]u8 = undefined;
+    return std.fmt.bufPrint(buf, "{s} ago", .{span(&b, now_ms - then_ms, style)}) catch "a while ago";
+}
+
+test "ago reads naturally at every scale, long and short" {
+    const t = std.testing;
+    var buf: [48]u8 = undefined;
+    const now: i64 = 1_000_000_000_000;
+    const sec = 1000;
+    const min = 60 * sec;
+    const hour = 60 * min;
+    const day = 24 * hour;
+
+    try t.expectEqualStrings("just now", ago(&buf, now, now, .long));
+    try t.expectEqualStrings("just now", ago(&buf, now, now - 89 * sec, .long));
+    try t.expectEqualStrings("1 minute ago", ago(&buf, now, now - 90 * sec, .long));
+    try t.expectEqualStrings("5 minutes ago", ago(&buf, now, now - 5 * min, .long));
+    try t.expectEqualStrings("89 minutes ago", ago(&buf, now, now - 89 * min, .long));
+    try t.expectEqualStrings("1 hour ago", ago(&buf, now, now - 90 * min, .long));
+    try t.expectEqualStrings("47 hours ago", ago(&buf, now, now - 47 * hour, .long));
+    try t.expectEqualStrings("2 days ago", ago(&buf, now, now - 48 * hour, .long));
+    try t.expectEqualStrings("13 days ago", ago(&buf, now, now - 13 * day, .long));
+    try t.expectEqualStrings("2 weeks ago", ago(&buf, now, now - 14 * day, .long));
+    try t.expectEqualStrings("8 weeks ago", ago(&buf, now, now - 60 * day, .long));
+    try t.expectEqualStrings("2 months ago", ago(&buf, now, now - 63 * day, .long));
+    try t.expectEqualStrings("23 months ago", ago(&buf, now, now - 700 * day, .long));
+    try t.expectEqualStrings("2 years ago", ago(&buf, now, now - 730 * day, .long));
+    try t.expectEqualStrings("16m ago", ago(&buf, now, now - 16 * min, .short));
+    try t.expectEqualStrings("2mo ago", ago(&buf, now, now - 63 * day, .short));
+    try t.expectEqualStrings("45s", span(&buf, 45 * sec, .short));
+    try t.expectEqualStrings("18m", span(&buf, 18 * min, .short));
+    try t.expectEqualStrings("0s", span(&buf, -5, .short));
+    // Never says nothing rather than "56 years ago"; a clock that stepped
+    // backwards must not print a negative age.
+    try t.expectEqualStrings("", ago(&buf, now, 0, .long));
+    try t.expectEqualStrings("just now", ago(&buf, now, now + 5 * min, .long));
+}
+
 test "isoLocal writes local time with its offset, and isoClock its HH:MM" {
     const t = std.testing;
     var buf: [ISO_LEN]u8 = undefined;

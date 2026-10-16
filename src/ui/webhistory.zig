@@ -83,40 +83,6 @@ const List = struct {
     }
 };
 
-// ── relative time ───────────────────────────────────────────────
-
-/// "3 minutes ago" for a wall-clock timestamp, written into `buf`.
-///
-/// Relative rather than absolute so no timezone has to be guessed at,
-/// and buffer-based because it is called once per visible row. The
-/// thresholds overshoot each unit (90 seconds is still "just now") so a
-/// list never shows "1 minutes ago" rounding noise.
-pub fn relativeTime(buf: []u8, now_ms: i64, then_ms: i64) []const u8 {
-    if (then_ms <= 0) return "";
-    if (then_ms > now_ms) return "just now";
-    const secs = @divTrunc(now_ms - then_ms, 1000);
-    if (secs < 90) return "just now";
-    const mins = @divTrunc(secs, 60);
-    if (mins < 90) return plural(buf, mins, "minute");
-    const hours = @divTrunc(mins, 60);
-    if (hours < 48) return plural(buf, hours, "hour");
-    const days = @divTrunc(hours, 24);
-    if (days < 14) return plural(buf, days, "day");
-    const weeks = @divTrunc(days, 7);
-    if (weeks < 9) return plural(buf, weeks, "week");
-    const months = @divTrunc(days, 30);
-    if (months < 24) return plural(buf, months, "month");
-    return plural(buf, @divTrunc(days, 365), "year");
-}
-
-fn plural(buf: []u8, n: i64, unit: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{d} {s}{s} ago", .{
-        n,
-        unit,
-        if (n == 1) "" else "s",
-    }) catch "a while ago";
-}
-
 const wallMs = @import("../util/clock.zig").wallMs;
 
 // ── window construction ─────────────────────────────────────────
@@ -437,7 +403,7 @@ fn addHistoryRow(self: *List, hit: webstore.HistoryHit) void {
 
     var meta: [64]u8 = undefined;
     var age: [48]u8 = undefined;
-    const when = relativeTime(&age, self.now_ms, hit.last_ms);
+    const when = @import("../util/clock.zig").ago(&age, self.now_ms, hit.last_ms, .long);
     const text = if (hit.visits > 1)
         std.fmt.bufPrintZ(&meta, "{s} · {d} visits", .{ when, hit.visits }) catch ""
     else
@@ -751,36 +717,6 @@ fn onClearAnswer(user: ?*anyopaque, response: []const u8) void {
 }
 
 // ── tests ───────────────────────────────────────────────────────
-
-test "webhistory: relative time reads naturally at every scale" {
-    const t = std.testing;
-    var buf: [48]u8 = undefined;
-    const now: i64 = 1_000_000_000_000;
-    const sec = 1000;
-    const min = 60 * sec;
-    const hour = 60 * min;
-    const day = 24 * hour;
-
-    try t.expectEqualStrings("just now", relativeTime(&buf, now, now));
-    try t.expectEqualStrings("just now", relativeTime(&buf, now, now - 89 * sec));
-    try t.expectEqualStrings("1 minute ago", relativeTime(&buf, now, now - 90 * sec));
-    try t.expectEqualStrings("5 minutes ago", relativeTime(&buf, now, now - 5 * min));
-    try t.expectEqualStrings("89 minutes ago", relativeTime(&buf, now, now - 89 * min));
-    try t.expectEqualStrings("1 hour ago", relativeTime(&buf, now, now - 90 * min));
-    try t.expectEqualStrings("47 hours ago", relativeTime(&buf, now, now - 47 * hour));
-    try t.expectEqualStrings("2 days ago", relativeTime(&buf, now, now - 48 * hour));
-    try t.expectEqualStrings("13 days ago", relativeTime(&buf, now, now - 13 * day));
-    try t.expectEqualStrings("2 weeks ago", relativeTime(&buf, now, now - 14 * day));
-    try t.expectEqualStrings("8 weeks ago", relativeTime(&buf, now, now - 60 * day));
-    try t.expectEqualStrings("2 months ago", relativeTime(&buf, now, now - 63 * day));
-    try t.expectEqualStrings("23 months ago", relativeTime(&buf, now, now - 700 * day));
-    try t.expectEqualStrings("2 years ago", relativeTime(&buf, now, now - 730 * day));
-
-    // A never-visited entry says nothing rather than "56 years ago",
-    // and a clock that stepped backwards must not print a negative age.
-    try t.expectEqualStrings("", relativeTime(&buf, now, 0));
-    try t.expectEqualStrings("just now", relativeTime(&buf, now, now + 5 * min));
-}
 
 test "webhistory: bookmark grouping puts top level first, then folders" {
     const t = std.testing;

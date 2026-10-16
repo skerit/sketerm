@@ -36,6 +36,7 @@
 
 const std = @import("std");
 const diagnostic = @import("../web/diagnostic.zig");
+const numtext = @import("../util/numtext.zig");
 const mcp = @import("mcp.zig");
 const protocol = @import("protocol.zig");
 const webdrive = @import("webdrive.zig");
@@ -1881,7 +1882,7 @@ fn targetRequiredErr(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u
     try msg.writer.print("{d} browser tabs are open, so a call that names no tab would act on whichever one another caller touched last. Pass 'pane' with the tab you mean:", .{refs.items.len});
     for (refs.items, 0..) |r, i| {
         if (i == 20) {
-            try msg.writer.print(" (and {d} more in details.tabs)", .{refs.items.len - 20});
+            try msg.writer.print(" (and {d} more: web_tabs lists every tab)", .{refs.items.len - 20});
             break;
         }
         try msg.writer.print("{s} {s} {d}", .{ if (i == 0) "" else ";", handleKey(mode), r.view orelse r.pane.? });
@@ -3374,7 +3375,10 @@ fn renderAfter(res: *mcp.Res, arena: std.mem.Allocator, after: ActAfter) !void {
         try res.fact("navigated_to", u);
         try res.textf("navigated to {s}", .{try clip(arena, u, URL_MAX)});
     }
-    if (after.loading_after) |l| try res.fact("loading_after", l);
+    if (after.loading_after) |l| {
+        try res.fact("loading_after", l);
+        if (l) try res.text("the page was still loading after the act");
+    }
     // Text lane only: a caveat is prose, not a machine fact.
     if (after.note) |n| try res.textf("note: {s}", .{n});
     if (after.delta_error) |e| {
@@ -3394,7 +3398,13 @@ fn renderAfter(res: *mcp.Res, arena: std.mem.Allocator, after: ActAfter) !void {
             if (sl) |s| {
                 try res.fact("scope_state", @tagName(s.state));
                 if (s.state == .replaced or s.state == .ancestor) try res.fact("scope_resolved", s.sid);
-            }
+                // Live is the default reading; anything else changes what the delta covers.
+                switch (s.state) {
+                    .live => {},
+                    .replaced, .ancestor => try res.textf("scope {d}: {s}, the delta covers {d}", .{ sc, @tagName(s.state), s.sid }),
+                    else => try res.textf("scope {d}: {s}", .{ sc, @tagName(s.state) }),
+                }
+            } else try res.textf("scope {d}: not confirmed live, the delta may cover the whole page", .{sc});
         }
         try treeSectionMax(res, arena, "delta", d, after.follow.max_chars);
         try res.text(TRUST_LINE);
@@ -5314,6 +5324,15 @@ fn streamResult(arena: std.mem.Allocator, view: View, offer: web_proto.EvStreamO
         "opened a single-use local binary stream socket carrying ENCODED frames; authenticate with the token as the first frame, ACK each logical frame, and close the socket to end the stream"
     else
         "opened a single-use local binary stream socket; authenticate with the token as the first frame, ACK frame ends, and close the socket to end the stream");
+    try res.textf("socket {s} token {s}, protocol 1, {s}{s}{s}, at most {d} frames unacked{s}", .{
+        offer.path,
+        offer.token,
+        if (encoded) "encoded " else "bgra-premultiplied",
+        if (encoded) (codec orelse "video") else "",
+        if (offer.audio != 0) ", audio" else "",
+        @import("../web/stream.zig").MAX_UNACKED,
+        if (popups) ", popups" else "",
+    });
     if (asked_encoded and !encoded)
         try res.text("encoded frames were asked for, but this browser helper does not stream them (capability 'stream-encoded'): the stream is RAW BGRA");
     return res.finish();
@@ -5803,6 +5822,36 @@ fn policyJson(arena: std.mem.Allocator, p: *const webdrive.NetPolicy) ![]const u
     return aw.written();
 }
 
+/// `policyJson` as one text line, defaults and empty lists left out.
+fn policyText(arena: std.mem.Allocator, p: *const webdrive.NetPolicy) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeAll("policy:");
+    if (p.allow_top.len > 0) try w.print(" hosts {s};", .{try joinNames(arena, p.allow_top)});
+    if (p.allow_sub.len > 0) try w.print(" subresource hosts {s};", .{try joinNames(arena, p.allow_sub)});
+    if (p.block_types != 0) {
+        try w.writeAll(" blocks");
+        inline for (std.meta.fields(filter.RType)) |f| {
+            if (p.block_types & (@as(filter.RType, @enumFromInt(f.value))).bit() != 0) try w.print(" {s}", .{f.name});
+        }
+        try w.writeAll(";");
+    }
+    try w.writeAll(" schemes");
+    inline for (std.meta.fields(netpolicy.Scheme)) |f| {
+        if (p.allow_schemes & (@as(netpolicy.Scheme, @enumFromInt(f.value))).bit() != 0) try w.print(" {s}", .{f.name});
+    }
+    try w.writeAll(";");
+    if (p.allow_private) try w.writeAll(" private addresses allowed;");
+    if (p.untrusted) try w.writeAll(" untrusted;");
+    if (p.block_ads) |on| try w.print(" ads {s};", .{if (on) "blocked" else "allowed"});
+    if (p.navigation_guard != null) try w.writeAll(" navigation guard;");
+    if (p.max_requests > 0) try w.print(" max {d} requests;", .{p.max_requests});
+    if (p.max_bytes > 0) try w.print(" max {d} bytes;", .{p.max_bytes});
+    if (p.max_navigations > 0) try w.print(" max {d} navigations;", .{p.max_navigations});
+    if (p.deadline_ms > 0) try w.print(" deadline {d}ms;", .{p.deadline_ms});
+    return aw.written()[0 .. aw.written().len - 1];
+}
+
 fn hostListJson(w: *std.Io.Writer, hosts: []const []const u8) !void {
     try w.writeByte('[');
     for (hosts, 0..) |h, i| {
@@ -5839,6 +5888,7 @@ fn policyTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, views
         try res.fact("policy_active", true);
         try res.fact("policy_source", "profile_default");
         try res.raw("policy", try policyJson(arena, p));
+        try res.text(try policyText(arena, p));
         try res.fact("durable", false);
         try res.textf("profile '{s}' session-default policy (in-memory; applied by web_open profile:\"{s}\" when no explicit policy rides the call)", .{ name, name });
         return res.finish();
@@ -5869,7 +5919,11 @@ fn policyViewResult(arena: std.mem.Allocator, listed: View, fresh: *const webdri
     try res.fact("policy_active", fresh.pol_active);
     try res.fact("policy_source", if (fresh.pol != null) "call" else "none");
     try res.fact("policy_serial", fresh.pol_serial);
-    if (fresh.pol) |*p| try res.raw("policy", try policyJson(arena, p));
+    if (fresh.pol) |*p| {
+        try res.raw("policy", try policyJson(arena, p));
+        try res.text(try policyText(arena, p));
+    }
+    if (listed.untrusted) try res.text("untrusted view: no internet sockets, workers, websockets, webrtc, extensions, permissions, downloads, popups or uploads; GET/HEAD and same-origin POST only; cross-origin requests lose cookies and Referer");
     // A routed restricted helper's broker dials the route's proxy and
     // nothing else; the proxy resolves every host (`web_untrusted.c`).
     const proxied = !isDirectRoute(listed.route);
@@ -5949,16 +6003,20 @@ fn policyViewResult(arena: std.mem.Allocator, listed: View, fresh: *const webdri
     try res.fact("durable", false);
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
+    var tw: std.Io.Writer.Allocating = .init(arena);
     try w.writeByte('{');
     var first = true;
     for (fresh.pol_denied, 0..) |count, i| {
         if (count == 0) continue;
+        const reason = web_proto.reasonName(@enumFromInt(@as(u8, @intCast(i))));
         if (!first) try w.writeByte(',');
-        try w.print("\"{s}\":{d}", .{ web_proto.reasonName(@enumFromInt(@as(u8, @intCast(i)))), count });
+        try w.print("\"{s}\":{d}", .{ reason, count });
+        try tw.writer.print("{s} {s} {d}", .{ if (first) "denied:" else ",", reason, count });
         first = false;
     }
     try w.writeByte('}');
     try res.raw("denied", aw.written());
+    if (!first) try res.text(tw.written());
     if (!fresh.pol_active) {
         try res.text("no policy is installed on this view (web_open's 'policy' object installs one at open)");
     } else {
@@ -5994,6 +6052,7 @@ fn policySetTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, vi
         try res.fact("profile", name);
         try res.fact("policy_source", "profile_default");
         try res.raw("policy", try policyJson(arena, &full));
+        try res.text(try policyText(arena, &full));
         try res.fact("durable", false);
         try res.textf("registered the session-default policy for profile '{s}' (in-memory: it lasts until this MCP server exits, deliberately — a durable copy could be silently lost by a store rebuild)", .{name});
         return res.finish();
@@ -6019,7 +6078,10 @@ fn policySetTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, vi
     var res = mcp.Res.init(arena);
     try head(&res, arena, .headless, view);
     try res.fact("policy_serial", fresh.pol_serial);
-    if (fresh.pol) |*p| try res.raw("policy", try policyJson(arena, p));
+    if (fresh.pol) |*p| {
+        try res.raw("policy", try policyJson(arena, p));
+        try res.text(try policyText(arena, p));
+    }
     try res.raw("tightened", try nameListJson(arena, report.tightened[0..report.n_tightened]));
     try res.raw("ignored", try nameListJson(arena, report.ignored[0..report.n_ignored]));
     if (report.n_tightened > 0)
@@ -6655,10 +6717,10 @@ fn captureBodyResult(
     }
     try res.fact("bytes", shown.bytes.len);
     try res.fact("inline_truncated", cut);
-    try res.fact("body", out);
+    if (!binary) try res.fact("body", out);
     if (cut) try res.textf("INLINE limit: {d} of {d} bytes are in 'body'; pass out_file for the whole body, or a larger max_bytes (at most {d})", .{ out.len, shown.bytes.len, CAPTURE_INLINE_MAX });
     try res.textf("{s} body of exchange {d}: {d} bytes as {s}", .{ part, seq, shown.bytes.len, if (binary) "base64" else "UTF-8 text" });
-    try section(&res, "body", if (binary) "(binary: the base64 is in structuredContent.body)" else out);
+    if (binary) try res.bulk("body", out, "--- body ---\n(binary: the base64 is in structuredContent.body)") else try section(&res, "body", out);
     try res.text(TRUST_LINE);
     return res.finish();
 }
@@ -7917,6 +7979,15 @@ fn downloadListResult(drv: Driver, arena: std.mem.Allocator, view: View) ![]cons
     try res.fact("downloads", try withFates(arena, rows.items));
     try res.fact("listing", true);
     try res.textf("{d} download(s) known to this view; pass 'url' or 'urls' to fetch one", .{rows.items.len});
+    if (rows.items.len > 0) {
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        for (rows.items, 0..) |r, i| {
+            var nb: [24]u8 = undefined;
+            try aw.writer.print("{s}{s} {s}B {s} from {s}", .{ if (i > 0) "\n" else "", r.state, numtext.count(&nb, r.bytes), if (r.path.len > 0) r.path else "(no file yet)", try clip(arena, r.url, URL_MAX) });
+            if (r.reason.len > 0) try aw.writer.print(" ({s})", .{r.reason});
+        }
+        try section(&res, "downloads", aw.written());
+    }
     return res.finish();
 }
 

@@ -378,12 +378,11 @@ fn fileRead(arena: std.mem.Allocator, fs: *fsdrive.Fs, args: std.json.Value) ![]
         // multi-megabyte read for no reader.
         try res.textf("--- content ---\n{s}", .{data.items});
     } else {
-        // Bytes are machine data, not prose: the base64 belongs in
-        // the structured lane, and the text lane just says so.
+        // Bytes are machine data, not prose: base64 in the facts lane
+        // when there is one, else behind the text lane's divider.
         const enc = std.base64.standard.Encoder;
         const b64 = arena.alloc(u8, enc.calcSize(data.items.len)) catch return error.OutOfMemory;
-        try res.fact("base64", enc.encode(b64, data.items));
-        try res.text("binary content: the bytes are base64 in structuredContent.base64");
+        try res.bulk("base64", enc.encode(b64, data.items), "binary content: the bytes are base64 in structuredContent.base64");
     }
     return res.finish();
 }
