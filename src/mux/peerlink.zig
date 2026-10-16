@@ -54,6 +54,11 @@ pub const DialResult = struct {
     peer_federation: bool = false,
     peer_callin: bool = false,
     peer_slow_mail: bool = false,
+    /// A failed dial: why (`dialWhy`), and what said so.
+    why: ?PeerLinkWhy = null,
+    detail: []const u8 = "",
+    /// The far daemon's version (its welcome), "" = it named none.
+    version: []const u8 = "",
 };
 
 pub const Verdict = enum { federate, unsupported, failed };
@@ -65,6 +70,33 @@ pub fn verdict(r: DialResult, callin: bool) Verdict {
     if (!r.peers or !r.peer_federation) return .unsupported;
     if (callin and !r.peer_callin) return .unsupported;
     return .federate;
+}
+
+/// Why a dial failed and what said so.
+pub const DialWhy = struct { why: PeerLinkWhy, detail: []const u8 };
+
+/// What a failed `connectRemote` means, from what its transport noted on
+/// the dialing thread: ssh's line that the host could not be reached
+/// (`client.sshUnreachable`), a route's failing hop (`routeFailure`), ssh's
+/// last line otherwise (`sshSaid`: a refused login reads `auth_failed`),
+/// else the error's name.
+pub fn dialWhy(err_name: []const u8, unreachable_line: []const u8, route_failure: []const u8, said: []const u8) DialWhy {
+    if (unreachable_line.len > 0) return .{ .why = .@"unreachable", .detail = unreachable_line };
+    if (route_failure.len > 0) return .{ .why = .dial_failed, .detail = route_failure };
+    for (AUTH_REFUSALS) |needle| {
+        if (std.mem.indexOf(u8, said, needle) != null) return .{ .why = .auth_failed, .detail = said };
+    }
+    return .{ .why = .dial_failed, .detail = if (said.len > 0) said else err_name };
+}
+
+/// What ssh writes when it reached the host and the login failed.
+const AUTH_REFUSALS = [_][]const u8{ "Permission denied", "Host key verification failed", "Too many authentication failures", "Authentication failed" };
+
+/// The detail of an `unsupported` link: the far daemon's version, and
+/// what it lacks.
+fn unsupportedDetail(buf: []u8, r: DialResult, callin: bool) []const u8 {
+    const lacks = if (callin and r.peers and r.peer_federation) "call-in members (no peer_callin)" else "peer federation (no peer_federation)";
+    return std.fmt.bufPrint(buf, "it runs {s}, which predates {s}", .{ if (r.version.len > 0) r.version else "a version it does not name", lacks }) catch "it predates federation";
 }
 
 /// The frame a relay leaves this broker in, whichever side dialed.
@@ -191,14 +223,14 @@ pub const Links = struct {
                 var st: c_int = 0;
                 if (c.waitpid(l.dial_pid, &st, c.WNOHANG) != 0) l.dial_pid = -1;
             }
-            if (l.broken) self.drop(l, store, now, wall, "its connection stopped taking data");
+            if (l.broken) self.drop(l, store, now, wall, .dropped, "its connection stopped taking data");
             if (l.phase == .dialing and now - l.dial_started_ms > DIAL_TIMEOUT_MS) {
                 if (l.dial_pid > 0) _ = c.kill(l.dial_pid, c.SIGKILL);
-                self.dialFailed(l, now, "the dial timed out");
+                self.dialFailed(l, store, now, wall, .dial_failed, std.fmt.comptimePrint("no answer within {d} s", .{@divExact(DIAL_TIMEOUT_MS, 1000)}));
             }
-            if (l.phase == .greeting and now - l.dial_started_ms > DIAL_TIMEOUT_MS) self.drop(l, store, now, wall, "the hub never answered the hello");
+            if (l.phase == .greeting and now - l.dial_started_ms > DIAL_TIMEOUT_MS) self.drop(l, store, now, wall, .dropped, "the hub never answered the hello");
             switch (l.direction) {
-                .outbound => if (l.phase == .waiting and l.dial_pid < 0 and l.backoff.due(now)) self.startDial(d, l, now),
+                .outbound => if (l.phase == .waiting and l.dial_pid < 0 and l.backoff.due(now)) self.startDial(d, store, l, now, wall),
                 .inbound => {},
             }
         }
@@ -299,14 +331,14 @@ pub const Links = struct {
         return false;
     }
 
-    fn startDial(self: *Links, d: *Daemon, l: *Link, now: i64) void {
+    fn startDial(self: *Links, d: *Daemon, store: *peermail.Store, l: *Link, now: i64, wall: i64) void {
         var sp: [2]c_int = undefined;
-        if (platform.socketpairCloexec(&sp) != 0) return self.dialFailed(l, now, "socketpair failed");
+        if (platform.socketpairCloexec(&sp) != 0) return self.dialFailed(l, store, now, wall, .dial_failed, "socketpair failed");
         const pid = c.fork();
         if (pid < 0) {
             _ = c.close(sp[0]);
             _ = c.close(sp[1]);
-            return self.dialFailed(l, now, "fork failed");
+            return self.dialFailed(l, store, now, wall, .dial_failed, "fork failed");
         }
         if (pid == 0) {
             daemon_sessions.closeInheritedBrokerFds(d, sp[1]);
@@ -319,6 +351,7 @@ pub const Links = struct {
         l.dial_fd = sp[0];
         l.dial_started_ms = now;
         l.phase = .dialing;
+        store.linkDialing(l.domain);
     }
 
     fn dialDone(self: *Links, l: *Link, store: *peermail.Store, now: i64, wall: i64) void {
@@ -335,28 +368,31 @@ pub const Links = struct {
         }
         if (n <= 0) {
             if (fd >= 0) _ = c.close(fd);
-            return self.dialFailed(l, now, "the dialer exited without an answer");
+            return self.dialFailed(l, store, now, wall, .dial_failed, "the dialer exited without an answer");
         }
         const parsed = std.json.parseFromSlice(DialResult, self.allocator, buf[0..@intCast(n)], .{ .ignore_unknown_fields = true }) catch {
             if (fd >= 0) _ = c.close(fd);
-            return self.dialFailed(l, now, "the dialer's answer did not parse");
+            return self.dialFailed(l, store, now, wall, .dial_failed, "the dialer's answer did not parse");
         };
         defer parsed.deinit();
         const res = parsed.value;
         switch (verdict(res, !self.hub)) {
             .failed => {
                 if (fd >= 0) _ = c.close(fd);
-                return self.dialFailed(l, now, res.@"error");
+                return self.dialFailed(l, store, now, wall, res.why orelse .dial_failed, if (res.detail.len > 0) res.detail else res.@"error");
             },
             .unsupported => {
                 if (fd >= 0) _ = c.close(fd);
                 l.phase = .waiting;
-                _ = l.backoff.failLong(now);
+                const wait = l.backoff.failLong(now);
+                var db: [256]u8 = undefined;
+                const detail = unsupportedDetail(&db, res, !self.hub);
                 store.linkUnsupported(l.domain, wall);
-                log.warn("peer federation: {s}'s daemon predates {s}; retrying in {d} s", .{ l.domain, if (self.hub) "federation (no peer_federation)" else "call-in members (no peer_callin)", @divTrunc(l.backoff.delay_ms, 1000) });
+                store.linkWhy(l.domain, .unsupported, detail, wait, wall);
+                log.warn("peer federation: {s}'s daemon is too old: {s}; retrying in {d} s", .{ l.domain, detail, @divTrunc(wait, 1000) });
             },
             .federate => {
-                if (fd < 0) return self.dialFailed(l, now, "the dialer sent no socket");
+                if (fd < 0) return self.dialFailed(l, store, now, wall, .dial_failed, "the dialer sent no socket");
                 const fl = c.fcntl(fd, c.F_GETFL);
                 _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
                 self.next_id +%= 1;
@@ -373,10 +409,11 @@ pub const Links = struct {
                     l.conn.?.queueJson(.peer_hub_hello, peermail.HubHello{ .host = store.host, .as = l.domain, .slow_mail = true })
                 else
                     l.conn.?.queueJson(.peer_member_hello, peermail.MemberHello{ .host = store.host, .slow_mail = true });
-                hello catch return self.drop(l, store, now, wall, "the hello could not be sent");
+                hello catch return self.drop(l, store, now, wall, .dropped, "the hello could not be sent");
                 if (self.hub) return self.up(l, id, store, wall);
                 l.phase = .greeting;
                 l.dial_started_ms = now;
+                store.linkWhy(l.domain, .greeting, "", 0, wall);
                 log.info("peer federation: called in to {s}; waiting for its hello", .{l.domain});
             },
         }
@@ -384,11 +421,11 @@ pub const Links = struct {
 
     fn serviceUp(self: *Links, l: *Link, revents: c_short, store: *peermail.Store, now: i64, wall: i64) void {
         const conn = if (l.conn) |*cc| cc else return;
-        if (revents & c.POLLOUT != 0) conn.flushQueued() catch return self.drop(l, store, now, wall, "a write failed");
+        if (revents & c.POLLOUT != 0) conn.flushQueued() catch return self.drop(l, store, now, wall, .dropped, "a write failed");
         if (revents & (c.POLLIN | c.POLLHUP | c.POLLERR) == 0) return;
         const alive = conn.fillAvailable();
         while (true) {
-            const f = conn.takeFrame() catch return self.drop(l, store, now, wall, "a malformed frame arrived");
+            const f = conn.takeFrame() catch return self.drop(l, store, now, wall, .dropped, "a malformed frame arrived");
             const frame = f orelse break;
             defer frame.deinit(self.allocator);
             switch (frame.ftype) {
@@ -409,25 +446,30 @@ pub const Links = struct {
                 .peer_hub_hello => {
                     if (self.hub) continue;
                     const parsed = std.json.parseFromSlice(peermail.HubHello, self.allocator, frame.payload, .{ .ignore_unknown_fields = true }) catch
-                        return self.drop(l, store, now, wall, "the hub's hello did not parse");
+                        return self.drop(l, store, now, wall, .dropped, "the hub's hello did not parse");
                     defer parsed.deinit();
                     store.uplinkUp(l.conn_id, parsed.value, .outbound, wall) catch |e|
-                        return self.drop(l, store, now, wall, @errorName(e));
+                        return self.drop(l, store, now, wall, .refused, @errorName(e));
                     log.info("peer federation: hub {s} linked, calling this host {s}", .{ parsed.value.host, parsed.value.as });
                     self.up(l, l.conn_id, store, wall);
                 },
                 .err => {
-                    log.warn("peer federation: {s} refused the link: {s}", .{ l.domain, frame.payload[0..@min(frame.payload.len, 200)] });
-                    return self.drop(l, store, now, wall, "the far daemon refused it");
+                    // Its words: `.err` carries `{"error": ..., "for": ...}`.
+                    const Said = struct { @"error": []const u8 = "" };
+                    const parsed = std.json.parseFromSlice(Said, self.allocator, frame.payload, .{ .ignore_unknown_fields = true }) catch null;
+                    defer if (parsed) |p| p.deinit();
+                    const said = if (parsed) |p| p.value.@"error" else std.mem.trim(u8, frame.payload[0..@min(frame.payload.len, 200)], " \r\n");
+                    log.warn("peer federation: {s} refused the link: {s}", .{ l.domain, said });
+                    return self.drop(l, store, now, wall, .refused, said);
                 },
                 else => {},
             }
             if (l.conn == null) return;
         }
-        if (!alive) self.drop(l, store, now, wall, "the far side closed it");
+        if (!alive) self.drop(l, store, now, wall, .dropped, "the far side closed it");
     }
 
-    fn dialFailed(self: *Links, l: *Link, now: i64, why: []const u8) void {
+    fn dialFailed(self: *Links, l: *Link, store: *peermail.Store, now: i64, wall: i64, why: PeerLinkWhy, detail: []const u8) void {
         _ = self;
         if (l.dial_fd >= 0) {
             _ = c.close(l.dial_fd);
@@ -435,10 +477,11 @@ pub const Links = struct {
         }
         l.phase = .waiting;
         const wait = l.backoff.fail(now);
-        log.warn("peer federation: dialing {s} failed ({s}); retrying in {d} s", .{ l.domain, why, @divTrunc(wait, 1000) });
+        store.linkWhy(l.domain, why, detail, wait, wall);
+        log.warn("peer federation: dialing {s} failed ({s}: {s}); retrying in {d} s", .{ l.domain, why.label(), detail, @divTrunc(wait, 1000) });
     }
 
-    fn drop(self: *Links, l: *Link, store: *peermail.Store, now: i64, wall: i64, why: []const u8) void {
+    fn drop(self: *Links, l: *Link, store: *peermail.Store, now: i64, wall: i64, why: PeerLinkWhy, detail: []const u8) void {
         _ = self;
         const id = l.conn_id;
         if (l.conn) |*conn| conn.deinit();
@@ -447,8 +490,9 @@ pub const Links = struct {
         l.broken = false;
         l.phase = .waiting;
         const wait = l.backoff.fail(now);
-        log.warn("peer federation: link to {s} down ({s}); redialing in {d} s", .{ l.domain, why, @divTrunc(wait, 1000) });
+        log.warn("peer federation: link to {s} down ({s}: {s}); redialing in {d} s", .{ l.domain, why.label(), detail, @divTrunc(wait, 1000) });
         store.connGone(id, wall);
+        store.linkWhy(l.domain, why, detail, wait, wall);
     }
 };
 
@@ -473,9 +517,15 @@ fn dialChild(spec: []const u8, out_fd: c_int) noreturn {
             .peer_federation = conn.caps.peer_federation,
             .peer_callin = conn.caps.peer_callin,
             .peer_slow_mail = conn.caps.peer_slow_mail,
+            .version = conn.serverVersion(),
         };
         conn_fd = conn.fd;
-    } else |e| res.@"error" = @errorName(e);
+    } else |e| {
+        const dw = dialWhy(@errorName(e), muxclient.sshUnreachable(), muxclient.routeFailure(), muxclient.sshSaid());
+        res.@"error" = @errorName(e);
+        res.why = dw.why;
+        res.detail = dw.detail;
+    }
     const json = std.json.Stringify.valueAlloc(a, res, .{}) catch c._exit(1);
     var iov = c.struct_iovec{ .iov_base = @constCast(json.ptr), .iov_len = json.len };
     var cbuf: [64]u8 align(@alignOf(c.struct_cmsghdr)) = std.mem.zeroes([64]u8);
@@ -574,7 +624,7 @@ test "the hub takes a call-in only from a configured inbound domain, and a newer
     // 2. The inbound member calls in: its link is up over that client.
     const l = try links.callin("aeor");
     try t.expectEqual(@as(u32, 0), links.acceptCallin(l, 7, true, &store, 100));
-    const hosts = try store.hostList(arena.allocator());
+    const hosts = try store.hostList(arena.allocator(), 0);
     try t.expectEqual(PeerLink.up, hosts[1].link);
     try t.expectEqual(@as(?PeerLinkDirection, .inbound), hosts[1].direction);
     // 3. It calls in again before the old client is gone: the new one
@@ -582,12 +632,36 @@ test "the hub takes a call-in only from a configured inbound domain, and a newer
     try t.expectEqual(@as(u32, 7), links.acceptCallin(l, 9, true, &store, 200));
     links.clientGone(7);
     store.connGone(7, 210);
-    try t.expectEqual(PeerLink.up, (try store.hostList(arena.allocator()))[1].link);
+    try t.expectEqual(PeerLink.up, (try store.hostList(arena.allocator(), 0))[1].link);
     // 4. The live one hangs up: the domain stays listed, down.
     links.clientGone(9);
     store.connGone(9, 300);
-    try t.expectEqual(PeerLink.down, (try store.hostList(arena.allocator()))[1].link);
+    try t.expectEqual(PeerLink.down, (try store.hostList(arena.allocator(), 0))[1].link);
     try t.expectEqual(@as(u32, 0), l.conn_id);
 }
 
+test "a failed dial names why: unreachable, a refused login, a route's hop, else what ssh said or the error; an old daemon names its version" {
+    const unreach = dialWhy("HostUnreachable", "ssh: connect to host dalaran port 22: Connection refused", "", "ssh: connect to host dalaran port 22: Connection refused");
+    try t.expectEqual(PeerLinkWhy.@"unreachable", unreach.why);
+    try t.expectEqualStrings("ssh: connect to host dalaran port 22: Connection refused", unreach.detail);
+    const auth = dialWhy("SshTransportFailed", "", "", "me@dalaran: Permission denied (publickey).");
+    try t.expectEqual(PeerLinkWhy.auth_failed, auth.why);
+    try t.expectEqual(PeerLinkWhy.auth_failed, dialWhy("SshTransportFailed", "", "", "Host key verification failed.").why);
+    const hop = dialWhy("RouteHopUnreachable", "", "route hop b did not answer: x", "x");
+    try t.expectEqual(PeerLinkWhy.dial_failed, hop.why);
+    try t.expectEqualStrings("route hop b did not answer: x", hop.detail);
+    try t.expectEqualStrings("sh: 1: sketerm-mux: not found", dialWhy("SshTransportFailed", "", "", "sh: 1: sketerm-mux: not found").detail);
+    try t.expectEqualStrings("Timeout", dialWhy("Timeout", "", "", "").detail);
+    var buf: [256]u8 = undefined;
+    try t.expectEqualStrings("it runs 0.2.2, which predates peer federation (no peer_federation)", unsupportedDetail(&buf, .{ .ok = true, .peers = true, .version = "0.2.2" }, false));
+    try t.expectEqualStrings("it runs 0.3.0, which predates call-in members (no peer_callin)", unsupportedDetail(&buf, .{ .ok = true, .peers = true, .peer_federation = true, .version = "0.3.0" }, true));
+    // The dialer's answer carries it across the socketpair.
+    const json = try std.json.Stringify.valueAlloc(t.allocator, DialResult{ .@"error" = "HostUnreachable", .why = .@"unreachable", .detail = "ssh: x" }, .{});
+    defer t.allocator.free(json);
+    const back = try std.json.parseFromSlice(DialResult, t.allocator, json, .{ .ignore_unknown_fields = true });
+    defer back.deinit();
+    try t.expectEqual(@as(?PeerLinkWhy, .@"unreachable"), back.value.why);
+}
+
 const PeerLink = peermail.PeerLink;
+const PeerLinkWhy = peermail.PeerLinkWhy;

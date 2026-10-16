@@ -163,6 +163,16 @@ pub fn sshUnreachable() []const u8 {
     return ssh_unreachable_buf[0..ssh_unreachable_len];
 }
 
+/// The last line ssh wrote on stderr when the last direct ssh connect on
+/// this thread failed for any reason (a refused login, a missing
+/// sketerm-mux); empty after a success or when it wrote nothing.
+threadlocal var ssh_said_buf: [384]u8 = undefined;
+threadlocal var ssh_said_len: usize = 0;
+
+pub fn sshSaid() []const u8 {
+    return ssh_said_buf[0..ssh_said_len];
+}
+
 pub const ConnectOptions = struct {
     udp_port_range: ?[]const u8 = null,
     tor_socks_endpoint: []const u8 = @import("socks5_client.zig").DEFAULT_ENDPOINT,
@@ -438,6 +448,9 @@ pub const Conn = struct {
     /// daemon that predates the announce — stale by definition.
     server_build: [72]u8 = undefined,
     server_build_len: usize = 0,
+    /// The daemon's semver as its welcome announced it ("" = none).
+    server_version: [32]u8 = undefined,
+    server_version_len: usize = 0,
     /// Independent panel relay capability advertised by the daemon.
     panel_rpc: u8 = 0,
     attach_identity_pending: bool = false,
@@ -676,6 +689,7 @@ pub const Conn = struct {
         self.panel_rpc = 0;
         self.attach_identity_pending = false;
         self.server_build_len = 0;
+        self.server_version_len = 0;
         const Probe = struct {
             proto: u32 = 1,
             server_proto: ?u32 = null,
@@ -683,6 +697,7 @@ pub const Conn = struct {
             snapshot: u8 = 0,
             panel_rpc: u8 = 0,
             build: []const u8 = "",
+            version: []const u8 = "",
         };
         if (std.json.parseFromSlice(Probe, allocator, payload, .{ .ignore_unknown_fields = true })) |parsed| {
             defer parsed.deinit();
@@ -697,6 +712,8 @@ pub const Conn = struct {
             self.panel_rpc = @min(parsed.value.panel_rpc, wire.PANEL_RPC_VERSION);
             self.server_build_len = @min(parsed.value.build.len, self.server_build.len);
             @memcpy(self.server_build[0..self.server_build_len], parsed.value.build[0..self.server_build_len]);
+            self.server_version_len = @min(parsed.value.version.len, self.server_version.len);
+            @memcpy(self.server_version[0..self.server_version_len], parsed.value.version[0..self.server_version_len]);
             self.snapshot_version = if (parsed.value.snapshot > 0)
                 @min(parsed.value.snapshot, @import("snapshot.zig").SNAPSHOT_VERSION)
             else if (self.proto >= 6)
@@ -704,6 +721,10 @@ pub const Conn = struct {
             else
                 @import("snapshot.zig").LEGACY_SNAPSHOT_VERSION;
         } else |_| {}
+    }
+
+    pub fn serverVersion(self: *const Conn) []const u8 {
+        return self.server_version[0..self.server_version_len];
     }
 
     pub fn serverBuild(self: *const Conn) []const u8 {
@@ -1288,6 +1309,7 @@ pub const Conn = struct {
     /// Route-aware SSH connect with every connect option (`udp_port_range` unused).
     pub fn connectSshWith(allocator: std.mem.Allocator, spec: []const u8, options: ConnectOptions) !Conn {
         ssh_unreachable_len = 0;
+        ssh_said_len = 0;
         // A route never deploys: no earlier connect's outcome may describe it.
         deploy.forgetOutcome();
         if (RouteSpec.isRoute(spec)) return connectRoute(allocator, spec, options);
@@ -1350,6 +1372,7 @@ pub const Conn = struct {
     /// `connectSshOnceWithEndpoint` with every connect option.
     pub fn connectSshOnceWith(allocator: std.mem.Allocator, spec: []const u8, options: ConnectOptions) !Conn {
         ssh_unreachable_len = 0;
+        ssh_said_len = 0;
         if (RouteSpec.isRoute(spec)) return connectRoute(allocator, spec, options);
         const remote = RemoteSpec.parse(spec);
         const route: sshroute.Route = switch (remote.mode) {
@@ -1553,17 +1576,25 @@ pub const Conn = struct {
     /// `sshUnreachable`) when ssh could not reach it at all.
     fn sshBroke(err_fd: c_int) anyerror {
         var buf: [1024]u8 = undefined;
-        const line = sshroute.unreachableLine(scratchRead(err_fd, &buf)) orelse return error.SshTransportFailed;
+        const said = scratchRead(err_fd, &buf);
+        const kept = std.fmt.bufPrint(&ssh_said_buf, "{s}", .{tailLine(said)}) catch ssh_said_buf[0..];
+        ssh_said_len = kept.len;
+        const line = sshroute.unreachableLine(said) orelse return error.SshTransportFailed;
         const text = std.fmt.bufPrint(&ssh_unreachable_buf, "{s}", .{line}) catch ssh_unreachable_buf[0..];
         ssh_unreachable_len = text.len;
         return error.HostUnreachable;
     }
 
     fn lastLine(text: []const u8) []const u8 {
+        const tail = tailLine(text);
+        return if (tail.len > 0) tail else "no ssh output (host down, auth refused, or no sketerm-mux there)";
+    }
+
+    /// The last line of `text`, blank ones skipped; "" when it has none.
+    fn tailLine(text: []const u8) []const u8 {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
-        if (trimmed.len == 0) return "no ssh output (host down, auth refused, or no sketerm-mux there)";
         const nl = std.mem.lastIndexOfScalar(u8, trimmed, '\n') orelse return trimmed;
-        return trimmed[nl + 1 ..];
+        return std.mem.trim(u8, trimmed[nl + 1 ..], " \t\r");
     }
 
     /// One `\n`-terminated line, read a byte at a time so nothing past it

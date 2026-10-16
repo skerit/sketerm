@@ -23168,3 +23168,23 @@ no_mcp: true`, a footnote in text) and `to_no_mcp` on sends to it, relayed
 across federation; `SessionEnd`, a server registering it again or 2 min of
 silence end it. Unit test in peermail; smoke peer stage step 27a kills a
 server by its exact pid and runs its client's hook.
+
+## 2026-10-16: a federation link that is not up says why
+
+A host listed `link: unsupported` (or down) gave no reason, so nobody knew
+whether it was config, version or the host. Every non-up link now carries
+one reason from `vocab.PeerLinkWhy` (the one vocabulary, exhaustive
+`label`), set where the link fails: the dialer child classifies its
+`connectRemote` failure (`peerlink.dialWhy`: ssh's unreachable line, a
+refused login by ssh's last line (`client.sshSaid`, new), a route hop, else
+the error), an old daemon names its welcome `version` (`Conn.serverVersion`,
+new), a `.err` on the link is `refused` with the far daemon's words, a drop
+says how, an inbound link waits for the far side to dial. The store keeps
+it per route (`Store.linkWhy`/`linkDialing`, detail capped at 200 bytes)
+with the next dial's time; `HostInfo` gains `why/detail/retry_in_ms/
+redialing`, `PeerInfo` `link_why`, relayed by the hub. Text: `links:
+dalaran down (unreachable: ssh: ...; retry in 40s; seen 15m ago)` and
+`link down (unreachable)` on each peer row; `sketerm peer status` too.
+Unit tests in peerlink, peermail, peer_cli, vocab; the smoke federation
+stage asserts `unreachable` (the fake ssh now prints ssh's refusal) and
+`awaiting_dial` on its two cuts.

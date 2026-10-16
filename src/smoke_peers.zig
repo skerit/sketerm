@@ -1062,12 +1062,12 @@ const FakeSsh = struct {
         writeFileOrFail(f.path, std.fmt.allocPrint(arena,
             \\#!/bin/sh
             \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
-            \\[ -e '{s}' ] && exit 255
+            \\[ -e '{s}' ] && {{ echo 'ssh: connect to host {s} port 22: Connection refused' >&2; exit 255; }}
             \\echo $$ > '{s}.tmp' && mv '{s}.tmp' '{s}'
             \\export XDG_RUNTIME_DIR='{s}' XDG_STATE_HOME='{s}' XDG_CONFIG_HOME='{s}'
             \\exec '{s}' --proxy
             \\
-        , .{ f.down, f.pid_file, f.pid_file, f.pid_file, target.rt, target.st, target.cfg, std.mem.span(mux_bin) }) catch fail("oom"), 0o700);
+        , .{ f.down, name, f.pid_file, f.pid_file, f.pid_file, target.rt, target.st, target.cfg, std.mem.span(mux_bin) }) catch fail("oom"), 0o700);
         return f;
     }
 };
@@ -1090,12 +1090,19 @@ fn mailBothWays(from: *Mcp, to: *Mcp, arena: std.mem.Allocator, to_addr: []const
 /// The link through `ssh` is cut (its proxy, by its exact pid) and kept
 /// down: `far` stays listed on `hub` with link down; a send is queued
 /// host_unreachable; restored, it arrives once with its age.
-fn cutAndRestore(hub: *Mcp, far: *Mcp, arena: std.mem.Allocator, ssh: *const FakeSsh, far_addr: []const u8, hub_addr: []const u8, comptime tag: []const u8) void {
+fn cutAndRestore(hub: *Mcp, far: *Mcp, arena: std.mem.Allocator, ssh: *const FakeSsh, far_addr: []const u8, hub_addr: []const u8, comptime want_why: []const u8, comptime tag: []const u8) void {
     writeFileOrFail(ssh.down, "", 0o600);
     const pid_text = readfile.capped(arena, ssh.pid_file, 64) orelse fail(tag ++ " the fake ssh left no pid");
     const link_pid = std.fmt.parseInt(c.pid_t, std.mem.trim(u8, pid_text, " \n"), 10) catch fail(tag ++ " the fake ssh pid is not a number");
     if (c.kill(link_pid, c.SIGTERM) != 0) fail(tag ++ " could not stop the link's proxy");
     _ = awaitListed(hub, arena, far_addr, "down", 20_000, tag ++ " the hub lists the far peer down");
+    // The host line says why it is down, from where the link failed.
+    {
+        const host = far_addr[0 .. std.mem.indexOfScalar(u8, far_addr, '/') orelse fail(tag ++ " not a host/name")];
+        const h = awaitHostWhy(hub, arena, host, want_why, 30_000, tag ++ " the link's reason");
+        if (std.mem.eql(u8, want_why, "unreachable")) contains(str(h, "detail", tag ++ " detail"), "Connection refused", tag ++ " ssh's own line");
+        printList(hub, arena, tag ++ " the link down,");
+    }
     const r = send(hub, arena, far_addr, "sent while the link was down", tag ++ " send");
     expectStr(r, "outcome", "queued", tag ++ " outcome");
     expectStr(r, "reason", "host_unreachable", tag ++ " reason");
@@ -1106,6 +1113,24 @@ fn cutAndRestore(hub: *Mcp, far: *Mcp, arena: std.mem.Allocator, ssh: *const Fak
     if (it.get("age_s") == null) fail(tag ++ " the delivery has no age");
     expectNothing(far, arena, tag ++ " delivered once");
     _ = awaitListed(hub, arena, far_addr, "up", 20_000, tag ++ " the hub lists the far peer up again");
+}
+
+/// Poll `m`'s peer_list until host `host` is listed with the reason `why`;
+/// its `hosts` entry.
+fn awaitHostWhy(m: *Mcp, arena: std.mem.Allocator, host: []const u8, why: []const u8, budget_ms: i64, comptime what: []const u8) std.json.ObjectMap {
+    const deadline = nowMs() + budget_ms;
+    while (nowMs() < deadline) {
+        const r = call(m, arena, "peer_list", "{}", what);
+        if (r.get("hosts")) |hs| for (hs.array.items) |h| {
+            if (!std.mem.eql(u8, str(h.object, "host", what), host)) continue;
+            const got = if (h.object.get("why")) |v| v.string else "";
+            if (std.mem.eql(u8, got, why)) return h.object;
+        };
+        _ = c.usleep(200_000);
+    }
+    std.debug.print("{s}: host {s} never listed with the reason {s}\n", .{ what, host, why });
+    printList(m, arena, what);
+    fail(what ++ ": the link never said why it is down");
 }
 
 /// Poll `m`'s peer_list until `address` is listed with `link` (null: any).
@@ -1193,7 +1218,7 @@ pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
 
     // 4. The link is cut and kept down: queued host_unreachable on the
     //    hub; restored, it arrives once.
-    cutAndRestore(&zed, &mia, arena, &ssh, mia_on_hub, zed_on_mem, "f4.");
+    cutAndRestore(&zed, &mia, arena, &ssh, mia_on_hub, zed_on_mem, "unreachable", "f4.");
     std.debug.print("smoke: peers: federation link cut, queued, restored, delivered once ok\n", .{});
 
     // 5. A name the member does not know: the far broker's refusal comes
@@ -1257,7 +1282,7 @@ pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
         _ = awaitListed(&zed, arena, cid_on_hub, "up", 60_000, "f8. zed lists the call-in cid");
         _ = awaitListed(&cid, arena, zed_on_mem, "up", 20_000, "f8. cid lists zed");
         mailBothWays(&cid, &zed, arena, zed_on_mem, cid_on_hub, "f8.");
-        cutAndRestore(&zed, &cid, arena, &cin_ssh, cid_on_hub, zed_on_mem, "f8. cut");
+        cutAndRestore(&zed, &cid, arena, &cin_ssh, cid_on_hub, zed_on_mem, "awaiting_dial", "f8. cut");
         cid.closeStdinWait();
     }
     std.debug.print("smoke: peers: federation call-in member presence, mail, cut and redial ok\n", .{});

@@ -512,7 +512,7 @@ fn queueList(d: *Daemon, s: *peermail.Store, cl: *Client, req: u32) void {
     defer arena.deinit();
     const a = arena.allocator();
     const peers = s.list(a, clock.wallMs()) catch return cl.queueErrFor("peer list failed on the broker", "peer_list_req");
-    const hosts = s.hostList(a) catch return cl.queueErrFor("peer list failed on the broker", "peer_list_req");
+    const hosts = s.hostList(a, clock.wallMs()) catch return cl.queueErrFor("peer list failed on the broker", "peer_list_req");
     const me = if (req == 0) (s.selfInfo(a, cl.id) catch null) else null;
     cl.queueJson(.peer_list, peermail.ListReply{ .req = req, .self = me, .peers = peers, .hosts = hosts, .federation = s.federation() });
 }

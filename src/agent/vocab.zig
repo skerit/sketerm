@@ -178,6 +178,45 @@ pub const PeerLink = enum {
     unsupported,
 };
 
+/// Why a federation link is not up, as the side that dials or awaits it
+/// saw it fail (`peerlink`); shown beside every non-up `PeerLink`.
+pub const PeerLinkWhy = enum {
+    /// A dial is under way.
+    dialing,
+    /// The transport could not reach the host (detail: ssh's own line).
+    @"unreachable",
+    /// ssh reached the host and refused the login (detail: ssh's line).
+    auth_failed,
+    /// The dial failed otherwise (detail: ssh's last line, or the error).
+    dial_failed,
+    /// That host's daemon predates federation or call-ins (detail: its version).
+    unsupported,
+    /// The far daemon refused the link (detail: its own words).
+    refused,
+    /// The link was up and dropped (detail: how).
+    dropped,
+    /// The far side dials this link (a hub's call-in member, or a member's
+    /// hub) and has not (yet, or again).
+    awaiting_dial,
+    /// A call-in member waiting for its hub's hello.
+    greeting,
+
+    /// The words a list shows (its detail follows after a colon).
+    pub fn label(self: PeerLinkWhy) []const u8 {
+        return switch (self) {
+            .dialing => "dialing",
+            .@"unreachable" => "unreachable",
+            .auth_failed => "auth failed",
+            .dial_failed => "dial failed",
+            .unsupported => "its daemon is too old",
+            .refused => "refused",
+            .dropped => "dropped",
+            .awaiting_dial => "waiting for it to dial in",
+            .greeting => "waiting for the hub's hello",
+        };
+    }
+};
+
 /// This daemon's part in peer federation.
 pub const PeerFederation = enum {
     /// Config `peer_hub`: it dials every outbound `[domain.<name>] peers =
@@ -527,6 +566,7 @@ test "peer vocabulary: every state ranked except unknown, every reason described
     try t.expectEqual(@as(?Attention, null), PeerState.unknown.attention());
     for (std.enums.values(RefuseReason)) |r| try t.expect(r.describe().len > 0);
     for (std.enums.values(PeerUnavailable)) |r| try t.expect(r.describe().len > 0);
+    for (std.enums.values(PeerLinkWhy)) |w| try t.expect(w.label().len > 0);
     try t.expectEqualStrings("waiting_user", names(PeerState)[3]);
     try t.expectEqual(@as(usize, 5), names(PeerOutcome).len);
     try t.expect(RefuseReason.host_unreachable.queues());

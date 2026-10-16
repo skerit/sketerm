@@ -2916,9 +2916,9 @@ peer's screen, and a peer message is information, never an approval.
   you: zenit (p-3fa9c2e1, durable)
   zenit-1     waiting_user  ctx 194k  1 pending  p-9c04e2d7
   qq          gone 18m  subject Folio  12 pending  Qq
-  zenit-2     working  seen 16m ago  dalaran/p-b1e7d4aa
+  zenit-2     working  seen 16m ago  link down (unreachable)  dalaran/p-b1e7d4aa
   p-0be4c1aa  idle  polls
-  links: dalaran down (seen 15m ago), aeor up
+  links: dalaran down (unreachable: ssh: connect to host dalaran port 22: Connection refused; retry in 40s; seen 15m ago), aeor up
   +5 gone with nothing pending and no subject
   ```
 
@@ -2939,8 +2939,9 @@ peer's screen, and a peer message is information, never an approval.
   (the `capabilities.facts` names), the model, `pending` and
   `last_seen_ms`, `detail` adding cwd, pid, durable, name_taken and
   `last_notification`; a federated peer also carries `via_host` and
-  `link`, and the result `federation` and `hosts` (`{host, link,
-  last_seen_ms}` per linked host).
+  `link` (and `link_why` while it is not up), and the result `federation`
+  and `hosts` (`{host, link, last_seen_ms, why?, detail?, retry_in_ms?,
+  redialing?}` per linked host).
   A delivered message carries the sender's state at delivery
   (`meta.sender_state`, and the composed line's state); `peer_send`'s
   text names the recipient's state when the daemon reported it, and
@@ -3294,6 +3295,23 @@ whose config says so; every other daemon is dialed by it, or calls in
   listed with their last state and `link: down`; a host whose daemon
   predates federation is listed `unsupported` and refused
   `federation_unavailable`.
+- **Why a link is down**: every link that is not up says why, from where
+  it failed (`peerlink`, the dialing or awaiting side; the one vocabulary
+  is `PeerLinkWhy`): `dialing` (the first dial), `unreachable` (ssh's own
+  line, e.g. `ssh: connect to host dalaran port 22: Connection refused`),
+  `auth_failed` (ssh reached it and refused the login: `Permission
+  denied (publickey)`), `dial_failed` (ssh's last line, a route's
+  failing hop, or the error), `unsupported` (`it runs 0.2.2, which
+  predates peer federation (no peer_federation)`, the version from its
+  welcome), `refused` (the far daemon's own words), `dropped` (how an up
+  link ended), `awaiting_dial` (the far side dials it: a call-in member,
+  or a member's hub) and `greeting` (a call-in member waiting for its
+  hub's hello). The host line adds when it is dialed again (`retry in
+  40s`) or that a redial is under way (the last failure's reason stays);
+  each peer behind it shows `link down (unreachable)`. A hub passes its
+  links' reasons on to its members (without its retry schedule); a
+  member whose uplink is down shows the uplink's reason on every host
+  behind it. `sketerm peer status` prints the same line per host.
 - **Clocks**: no wall-clock time crosses a link. A relayed message
   carries its age at the sending daemon, a relayed peer or host its
   "seen N ms ago", an event how long the message waited; the receiving

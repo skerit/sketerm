@@ -80,6 +80,8 @@ pub const ListLine = struct {
     via_host: ?[]const u8 = null,
     /// Federation: that link's state.
     link: ?[]const u8 = null,
+    /// Federation: why that link is not up (`HostLine.why`).
+    link_why: ?[]const u8 = null,
 };
 
 /// One federated host as `peer_list` and `sketerm peer list --json` report it.
@@ -87,19 +89,49 @@ pub const HostLine = struct {
     host: []const u8,
     link: []const u8,
     last_seen_ms: i64,
+    /// Why the link is not up, and what said so; absent while it is.
+    why: ?[]const u8 = null,
+    detail: ?[]const u8 = null,
+    /// The next dial is due in this many ms; absent when none waits here.
+    retry_in_ms: ?i64 = null,
+    /// A redial is under way (why is the last failure's).
+    redialing: ?bool = null,
 };
 
 pub fn hostLine(h: peermail.HostInfo) HostLine {
-    return .{ .host = h.host, .link = @tagName(h.link), .last_seen_ms = h.last_seen_ms };
+    return .{
+        .host = h.host,
+        .link = @tagName(h.link),
+        .last_seen_ms = h.last_seen_ms,
+        .why = if (h.why) |w| @tagName(w) else null,
+        .detail = nonEmpty(h.detail),
+        .retry_in_ms = if (h.retry_in_ms > 0) h.retry_in_ms else null,
+        .redialing = if (h.redialing) true else null,
+    };
+}
+
+/// Why a host's link is not up, as every text surface reads it: the
+/// reason, what said so, and when it is dialed again (nothing while up).
+pub fn writeWhy(w: *std.Io.Writer, h: peermail.HostInfo) !void {
+    const why = h.why orelse return;
+    try w.writeAll(why.label());
+    if (h.detail.len > 0) try w.print(": {s}", .{h.detail});
+    var buf: [48]u8 = undefined;
+    if (h.redialing) try w.writeAll("; redialing now") else if (h.retry_in_ms > 0) try w.print("; retry in {s}", .{clock.span(&buf, h.retry_in_ms, .short)});
 }
 
 /// One line: the host (or "the hub" before it said hello), its link
-/// state, and when it was last heard from while not up.
+/// state and why it is not up, and when it was last heard from then.
 pub fn writeHostText(w: *std.Io.Writer, h: peermail.HostInfo) !void {
     try w.print("host {s}: link {s}", .{ if (h.host.len > 0) h.host else "(the hub, not heard from yet)", @tagName(h.link) });
     switch (h.link) {
         .up => {},
         .down, .unsupported => {
+            if (h.why != null) {
+                try w.writeAll(" (");
+                try writeWhy(w, h);
+                try w.writeAll(")");
+            }
             var buf: [clock.ISO_LEN]u8 = undefined;
             if (h.last_seen_ms > 0) if (clock.isoLocal(&buf, h.last_seen_ms)) |iso| try w.print(", last heard {s}", .{iso});
         },
@@ -129,6 +161,7 @@ pub fn listLine(pi: peermail.PeerInfo, is_self: bool, detail: bool) ListLine {
         .self = if (is_self) true else null,
         .via_host = nonEmpty(pi.via_host),
         .link = if (pi.link) |k| @tagName(k) else null,
+        .link_why = if (pi.link_why) |w| (if (pi.link != null and pi.link.? != .up) @tagName(w) else null) else null,
     };
     if (detail) {
         l.cwd = pi.cwd;
@@ -246,6 +279,10 @@ pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []c
             const seen = clock.ago(&buf, now_ms, pi.last_seen_ms, .short);
             if (seen.len > 0 and !std.mem.eql(u8, seen, "just now")) try w.print("  seen {s}", .{seen});
         }
+        if (pi.link) |k| if (k != .up) {
+            try w.print("  link {s}", .{@tagName(k)});
+            if (pi.link_why) |why| try w.print(" ({s})", .{why.label()});
+        };
         if (detail) {
             if (pi.cwd.len > 0) try w.print("  cwd {s}", .{pi.cwd});
             if (pi.pid > 0) try w.print("  pid {d}", .{pi.pid});
@@ -257,9 +294,12 @@ pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []c
         try w.writeAll("links:");
         for (hosts, 0..) |h, i| {
             try w.print("{s} {s} {s}", .{ if (i > 0) "," else "", if (h.host.len > 0) h.host else "the hub (not heard from yet)", @tagName(h.link) });
-            if (h.link != .up and h.last_seen_ms > 0) {
+            if (h.link != .up and (h.why != null or h.last_seen_ms > 0)) {
+                try w.writeAll(" (");
+                try writeWhy(w, h);
                 var buf: [48]u8 = undefined;
-                try w.print(" (seen {s})", .{clock.ago(&buf, now_ms, h.last_seen_ms, .short)});
+                if (h.last_seen_ms > 0) try w.print("{s}seen {s}", .{ if (h.why != null) "; " else "", clock.ago(&buf, now_ms, h.last_seen_ms, .short) });
+                try w.writeAll(")");
             }
         }
         try w.writeAll("\n");
@@ -1127,17 +1167,17 @@ test "the list: you once, one state word, rounded facts, gone peers counted, lin
         .{ .address = "p-da26a6b5", .app = "claude-code", .host = "h", .state = .idle, .live = true, .facts = f, .model = "Opus 5.5", .last_seen_ms = now },
         .{ .address = "Artefacts", .host = "h", .state = .gone, .pending = 1, .subject = "Folio", .last_seen_ms = now - 18 * min },
         .{ .address = "Nib", .host = "h", .state = .gone, .last_seen_ms = now - 3 * min },
-        .{ .address = "dalaran/p-b1e7d4aa", .app = "claude-code", .host = "dalaran", .state = .working, .live = true, .model = "Opus 5.5", .last_seen_ms = now - 16 * min, .via_host = "dalaran", .link = .down },
+        .{ .address = "dalaran/p-b1e7d4aa", .app = "claude-code", .host = "dalaran", .state = .working, .live = true, .model = "Opus 5.5", .last_seen_ms = now - 16 * min, .via_host = "dalaran", .link = .down, .link_why = .@"unreachable" },
     };
-    const hosts = [_]peermail.HostInfo{ .{ .host = "dalaran", .link = .down, .last_seen_ms = now - 15 * min }, .{ .host = "aeor", .link = .up, .last_seen_ms = now } };
+    const hosts = [_]peermail.HostInfo{ .{ .host = "dalaran", .link = .down, .last_seen_ms = now - 15 * min, .why = .@"unreachable", .detail = "ssh: connect to host dalaran port 22: Connection refused", .retry_in_ms = 40_000 }, .{ .host = "aeor", .link = .up, .last_seen_ms = now } };
     var aw: std.Io.Writer.Allocating = .init(a);
     try writeList(&aw.writer, &peers, &hosts, .{ .address = "p-da26a6b5", .durable = true, .name_taken = false }, now, false);
     try t.expectEqualStrings(
         \\you: p-da26a6b5 (durable)
         \\Zenit1              waiting_user  ctx 194k  1 pending
         \\Artefacts           gone 18m  subject Folio  1 pending
-        \\dalaran/p-b1e7d4aa  working  seen 16m ago
-        \\links: dalaran down (seen 15m ago), aeor up
+        \\dalaran/p-b1e7d4aa  working  seen 16m ago  link down (unreachable)
+        \\links: dalaran down (unreachable: ssh: connect to host dalaran port 22: Connection refused; retry in 40s; seen 15m ago), aeor up
         \\+1 gone with nothing pending and no subject
         \\
     , aw.written());
@@ -1148,7 +1188,16 @@ test "the list: you once, one state word, rounded facts, gone peers counted, lin
     other[4].pid = 42;
     aw.clearRetainingCapacity();
     try writeList(&aw.writer, other[1..], &.{}, null, now, true);
-    try t.expectEqualStrings("p-da26a6b5          idle  ctx 194k  Opus 5.5\nArtefacts           gone 18m  subject Folio  1 pending\ndalaran/p-b1e7d4aa  working  Haiku 4.5  seen 16m ago  cwd /w  pid 42\n+1 gone with nothing pending and no subject\n", aw.written());
+    try t.expectEqualStrings("p-da26a6b5          idle  ctx 194k  Opus 5.5\nArtefacts           gone 18m  subject Folio  1 pending\ndalaran/p-b1e7d4aa  working  Haiku 4.5  seen 16m ago  link down (unreachable)  cwd /w  pid 42\n+1 gone with nothing pending and no subject\n", aw.written());
+    // Every reason reads the same on a host line (`sketerm peer status`):
+    // an old daemon names its version; a redial keeps the last failure.
+    aw.clearRetainingCapacity();
+    try writeHostText(&aw.writer, .{ .host = "dalaran", .link = .unsupported, .why = .unsupported, .detail = "it runs 0.2.2, which predates peer federation (no peer_federation)", .retry_in_ms = 60_000 });
+    try t.expectEqualStrings("host dalaran: link unsupported (its daemon is too old: it runs 0.2.2, which predates peer federation (no peer_federation); retry in 60s)", aw.written());
+    aw.clearRetainingCapacity();
+    try writeWhy(&aw.writer, .{ .host = "aeor", .link = .down, .why = .auth_failed, .detail = "me@aeor: Permission denied (publickey).", .redialing = true });
+    try t.expectEqualStrings("auth failed: me@aeor: Permission denied (publickey).; redialing now", aw.written());
+    try t.expectEqualStrings("unreachable", listLine(peers[4], false, false).link_why.?);
     aw.clearRetainingCapacity();
     try writeList(&aw.writer, &.{}, &.{}, null, now, false);
     try t.expectEqualStrings("no other peers\n", aw.written());

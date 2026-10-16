@@ -48,6 +48,9 @@ pub const RefuseReason = vocab.RefuseReason;
 pub const PeerLink = vocab.PeerLink;
 pub const PeerFederation = vocab.PeerFederation;
 pub const PeerLinkDirection = vocab.PeerLinkDirection;
+pub const PeerLinkWhy = vocab.PeerLinkWhy;
+/// Longest `HostInfo.detail` kept (bytes of UTF-8).
+pub const LINK_DETAIL_MAX: usize = 200;
 
 /// A message text above this many bytes is refused `too_large`.
 pub const PEER_TEXT_MAX: usize = 64 * 1024;
@@ -247,6 +250,8 @@ pub const PeerInfo = struct {
     via_host: []const u8 = "",
     /// Federation: the state of the link it is reached through (null = local).
     link: ?PeerLink = null,
+    /// Federation: why that link is not up (the host's `HostInfo.why`).
+    link_why: ?PeerLinkWhy = null,
     /// The address's alias, empty = none (or a broker that predates them).
     alias: []const u8 = "",
 };
@@ -260,6 +265,17 @@ pub const HostInfo = struct {
     /// Which side dials this host's link; null for a host reported over
     /// another link.
     direction: ?PeerLinkDirection = null,
+    /// Why the link is not up (null while it is, or from a broker that
+    /// predates reasons): where it failed, as `peerlink` saw it.
+    why: ?PeerLinkWhy = null,
+    /// What that failure said (ssh's line, the far daemon's words, its
+    /// version); "" = nothing more.
+    detail: []const u8 = "",
+    /// The next dial is due in this many ms; 0 = none is waiting (or
+    /// another host's link, whose schedule is not relayed).
+    retry_in_ms: i64 = 0,
+    /// A redial is under way; `why` is still the last failure's.
+    redialing: bool = false,
 };
 
 /// `peer_list` body. `req` echoes `peer_list_req`; 0 = the answer to a
@@ -757,6 +773,28 @@ const Route = struct {
     /// the hub names them, owned), sent with each presence until the
     /// member reports them.
     grants: std.ArrayList(Grant) = .empty,
+    /// Why `link` is not up (`Store.linkWhy`); null while up or not said yet.
+    why: ?PeerLinkWhy = null,
+    /// Owned; `HostInfo.detail`.
+    why_detail: []u8 = &.{},
+    /// Wall ms the next dial is due; 0 = none.
+    retry_at_ms: i64 = 0,
+    redialing: bool = false,
+
+    /// This route's own link as a host list shows it at `now`.
+    fn info(self: *const Route, now: i64) HostInfo {
+        const down = self.link != .up;
+        return .{
+            .host = self.host,
+            .link = self.link,
+            .last_seen_ms = self.last_seen_ms,
+            .direction = self.direction,
+            .why = if (down) self.why else null,
+            .detail = if (down) self.why_detail else "",
+            .retry_in_ms = if (down and self.retry_at_ms > now) self.retry_at_ms - now else 0,
+            .redialing = down and self.redialing,
+        };
+    }
 
     fn isUplink(self: *const Route) bool {
         return self.name.len == 0;
@@ -932,7 +970,10 @@ pub const Store = struct {
                 return e;
             };
             for (opts.inbound) |in| {
-                if (std.mem.eql(u8, in, name)) r.direction = .inbound;
+                if (std.mem.eql(u8, in, name)) {
+                    r.direction = .inbound;
+                    r.why = .awaiting_dial;
+                }
             }
         };
         return s;
@@ -1339,6 +1380,7 @@ pub const Store = struct {
         for (self.routes.items) |r| for (r.peers) |p| {
             var e = p;
             e.link = linkOf(r, p.link);
+            e.link_why = if (r.link != .up) r.why else p.link_why;
             try out.append(arena, e);
         };
         return out.items;
@@ -1817,14 +1859,54 @@ pub const Store = struct {
 
     /// Every federated host and its link: on a hub one per domain; on a
     /// member the hub (`host` empty until it said hello since this broker
-    /// started) and then the hosts it reported, down while the uplink is.
-    pub fn hostList(self: *Store, arena: std.mem.Allocator) error{OutOfMemory}![]HostInfo {
+    /// started) and then the hosts it reported, down while the uplink is
+    /// (with the uplink's reason).
+    pub fn hostList(self: *Store, arena: std.mem.Allocator, now: i64) error{OutOfMemory}![]HostInfo {
         var out: std.ArrayList(HostInfo) = .empty;
         for (self.routes.items) |r| {
-            try out.append(arena, .{ .host = r.host, .link = r.link, .last_seen_ms = r.last_seen_ms, .direction = r.direction });
-            for (r.hosts) |h| try out.append(arena, .{ .host = h.host, .link = linkOf(r, h.link), .last_seen_ms = h.last_seen_ms });
+            const own = r.info(now);
+            try out.append(arena, own);
+            for (r.hosts) |h| {
+                var e = h;
+                if (r.link != .up) {
+                    e.link = r.link;
+                    e.why = own.why;
+                    e.detail = own.detail;
+                    e.retry_in_ms = own.retry_in_ms;
+                    e.redialing = own.redialing;
+                }
+                try out.append(arena, e);
+            }
         }
         return out.items;
+    }
+
+    /// The route the link to `domain` serves: that domain's on a hub, the
+    /// uplink on a member.
+    fn linkRoute(self: *Store, domain: []const u8) ?*Route {
+        return if (self.hub) self.routeNamed(domain) else (self.ensureUplink() catch null);
+    }
+
+    /// Why the link to `domain` is not up, from where it failed (`peerlink`);
+    /// `retry_in_ms` > 0: when it is dialed again. Up clears it.
+    pub fn linkWhy(self: *Store, domain: []const u8, why: PeerLinkWhy, detail: []const u8, retry_in_ms: i64, now: i64) void {
+        const r = self.linkRoute(domain) orelse return;
+        const owned = self.allocator.dupe(u8, utf8Prefix(detail, LINK_DETAIL_MAX)) catch return self.warnf("peermail: out of memory noting why the link to {s} is down", .{domain});
+        self.allocator.free(r.why_detail);
+        r.why_detail = owned;
+        r.why = why;
+        r.retry_at_ms = if (retry_in_ms > 0) now + retry_in_ms else 0;
+        r.redialing = false;
+        self.presence_dirty = true;
+    }
+
+    /// A dial of `domain` started: the reason it last failed for stays,
+    /// marked redialing; a first dial reads `dialing`.
+    pub fn linkDialing(self: *Store, domain: []const u8) void {
+        const r = self.linkRoute(domain) orelse return;
+        r.retry_at_ms = 0;
+        if (r.why == null) r.why = .dialing else r.redialing = r.why.? != .dialing;
+        self.presence_dirty = true;
     }
 
     /// Hub: the link to `domain` came up as connection `conn`, its far
@@ -1839,7 +1921,7 @@ pub const Store = struct {
     /// `domain`'s daemon predates federation (on a member: the hub it
     /// calls in to predates call-ins).
     pub fn linkUnsupported(self: *Store, domain: []const u8, now: i64) void {
-        const r = (if (self.hub) self.routeNamed(domain) else (self.ensureUplink() catch null)) orelse return;
+        const r = self.linkRoute(domain) orelse return;
         if (r.conn != 0) self.detach(r, now);
         r.link = .unsupported;
         r.last_seen_ms = now;
@@ -1906,6 +1988,9 @@ pub const Store = struct {
     fn attach(self: *Store, r: *Route, conn: u32, now: i64) void {
         r.conn = conn;
         r.link = .up;
+        r.why = null;
+        r.retry_at_ms = 0;
+        r.redialing = false;
         r.last_seen_ms = now;
         self.presence_dirty = true;
         for (r.box.items.items) |s| {
@@ -1917,6 +2002,12 @@ pub const Store = struct {
         const old = r.conn;
         r.conn = 0;
         r.link = .down;
+        // The far side dials this link (a call-in member, or a member's
+        // hub that dials it): only it can bring it back.
+        if (r.direction == .inbound) {
+            r.why = .awaiting_dial;
+            r.redialing = false;
+        }
         r.last_seen_ms = now;
         self.presence_dirty = true;
         self.answerPending(.{ .route_conn = old });
@@ -1953,12 +2044,13 @@ pub const Store = struct {
                 .via_host = via,
                 // A hub judges its own links; a member keeps the hub's view.
                 .link = if (self.hub) null else p.link,
+                .link_why = if (self.hub) null else p.link_why,
             };
         }
         r.peers = peers;
         if (!self.hub) {
             const hosts = try a.alloc(HostInfo, @min(rl.hosts.len, PRESENCE_PEERS_MAX));
-            for (rl.hosts[0..hosts.len], hosts) |h, *o| o.* = .{ .host = try a.dupe(u8, h.host), .link = h.link, .last_seen_ms = RelayAge.seenAt(now, h.last_seen_ms) };
+            for (rl.hosts[0..hosts.len], hosts) |h, *o| o.* = .{ .host = try a.dupe(u8, h.host), .link = h.link, .last_seen_ms = RelayAge.seenAt(now, h.last_seen_ms), .why = h.why, .detail = try a.dupe(u8, h.detail), .redialing = h.redialing };
             r.hosts = hosts;
         }
         // The hub judges every claim against the network and passes every
@@ -2050,10 +2142,17 @@ pub const Store = struct {
         var hosts: std.ArrayList(HostInfo) = .empty;
         if (self.hub) for (self.routes.items) |o| {
             if (o == r) continue;
-            try hosts.append(a, .{ .host = o.name, .link = o.link, .last_seen_ms = RelayAge.seenAgo(now, o.last_seen_ms) });
+            var hi = o.info(now);
+            hi.host = o.name;
+            hi.last_seen_ms = RelayAge.seenAgo(now, o.last_seen_ms);
+            // A schedule is this host's own: only the reason travels.
+            hi.retry_in_ms = 0;
+            hi.direction = null;
+            try hosts.append(a, hi);
             for (o.peers) |p| {
                 var e = p;
                 e.link = linkOf(o, null);
+                e.link_why = hi.why;
                 try peers.append(a, e);
             }
         };
@@ -2285,6 +2384,7 @@ pub const Store = struct {
         for (r.grants.items) |g| freeGrant(self.allocator, g);
         r.grants.deinit(self.allocator);
         self.allocator.free(r.name);
+        self.allocator.free(r.why_detail);
         self.allocator.free(r.host);
         self.allocator.destroy(r);
     }
@@ -3955,14 +4055,14 @@ fn exchangeOver(link: PeerLinkDirection) !void {
     // 1. Before any link: the member is not federated, the hub lists the
     // domain down with its configured direction.
     try t.expectEqual(PeerFederation.off, net.mem.federation());
-    try t.expectEqual(PeerLink.down, (try net.hub.hostList(a))[0].link);
-    try t.expectEqual(@as(?PeerLinkDirection, link), (try net.hub.hostList(a))[0].direction);
+    try t.expectEqual(PeerLink.down, (try net.hub.hostList(a, 0))[0].link);
+    try t.expectEqual(@as(?PeerLinkDirection, link), (try net.hub.hostList(a, 0))[0].direction);
     // 2. The link comes up: each side lists the other's peer, qualified,
     // with the host it came through.
     try net.connect(100);
     try net.pump(100);
     try t.expectEqual(PeerFederation.member, net.mem.federation());
-    try t.expectEqual(@as(?PeerLinkDirection, net.mem_direction), (try net.mem.hostList(a))[0].direction);
+    try t.expectEqual(@as(?PeerLinkDirection, net.mem_direction), (try net.mem.hostList(a, 0))[0].direction);
     const on_hub = listed(&net.hub, a, "box/alice") orelse return error.TestUnexpectedResult;
     try t.expectEqualStrings("box", on_hub.via_host);
     try t.expectEqual(@as(?PeerLink, .up), on_hub.link);
@@ -4175,7 +4275,7 @@ test "federation: trust gate, unknown and unsupported hosts" {
     try t.expectEqual(@as(?RefuseReason, .federation_unavailable), (try net.hub.send(1, .{ .to = "box/x", .text = "?" }, 40, &idb)).reason);
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
-    try t.expectEqual(PeerLink.unsupported, (try net.hub.hostList(arena.allocator()))[0].link);
+    try t.expectEqual(PeerLink.unsupported, (try net.hub.hostList(arena.allocator(), 0))[0].link);
 }
 
 test "federation: the outbound mailbox and membership survive a restart" {
@@ -4307,4 +4407,60 @@ test "a session whose server is gone but whose hooks still report reads no_mcp, 
     const back = listedAt(s, a, "Zenit", late + 60) orelse return error.TestUnexpectedResult;
     try t.expect(back.live and !back.no_mcp);
     try t.expect(s.hookPresence(&.{4242}, .working, late + 70) == null);
+}
+
+test "a link that is not up says why: its host line and its peers, with when it is dialed again; up clears it" {
+    var net: Net = undefined;
+    try net.init(null);
+    defer net.deinit();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try net.mem.register(1, regSlow("alice"), 0);
+    // 1. The first dial reads dialing.
+    net.hub.linkDialing("box");
+    try t.expectEqual(@as(?PeerLinkWhy, .dialing), (try net.hub.hostList(a, 0))[0].why);
+    // 2. Up: no reason; the far peers are listed up.
+    try net.connect(10);
+    try net.pump(10);
+    try t.expectEqual(@as(?PeerLinkWhy, null), (try net.hub.hostList(a, 10))[0].why);
+    try t.expectEqual(@as(?PeerLinkWhy, null), (listed(&net.hub, a, "box/alice") orelse return error.TestUnexpectedResult).link_why);
+    // 3. Cut, and the redial fails: the host line carries why, what said
+    // so and when it is dialed again; each of its peers the why.
+    net.cut(20);
+    net.hub.linkWhy("box", .@"unreachable", "ssh: connect to host box port 22: Connection refused", 40_000, 30);
+    const h = (try net.hub.hostList(a, 10_030))[0];
+    try t.expectEqual(PeerLink.down, h.link);
+    try t.expectEqual(@as(?PeerLinkWhy, .@"unreachable"), h.why);
+    try t.expectEqualStrings("ssh: connect to host box port 22: Connection refused", h.detail);
+    try t.expectEqual(@as(i64, 30_000), h.retry_in_ms);
+    try t.expectEqual(@as(?PeerLinkWhy, .@"unreachable"), (listed(&net.hub, a, "box/alice") orelse return error.TestUnexpectedResult).link_why);
+    // 4. The redial keeps the last failure's reason, marked redialing.
+    net.hub.linkDialing("box");
+    const r = (try net.hub.hostList(a, 40_030))[0];
+    try t.expect(r.redialing and r.why.? == .@"unreachable" and r.retry_in_ms == 0);
+    // 5. The member, whose hub dials it, waits for the hub.
+    try t.expectEqual(@as(?PeerLinkWhy, .awaiting_dial), (try net.mem.hostList(a, 40_030))[0].why);
+    // 6. A long detail is cut on a UTF-8 boundary.
+    net.hub.linkWhy("box", .refused, "é" ** 200, 0, 50_000);
+    try t.expect((try net.hub.hostList(a, 50_000))[0].detail.len <= LINK_DETAIL_MAX);
+    // 7. Up again clears it on both sides.
+    try net.connect(60_000);
+    try net.pump(60_000);
+    try t.expectEqual(@as(?PeerLinkWhy, null), (try net.hub.hostList(a, 60_000))[0].why);
+    try t.expectEqual(@as(?PeerLinkWhy, null), (try net.mem.hostList(a, 60_000))[0].why);
+}
+
+test "an inbound domain whose member has not called in waits for it, again after it hangs up" {
+    var net: Net = undefined;
+    try net.initLink(null, .inbound);
+    defer net.deinit();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try t.expectEqual(@as(?PeerLinkWhy, .awaiting_dial), (try net.hub.hostList(a, 0))[0].why);
+    try net.connect(0);
+    try t.expectEqual(@as(?PeerLinkWhy, null), (try net.hub.hostList(a, 0))[0].why);
+    net.cut(10);
+    try t.expectEqual(@as(?PeerLinkWhy, .awaiting_dial), (try net.hub.hostList(a, 10))[0].why);
 }
