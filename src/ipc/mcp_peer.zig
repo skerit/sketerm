@@ -688,27 +688,18 @@ fn peerList(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     try res.fact("available", true);
     try res.raw("self", try jsonOf(arena, SelfFacts{ .address = link.address, .durable = link.durable, .name_taken = link.name_taken, .ttl_hours = link.ttl_hours }));
     const lines = try arena.alloc(ListLine, reply.value.peers.len);
-    try res.textf("{d} peer(s); this session is {s}{s}", .{ lines.len, if (link.address.len > 0) link.address else "(not registered yet)", if (link.name_taken) " (the name it asked for is taken)" else "" });
-    for (reply.value.peers, lines) |pi, *l| {
-        const is_self = std.mem.eql(u8, pi.address, link.address);
-        l.* = peer_cli.listLine(pi, is_self, detail);
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        try peer_cli.writeListText(&aw.writer, arena, pi, is_self);
-        try res.textf("{s}", .{aw.written()});
-    }
+    for (reply.value.peers, lines) |pi, *l| l.* = peer_cli.listLine(pi, std.mem.eql(u8, pi.address, link.address), detail);
     try res.raw("peers", try jsonOf(arena, lines));
     link.federation = reply.value.federation;
     try res.fact("federation", @tagName(reply.value.federation));
     if (reply.value.hosts.len > 0) {
         const hosts = try arena.alloc(peer_cli.HostLine, reply.value.hosts.len);
-        for (reply.value.hosts, hosts) |h, *l| {
-            l.* = peer_cli.hostLine(h);
-            var aw: std.Io.Writer.Allocating = .init(arena);
-            try peer_cli.writeHostText(&aw.writer, h);
-            try res.textf("{s}", .{aw.written()});
-        }
+        for (reply.value.hosts, hosts) |h, *l| l.* = peer_cli.hostLine(h);
         try res.raw("hosts", try jsonOf(arena, hosts));
     }
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try peer_cli.writeList(&aw.writer, reply.value.peers, reply.value.hosts, .{ .address = link.address, .durable = link.durable, .name_taken = link.name_taken }, clock.wallMs(), detail);
+    try res.text(std.mem.trimEnd(u8, aw.written(), "\n"));
     return res.finish();
 }
 
@@ -791,13 +782,13 @@ fn peerSend(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             try res.fact("outcome", @tagName(r.outcome));
             if (r.reason) |why| try res.fact("reason", @tagName(why));
             if (r.to_state) |st| try res.fact("to_state", @tagName(st));
-            try writeOutcome(&res, r.id, addr, r.outcome, r.reason);
+            try writeOutcome(&res, r.id, addr, r.outcome, r.reason, r.to_state);
         },
         .many => {
             const lines = try arena.alloc(ResultLine, r.results.len);
             for (r.results, lines) |x, *l| {
                 l.* = .{ .to = x.to, .outcome = @tagName(x.outcome), .reason = if (x.reason) |why| @tagName(why) else null, .to_state = if (x.to_state) |st| @tagName(st) else null };
-                try writeOutcome(&res, r.id, x.to, x.outcome, x.reason);
+                try writeOutcome(&res, r.id, x.to, x.outcome, x.reason, x.to_state);
             }
             try res.raw("results", try jsonOf(arena, lines));
         },
@@ -805,12 +796,15 @@ fn peerSend(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     return res.finish();
 }
 
-fn writeOutcome(res: *Res, id: []const u8, to: []const u8, outcome: vocab.PeerOutcome, reason: ?vocab.RefuseReason) !void {
+/// One recipient's line, with its state when the broker reported it.
+fn writeOutcome(res: *Res, id: []const u8, to: []const u8, outcome: vocab.PeerOutcome, reason: ?vocab.RefuseReason, to_state: ?vocab.PeerState) !void {
     const shown = if (id.len > 0) id else "message";
+    var sb: [40]u8 = undefined;
+    const st: []const u8 = if (to_state) |s| std.fmt.bufPrint(&sb, ", it is {s}", .{@tagName(s)}) catch "" else "";
     if (reason) |why|
-        try res.textf("{s} to {s}: {s} ({s}: {s})", .{ shown, to, @tagName(outcome), @tagName(why), why.describe() })
+        try res.textf("{s} to {s}: {s} ({s}: {s}){s}", .{ shown, to, @tagName(outcome), @tagName(why), why.describe(), st })
     else
-        try res.textf("{s} to {s}: {s}", .{ shown, to, @tagName(outcome) });
+        try res.textf("{s} to {s}: {s}{s}", .{ shown, to, @tagName(outcome), st });
 }
 
 const ReadItem = struct {
@@ -852,6 +846,7 @@ fn peerRead(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         if (!g.earlier) fresh += 1;
     }
     try res.textf("{d} new peer item(s){s}", .{ fresh, if (got.len > fresh) " plus earlier ones re-read" else "" });
+    if (why) |w| try res.textf("peers unavailable now ({s}): {s}", .{ @tagName(w), w.describe() });
     for (got, items) |g, *o| {
         const h = g.held;
         const pushed = try agentpush.composePeer(arena, h.item);
@@ -872,7 +867,7 @@ fn peerRead(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             .expired_away => |x| o.from = try arena.dupe(u8, x.from),
         }
         if (!g.earlier and h.needsAck()) try ids.append(arena, o.id);
-        try res.textf("\n[{d}] {s}", .{ h.seq, pushed.content });
+        try res.textf("\n[{d}{s}{s}] {s}", .{ h.seq, if (g.earlier) ", re-read" else "", if (h.quiet()) ", slow mail" else "", pushed.content });
     }
     try res.raw("items", try jsonOf(arena, items));
     ack(ids.items);

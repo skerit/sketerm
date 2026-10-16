@@ -8,7 +8,7 @@
 //! finds that session's own servers the way `sketerm mcp hook` does and
 //! posts the subject as a presence line; `--name` sets it on the broker
 //! by address. It is also the one home of how a peer list entry reads,
-//! for this CLI and the `peer_list` tool alike (`listLine`, `writeListText`).
+//! for this CLI and the `peer_list` tool alike (`listLine`, `writeList`).
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -18,7 +18,6 @@ const clock = @import("../util/clock.zig");
 const Backoff = @import("../util/backoff.zig").Backoff;
 const env = @import("../util/env.zig");
 const vocab = @import("../agent/vocab.zig");
-const facts = @import("../agent/facts.zig");
 const peeraddr = @import("peeraddr.zig");
 const agentpush = @import("agentpush.zig");
 const muxclient = @import("../mux/client.zig");
@@ -26,6 +25,8 @@ const peerclient = @import("../mux/peerclient.zig");
 const agentwait = @import("agentwait.zig");
 const mcp_hook = @import("mcp_hook.zig");
 const peermail = peerclient.peermail;
+const peerwake = @import("../mux/peerwake.zig");
+const numtext = @import("../util/numtext.zig");
 const peer_setup = @import("peer_setup.zig");
 
 /// The argv word that selects this command (`sketerm peer`, `sketerm mcp peer`).
@@ -126,36 +127,98 @@ pub fn listLine(pi: peermail.PeerInfo, is_self: bool, detail: bool) ListLine {
     return l;
 }
 
-/// One line: address, app and host, state (and its attention when that
-/// reads differently), its subject, the facts' compact labels, model,
-/// pending, and when an offline peer was last seen.
-pub fn writeListText(w: *std.Io.Writer, arena: std.mem.Allocator, pi: peermail.PeerInfo, is_self: bool) !void {
-    try w.print("{s}{s} {s} on {s}, {s}", .{
-        pi.address,
-        if (is_self) " (you)" else "",
-        if (pi.app.len > 0) pi.app else "unknown app",
-        if (pi.host.len > 0) pi.host else "this host",
-        @tagName(pi.state),
+/// The session the list is read from, for its one `you:` line.
+pub const SelfLine = struct { address: []const u8, durable: bool, name_taken: bool };
+
+/// Whether `pi` is worth a row: a gone address with nothing pending and
+/// no subject is only counted.
+fn listed(pi: peermail.PeerInfo) bool {
+    return pi.state != .gone or pi.pending > 0 or pi.subject.len > 0;
+}
+
+/// Whether `field` of the rows' peers differs between them (a model or an
+/// app every row shares says nothing per row).
+fn varies(peers: []const peermail.PeerInfo, self: ?SelfLine, comptime field: []const u8) bool {
+    var first: ?[]const u8 = null;
+    for (peers) |pi| {
+        if (!listed(pi) or isSelf(pi, self)) continue;
+        const v = @field(pi, field);
+        if (v.len == 0) continue;
+        if (first) |f| {
+            if (!std.mem.eql(u8, f, v)) return true;
+        } else first = v;
+    }
+    return false;
+}
+
+fn isSelf(pi: peermail.PeerInfo, self: ?SelfLine) bool {
+    return if (self) |s| std.mem.eql(u8, pi.address, s.address) else false;
+}
+
+/// The whole list as compact text, for the `peer_list` tool and `sketerm peer
+/// list` alike: the reader once (`self`), then one row per peer (address,
+/// one state word, `ctx`, subject, pending, how long ago it was seen), the
+/// federation links, and a count of the gone peers left out. `ctx` is the
+/// context the wake rule judges (`peerwake.contextOf`); the account-wide rate
+/// limits and the cost stay in the JSON. Model and app show only where they
+/// differ between peers; `detail` adds cwd and pid.
+pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []const peermail.HostInfo, self: ?SelfLine, now_ms: i64, detail: bool) !void {
+    if (self) |s| try w.print("you: {s}{s}{s}\n", .{
+        if (s.address.len > 0) s.address else "(not registered yet)",
+        if (s.durable) " (durable)" else "",
+        if (s.name_taken) " (the name it asked for is taken)" else "",
     });
-    if (pi.state.attention()) |at| {
-        if (!std.mem.eql(u8, at.label(), @tagName(pi.state))) try w.print(" ({s})", .{at.label()});
+    const show_model = varies(peers, self, "model");
+    const show_app = varies(peers, self, "app");
+    var width: usize = 0;
+    var rows: usize = 0;
+    var omitted: usize = 0;
+    for (peers) |pi| {
+        if (isSelf(pi, self)) continue;
+        if (!listed(pi)) {
+            omitted += 1;
+            continue;
+        }
+        rows += 1;
+        width = @max(width, pi.address.len);
     }
-    if (pi.subject.len > 0) try w.print(", subject: {s}", .{pi.subject});
-    if (pi.facts) |f| if (facts.shipped()) |v| {
-        if (try facts.compactLine(arena, v, try facts.fromJson(arena, v, f))) |line| try w.print(", {s}", .{line});
-    } else |_| {};
-    if (pi.model.len > 0) try w.print(", {s}", .{pi.model});
-    try w.print(", pending {d}", .{pi.pending});
-    if (!pi.live) {
-        try w.writeAll(", offline");
-        var buf: [clock.ISO_LEN]u8 = undefined;
-        if (pi.last_seen_ms > 0) if (clock.isoLocal(&buf, pi.last_seen_ms)) |iso| try w.print(", last seen {s}", .{iso});
+    if (rows == 0 and omitted == 0) try w.writeAll("no other peers\n");
+    for (peers) |pi| {
+        if (isSelf(pi, self) or !listed(pi)) continue;
+        try w.writeAll(pi.address);
+        try w.splatByteAll(' ', width - pi.address.len);
+        var buf: [48]u8 = undefined;
+        if (pi.state == .gone) {
+            try w.writeAll("  gone");
+            if (pi.last_seen_ms > 0) try w.print(" {s}", .{clock.span(&buf, now_ms - pi.last_seen_ms, .short)});
+        } else try w.print("  {s}", .{if (pi.live) @tagName(pi.state) else "offline"});
+        if (show_app and pi.app.len > 0) try w.print("  {s}", .{pi.app});
+        if (peerwake.contextOf(pi.facts)) |ctx| try w.print("  ctx {s}", .{numtext.count(&buf, ctx)});
+        if (show_model and pi.model.len > 0) try w.print("  {s}", .{pi.model});
+        if (pi.subject.len > 0) try w.print("  subject {s}", .{pi.subject});
+        if (pi.pending > 0) try w.print("  {d} pending", .{pi.pending});
+        if (pi.state != .gone) {
+            const seen = clock.ago(&buf, now_ms, pi.last_seen_ms, .short);
+            if (seen.len > 0 and !std.mem.eql(u8, seen, "just now")) try w.print("  seen {s}", .{seen});
+        }
+        if (detail) {
+            if (pi.cwd.len > 0) try w.print("  cwd {s}", .{pi.cwd});
+            if (pi.pid > 0) try w.print("  pid {d}", .{pi.pid});
+        }
+        try w.writeAll("\n");
     }
-    if (pi.via_host.len > 0) try w.print(", via {s}", .{pi.via_host});
-    if (pi.link) |k| switch (k) {
-        .up => {},
-        .down, .unsupported => try w.print(", link {s} (last known state)", .{@tagName(k)}),
-    };
+    if (hosts.len > 0) {
+        try w.writeAll("links:");
+        for (hosts, 0..) |h, i| {
+            try w.print("{s} {s} {s}", .{ if (i > 0) "," else "", if (h.host.len > 0) h.host else "the hub (not heard from yet)", @tagName(h.link) });
+            if (h.link != .up and h.last_seen_ms > 0) {
+                var buf: [48]u8 = undefined;
+                try w.print(" (seen {s})", .{clock.ago(&buf, now_ms, h.last_seen_ms, .short)});
+            }
+        }
+        try w.writeAll("\n");
+    }
+    if (omitted > 0) try w.print("+{d} gone with nothing pending and no subject\n", .{omitted});
 }
 
 // ── what a received item prints as ──────────────────────────────
@@ -494,14 +557,7 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
                 for (reply.value.hosts, hosts) |h, *l| l.* = hostLine(h);
                 aw.writer.print("{f}\n", .{std.json.fmt(.{ .peers = lines, .hosts = hosts, .federation = @tagName(reply.value.federation) }, .{ .emit_null_optional_fields = false })}) catch return 1;
             } else {
-                for (reply.value.peers) |pi| {
-                    writeListText(&aw.writer, arena, pi, false) catch return 1;
-                    aw.writer.writeAll("\n") catch return 1;
-                }
-                for (reply.value.hosts) |h| {
-                    writeHostText(&aw.writer, h) catch return 1;
-                    aw.writer.writeAll("\n") catch return 1;
-                }
+                writeList(&aw.writer, reply.value.peers, reply.value.hosts, null, clock.wallMs(), o.detail) catch return 1;
             }
             say(1, aw.written());
             return 0;
@@ -898,25 +954,48 @@ test "a received message prints as one JSON line with the documented fields" {
     try t.expect(std.mem.startsWith(u8, text, "Peer message from alice ("));
 }
 
-test "a list entry: compact facts by their labels, attention only where it reads differently" {
+test "the list: you once, one state word, rounded facts, gone peers counted, links last" {
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const f = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"context_used_percent\":14,\"rate_7d_used_percent\":98}", .{});
+    const f = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"context_used_percent\":19,\"context_used_tokens\":194029,\"rate_7d_used_percent\":71,\"cost_usd\":4.757664899999999}", .{});
+    const now: i64 = 10_000_000_000;
+    const min: i64 = 60_000;
+    const peers = [_]peermail.PeerInfo{
+        .{ .address = "Zenit1", .app = "claude-code", .host = "h", .state = .waiting_user, .live = true, .pending = 1, .facts = f, .model = "Opus 5.5", .last_seen_ms = now },
+        .{ .address = "p-da26a6b5", .app = "claude-code", .host = "h", .state = .idle, .live = true, .facts = f, .model = "Opus 5.5", .last_seen_ms = now },
+        .{ .address = "Artefacts", .host = "h", .state = .gone, .pending = 1, .subject = "Folio", .last_seen_ms = now - 18 * min },
+        .{ .address = "Nib", .host = "h", .state = .gone, .last_seen_ms = now - 3 * min },
+        .{ .address = "dalaran/p-b1e7d4aa", .app = "claude-code", .host = "dalaran", .state = .working, .live = true, .model = "Opus 5.5", .last_seen_ms = now - 16 * min, .via_host = "dalaran", .link = .down },
+    };
+    const hosts = [_]peermail.HostInfo{ .{ .host = "dalaran", .link = .down, .last_seen_ms = now - 15 * min }, .{ .host = "aeor", .link = .up, .last_seen_ms = now } };
     var aw: std.Io.Writer.Allocating = .init(a);
-    try writeListText(&aw.writer, a, .{ .address = "alice", .app = "claude-code", .host = "h", .state = .waiting_user, .live = true, .pending = 2, .facts = f, .model = "Opus 4.7" }, true);
-    try t.expectEqualStrings("alice (you) claude-code on h, waiting_user (needs input), context 14%, 7d limit 98%, Opus 4.7, pending 2", aw.written());
+    try writeList(&aw.writer, &peers, &hosts, .{ .address = "p-da26a6b5", .durable = true, .name_taken = false }, now, false);
+    try t.expectEqualStrings(
+        \\you: p-da26a6b5 (durable)
+        \\Zenit1              waiting_user  ctx 194k  1 pending
+        \\Artefacts           gone 18m  subject Folio  1 pending
+        \\dalaran/p-b1e7d4aa  working  seen 16m ago
+        \\links: dalaran down (seen 15m ago), aeor up
+        \\+1 gone with nothing pending and no subject
+        \\
+    , aw.written());
+    // A model or an app shows only where the peers differ; detail adds cwd and pid.
+    var other = peers;
+    other[4].model = "Haiku 4.5";
+    other[4].cwd = "/w";
+    other[4].pid = 42;
     aw.clearRetainingCapacity();
-    try writeListText(&aw.writer, a, .{ .address = "bob", .state = .working, .live = true }, false);
-    try t.expectEqualStrings("bob unknown app on this host, working, pending 0", aw.written());
+    try writeList(&aw.writer, other[1..], &.{}, null, now, true);
+    try t.expectEqualStrings("p-da26a6b5          idle  ctx 194k  Opus 5.5\nArtefacts           gone 18m  subject Folio  1 pending\ndalaran/p-b1e7d4aa  working  Haiku 4.5  seen 16m ago  cwd /w  pid 42\n+1 gone with nothing pending and no subject\n", aw.written());
+    aw.clearRetainingCapacity();
+    try writeList(&aw.writer, &.{}, &.{}, null, now, false);
+    try t.expectEqualStrings("no other peers\n", aw.written());
+    // The JSON lines keep every fact.
     const l = listLine(.{ .address = "bob", .state = .unknown, .live = false, .last_notification = "idle_prompt" }, false, true);
     try t.expect(l.attention == null);
     try t.expectEqualStrings("idle_prompt", l.last_notification.?);
     try t.expect(listLine(.{ .address = "bob", .last_notification = "x" }, false, false).last_notification == null);
-    // A subject reads right after the state, and in the compact JSON.
-    aw.clearRetainingCapacity();
-    try writeListText(&aw.writer, a, .{ .address = "carol", .app = "claude-code", .state = .idle, .live = true, .subject = "template links", .model = "Opus" }, false);
-    try t.expectEqualStrings("carol claude-code on this host, idle, subject: template links, Opus, pending 0", aw.written());
     try t.expectEqualStrings("template links", listLine(.{ .address = "carol", .subject = "template links" }, false, false).subject.?);
     try t.expect(listLine(.{ .address = "carol" }, false, false).subject == null);
 }
