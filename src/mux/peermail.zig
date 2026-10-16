@@ -79,6 +79,11 @@ pub const FACTS_MAX: usize = 4096;
 pub const PRESENCE_TEXT_MAX: usize = 128;
 /// Longest subject (bytes of UTF-8) a peer may carry.
 pub const SUBJECT_MAX: usize = 200;
+/// Longest note (bytes of UTF-8) a peer may carry: one short line.
+pub const NOTE_MAX: usize = 120;
+/// A note not set again for this long (wall ms) is stale: no list and no
+/// message header shows it.
+pub const NOTE_STALE_MS: i64 = 4 * 3_600_000;
 /// A durable address's own state beside its mailbox: `<address>` + this
 /// holds `AddressMeta`. It never ends in `FILE_EXT`, so `load` never
 /// reads it as a mailbox, and an older broker ignores it.
@@ -117,15 +122,22 @@ pub const From = struct {
 /// Why a subject is refused.
 pub const SubjectError = error{ SubjectTooLong, SubjectNotText };
 
-/// The one rule for a peer's subject: at most `SUBJECT_MAX` bytes of
-/// UTF-8 with no control character (C0, DEL or C1); "" clears it.
-pub fn checkSubject(text: []const u8) SubjectError!void {
-    if (text.len > SUBJECT_MAX) return error.SubjectTooLong;
-    const view = std.unicode.Utf8View.init(text) catch return error.SubjectNotText;
+/// The text rule subjects and notes share: UTF-8 with no control
+/// character (C0, DEL or C1), so no newline or tab.
+fn oneLine(text: []const u8) bool {
+    const view = std.unicode.Utf8View.init(text) catch return false;
     var it = view.iterator();
     while (it.nextCodepoint()) |cp| {
-        if (cp < 0x20 or (cp >= 0x7f and cp <= 0x9f)) return error.SubjectNotText;
+        if (cp < 0x20 or (cp >= 0x7f and cp <= 0x9f)) return false;
     }
+    return true;
+}
+
+/// The one rule for a peer's subject: at most `SUBJECT_MAX` bytes of
+/// `oneLine` text; "" clears it.
+pub fn checkSubject(text: []const u8) SubjectError!void {
+    if (text.len > SUBJECT_MAX) return error.SubjectTooLong;
+    if (!oneLine(text)) return error.SubjectNotText;
 }
 
 /// The refusal every surface prints for `e`.
@@ -134,6 +146,34 @@ pub fn subjectRefusal(e: SubjectError) []const u8 {
         error.SubjectTooLong => "the subject is longer than 200 bytes",
         error.SubjectNotText => "the subject must be UTF-8 text without control characters (no newlines or tabs)",
     };
+}
+
+/// Why a note is refused.
+pub const NoteError = error{ NoteTooLong, NoteNotText };
+
+/// The one rule for a peer's note (what its own assistant says it is
+/// doing, unlike the user's subject): surrounding whitespace trimmed, then
+/// at most `NOTE_MAX` bytes of `oneLine` text; "" clears it.
+/// @return the trimmed note.
+pub fn checkNote(text: []const u8) NoteError![]const u8 {
+    const v = std.mem.trim(u8, text, " \t\r\n");
+    if (v.len > NOTE_MAX) return error.NoteTooLong;
+    if (!oneLine(v)) return error.NoteNotText;
+    return v;
+}
+
+/// The refusal every surface prints for `e`.
+pub fn noteRefusal(e: NoteError) []const u8 {
+    return switch (e) {
+        error.NoteTooLong => std.fmt.comptimePrint("the note is longer than {d} bytes: keep it to one short line", .{NOTE_MAX}),
+        error.NoteNotText => "the note must be one line of UTF-8 text without control characters (no newline or tab inside it)",
+    };
+}
+
+/// `note` as a reader may see it at `now`: "" once it is `NOTE_STALE_MS`
+/// old (`note_ms` is when it was set, on the reader's clock).
+pub fn freshNote(note: []const u8, note_ms: i64, now: i64) []const u8 {
+    return if (note.len > 0 and now - note_ms <= NOTE_STALE_MS) note else "";
 }
 
 /// What `<address>` + `META_EXT` holds.
@@ -253,6 +293,11 @@ pub const PeerInfo = struct {
     last_notification: []const u8 = "",
     /// The user-set subject of the address, empty = none.
     subject: []const u8 = "",
+    /// The note its own assistant set (`checkNote`), empty = none or
+    /// stale (`freshNote`); it lives only while a server of the address does.
+    note: []const u8 = "",
+    /// Wall ms the note was set (0 = none); a relay carries it as an age.
+    note_ms: i64 = 0,
     /// Federation: the host whose link this entry came over (empty = local).
     via_host: []const u8 = "",
     /// Federation: the state of the link it is reached through (null = local).
@@ -364,6 +409,9 @@ pub const Deliver = struct {
     /// The sender's user-set subject at delivery, empty = none (or a
     /// broker that predates it).
     sender_subject: []const u8 = "",
+    /// The sender's own note at delivery (`PeerInfo.note`), empty = none,
+    /// stale, or a broker that predates notes.
+    sender_note: []const u8 = "",
     /// Slow mail: the server hands it with the session's next turn (or
     /// `peer_read`) and never wakes the session with it.
     quiet: bool = false,
@@ -414,6 +462,9 @@ pub const SubjectReq = struct {
     /// viewer (pane or tab), the source of its peer's alias and default
     /// subject (`offerTitle`). Null = unchanged, "" = none.
     title: ?[]const u8 = null,
+    /// On a broker connection only (welcome `peer_note`): set ("" clears)
+    /// the note of the live peer `address`. Null = unchanged.
+    note: ?[]const u8 = null,
 };
 
 /// `peer_subject_reply` body, echoing `req`.
@@ -422,9 +473,14 @@ pub const SubjectReply = struct {
     found: bool = false,
     address: []const u8 = "",
     subject: []const u8 = "",
-    /// Why a set was refused (`subjectRefusal`).
+    /// The address's fresh note, "" = none.
+    note: []const u8 = "",
+    /// Why a set was refused (`subjectRefusal`, `noteRefusal`, `NOT_LIVE_NOTE`).
     refused: ?[]const u8 = null,
 };
+
+/// Why a note for an address with no live server is refused.
+pub const NOT_LIVE_NOTE = "no live peer holds that address: a note lives only while its peer runs";
 
 /// `peer_hook_presence` body: a session's hook or status line found no
 /// live server of its own and reports to the broker instead. The broker
@@ -629,6 +685,11 @@ const Box = struct {
     hook_ms: i64 = 0,
     /// What its live session runs besides its main turn (`setWork`).
     work: PeerWork = .{},
+    /// Owned; what its own assistant says it is doing (`setNote`), "" =
+    /// none. Only while a server of the address is live; never persisted.
+    note: []u8 = &.{},
+    /// Wall ms the note was last set; 0 = none.
+    note_ms: i64 = 0,
 
     /// Its session runs while its server is down (`PeerInfo.no_mcp`).
     fn noMcp(self: *const Box, now: i64) bool {
@@ -1145,6 +1206,7 @@ pub const Store = struct {
         box.last_seen_ms = now;
         box.client_pid = p.client_pid;
         box.work = .{};
+        self.clearNote(box);
         if (box.durable) return;
         _ = self.boxes.orderedRemove(bi);
         defer self.freeBox(box);
@@ -1423,6 +1485,9 @@ pub const Store = struct {
             var e = p;
             e.link = linkOf(r, p.link);
             e.link_why = if (r.link != .up) r.why else p.link_why;
+            // A relayed note ages here too: no presence follows staleness.
+            e.note = freshNote(p.note, p.note_ms, now);
+            if (e.note.len == 0) e.note_ms = 0;
             try out.append(arena, e);
         };
         return out.items;
@@ -1448,6 +1513,8 @@ pub const Store = struct {
                 .model = p.model,
                 .last_notification = p.last_notification,
                 .subject = if (box) |b| b.subject else "",
+                .note = if (box) |b| freshNote(b.note, b.note_ms, now) else "",
+                .note_ms = if (box) |b| (if (freshNote(b.note, b.note_ms, now).len > 0) b.note_ms else 0) else 0,
                 .alias = if (box) |b| b.alias else "",
                 .work = if (box) |b| (if (b.work.isEmpty()) null else b.work) else null,
             });
@@ -1579,6 +1646,35 @@ pub const Store = struct {
         if (box.work.eql(work)) return;
         box.work = work;
         self.presence_dirty = true;
+    }
+
+    /// Set (or with "" clear) the note of the live peer `address`: what
+    /// its own assistant says it is doing. Setting it again, unchanged
+    /// too, restarts its staleness (`NOTE_STALE_MS`).
+    /// @return error.NotLive when no server of `address` is live here.
+    pub fn setNote(self: *Store, address: []const u8, text: []const u8, now: i64) (NoteError || error{ NotLive, OutOfMemory })!void {
+        const v = try checkNote(text);
+        if (self.livePeer(address) == null) return error.NotLive;
+        const box = self.boxOf(address) orelse return error.NotLive;
+        if (!std.mem.eql(u8, box.note, v)) {
+            const owned = try self.allocator.dupe(u8, v);
+            self.allocator.free(box.note);
+            box.note = owned;
+        }
+        box.note_ms = if (v.len > 0) now else 0;
+        self.presence_dirty = true;
+    }
+
+    /// The fresh note of `address` at `now`, "" when none, stale or unknown.
+    pub fn noteOf(self: *const Store, address: []const u8, now: i64) []const u8 {
+        const box = self.boxOf(address) orelse return "";
+        return freshNote(box.note, box.note_ms, now);
+    }
+
+    fn clearNote(self: *Store, box: *Box) void {
+        self.allocator.free(box.note);
+        box.note = &.{};
+        box.note_ms = 0;
     }
 
     // ---------------------------------------------------------- aliases
@@ -2105,6 +2201,8 @@ pub const Store = struct {
                 .model = try a.dupe(u8, p.model),
                 .last_notification = try a.dupe(u8, p.last_notification),
                 .subject = try a.dupe(u8, p.subject),
+                .note = try a.dupe(u8, p.note),
+                .note_ms = RelayAge.seenAt(now, p.note_ms),
                 .alias = try a.dupe(u8, p.alias),
                 .work = p.work,
                 .via_host = via,
@@ -2226,6 +2324,7 @@ pub const Store = struct {
             var b: [peeraddr.ADDRESS_MAX]u8 = undefined;
             p.address = try a.dupe(u8, self.outAddr(&b, r, p.address));
             p.last_seen_ms = RelayAge.seenAgo(now, p.last_seen_ms);
+            p.note_ms = RelayAge.seenAgo(now, p.note_ms);
         }
         const grants = try a.alloc(Grant, r.grants.items.len);
         for (r.grants.items, grants) |g, *o| {
@@ -2639,7 +2738,7 @@ pub const Store = struct {
         const it = &s.item;
         return switch (it.kind) {
             .message => blk: {
-                const sp = self.senderPresence(it.from.address);
+                const sp = self.senderPresence(it.from.address, now);
                 break :blk self.emit.call(conn, .{ .deliver = .{
                     .id = it.id,
                     .from = it.from,
@@ -2651,6 +2750,7 @@ pub const Store = struct {
                     .sender_live = sp.live,
                     .sender_state = sp.state,
                     .sender_subject = sp.subject,
+                    .sender_note = sp.note,
                     .queued = it.queued,
                     .quiet = it.quiet,
                 } });
@@ -2670,11 +2770,11 @@ pub const Store = struct {
     }
 
     /// A local or federated peer's liveness and state, `gone` when unknown.
-    fn senderPresence(self: *const Store, address: []const u8) struct { live: bool, state: PeerState, subject: []const u8 = "" } {
+    fn senderPresence(self: *const Store, address: []const u8, now: i64) struct { live: bool, state: PeerState, subject: []const u8 = "", note: []const u8 = "" } {
         const subject: []const u8 = if (self.boxOf(address)) |b| b.subject else "";
-        if (self.livePeer(address)) |p| return .{ .live = true, .state = p.state, .subject = subject };
+        if (self.livePeer(address)) |p| return .{ .live = true, .state = p.state, .subject = subject, .note = self.noteOf(address, now) };
         for (self.routes.items) |r| for (r.peers) |p| {
-            if (std.mem.eql(u8, p.address, address)) return .{ .live = p.live and linkOf(r, p.link) == .up, .state = p.state, .subject = p.subject };
+            if (std.mem.eql(u8, p.address, address)) return .{ .live = p.live and linkOf(r, p.link) == .up, .state = p.state, .subject = p.subject, .note = freshNote(p.note, p.note_ms, now) };
         };
         return .{ .live = false, .state = .gone, .subject = subject };
     }
@@ -2903,6 +3003,7 @@ pub const Store = struct {
         b.items.deinit(self.allocator);
         self.allocator.free(b.address);
         self.allocator.free(b.subject);
+        self.allocator.free(b.note);
         self.allocator.free(b.alias);
         self.allocator.destroy(b);
     }
@@ -3032,6 +3133,7 @@ const Rec = struct {
         req: u32 = 0,
         relay: ?RelayKind = null,
         sender_subject: []const u8 = "",
+        sender_note: []const u8 = "",
         from_alias: []const u8 = "",
         quiet: bool = false,
         results: []const RecipientResult = &.{},
@@ -3056,7 +3158,7 @@ const Rec = struct {
         const a = self.arena.allocator();
         for (self.dead.items) |d| if (d == conn) return false;
         const g: Got = switch (out) {
-            .deliver => |d| .{ .conn = conn, .kind = .deliver, .id = a.dupe(u8, d.id) catch "", .to = a.dupe(u8, d.to) catch "", .queued = d.queued, .age_ms = d.age_ms, .text = a.dupe(u8, d.text) catch "", .from = a.dupe(u8, d.from.address) catch "", .sender_state = d.sender_state, .sender_subject = a.dupe(u8, d.sender_subject) catch "", .quiet = d.quiet, .from_alias = a.dupe(u8, d.from.alias) catch "" },
+            .deliver => |d| .{ .conn = conn, .kind = .deliver, .id = a.dupe(u8, d.id) catch "", .to = a.dupe(u8, d.to) catch "", .queued = d.queued, .age_ms = d.age_ms, .text = a.dupe(u8, d.text) catch "", .from = a.dupe(u8, d.from.address) catch "", .sender_state = d.sender_state, .sender_subject = a.dupe(u8, d.sender_subject) catch "", .sender_note = a.dupe(u8, d.sender_note) catch "", .quiet = d.quiet, .from_alias = a.dupe(u8, d.from.alias) catch "" },
             .event => |e| .{ .conn = conn, .kind = .event, .id = a.dupe(u8, e.id) catch "", .outcome = e.outcome, .reason = e.reason, .to = a.dupe(u8, e.to) catch "", .queued_ms = e.queued_ms, .quiet = e.quiet, .to_alias = a.dupe(u8, e.to_alias) catch "" },
             .reply => |r| .{ .conn = conn, .kind = .reply, .id = a.dupe(u8, r.id) catch "", .outcome = r.outcome, .reason = r.reason, .to_state = r.to_state, .to_polls = r.to_polls, .req = r.req, .results = dupeResults(a, r.results) },
             .relay => |r| .{ .conn = conn, .kind = .relay, .id = a.dupe(u8, r.id) catch "", .relay = r.kind, .outcome = r.outcome, .reason = r.reason },
@@ -3527,6 +3629,95 @@ test "federation: a peer's subject crosses the hub with its presence and its mai
     try net.mem.setSubject("alice", "");
     try net.pump(300);
     try t.expectEqualStrings("", (listed(&net.hub, a, "box/alice") orelse return error.TestUnexpectedResult).subject);
+}
+
+test "notes: a live peer's own, trimmed, refused too long or multi-line, stale after NOTE_STALE_MS, gone with its server, in its mail's header" {
+    var rec = Rec.init();
+    defer rec.deinit();
+    var s = try Store.init(t.allocator, .{ .emit = rec.emit() });
+    defer s.deinit();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try s.register(1, regSlow("zenit"), 0);
+    try s.register(2, regSlow("qq"), 0);
+    const note = "landing M015; holding the zenit-cms push";
+    // 1. Set, trimmed: the list shows it with when it was set.
+    try s.setNote("zenit", "  " ++ note ++ " \n", 1000);
+    const l = listedAt(&s, a, "zenit", 2000) orelse return error.TestUnexpectedResult;
+    try t.expectEqualStrings(note, l.note);
+    try t.expectEqual(@as(i64, 1000), l.note_ms);
+    try t.expectEqualStrings("", (listedAt(&s, a, "qq", 2000) orelse return error.TestUnexpectedResult).note);
+    // 2. Its mail carries it to the recipient, beside its subject.
+    var idb: [ID_LEN]u8 = undefined;
+    _ = try sendText(&s, 1, "qq", "is the push yours?", 3000, &idb);
+    try t.expectEqualStrings(note, rec.last().sender_note);
+    // 3. Refused: too long, a newline or a tab inside; nothing changes.
+    try t.expectError(error.NoteTooLong, s.setNote("zenit", "x" ** (NOTE_MAX + 1), 4000));
+    try t.expectError(error.NoteNotText, s.setNote("zenit", "two\nlines", 4000));
+    try t.expectError(error.NoteNotText, s.setNote("zenit", "tab\there", 4000));
+    try t.expectEqualStrings("x" ** NOTE_MAX, try checkNote("x" ** NOTE_MAX));
+    try t.expectEqualStrings(note, s.noteOf("zenit", 4000));
+    // 4. Stale after NOTE_STALE_MS without being set again: hidden from the
+    // list and from headers; setting it again (unchanged) restarts it.
+    try t.expectEqualStrings(note, s.noteOf("zenit", 1000 + NOTE_STALE_MS));
+    const late = 1000 + NOTE_STALE_MS + 1;
+    try t.expectEqualStrings("", (listedAt(&s, a, "zenit", late) orelse return error.TestUnexpectedResult).note);
+    try t.expectEqual(@as(i64, 0), (listedAt(&s, a, "zenit", late) orelse return error.TestUnexpectedResult).note_ms);
+    _ = try sendText(&s, 1, "qq", "still?", late, &idb);
+    try t.expectEqualStrings("", rec.last().sender_note);
+    try s.setNote("zenit", note, late);
+    try t.expectEqualStrings(note, s.noteOf("zenit", late + 1));
+    // 5. Cleared with "".
+    try s.setNote("zenit", "", late + 2);
+    try t.expectEqualStrings("", s.noteOf("zenit", late + 3));
+    // 6. Only a live peer has one: gone with its server, and a durable
+    // address with no live server (or an unknown one) cannot take one.
+    try s.setNote("zenit", note, late + 4);
+    s.deregister(1, late + 5);
+    try t.expectEqualStrings("", s.noteOf("zenit", late + 5));
+    try t.expectError(error.NotLive, s.setNote("zenit", "back?", late + 6));
+    try t.expectError(error.NotLive, s.setNote("nobody", "x", late + 6));
+    try s.register(3, regSlow("zenit"), late + 7);
+    try t.expectEqualStrings("", (listedAt(&s, a, "zenit", late + 7) orelse return error.TestUnexpectedResult).note);
+}
+
+test "federation: a peer's note crosses the hub as an age, goes stale on the hub's own clock, and rides its mail" {
+    var net: Net = undefined;
+    try net.init(null);
+    defer net.deinit();
+    // The member's clock runs an hour ahead: only ages cross.
+    net.skew = 3_600_000;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try net.hub.register(1, regSlow("Zenit"), 0);
+    try net.mem.register(1, regSlow("bob"), net.skew);
+    try net.connect(100);
+    try net.pump(100);
+    // 1. Set on bob's host: the hub lists it, set "now" on its own clock.
+    try net.mem.setNote("bob", "waiting on zenit's review", 200 + net.skew);
+    try net.pump(200);
+    const h = listedAt(&net.hub, a, "box/bob", 200) orelse return error.TestUnexpectedResult;
+    try t.expectEqualStrings("waiting on zenit's review", h.note);
+    try t.expectEqual(@as(i64, 200), h.note_ms);
+    // 2. His mail delivered on the hub carries it.
+    var idb: [ID_LEN]u8 = undefined;
+    _ = try net.mem.send(1, .{ .to = "hub/Zenit", .text = "ready?" }, 300 + net.skew, &idb);
+    try net.pump(300);
+    try t.expectEqualStrings("waiting on zenit's review", (lastOf(&net.hub_rec, 1, .deliver) orelse return error.TestUnexpectedResult).sender_note);
+    // 3. Stale on the hub without any further presence.
+    try t.expectEqualStrings("", (listedAt(&net.hub, a, "box/bob", 200 + NOTE_STALE_MS + 1) orelse return error.TestUnexpectedResult).note);
+    // 4. Cleared on his host, then gone with his server: the hub follows.
+    try net.mem.setNote("bob", "", 400 + net.skew);
+    try net.pump(400);
+    try t.expectEqualStrings("", (listedAt(&net.hub, a, "box/bob", 400) orelse return error.TestUnexpectedResult).note);
+    try net.mem.setNote("bob", "landing it", 500 + net.skew);
+    try net.pump(500);
+    try t.expectEqualStrings("landing it", (listedAt(&net.hub, a, "box/bob", 500) orelse return error.TestUnexpectedResult).note);
+    net.mem.deregister(1, 600 + net.skew);
+    try net.pump(600);
+    try t.expectEqualStrings("", (listedAt(&net.hub, a, "box/bob", 600) orelse return error.TestUnexpectedResult).note);
 }
 
 /// A current server in the pane session whose origin id starts `hex8`.
@@ -4186,8 +4377,7 @@ const Net = struct {
 };
 
 fn listed(s: *Store, arena: std.mem.Allocator, address: []const u8) ?PeerInfo {
-    for (s.list(arena, 0) catch return null) |p| if (std.mem.eql(u8, p.address, address)) return p;
-    return null;
+    return listedAt(s, arena, address, 0);
 }
 
 fn lastOf(rec: *const Rec, conn: u32, kind: std.meta.Tag(Out)) ?Rec.Got {

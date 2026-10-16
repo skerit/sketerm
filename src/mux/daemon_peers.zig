@@ -292,9 +292,10 @@ pub fn handleRelay(d: *Daemon, cl: *Client, ftype: wire.FrameType, payload: []co
 }
 
 /// `peer_subject`. On a broker connection: ask, set or clear the subject
-/// of `address`, answered by `peer_subject_reply`. On a worker (an
-/// attached viewer): handed to the broker for the peer in this session's
-/// tree; the `session_meta` push that follows is the answer.
+/// or the note of `address`, answered by `peer_subject_reply`. On a worker
+/// (an attached viewer): a subject or title handed to the broker for the
+/// peer in this session's tree; the `session_meta` push that follows is
+/// the answer. A note is never a viewer's: its peer sets it by address.
 pub fn handleSubject(d: *Daemon, cl: *Client, payload: []const u8) void {
     const frame = "peer_subject";
     var parsed = std.json.parseFromSlice(peermail.SubjectReq, d.allocator, payload, .{ .ignore_unknown_fields = true }) catch
@@ -305,6 +306,7 @@ pub fn handleSubject(d: *Daemon, cl: *Client, payload: []const u8) void {
         if (q.address.len > 0) return cl.queueErrFor("peer_subject on an attached session names no address", frame);
         if (cl.attached == null) return cl.queueErrFor("peer_subject: not attached", frame);
         if (!cl.actsOnSession()) return cl.queueErrFor("a view-only attachment cannot set the subject", frame);
+        if (q.note != null) return cl.queueErrFor("a peer's note is set by its own assistant (peer_set_note, sketerm peer note), never through a viewer", frame);
         if (q.title) |title| setUserTitle(d, title);
         const subject = q.subject orelse return;
         peermail.checkSubject(subject) catch |e| return cl.queueErrFor(peermail.subjectRefusal(e), frame);
@@ -325,7 +327,14 @@ pub fn handleSubject(d: *Daemon, cl: *Client, payload: []const u8) void {
         error.UnknownAddress => {},
         error.OutOfMemory => return cl.queueErrFor("peer_subject failed on the broker", frame),
     };
+    const now = clock.wallMs();
+    if (q.note) |note| s.setNote(address, note, now) catch |e| switch (e) {
+        error.NoteTooLong, error.NoteNotText => reply.refused = peermail.noteRefusal(@errorCast(e)),
+        error.NotLive => reply.refused = peermail.NOT_LIVE_NOTE,
+        error.OutOfMemory => return cl.queueErrFor("peer_subject failed on the broker", frame),
+    };
     reply.subject = s.subjectOf(address);
+    reply.note = s.noteOf(address, now);
     cl.queueJson(.peer_subject_reply, reply);
 }
 

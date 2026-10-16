@@ -169,6 +169,12 @@ pub const Flag = enum {
     /// and lists that address `no_mcp` (`to_no_mcp` in `peer_send_reply`).
     /// Absent = never send it; such an address reads gone.
     peer_hook_presence,
+    /// The broker keeps each live peer's note (what its own assistant says
+    /// it is doing): `peer_subject` `note` sets it on a live address, and
+    /// `note`/`note_ms` in `peer_list`, `sender_note` in `peer_deliver`
+    /// and the federation presence carry it. Absent = never send it; the
+    /// `peer_set_note` tool answers unavailable.
+    peer_note,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

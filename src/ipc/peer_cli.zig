@@ -1,16 +1,17 @@
-//! `sketerm peer list|send|read|subject|alias`: any program is a peer by
-//! running this, a client of the same `peer_*` frames the MCP server speaks
-//! (`peerclient.Peer`, no wire of its own). `read --follow` registers a
-//! durable address (`n-`, from its name, which it asks for as its alias)
-//! and prints each incoming message as it arrives (one JSON line with
-//! `--json`), acknowledging it only once the line is written; lines it
-//! reads on its stdin are sent from that address. `subject` and `alias`
-//! set what a session works on and the name it is reached by: inside an
-//! assistant session they find that session's own servers the way
-//! `sketerm mcp hook` does and post a presence line; `subject --name`
-//! sets it on the broker by alias or address. It is also the one home of
-//! how a peer list entry reads, for this CLI and the `peer_list` tool
-//! alike (`listLine`, `writeList`).
+//! `sketerm peer list|send|read|subject|note|alias`: any program is a peer
+//! by running this, a client of the same `peer_*` frames the MCP server
+//! speaks (`peerclient.Peer`, no wire of its own). `read --follow`
+//! registers a durable address (`n-`, from its name, which it asks for as
+//! its alias) and prints each incoming message as it arrives (one JSON
+//! line with `--json`), acknowledging it only once the line is written;
+//! lines it reads on its stdin are sent from that address. `subject` and
+//! `alias` set what a session works on and the name it is reached by:
+//! inside an assistant session they find that session's own servers the
+//! way `sketerm mcp hook` does and post a presence line; `subject --name`
+//! sets it on the broker by alias or address. `note` sets a live peer's
+//! own note on the broker, by `--name` or this session's own address. It
+//! is also the one home of how a peer list entry reads, for this CLI and
+//! the `peer_list` tool alike (`listLine`, `writeList`).
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -71,6 +72,11 @@ pub const ListLine = struct {
     model: ?[]const u8 = null,
     /// What it works on, set by its user; absent when none.
     subject: ?[]const u8 = null,
+    /// What it says it is doing, set by its own assistant; absent when
+    /// none or stale.
+    note: ?[]const u8 = null,
+    /// When the note was set (wall ms); absent with it.
+    note_ms: ?i64 = null,
     /// Its known facts (`data/agents/facts.json` names).
     facts: ?std.json.Value = null,
     self: ?bool = null,
@@ -161,6 +167,8 @@ pub fn listLine(pi: peermail.PeerInfo, is_self: bool, detail: bool) ListLine {
         .last_seen_ms = pi.last_seen_ms,
         .model = nonEmpty(pi.model),
         .subject = nonEmpty(pi.subject),
+        .note = nonEmpty(pi.note),
+        .note_ms = if (pi.note.len > 0) pi.note_ms else null,
         .cwd = nonEmpty(pi.cwd),
         .facts = pi.facts,
         .self = if (is_self) true else null,
@@ -179,6 +187,19 @@ pub fn listLine(pi: peermail.PeerInfo, is_self: bool, detail: bool) ListLine {
 
 /// The session the list is read from, for its one `you:` line.
 pub const SelfLine = struct { address: []const u8, alias: []const u8 = "", durable: bool, name_taken: bool };
+
+/// A note older than this shows its age in the list text.
+const NOTE_AGE_SHOWN_MS: i64 = 3_600_000;
+
+/// `  note: TEXT` (or `  note 2h ago: TEXT` once it is an hour old); nothing without one.
+fn writeNote(w: *std.Io.Writer, pi: peermail.PeerInfo, now_ms: i64) !void {
+    if (pi.note.len == 0) return;
+    var buf: [48]u8 = undefined;
+    if (pi.note_ms > 0 and now_ms - pi.note_ms >= NOTE_AGE_SHOWN_MS)
+        try w.print("  note {s}: {s}", .{ clock.ago(&buf, now_ms, pi.note_ms, .short), pi.note })
+    else
+        try w.print("  note: {s}", .{pi.note});
+}
 
 /// Whether `pi` is worth a row: a gone address with nothing pending and
 /// no subject is only counted.
@@ -238,7 +259,9 @@ pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []c
         }
         try w.print("you: {s}", .{if (s.alias.len > 0) s.alias else addr});
         for (notes[0..n], 0..) |note, i| try w.print("{s}{s}", .{ if (i == 0) " (" else ", ", note });
-        try w.writeAll(if (n > 0) ")\n" else "\n");
+        if (n > 0) try w.writeAll(")");
+        for (peers) |pi| if (isSelf(pi, self)) try writeNote(w, pi, now_ms);
+        try w.writeAll("\n");
     }
     const show_model = varies(peers, self, "model");
     const show_app = varies(peers, self, "app");
@@ -300,6 +323,8 @@ pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []c
             if (pi.pid > 0) try w.print("  pid {d}", .{pi.pid});
         }
         if (pi.alias.len > 0) try w.print("  {s}", .{pi.address});
+        // Free text last, so every other column keeps its place.
+        try writeNote(w, pi, now_ms);
         try w.writeAll("\n");
     }
     if (hosts.len > 0) {
@@ -359,6 +384,7 @@ const MessageLine = struct {
     sender_state: []const u8,
     text: []const u8,
     sender_subject: ?[]const u8 = null,
+    sender_note: ?[]const u8 = null,
     reply_to: ?[]const u8 = null,
     /// Slow mail (it would not have woken an assistant).
     slow: ?bool = null,
@@ -417,6 +443,7 @@ pub fn itemText(arena: std.mem.Allocator, item: agentpush.PeerItem, json: bool) 
             .sender_state = @tagName(m.sender_state orelse if (m.sender_live) vocab.PeerState.unknown else .gone),
             .text = m.text,
             .sender_subject = nonEmpty(m.sender_subject),
+            .sender_note = nonEmpty(m.sender_note),
             .reply_to = m.reply_to,
             .slow = if (m.quiet) true else null,
         }),
@@ -465,7 +492,7 @@ fn sendReq(arena: std.mem.Allocator, to: []const u8, text: []const u8, reply_to:
 
 // ── arguments ────────────────────────────────────────────────────
 
-pub const Verb = enum { list, send, read, subject, alias };
+pub const Verb = enum { list, send, read, subject, note, alias };
 
 pub const Cli = struct {
     verb: ?Verb = null,
@@ -474,24 +501,24 @@ pub const Cli = struct {
     json: bool = false,
     follow: bool = false,
     detail: bool = false,
-    /// `subject --clear`.
+    /// `subject --clear`, `note --clear`.
     clear: bool = false,
     reply_to: ?[]const u8 = null,
     /// `send --quiet`: slow mail, never waking the recipient.
     quiet: bool = false,
     /// `send`: the address (or a comma-separated list), then the text
-    /// (null: read from stdin). `subject`, `alias`: the text (null: print
-    /// the current one).
+    /// (null: read from stdin). `subject`, `note`, `alias`: the text
+    /// (null: print the current one; a note is already trimmed).
     to: ?[]const u8 = null,
     text: ?[]const u8 = null,
     help: bool = false,
 
-    pub const ParseError = error{ UnknownFlag, MissingValue, ExtraArgument, UnknownVerb, NoName, NoAddress, BadName, NotForVerb, TooManyAddresses, BadAlias } || peermail.SubjectError;
+    pub const ParseError = error{ UnknownFlag, MissingValue, ExtraArgument, UnknownVerb, NoName, NoAddress, BadName, NotForVerb, TooManyAddresses, BadAlias } || peermail.SubjectError || peermail.NoteError;
 
     /// `env_name` (SKETERM_PEER_NAME) names the peer for send and read; a
-    /// subject is set on another peer only by an explicit `--name`, so
-    /// inside a session it always reaches that session's own server, and
-    /// an alias only ever from inside the session.
+    /// subject or note is set on another peer only by an explicit
+    /// `--name`, so inside a session it always reaches that session's own
+    /// peer, and an alias only ever from inside the session.
     pub fn parse(args: []const []const u8, env_name: ?[]const u8) ParseError!Cli {
         var o: Cli = .{};
         var i: usize = 0;
@@ -531,17 +558,19 @@ pub const Cli = struct {
         }
         if (o.help) return o;
         const verb = o.verb orelse return error.UnknownVerb;
-        if (o.name == null and verb != .subject and verb != .alias) o.name = env_name;
+        if (o.name == null and verb != .subject and verb != .note and verb != .alias) o.name = env_name;
         switch (verb) {
             .list => if (o.to != null) return error.ExtraArgument,
             .read => if (o.to != null) return error.ExtraArgument,
             .send => if (o.to == null) return error.NoAddress,
-            .subject => {
+            .subject, .note => {
                 if (o.text != null) return error.ExtraArgument;
                 o.text = o.to;
                 o.to = null;
                 if (o.clear and o.text != null) return error.ExtraArgument;
-                if (o.text) |tx| try peermail.checkSubject(tx);
+                if (o.text) |tx| {
+                    if (verb == .subject) try peermail.checkSubject(tx) else o.text = try peermail.checkNote(tx);
+                }
             },
             .alias => {
                 if (o.text != null) return error.ExtraArgument;
@@ -554,9 +583,9 @@ pub const Cli = struct {
         if (o.follow and verb != .read) return error.NotForVerb;
         if ((o.reply_to != null or o.quiet) and verb != .send) return error.NotForVerb;
         if (verb == .send and std.mem.count(u8, o.to.?, ",") >= peermail.PEER_TO_MAX) return error.TooManyAddresses;
-        if (o.clear and verb != .subject) return error.NotForVerb;
+        if (o.clear and verb != .subject and verb != .note) return error.NotForVerb;
         if (verb != .list and verb != .alias) {
-            const n = o.name orelse if (verb == .subject) return o else return error.NoName;
+            const n = o.name orelse if (verb == .subject or verb == .note) return o else return error.NoName;
             const addr = peeraddr.Address.parse(n) catch return error.BadName;
             if (addr.host != null) return error.BadName;
         }
@@ -569,6 +598,7 @@ pub const HELP =
     \\       sketerm peer send --name NAME [--json] [--quiet] [--reply-to ID] TO[,TO...] [TEXT]
     \\       sketerm peer read --name NAME [--json] [--follow]
     \\       sketerm peer subject [--name NAME] [TEXT | --clear]
+    \\       sketerm peer note [--name NAME] [TEXT | --clear]
     \\       sketerm peer alias [ALIAS]
     \\       sketerm peer hub add NAME [--host SSH_TARGET] [--inbound] [--dry-run]
     \\       sketerm peer hub remove NAME [--dry-run]
@@ -592,7 +622,7 @@ pub const HELP =
     \\{"to":TO,"text":TEXT,"reply_to":ID?,"quiet":BOOL?} is sent from NAME,
     \\answered with a "sent" line. --json prints one JSON object per line:
     \\messages {"kind":"message","id","from","from_alias"?,"sent_ms","age_ms",
-    \\"queued","sender_live","sender_state","sender_subject"?,"text",
+    \\"queued","sender_live","sender_state","sender_subject"?,"sender_note"?,"text",
     \\"reply_to"?,"slow"?}, and "event" / "expired_away" for what became of mail.
     \\
     \\subject sets what a session works on, shown by peer_list, in its peer
@@ -603,6 +633,16 @@ pub const HELP =
     \\NAME sets the peer NAME (an alias or an address) instead (a `read
     \\--follow` program, or any session). The daemon keeps it with the
     \\address, across server restarts.
+    \\
+    \\note sets a peer's own note: one line (at most 120 bytes, surrounding
+    \\whitespace trimmed) on what it is doing now, shown at the end of its
+    \\peer_list row and in its peer messages' headers. It is the
+    \\assistant's or program's own word, unlike the subject, which is its
+    \\user's (an MCP session sets it with the peer_set_note tool). Inside an
+    \\assistant session it sets that session's peer; --name NAME sets the
+    \\live peer NAME (a `read --follow` program). The daemon keeps it while
+    \\a server of the address is connected and stops showing it 4 hours
+    \\after it was last set. --clear removes it, no TEXT prints it.
     \\
     \\alias sets the name this session is reached by: lowercase letters,
     \\digits and single dashes, at most 48 bytes, refused while a live
@@ -625,9 +665,10 @@ pub const HELP =
     \\
     \\Exit status: 0 done, 1 the daemon could not be reached, the name is held
     \\by another live peer, a send was refused, no server or peer was found
-    \\for subject or alias, an alias is held by a live session, or a
-    \\federation edit was refused (hub and member at once, no such domain);
-    \\2 bad usage (a refused subject, alias, name or host too).
+    \\for subject, note or alias, an alias is held by a live session, a note
+    \\names no live peer, or a federation edit was refused (hub and member at
+    \\once, no such domain); 2 bad usage (a refused subject, note, alias,
+    \\name or host too).
     \\
 ;
 
@@ -674,11 +715,15 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             error.NoName => "peer: --name NAME (or SKETERM_PEER_NAME) is required: the address this program is reached at\n",
             error.NoAddress => "peer: send needs the address to send to\n",
             error.BadName => "peer: the name must be 1-64 of A-Za-z0-9._- (no host)\n",
-            error.NotForVerb => "peer: --follow is for read, --reply-to and --quiet for send, --clear for subject\n",
+            error.NotForVerb => "peer: --follow is for read, --reply-to and --quiet for send, --clear for subject and note\n",
             error.TooManyAddresses => std.fmt.comptimePrint("peer: send takes at most {d} addresses\n", .{peermail.PEER_TO_MAX}),
             error.BadAlias => std.fmt.comptimePrint("peer: an alias is lowercase letters, digits and single dashes, at most {d} bytes\n", .{peeraddr.SLUG_MAX}),
             error.SubjectTooLong, error.SubjectNotText => {
                 _ = fail("{s}", .{peermail.subjectRefusal(@errorCast(err))});
+                return 2;
+            },
+            error.NoteTooLong, error.NoteNotText => {
+                _ = fail("{s}", .{peermail.noteRefusal(@errorCast(err))});
                 return 2;
             },
         });
@@ -694,6 +739,7 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     const arena = arena_state.allocator();
     if (o.verb.? == .read and o.follow) return follow(allocator, o);
     if (o.verb.? == .subject) return subject(allocator, arena, o);
+    if (o.verb.? == .note) return noteCmd(allocator, arena, o);
     if (o.verb.? == .alias) return aliasCmd(allocator, arena, o);
 
     var link = Link.open(allocator) catch |e| return fail("{s}", .{linkError(e)});
@@ -735,7 +781,7 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             link.peer.ack(ids.items) catch {};
             return 0;
         },
-        .subject, .alias => unreachable,
+        .subject, .note, .alias => unreachable,
     }
 }
 
@@ -750,7 +796,7 @@ fn subject(allocator: std.mem.Allocator, arena: std.mem.Allocator, o: Cli) u8 {
         const r = link.peer.subject(arena, name, value, REPLY_MS) catch return fail("the daemon did not answer the subject request", .{});
         if (r.value.refused) |why| return fail("{s}", .{why});
         if (!r.value.found) return fail("no peer {s} here: neither a live peer nor a durable address this daemon knows", .{name});
-        say(1, subjectText(arena, name, value, r.value.subject) catch return 1);
+        say(1, setText(arena, "subject", name, value, r.value.subject) catch return 1);
         return 0;
     }
     const own = mcp_hook.serversOfThisClient(arena, null);
@@ -764,19 +810,47 @@ fn subject(allocator: std.mem.Allocator, arena: std.mem.Allocator, o: Cli) u8 {
     // The broker names the server's peer (its registration carries the pid).
     const me = ownPeer(allocator, arena, own) orelse {
         if (value == null) return fail("this session's server is not registered as a peer with the per-user daemon", .{});
-        say(1, subjectText(arena, "this session", value, "") catch return 1);
+        say(1, setText(arena, "subject", "this session", value, "") catch return 1);
         return 0;
     };
-    say(1, subjectText(arena, if (me.alias.len > 0) me.alias else me.address, value, me.subject) catch return 1);
+    say(1, setText(arena, "subject", if (me.alias.len > 0) me.alias else me.address, value, me.subject) catch return 1);
     return 0;
 }
 
-/// What `subject` prints: the confirmation of a set or clear, or the
-/// current subject alone (nothing when there is none).
-fn subjectText(arena: std.mem.Allocator, address: []const u8, value: ?[]const u8, current: []const u8) ![]const u8 {
+/// `sketerm peer note`: set (`o.text`), clear (`o.clear`) or print the
+/// note of the live peer `o.name`, else of this process's own session's
+/// peer (found as `subject` finds it).
+fn noteCmd(allocator: std.mem.Allocator, arena: std.mem.Allocator, o: Cli) u8 {
+    const value: ?[]const u8 = if (o.clear) "" else o.text;
+    var target: []const u8 = undefined;
+    var shown: []const u8 = undefined;
+    if (o.name) |name| {
+        target = name;
+        shown = name;
+    } else {
+        const own = mcp_hook.serversOfThisClient(arena, null);
+        if (own.len == 0) return fail("no sketerm MCP server in this process's ancestry: run it inside an assistant session (Claude Code: ! sketerm peer note ...), or name a live peer with --name", .{});
+        const me = ownPeer(allocator, arena, own) orelse return fail("this session's server is not registered as a peer with the per-user daemon", .{});
+        target = me.address;
+        shown = if (me.alias.len > 0) me.alias else me.address;
+    }
+    var link = Link.open(allocator) catch |e| return fail("{s}", .{linkError(e)});
+    defer link.close();
+    if (!link.peer.notes()) return fail("the per-user sketerm daemon predates peer notes (restart it idle)", .{});
+    const r = link.peer.note(arena, target, value, REPLY_MS) catch return fail("the daemon did not answer the note request", .{});
+    if (r.value.refused) |why| return fail("{s}", .{why});
+    if (!r.value.found) return fail("no peer {s} here: neither a live peer nor a durable address this daemon knows", .{target});
+    say(1, setText(arena, "note", shown, value, r.value.note) catch return 1);
+    return 0;
+}
+
+/// What `subject` and `note` print (`what` names the field): the
+/// confirmation of a set or clear, or the current value alone (nothing
+/// when there is none).
+fn setText(arena: std.mem.Allocator, comptime what: []const u8, address: []const u8, value: ?[]const u8, current: []const u8) ![]const u8 {
     const v = value orelse return if (current.len > 0) std.fmt.allocPrint(arena, "{s}\n", .{current}) else "";
-    if (v.len == 0) return std.fmt.allocPrint(arena, "subject of {s} cleared\n", .{address});
-    return std.fmt.allocPrint(arena, "subject of {s}: {s}\n", .{ address, v });
+    if (v.len == 0) return std.fmt.allocPrint(arena, what ++ " of {s} cleared\n", .{address});
+    return std.fmt.allocPrint(arena, what ++ " of {s}: {s}\n", .{ address, v });
 }
 
 /// The live peer of this host one of `own` registered (by its pid).
@@ -1116,6 +1190,19 @@ test "arguments: a name for send and read (flag or SKETERM_PEER_NAME), none for 
     try t.expectError(error.BadAlias, Cli.parse(&.{ "alias", "Zenit" }, null));
     try t.expectError(error.BadAlias, Cli.parse(&.{ "alias", "p-1" }, null));
     try t.expectError(error.NotForVerb, Cli.parse(&.{ "alias", "--name", "x", "y" }, null));
+    // note: like subject (only --name redirects it), the text trimmed; one
+    // line of at most NOTE_MAX bytes.
+    const nt = try Cli.parse(&.{ "note", "  landing M015; holding the zenit-cms push\n" }, "env-name");
+    try t.expectEqual(Verb.note, nt.verb.?);
+    try t.expectEqualStrings("landing M015; holding the zenit-cms push", nt.text.?);
+    try t.expect(nt.name == null);
+    const nc = try Cli.parse(&.{ "note", "--clear", "--name", "webapp" }, null);
+    try t.expect(nc.clear and nc.text == null);
+    try t.expectEqualStrings("webapp", nc.name.?);
+    try t.expect((try Cli.parse(&.{"note"}, null)).text == null);
+    try t.expectError(error.NoteTooLong, Cli.parse(&.{ "note", "x" ** (peermail.NOTE_MAX + 1) }, null));
+    try t.expectError(error.NoteNotText, Cli.parse(&.{ "note", "two\nlines" }, null));
+    try t.expectError(error.ExtraArgument, Cli.parse(&.{ "note", "--clear", "x" }, null));
 }
 
 test "send: --quiet and a comma list of addresses, one line per recipient; the cap" {
@@ -1144,14 +1231,48 @@ test "send: --quiet and a comma list of addresses, one line per recipient; the c
     try t.expect(std.mem.indexOf(u8, try sentText(a, "w", "zenit", .{ .id = "m-2", .outcome = .delivered, .to_polls = true }, true), "\"to_polls\":true") != null);
 }
 
-test "subject prints a confirmation, or the current subject alone" {
+test "subject and note print a confirmation, or the current value alone" {
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    try t.expectEqualStrings("subject of Arcana: template links\n", try subjectText(a, "Arcana", "template links", ""));
-    try t.expectEqualStrings("subject of Arcana cleared\n", try subjectText(a, "Arcana", "", "old"));
-    try t.expectEqualStrings("template links\n", try subjectText(a, "Arcana", null, "template links"));
-    try t.expectEqualStrings("", try subjectText(a, "Arcana", null, ""));
+    try t.expectEqualStrings("subject of Arcana: template links\n", try setText(a, "subject", "Arcana", "template links", ""));
+    try t.expectEqualStrings("subject of Arcana cleared\n", try setText(a, "subject", "Arcana", "", "old"));
+    try t.expectEqualStrings("template links\n", try setText(a, "subject", "Arcana", null, "template links"));
+    try t.expectEqualStrings("", try setText(a, "subject", "Arcana", null, ""));
+    try t.expectEqualStrings("note of zenit: landing M015\n", try setText(a, "note", "zenit", "landing M015", ""));
+    try t.expectEqualStrings("note of zenit cleared\n", try setText(a, "note", "zenit", "", "x"));
+}
+
+test "the help names the note's bounds as peermail keeps them" {
+    try t.expect(std.mem.indexOf(u8, HELP, std.fmt.comptimePrint("at most {d} bytes", .{peermail.NOTE_MAX})) != null);
+    try t.expect(std.mem.indexOf(u8, HELP, std.fmt.comptimePrint("stops showing it {d} hours", .{@divExact(peermail.NOTE_STALE_MS, 3_600_000)})) != null);
+}
+
+test "the list: a peer's own note ends its row, with its age from an hour on; the reader's own on its you line" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const now: i64 = 10_000_000_000;
+    const peers = [_]peermail.PeerInfo{
+        .{ .address = "p-3fa9c2e1", .alias = "zenit", .state = .working, .live = true, .last_seen_ms = now, .subject = "Folio", .note = "landing M015; holding the zenit-cms push", .note_ms = now - 5 * 60_000 },
+        .{ .address = "p-9c04e2d7", .alias = "qq", .state = .idle, .live = true, .last_seen_ms = now, .note = "waiting on zenit's review", .note_ms = now - 2 * 3_600_000 },
+        .{ .address = "p-00000009", .alias = "me", .state = .idle, .live = true, .last_seen_ms = now, .note = "reviewing qq", .note_ms = now },
+    };
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try writeList(&aw.writer, &peers, &.{}, .{ .address = "p-00000009", .alias = "me", .durable = true, .name_taken = false }, now, false);
+    try t.expectEqualStrings(
+        \\you: me (p-00000009, durable)  note: reviewing qq
+        \\zenit  working  subject Folio  p-3fa9c2e1  note: landing M015; holding the zenit-cms push
+        \\qq     idle  p-9c04e2d7  note 2h ago: waiting on zenit's review
+        \\
+    , aw.written());
+    const l = listLine(peers[0], false, false);
+    try t.expectEqualStrings("landing M015; holding the zenit-cms push", l.note.?);
+    try t.expectEqual(now - 5 * 60_000, l.note_ms.?);
+    try t.expect(listLine(.{ .address = "carol" }, false, false).note == null);
+    // A received message's JSON line carries the sender's note.
+    const line = try itemText(a, .{ .message = .{ .id = "m-1", .from = .{ .address = "zenit" }, .text = "x", .sender_note = "landing M015" } }, true);
+    try t.expect(std.mem.indexOf(u8, line, "\"sender_note\":\"landing M015\"") != null);
 }
 
 test "a received message prints as one JSON line with the documented fields" {

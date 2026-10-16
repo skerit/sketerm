@@ -23265,3 +23265,25 @@ prompt cache). Every `configure*Deps` now embeds the shipped adapters.
 Unit tests in peerwork (a recorded Claude Code screen through the worker's
 reader), peermail, peer_cli, agentpush; smoke peers step 45 runs a real
 session printing that screen with a `claude-code` server inside it.
+
+## 2026-10-16: a peer's own note (`peer_set_note`)
+
+Subject and alias are the user's; the one thing an assistant now owns is a
+one-line note of what it is doing ("landing M015; holding the zenit-cms
+push"), so other sessions see it without asking. Named "note" throughout
+(tool `peer_set_note`, CLI `sketerm peer note [--name NAME] [TEXT|--clear]`,
+JSON `note`/`note_ms`, `sender_note`, welcome flag `peer_note`) because
+`sketerm peer status` already prints link state and "status line" is Claude
+Code's. `peermail.checkNote` (trimmed, at most 120 bytes, one line; it shares
+`oneLine` with the subject rule) and `freshNote` (hidden after
+`NOTE_STALE_MS` = 4 h, on each reader's clock) are the homes. The broker keeps
+it on the live address's box, clears it at deregister, never persists it,
+lists it, stamps it into deliveries (`Deliver.sender_note`) and relays it in
+federation presence as an age. Set over the existing `peer_subject` frame
+(`SubjectReq.note`, broker connections only; a viewer is refused). Shown last
+on a `peer_list` row (`note: ...`, `note 2h ago: ...` from an hour on), on the
+reader's `you:` line, and in message headers after the subject. Server
+instructions and the tool description tell agents what to put there. Unit
+tests in peermail (set/clear/refusals/staleness/gone, federation with a skewed
+clock), peer_cli, agentpush; smoke peers 38b/38c set it with the tool and
+read it in another session's list and in a message header.

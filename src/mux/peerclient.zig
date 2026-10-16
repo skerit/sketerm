@@ -102,12 +102,30 @@ pub const Peer = struct {
         return self.conn.caps.peer_polls;
     }
 
+    /// Whether the broker keeps each live peer's note (welcome flag `peer_note`).
+    pub fn notes(self: *const Peer) bool {
+        return self.conn.caps.peer_note;
+    }
+
     /// Ask (`subject` null), set or clear (`""`) the subject of `address`.
     pub fn subject(self: *Peer, allocator: std.mem.Allocator, address: []const u8, value: ?[]const u8, timeout_ms: i64) !std.json.Parsed(peermail.SubjectReply) {
         if (!self.subjects()) return error.Unsupported;
-        const req = self.nextReq();
-        try self.conn.sendJson(.peer_subject, peermail.SubjectReq{ .req = req, .address = address, .subject = value });
-        return self.awaitReply(peermail.SubjectReply, allocator, .peer_subject_reply, req, timeout_ms);
+        return self.identity(allocator, .{ .address = address, .subject = value }, timeout_ms);
+    }
+
+    /// Ask (`value` null), set or clear (`""`) the note of the live peer
+    /// `address`; the reply carries the subject too.
+    pub fn note(self: *Peer, allocator: std.mem.Allocator, address: []const u8, value: ?[]const u8, timeout_ms: i64) !std.json.Parsed(peermail.SubjectReply) {
+        if (!self.notes()) return error.Unsupported;
+        return self.identity(allocator, .{ .address = address, .note = value }, timeout_ms);
+    }
+
+    /// One `peer_subject` request (`req.req` is set here) and its reply.
+    fn identity(self: *Peer, allocator: std.mem.Allocator, req: peermail.SubjectReq, timeout_ms: i64) !std.json.Parsed(peermail.SubjectReply) {
+        var r = req;
+        r.req = self.nextReq();
+        try self.conn.sendJson(.peer_subject, r);
+        return self.awaitReply(peermail.SubjectReply, allocator, .peer_subject_reply, r.req, timeout_ms);
     }
 
     /// The oldest push received so far, or the next one within `timeout_ms`

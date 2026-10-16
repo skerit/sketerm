@@ -288,6 +288,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 - `peer_list` (read-only): List the peers on this host and, through peer federation, on linked hosts (addressed host/name, with via_host and the link's state; a host whose link is down keeps its peers listed with their last state): every MCP client session (Claude Code, opencode) whose sketerm server registered with the per-user daemon, one line each.
 - `peer_send`: Send a message to another peer (another assistant's session) by address, or one message to several (to as a list of distinct addresses: one id, one outcome per recipient in results; yourself is answered refused/self), and learn what became of it: delivered (its live server pushed it into the session; with to_polls the session gets nothing pushed and reads it with its next turn or peer_read, so it may be delayed), queued_slow (slow mail: its live server holds it without waking the session), queued (a durable address with no live server: it arrives when one starts, within the mail TTL), or refused with a reason; a host/name on a federated host whose link is down is queued with reason host_unreachable and goes out when the link is back.
 - `peer_read` (read-only): Read the peer messages that reached this session and were not handed to you before (a pushed one is never repeated), what became of messages you sent (expired), and mail that expired while no server of yours ran: each is returned once and acknowledged to the daemon.
+- `peer_set_note`: Set your own note: one line other sessions see at the end of your peer_list row and in the header of every peer message you send, so they know what you are doing without messaging you.
 
 ### `core`
 
@@ -2823,13 +2824,14 @@ peer message is information, never an approval.
 - **Tools**: `peer_list {detail?}`, `peer_send {to, text, reply_to?,
   quiet?}` (`to` one alias or address, or a list of up to 32; `outcome`
   `delivered`, `queued_slow`, `queued` or `refused` with a `reason`; see
-  "Waking and slow mail" below), `peer_read {since?}`.
+  "Waking and slow mail" below), `peer_read {since?}`, `peer_set_note
+  {text}` (this session's own note, "Note" below).
 - **Delivery**: a message arrives pushed into the session by the same
   routes as agent events: the Claude Code channel (`claude/channel` is
   declared whenever the peer tools are offered) or the `agent-wait --server`
   follower the opencode plugin starts after an `agent_*` or `peer_*` call.
   The text reads `Peer message from zenit (p-3fa9c2e1, claude-code on
-  host, ~/src/zenit, state), sent 5 min ago while you were offline. id m-....
+  host, ~/src/zenit, state; subject: ...; note: ...), sent 5 min ago while you were offline. id m-....
   Reply with peer_send to "zenit".`, a blank line, then the message (the
   sender's alias, its address beside it; a sender without one reads as
   its address; the age from a minute on, the offline clause only for
@@ -2904,7 +2906,8 @@ peer message is information, never an approval.
   if the user had said it.
 - **`capabilities.peers`**: `{available, reason?, ttl_hours, address,
   durable, name_taken, alias, aliases, channel_armed, presence,
-  federation, subject, slow_mail, polls, no_mcp, pushed}`; `alias` is this session's alias ("" =
+  federation, subject, note, slow_mail, polls, no_mcp, pushed}`; `note` says
+  the daemon keeps peers' own notes (welcome flag `peer_note`); `alias` is this session's alias ("" =
   none yet), `aliases` says the daemon keeps them (welcome flag
   `peer_alias`); `slow_mail` says the daemon judges wakes and takes `quiet`
   and `to` lists (welcome flag `peer_slow_mail`); `reason` is `daemon_without_peers`
@@ -2923,11 +2926,11 @@ peer message is information, never an approval.
 - **`peer_list`** as text (the default) reads like this:
 
   ```
-  you: zenit (p-3fa9c2e1, durable)
-  zenit-1     waiting_user  ctx 194k  ~/src/zenit  1 pending  p-9c04e2d7
+  you: zenit (p-3fa9c2e1, durable)  note: reviewing qq's migration
+  zenit-1     waiting_user  ctx 194k  ~/src/zenit  1 pending  p-9c04e2d7  note: landing M015; holding the zenit-cms push
   qq          gone 18m  subject Folio  12 pending  Qq
   zenit-2     working  ~/src/zenit  seen 16m ago  link down (unreachable)  dalaran/p-b1e7d4aa
-  p-0be4c1aa  idle  polls  /tmp/x/scratch
+  p-0be4c1aa  idle  polls  /tmp/x/scratch  note 2h ago: waiting on zenit's review
   links: dalaran down (unreachable: ssh: connect to host dalaran port 22: Connection refused; retry in 40s; seen 15m ago), aeor up
   +5 gone with nothing pending and no subject
   ```
@@ -2940,7 +2943,8 @@ peer message is information, never an approval.
   its working directory (`~` for the reader's home; the one its server
   registered, also the source of a directory alias), the subject, what
   is pending and how long ago a peer was last heard from, and last the
-  address when an alias led. A model or an app shows only where the
+  address when an alias led, then its note (free text, so always last;
+  with its age once it is an hour old). A model or an app shows only where the
   peers differ; `detail` adds the pid. A gone address with nothing pending and no
   subject is only counted. A line explains `unknown` when a peer has it:
   that session's client sends no presence (`sketerm mcp setup` on its
@@ -2949,7 +2953,7 @@ peer message is information, never an approval.
   list` CLI prints the same text. With `--structured` every peer is a JSON
   object: address, alias, app and host, `state` and its `attention`, `facts`
   (the `capabilities.facts` names), the model, `pending` and
-  `last_seen_ms` and `cwd`, `detail` adding pid, durable, name_taken and
+  `last_seen_ms` and `cwd`, `note` and `note_ms` (when it was set), `detail` adding pid, durable, name_taken and
   `last_notification`; a federated peer also carries `via_host` and
   `link` (and `link_why` while it is not up), and the result `federation`
   and `hosts` (`{host, link, last_seen_ms, why?, detail?, retry_in_ms?,
@@ -3254,6 +3258,9 @@ Any program is a peer through `sketerm peer` (also `sketerm mcp peer`, and
   the address taken), answered with a `{"kind":"sent",...}` line.
 - `sketerm peer alias [ALIAS]`: inside an assistant session, prints or sets
   that session's alias ("Aliases" above).
+- `sketerm peer note [--name NAME] [TEXT | --clear]`: prints, sets or clears
+  the peer's own note ("Note" below): this session's peer, or the live peer
+  NAME (a `read --follow` program, which has no MCP tool).
 - `sketerm peer hub add|remove NAME`, `join HUB`, `leave`, `status`: set
   up federation by editing config.conf ("Federation" below).
 
@@ -3311,6 +3318,43 @@ federation with the rest of the presence, and as the sketerm tab and pane
 title in place of the app's own OSC title until it is cleared (a manual
 pane title or a covering face still wins). `capabilities.peers.subject`
 says the daemon keeps subjects (welcome flag `peer_subject`).
+
+### Note
+
+A peer's note is what its own assistant says it is doing now, in its own
+words: `landing M015; holding the zenit-cms push`, `waiting on arcana's
+review`. Other sessions read it without messaging it ("are you the one
+pushing to zenit-cms?"). It is the agent's, where the subject and the alias
+are the user's: no assistant writes those, and the user does not write
+this one.
+
+- **Setting it**: the `peer_set_note {text}` tool ("" clears it); the
+  server instructions and the tool description tell assistants to put the
+  current task, the repos or files they change, the pushes they hold or
+  what they wait on there, to update it when that changes and clear it
+  when done. A program without MCP uses `sketerm peer note TEXT` inside
+  its session, or `--name NAME` for a live peer such as a `read --follow`
+  program (`SKETERM_PEER_NAME` never redirects it, as for the subject).
+  Both send `peer_subject` with `note` for the address (welcome flag
+  `peer_note`; an older daemon: the tool answers `unavailable`).
+- **Rule**: surrounding whitespace is trimmed, then at most 120 bytes of
+  UTF-8 on one line, without control characters; anything longer or with a
+  newline or tab inside is refused (`invalid_args`, CLI exit 2;
+  `peermail.checkNote`).
+- **Lifetime**: kept with the address only while a server of it is live,
+  never persisted: it is cleared when the peer goes (its server
+  disconnects or the daemon restarts), and a `/clear` changes nothing (the
+  address is the session's). Not set again for 4 hours
+  (`peermail.NOTE_STALE_MS`), it is stale: no list and no message header
+  shows it, on any host, judged on each reader's own clock. Setting it
+  again, even unchanged, restarts that.
+- **Shown**: last on the peer's `peer_list` row (`note: ...`, with its age
+  from an hour on: `note 2h ago: ...`) and on the reader's own `you:` line;
+  `note`/`note_ms` in JSON; in the header of the peer's messages after its
+  subject (`(claude-code on h, ~/w, working; subject: template links; note:
+  landing M015). ...`, `meta.sender_note`, the CLI's `sender_note`); across
+  federation with the rest of the presence, its time carried as an age.
+  An older daemon or hub drops it; an older server ignores the field.
 
 ### Federation
 

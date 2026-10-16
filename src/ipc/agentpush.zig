@@ -229,6 +229,8 @@ pub fn composePeer(arena: std.mem.Allocator, item: PeerItem) !Push {
             const presence = senderState(m);
             try w.print(", {s}", .{@tagName(presence)});
             if (m.sender_subject.len > 0) try w.print("; subject: {s}", .{m.sender_subject});
+            // The sender's own word, after its user's.
+            if (m.sender_note.len > 0) try w.print("; note: {s}", .{m.sender_note});
             try w.writeAll(")");
             const aged = m.age_ms >= PEER_AGE_SHOWN_MS;
             if (aged or m.queued) try w.writeAll(", sent");
@@ -283,6 +285,7 @@ fn peerMeta(arena: std.mem.Allocator, item: PeerItem) !agentwait.Meta {
             .age_s = try std.fmt.allocPrint(arena, "{d}", .{@divTrunc(@max(m.age_ms, 0), 1000)}),
             .sender_state = @tagName(senderState(m)),
             .sender_subject = nonEmpty(m.sender_subject),
+            .sender_note = nonEmpty(m.sender_note),
             .from_alias = nonEmpty(m.from.alias),
             .at = try wallAt(arena, m.sent_ms),
         },
@@ -469,6 +472,11 @@ test "a peer message reads as the plan's sentence: age from a minute on, offline
     const about = try composePeer(a, .{ .message = .{ .id = "m-8", .from = from, .text = "x", .sender_live = true, .sender_state = .idle, .sender_subject = "template links" } });
     try t.expect(std.mem.startsWith(u8, about.content, "Peer message from Zenit (claude-code on hohenheim, /home/u/zenit-workspace, idle; subject: template links). id m-8."));
     try t.expectEqualStrings("template links", about.meta.sender_subject.?);
+    // Its own note follows the user's subject, marked as its own.
+    const noted = try composePeer(a, .{ .message = .{ .id = "m-9", .from = from, .text = "x", .sender_live = true, .sender_state = .working, .sender_subject = "template links", .sender_note = "landing M015; holding the zenit-cms push" } });
+    try t.expect(std.mem.startsWith(u8, noted.content, "Peer message from Zenit (claude-code on hohenheim, /home/u/zenit-workspace, working; subject: template links; note: landing M015; holding the zenit-cms push). id m-9."));
+    try t.expectEqualStrings("landing M015; holding the zenit-cms push", noted.meta.sender_note.?);
+    try t.expect(about.meta.sender_note == null);
     // A sender with an alias reads as it, its address beside it.
     var aliased = from;
     aliased.address = "p-3fa9c2e1";

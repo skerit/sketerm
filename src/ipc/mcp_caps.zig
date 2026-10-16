@@ -642,7 +642,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             try res.raw("peers", try mcp_peer.capabilityJson(arena));
             const pc = mcp_peer.capability();
             if (pc.available)
-                try res.textf("peers: this session is {s}{s}; peer_list, peer_send and peer_read reach the other assistants' sessions on this host, their messages {s}", .{ if (pc.address.len > 0) pc.address else "(registering)", if (pc.durable) " (durable)" else "", if (pc.channel_armed) "arrive as channel messages" else "arrive through peer_read unless a follower (the opencode plugin) pushes them" })
+                try res.textf("peers: this session is {s}{s}; peer_list, peer_send and peer_read reach the other assistants' sessions on this host, their messages {s}{s}", .{ if (pc.address.len > 0) pc.address else "(registering)", if (pc.durable) " (durable)" else "", if (pc.channel_armed) "arrive as channel messages" else "arrive through peer_read unless a follower (the opencode plugin) pushes them", if (pc.note) "; peer_set_note tells them what you are doing" else "" })
             else
                 try res.textf("peers: unavailable ({s})", .{pc.reason orelse "unknown"});
         }

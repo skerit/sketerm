@@ -205,8 +205,8 @@ fn expectSilentOk(r: TreeRun, comptime what: []const u8) void {
     if (!std.mem.eql(u8, r.rc, "0")) fail(what ++ ": did not exit 0");
 }
 
-/// One tools/call: its structuredContent (skipping notification lines).
-fn call(m: *Mcp, arena: std.mem.Allocator, tool: []const u8, args: []const u8, comptime what: []const u8) std.json.ObjectMap {
+/// One tools/call: its result (skipping notification lines).
+fn resultOf(m: *Mcp, arena: std.mem.Allocator, tool: []const u8, args: []const u8, comptime what: []const u8) struct { line: []const u8, result: std.json.ObjectMap } {
     m.sendToolAllocated(tool, args);
     const deadline = nowMs() + 20_000;
     while (nowMs() < deadline) {
@@ -215,15 +215,33 @@ fn call(m: *Mcp, arena: std.mem.Allocator, tool: []const u8, args: []const u8, c
         if (v != .object) continue;
         const id = v.object.get("id") orelse continue;
         if (id != .integer or id.integer != m.id) continue;
-        const result = (v.object.get("result") orelse fail(what ++ ": no result")).object;
-        if (result.get("isError")) |e| if (e == .bool and e.bool) {
-            std.debug.print("{s}\n", .{line});
-            fail(what ++ ": error result");
-        };
-        const sc = result.get("structuredContent") orelse fail(what ++ ": no structuredContent");
-        return sc.object;
+        return .{ .line = line, .result = (v.object.get("result") orelse fail(what ++ ": no result")).object };
     }
     fail(what ++ ": no reply");
+}
+
+fn isError(result: std.json.ObjectMap) bool {
+    const e = result.get("isError") orelse return false;
+    return e == .bool and e.bool;
+}
+
+/// One tools/call: its structuredContent.
+fn call(m: *Mcp, arena: std.mem.Allocator, tool: []const u8, args: []const u8, comptime what: []const u8) std.json.ObjectMap {
+    const r = resultOf(m, arena, tool, args, what);
+    if (isError(r.result)) {
+        std.debug.print("{s}\n", .{r.line});
+        fail(what ++ ": error result");
+    }
+    const sc = r.result.get("structuredContent") orelse fail(what ++ ": no structuredContent");
+    return sc.object;
+}
+
+/// One tools/call that must fail: its error code.
+fn callErrorCode(m: *Mcp, arena: std.mem.Allocator, tool: []const u8, args: []const u8, comptime what: []const u8) []const u8 {
+    const r = resultOf(m, arena, tool, args, what);
+    if (!isError(r.result)) fail(what ++ ": not an error result");
+    const sc = r.result.get("structuredContent") orelse fail(what ++ ": no structuredContent");
+    return str((sc.object.get("error") orelse fail(what ++ ": no error")).object, "code", what);
 }
 
 fn str(o: std.json.ObjectMap, key: []const u8, comptime what: []const u8) []const u8 {
@@ -845,6 +863,26 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
         follower.terminate();
     }
     std.debug.print("smoke: peers: user-set subject ok\n", .{});
+
+    // -- j2. the peer's own note (peer_set_note), unlike the user's subject --
+    // 38b. alice sets hers with the tool: bob2 sees it at the end of her
+    //      peer_list row and in the header of her next message.
+    {
+        const note = "landing M015; holding the zenit-cms push";
+        if (!boolOf(registered(&alice, arena, "38b. caps"), "note", "38b.")) fail("38b. capabilities.peers.note is false on a daemon that keeps notes");
+        expectStr(call(&alice, arena, "peer_set_note", "{\"text\":\"  " ++ note ++ "\\n\"}", "38b. set"), "note", note, "38b. trimmed");
+        const text = listText(&bob2, arena, "38b. bob2 list");
+        contains(text, "  note: " ++ note ++ "\n", "38b. the note ends alice's row in bob2's list");
+        expectStr(listed(&bob2, arena, "alice", "38b. json") orelse fail("38b. alice not listed"), "note", note, "38b. the JSON note");
+        expectStr(send(&alice, arena, "bob", "with a note", "38b. send"), "outcome", "delivered", "38b. outcome");
+        contains(str(readOne(&bob2, arena, 5_000, "38b. bob2 peer_read"), "content", "38b."), "; note: " ++ note ++ "). id m-", "38b. the note in the composed header");
+        // 38c. Two lines are refused invalid_args; "" clears it.
+        const code = callErrorCode(&alice, arena, "peer_set_note", "{\"text\":\"two\\nlines\"}", "38c. refused");
+        if (!std.mem.eql(u8, code, "invalid_args")) fail("38c. a two-line note was not refused invalid_args");
+        expectStr(call(&alice, arena, "peer_set_note", "{\"text\":\"\"}", "38c. clear"), "note", "", "38c. cleared");
+        if ((listed(&bob2, arena, "alice", "38c. json") orelse fail("38c. alice not listed")).get("note") != null) fail("38c. a cleared note is still listed");
+    }
+    std.debug.print("smoke: peers: the peer's own note ok\n", .{});
 
     // -- k. wake rules: to lists, slow mail, dormancy, the loop cap --
     // 39. One message to a list: one id, one outcome per address, in list

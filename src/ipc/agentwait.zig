@@ -145,6 +145,8 @@ pub const Meta = struct {
     sender_state: ?[]const u8 = null,
     /// Peer: the sender's user-set subject, absent when none.
     sender_subject: ?[]const u8 = null,
+    /// Peer: the sender's own note (what it says it is doing), absent when none.
+    sender_note: ?[]const u8 = null,
     /// Peer: the sender's alias when it sent, absent when none.
     from_alias: ?[]const u8 = null,
 };
