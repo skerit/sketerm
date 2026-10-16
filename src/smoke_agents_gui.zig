@@ -13,7 +13,13 @@
 //!   2. after one agent turns `needs_input` the chip shows the amber
 //!      "1 needs input" pill and the tab badge turns amber;
 //!   3. clicking the chip opens the popover listing both agent ids;
-//!   4. removing the record hides the chip, the badge and the titlebar.
+//!   4. removing the record hides the chip, the badge and the titlebar;
+//!   5. (light theme only: it is not about colours) the user titles the
+//!      pane through Set Pane Title…, a real `sketerm mcp` starts in the
+//!      pane's shell, and `sketerm peer list` shows it at the address
+//!      `p-<the session's origin id>` with the pane title as its subject;
+//!      re-titling the pane leaves that subject alone, and once the user
+//!      clears it the pane does not apply its title again.
 //!
 //! The chip's and the popover's text must also READ: each word's glyphs
 //! against the background behind them, at WCAG AA. The whole rig runs
@@ -37,6 +43,8 @@ const glance = @import("ipc/agentglance.zig");
 const mux_client = @import("mux/client.zig");
 const mux_cli = @import("ipc/mux_cli.zig");
 const smokecli = @import("smoke/displaycli.zig");
+const ctlsock = @import("smoke/ctlsock.zig");
+const peeraddr = @import("ipc/peeraddr.zig");
 
 const TTL = "180";
 const SESSION = "agentsmoke";
@@ -216,8 +224,12 @@ fn wordsContrast(app: *appdrive.App, win_id: u32, region: ?appdrive.App.Region, 
     return lowest;
 }
 
-/// Re-run this executable once per `Theme`; any failure fails the rig.
-fn runEveryTheme() u8 {
+/// Re-run this executable once per `Theme`, with its own `args` (they
+/// carry `--bin-dir`); any failure fails the rig.
+fn runEveryTheme(args: []const [*:0]const u8) u8 {
+    var argv: [16:null]?[*:0]const u8 = @splat(null);
+    if (args.len > argv.len) return fail("too many arguments", .{});
+    for (args, 0..) |a, i| argv[i] = a;
     var failed = false;
     for (std.enums.values(Theme)) |theme| {
         const pid = c.fork();
@@ -226,8 +238,7 @@ fn runEveryTheme() u8 {
             platform.dieWithParent();
             var name_z: [32:0]u8 = undefined;
             _ = c.setenv(Theme.ENV, @import("util/strz.zig").copyZ(&name_z, theme.name()), 1);
-            const argv = [_:null]?[*:0]const u8{ "sketerm-smoke-agents-gui", null };
-            _ = c.execv("/proc/self/exe", @ptrCast(@constCast(&argv)));
+            _ = c.execv("/proc/self/exe", @ptrCast(&argv));
             c._exit(127);
         }
         var st: c_int = 0;
@@ -326,7 +337,8 @@ fn squeeze(buf: []u8, s: []const u8) []const u8 {
 }
 
 /// The GUI pane's session: the one live terminal session on the daemon.
-fn paneSession(allocator: std.mem.Allocator, sock: []const u8, out: []u8) ?[]const u8 {
+/// @param origin_out receives its origin id ("" from a daemon without one).
+fn paneSession(allocator: std.mem.Allocator, sock: []const u8, out: []u8, origin_out: *[32]u8) ?struct { name: []const u8, origin_id: []const u8 } {
     var conn = mux_client.Conn.connectProbed(allocator, sock) catch return null;
     defer conn.deinit();
     conn.setNonBlocking();
@@ -339,7 +351,9 @@ fn paneSession(allocator: std.mem.Allocator, sock: []const u8, out: []u8) ?[]con
         if (s.app or s.exited) continue;
         if (s.name.len > out.len) return null;
         @memcpy(out[0..s.name.len], s.name);
-        return out[0..s.name.len];
+        const n = @min(s.origin_id.len, origin_out.len);
+        @memcpy(origin_out[0..n], s.origin_id[0..n]);
+        return .{ .name = out[0..s.name.len], .origin_id = origin_out[0..n] };
     }
     return null;
 }
@@ -400,7 +414,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     // Without a theme, run this whole rig once per theme, one after
     // another (each run owns the display session name).
-    const raw_theme = c.getenv(Theme.ENV) orelse return runEveryTheme();
+    const raw_theme = c.getenv(Theme.ENV) orelse return runEveryTheme(init.args.vector);
     g_theme = std.meta.stringToEnum(Theme, std.mem.span(raw_theme)) orelse return fail("unknown " ++ Theme.ENV ++ " value", .{});
     say("theme: {s}", .{g_theme.name()});
     if (!@import("util/lifetime.zig").arm()) return fail("lifetime fence", .{});
@@ -482,14 +496,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (win_id == 0) return fail("no toplevel window", .{});
 
     var name_buf: [256]u8 = undefined;
-    const session = blk: {
+    var origin_buf: [32]u8 = undefined;
+    const pane_session = blk: {
         const t0 = clock.nowMs();
         while (clock.nowMs() - t0 < 20_000) {
             pumpFor(app, 250);
-            if (paneSession(allocator, mux_sock, &name_buf)) |s| break :blk s;
+            if (paneSession(allocator, mux_sock, &name_buf, &origin_buf)) |s| break :blk s;
         }
         return fail("the GUI pane's session never appeared on the daemon", .{});
     };
+    const session = pane_session.name;
     say("GUI up, pane session '{s}'", .{session});
     pumpFor(app, 1500);
     {
@@ -616,9 +632,207 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     savePng(app, win_id, "4-gone");
     say("PASS 4: record removed, chip + badge + titlebar hidden -> zig-out/smoke-agents-gui-<theme>-4-gone.png", .{});
 
+    // ── 5. the peer in the pane: its address and default subject ──
+    if (g_theme == .light) {
+        if (peerStage(allocator, app, win_id, rt, pane_session)) |why| {
+            savePng(app, win_id, "5-FAIL");
+            return fail("{s} (zig-out/smoke-agents-gui-<theme>-5-FAIL.png)", .{why});
+        }
+    }
+
     teardown();
     say("all stages passed", .{});
     return 0;
+}
+
+const PEER_TITLE = "Zenit work";
+const PEER_RETITLE = "Renamed pane";
+
+/// Whether the toplevel's title (`base | tab | pane title`) contains `text`.
+fn windowTitleHas(app: *appdrive.App, win_id: u32, text: []const u8) bool {
+    const w = app.winById(win_id) orelse return false;
+    const title = w.title orelse return false;
+    return std.mem.indexOf(u8, title, text) != null;
+}
+
+/// The user's path: the pane menu's "Set Pane Title…" (dispatched by its
+/// action name), the title typed into its popover, Enter. The action
+/// names the pane by its session: on this compositor no pane holds GTK
+/// focus once the previous popover has closed, so a focus-derived
+/// dispatch would find none.
+fn setPaneTitle(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, gui_sock: [:0]const u8, session: []const u8, title: []const u8) ?[]const u8 {
+    // Any earlier popover must be gone first, or it reads as this one.
+    const t_idle = clock.nowMs();
+    while (popupCount(app) > 0) {
+        if (clock.nowMs() - t_idle > 8_000) return "an earlier popover never closed";
+        pumpFor(app, 100);
+    }
+    // The seat keyboard went to the last popover; hand it back to the
+    // toplevel as a compositor would.
+    app.focusWindow(win_id) catch return "focusing the window failed";
+    pumpFor(app, 300);
+    var req_buf: [256]u8 = undefined;
+    const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"action\",\"data\":\"set_pane_title\",\"session\":{f}}}\n", .{std.json.fmt(session, .{})}) catch return "action request too long";
+    const reply = ctlsock.roundtrip(allocator, app, gui_sock, req) orelse
+        return "the GUI did not answer the set_pane_title action";
+    defer allocator.free(reply);
+    if (std.mem.indexOf(u8, reply, "\"ok\":true") == null) {
+        say("set_pane_title reply: {s}", .{reply});
+        return "the set_pane_title action was refused";
+    }
+    var pop: ?u32 = null;
+    const t0 = clock.nowMs();
+    while (clock.nowMs() - t0 < 8_000 and pop == null) {
+        pumpFor(app, 200);
+        if (popupCount(app) > 0) pop = newestPopup(app);
+    }
+    const pop_id = pop orelse return "Set Pane Title… opened no popover";
+    pumpFor(app, 300);
+    app.typeText(pop_id, title) catch return "typing the pane title failed";
+    pumpFor(app, 200);
+    app.pressKey(pop_id, "Enter") catch return "confirming the pane title failed";
+    const t1 = clock.nowMs();
+    while (clock.nowMs() - t1 < 10_000) {
+        pumpFor(app, 200);
+        if (windowTitleHas(app, win_id, title)) {
+            say("window title now '{s}'", .{app.winById(win_id).?.title.?});
+            return null;
+        }
+    }
+    if (app.winById(win_id)) |w| say("window title: '{s}'", .{w.title orelse ""});
+    return "the pane never showed the title typed into Set Pane Title…";
+}
+
+/// Run the built `sketerm` with `args`, pumping the viewer meanwhile.
+/// @return its stdout (caller frees), null when it could not run.
+fn sketermOut(allocator: std.mem.Allocator, app: *appdrive.App, args: []const [*:0]const u8) ?[]u8 {
+    var argv: [8:null]?[*:0]const u8 = @splat(null);
+    if (args.len + 1 > argv.len) return null;
+    argv[0] = bindir.path(.sketerm);
+    for (args, 1..) |a, i| argv[i] = a;
+    var p: [2]c_int = undefined;
+    if (c.pipe(&p) != 0) return null;
+    const pid = c.fork();
+    if (pid < 0) {
+        _ = c.close(p[0]);
+        _ = c.close(p[1]);
+        return null;
+    }
+    if (pid == 0) {
+        _ = c.dup2(p[1], 1);
+        _ = c.close(p[0]);
+        _ = c.close(p[1]);
+        _ = c.execv(bindir.path(.sketerm), @ptrCast(&argv));
+        c._exit(127);
+    }
+    _ = c.close(p[1]);
+    var text: std.ArrayList(u8) = .empty;
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        // The rig is the GUI's compositor brain: keep it served.
+        _ = app.pumpOnce(0);
+        const n = c.read(p[0], &buf, buf.len);
+        if (n <= 0) break;
+        text.appendSlice(allocator, buf[0..@intCast(n)]) catch break;
+    }
+    _ = c.close(p[0]);
+    var st: c_int = 0;
+    _ = c.waitpid(pid, &st, 0);
+    return text.toOwnedSlice(allocator) catch null;
+}
+
+/// The subject `sketerm peer list --json` shows for the live peer
+/// `address`, copied into `out`: null while no such live peer is listed,
+/// "" when it has none.
+fn listedSubject(allocator: std.mem.Allocator, app: *appdrive.App, address: []const u8, out: []u8) ?[]const u8 {
+    const text = sketermOut(allocator, app, &.{ "peer", "list", "--json" }) orelse return null;
+    defer allocator.free(text);
+    const Listed = struct { peers: []const struct { address: []const u8, live: bool = false, subject: ?[]const u8 = null } = &.{} };
+    const parsed = std.json.parseFromSlice(Listed, allocator, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return null;
+    defer parsed.deinit();
+    for (parsed.value.peers) |peer| {
+        if (!peer.live or !std.mem.eql(u8, peer.address, address)) continue;
+        const s = peer.subject orelse "";
+        const n = @min(s.len, out.len);
+        @memcpy(out[0..n], s[0..n]);
+        return out[0..n];
+    }
+    return null;
+}
+
+/// Stage 5; null when it passed, else why not.
+fn peerStage(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, rt: []const u8, pane: anytype) ?[]const u8 {
+    const origin_id = pane.origin_id;
+    var addr_buf: [peeraddr.PANE_NAME_LEN]u8 = undefined;
+    const address = peeraddr.paneName(&addr_buf, origin_id) orelse return "the pane session reports no valid origin id";
+    var addr_z_buf: [peeraddr.PANE_NAME_LEN + 1]u8 = undefined;
+    const address_z = std.fmt.bufPrintZ(&addr_z_buf, "{s}", .{address}) catch unreachable;
+    var sock_buf: [160]u8 = undefined;
+    const gui_sock = std.fmt.bufPrintZ(&sock_buf, "{s}/sketerm/{d}.sock", .{ rt, child_pid }) catch return "GUI socket path";
+
+    // 5a. the user titles the pane BEFORE any peer runs in it.
+    if (setPaneTitle(allocator, app, win_id, gui_sock, pane.name, PEER_TITLE)) |why| return why;
+    // 5b. a real MCP server starts in the pane's shell (its stdin held
+    //     open by sleep), so it inherits the session's origin id and runs
+    //     in the session's process tree.
+    var exe_buf: [4096:0]u8 = @splat(0);
+    if (c.realpath(bindir.path(.sketerm), &exe_buf) == null) return "realpath of the sketerm binary";
+    const exe = std.mem.sliceTo(&exe_buf, 0);
+    var cmd_buf: [4400]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&cmd_buf, "sleep 300 | '{s}' mcp --shared --no-record >/dev/null 2>&1\r", .{exe}) catch return "command too long";
+    var req_buf: [4600]u8 = undefined;
+    const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-text\",\"data\":{f}}}\n", .{std.json.fmt(cmd, .{})}) catch return "request too long";
+    const sent = ctlsock.roundtrip(allocator, app, gui_sock, req) orelse return "the GUI did not answer send-text";
+    allocator.free(sent);
+
+    // 5c. peer_list: the opaque pane address, the pane title as subject.
+    var subj_buf: [256]u8 = undefined;
+    var got: ?[]const u8 = null;
+    const t0 = clock.nowMs();
+    while (clock.nowMs() - t0 < 30_000) {
+        pumpFor(app, 300);
+        got = listedSubject(allocator, app, address, &subj_buf);
+        if (got) |s| if (std.mem.eql(u8, s, PEER_TITLE)) break;
+    }
+    const first = got orelse {
+        say("no live peer at {s}", .{address});
+        return "no peer registered at the pane's p- address";
+    };
+    if (!std.mem.eql(u8, first, PEER_TITLE)) {
+        say("peer {s} subject: '{s}'", .{ address, first });
+        return "the pane's peer did not get the pane title as its subject";
+    }
+    say("PASS 5a: the pane's peer is {s} with subject '{s}'", .{ address, first });
+
+    // 5d. re-titling the pane leaves the subject alone.
+    if (setPaneTitle(allocator, app, win_id, gui_sock, pane.name, PEER_RETITLE)) |why| return why;
+    pumpFor(app, 2_000);
+    const after = listedSubject(allocator, app, address, &subj_buf) orelse return "the pane's peer left after the re-title";
+    if (!std.mem.eql(u8, after, PEER_TITLE)) {
+        say("subject after the re-title: '{s}'", .{after});
+        return "re-titling the pane changed the peer's subject";
+    }
+    say("PASS 5b: re-titled to '{s}', the subject stayed '{s}'", .{ PEER_RETITLE, after });
+
+    // 5e. the user clears the subject: the pane does not default it again.
+    if (sketermOut(allocator, app, &.{ "peer", "subject", "--clear", "--name", address_z.ptr })) |o| allocator.free(o);
+    const t1 = clock.nowMs();
+    var cleared = false;
+    while (!cleared and clock.nowMs() - t1 < 10_000) {
+        pumpFor(app, 300);
+        if (listedSubject(allocator, app, address, &subj_buf)) |s| cleared = s.len == 0;
+    }
+    if (!cleared) return "sketerm peer subject --clear did not clear the subject";
+    pumpFor(app, 2_000);
+    const later = listedSubject(allocator, app, address, &subj_buf) orelse return "the pane's peer left after the clear";
+    if (later.len != 0) {
+        say("subject after the clear: '{s}'", .{later});
+        return "the pane applied its title again after the user cleared the subject";
+    }
+    say("PASS 5c: cleared, and the pane did not default the subject again", .{});
+    if (ctlsock.roundtrip(allocator, app, gui_sock, "{\"cmd\":\"send-keys\",\"data\":\"ctrl+c\"}\n")) |r| allocator.free(r);
+    pumpFor(app, 500);
+    return null;
 }
 
 fn popupCount(app: *appdrive.App) usize {

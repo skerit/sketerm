@@ -48,6 +48,7 @@ const paneface = @import("paneface.zig");
 const panetitlebar = @import("panetitlebar.zig");
 const agentbadge = @import("agentbadge.zig");
 const AgentTally = @import("../ipc/agentglance.zig").Tally;
+const peeraddr = @import("../ipc/peeraddr.zig");
 const clipboard = @import("clipboard.zig");
 const MouseAction = @import("../config.zig").MouseAction;
 pub const InputCtx = input.Ctx;
@@ -270,6 +271,11 @@ pub const Pane = struct {
     /// OSC 0/1/2 updates so the manual string sticks. Cleared via
     /// the menu's "Set Pane Title…" → empty input.
     title_locked: bool = false,
+    /// The session peer this pane already considered for a default
+    /// subject (`offerDefaultSubject`); the default is offered once per
+    /// address, so a subject the user cleared stays cleared.
+    subject_offered_buf: [peeraddr.NAME_MAX]u8 = undefined,
+    subject_offered_len: u8 = 0,
     /// Latest OSC 0/1/2 title text. Owned; freed in deinit.
     titlebar_text: ?[]u8 = null,
     /// Title provided by the visible non-terminal face (web page
@@ -1769,8 +1775,24 @@ fn onSessionRenamedEvent(ctx: ?*anyopaque, name: []const u8) void {
 /// moved: the subject titles the pane and its tab in place of the OSC title.
 fn onSessionPeerEvent(ctx: ?*anyopaque) void {
     const self = cast.userData(Pane, ctx);
+    offerDefaultSubject(self);
     self.refreshTitlebarLabel();
     self.notifyTitleFact();
+}
+
+/// A peer first seen in this pane's session without a subject gets the
+/// title the USER gave the pane, once per address: never the OSC title
+/// (the program sets that, and a subject never comes from an assistant),
+/// and a later retitle or a cleared subject is left alone.
+fn offerDefaultSubject(self: *Pane) void {
+    const address = self.terminal.sessionPeer() orelse return;
+    if (std.mem.eql(u8, address, self.subject_offered_buf[0..self.subject_offered_len])) return;
+    const n = @min(address.len, self.subject_offered_buf.len);
+    @memcpy(self.subject_offered_buf[0..n], address[0..n]);
+    self.subject_offered_len = @intCast(n);
+    if (!self.title_locked or self.terminal.peerSubject() != null or self.terminal.isViewOnly()) return;
+    const title = self.titlebar_text orelse return;
+    if (title.len > 0) _ = self.terminal.setPeerSubject(title);
 }
 
 /// The session's primary app host changed (fires at channel open —
