@@ -1095,10 +1095,11 @@ pub const Wakeup = struct {
     }
 };
 
-/// Per-user runtime directory for sockets: $XDG_RUNTIME_DIR when set
-/// (Linux convention), else $TMPDIR, else /tmp. macOS has no
-/// XDG_RUNTIME_DIR; its per-user $TMPDIR (/var/folders/...) gives
-/// the same ownership guarantees.
+/// Per-user runtime directory for sockets: $XDG_RUNTIME_DIR when set,
+/// else the OS's private user directory, then $TMPDIR or /tmp. Resolve
+/// Linux's /run/user/<uid> even in SSH/agent shells without XDG variables:
+/// falling straight back to /tmp starts a second per-user broker, whose
+/// federation link repeatedly evicts the desktop broker's link.
 pub fn runtimeDir() []const u8 {
     return runtimeDirFrom(envValue("XDG_RUNTIME_DIR"), envValue("TMPDIR"));
 }
@@ -1108,12 +1109,13 @@ fn envValue(name: [*:0]const u8) ?[]const u8 {
     return std.mem.span(@as([*:0]const u8, @ptrCast(p)));
 }
 
-/// `runtimeDir` for an environment passed by value, so a caller can resolve ANOTHER process's
-/// socket directory from its environment block. The result may point into either argument.
+/// `runtimeDir` for another process of THIS USER's environment block.
+/// The result borrows an argument or the OS-default path buffer.
 pub fn runtimeDirFrom(xdg_runtime_dir: ?[]const u8, tmpdir: ?[]const u8) []const u8 {
     if (xdg_runtime_dir) |s| {
         if (s.len > 0) return s;
     }
+    if (is_linux) if (linuxRuntimeDir()) |dir| return dir;
     if (is_macos) {
         // $TMPDIR is the per-user temp dir, but a non-interactive SSH
         // session may not have it in the environment — so a daemon
@@ -1133,6 +1135,28 @@ pub fn runtimeDirFrom(xdg_runtime_dir: ?[]const u8, tmpdir: ?[]const u8) []const
             return std.mem.trimEnd(u8, S.buf[0 .. n - 1], "/");
         }
     }
+    return runtimeTempDir(tmpdir);
+}
+
+/// logind creates this directory independently of whether a particular
+/// process inherited XDG_RUNTIME_DIR. Never create it ourselves or select
+/// another user's/public directory. Re-check each time: logout can remove it.
+fn linuxRuntimeDir() ?[]const u8 {
+    const S = struct {
+        threadlocal var buf: [64:0]u8 = undefined;
+    };
+    const uid = c.getuid();
+    const path = std.fmt.bufPrintZ(&S.buf, "/run/user/{d}", .{uid}) catch return null;
+    var st: c.struct_stat = undefined;
+    if (c.lstat(path.ptr, &st) != 0 or !privateRuntimeDir(st, uid)) return null;
+    return path;
+}
+
+fn privateRuntimeDir(st: c.struct_stat, uid: c.uid_t) bool {
+    return st.st_uid == uid and (st.st_mode & c.S_IFMT) == c.S_IFDIR and (st.st_mode & 0o777) == 0o700;
+}
+
+fn runtimeTempDir(tmpdir: ?[]const u8) []const u8 {
     if (tmpdir) |s| {
         // Unix socket sun_path is 104 bytes on Darwin — a long
         // /var/folders path still leaves room for sketerm/<pid>.sock.
@@ -1141,12 +1165,40 @@ pub fn runtimeDirFrom(xdg_runtime_dir: ?[]const u8, tmpdir: ?[]const u8) []const
     return "/tmp";
 }
 
-test "runtimeDirFrom prefers XDG_RUNTIME_DIR, then a short TMPDIR, then /tmp" {
-    try std.testing.expectEqualStrings("/run/user/7", runtimeDirFrom("/run/user/7", "/var/tmp/"));
-    if (!is_macos) {
-        try std.testing.expectEqualStrings("/var/tmp", runtimeDirFrom("", "/var/tmp/"));
-        try std.testing.expectEqualStrings("/tmp", runtimeDirFrom(null, null));
+test "an explicit runtime stays isolated; a missing XDG uses the OS user directory" {
+    const t = std.testing;
+    try t.expectEqualStrings("/isolated/runtime", runtimeDirFrom("/isolated/runtime", "/var/tmp/"));
+    if (is_linux) {
+        if (linuxRuntimeDir()) |dir| {
+            // The desktop, an SSH shell and an agent with TMPDIR must
+            // all reach the same broker when no explicit XDG overrides it.
+            var expected: [64]u8 = undefined;
+            const desktop = try std.fmt.bufPrint(&expected, "/run/user/{d}", .{c.getuid()});
+            try t.expectEqualStrings(desktop, dir);
+            try t.expectEqualStrings(desktop, runtimeDirFrom(null, null));
+            try t.expectEqualStrings(desktop, runtimeDirFrom("", "/var/tmp/"));
+        } else {
+            try t.expectEqualStrings("/var/tmp", runtimeDirFrom("", "/var/tmp/"));
+            try t.expectEqualStrings("/tmp", runtimeDirFrom(null, null));
+        }
     }
+    try t.expectEqualStrings("/var/tmp", runtimeTempDir("/var/tmp/"));
+    try t.expectEqualStrings("/tmp", runtimeTempDir(null));
+}
+
+test "the Linux runtime fallback accepts only a private directory owned by this user" {
+    const t = std.testing;
+    var st = std.mem.zeroes(c.struct_stat);
+    st.st_uid = 1000;
+    st.st_mode = c.S_IFDIR | 0o700;
+    try t.expect(privateRuntimeDir(st, 1000));
+    try t.expect(!privateRuntimeDir(st, 1001));
+    st.st_mode = c.S_IFDIR | 0o755;
+    try t.expect(!privateRuntimeDir(st, 1000));
+    st.st_mode = c.S_IFREG | 0o700;
+    try t.expect(!privateRuntimeDir(st, 1000));
+    st.st_mode = c.S_IFLNK | 0o700;
+    try t.expect(!privateRuntimeDir(st, 1000));
 }
 
 test "runtimeDir returns something usable" {
