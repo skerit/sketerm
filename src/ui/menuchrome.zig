@@ -67,6 +67,23 @@ pub fn setPopoverList(popover: *c.GtkWidget, list: *c.GtkWidget) void {
     c.gtk_popover_set_child(@ptrCast(popover), newPopoverScroller(list));
 }
 
+/// Keep cached menu widgets, but not a hidden popup's native surface and
+/// renderer. GTK only unmaps on popdown; with Vulkan that retains a
+/// swapchain's dma-buf/sync descriptors per visited menu/submenu, until
+/// the pane dies. Many panes can exhaust the process's descriptor limit.
+/// The next popup realizes the same widgets again. Run after the menu's
+/// own close handlers so they can dismiss submenus and restore focus.
+pub fn releaseSurfaceOnClose(popover: *c.GtkWidget) void {
+    _ = c.g_signal_connect_data(popover, "closed", @ptrCast(&onClosedReleaseSurface), null, null, c.G_CONNECT_AFTER);
+}
+
+fn onClosedReleaseSurface(popover: *c.GtkPopover, _: ?*anyopaque) callconv(.c) void {
+    const widget: *c.GtkWidget = @ptrCast(popover);
+    // A close handler may already have reopened the cached menu.
+    if (c.gtk_widget_get_visible(widget) == 0 and c.gtk_widget_get_mapped(widget) == 0)
+        c.gtk_widget_unrealize(widget);
+}
+
 /// Signature of a menu's right-click handler ("pressed" on a
 /// GtkGestureClick limited to button 3).
 pub const PressedFn = *const fn (*c.GtkGestureClick, c_int, f64, f64, ?*anyopaque) callconv(.c) void;

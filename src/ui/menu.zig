@@ -378,6 +378,7 @@ pub fn attachWithPrePopup(
     // render per-item icons. Each button activates its "term.*" action
     // (resolved through the group inserted above) and pops down on click.
     const popover = c.gtk_popover_new();
+    menuchrome.releaseSurfaceOnClose(popover);
     c.gtk_widget_set_parent(popover, widget);
     // Until `destroyMenuCtx` is installed below, nothing else unparents
     // this: an OOM on the way there would leave `widget` finalizing with
@@ -446,6 +447,7 @@ pub fn attachWithPrePopup(
             .submenu => |s| {
                 const btn = menuchrome.makeRow(s.icon, s.label, true);
                 const sub_pop = c.gtk_popover_new();
+                menuchrome.releaseSurfaceOnClose(sub_pop);
                 c.gtk_widget_set_parent(sub_pop, btn);
                 c.gtk_popover_set_has_arrow(@ptrCast(sub_pop), 0);
                 c.gtk_popover_set_autohide(@ptrCast(sub_pop), 0);
@@ -652,4 +654,57 @@ fn showAtPrepared(ctx: *ClickCtx, x: f64, y: f64) bool {
     c.gtk_popover_set_pointing_to(@ptrCast(ctx.popover), &rect);
     c.gtk_popover_popup(@ptrCast(ctx.popover));
     return true;
+}
+
+test "closed terminal menus release native resources and reopen with their actions" {
+    const opt_in = c.getenv("SKETERM_TEST_POPOVER_LIFETIME") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, std.mem.span(opt_in), "1")) return error.SkipZigTest;
+    const t = std.testing;
+    try t.expect(c.gtk_init_check() != 0);
+    const window = c.gtk_window_new().?;
+    defer c.gtk_window_destroy(@ptrCast(window));
+    c.gtk_window_set_default_size(@ptrCast(window), 800, 600);
+    const host = c.gtk_drawing_area_new().?;
+    c.gtk_widget_set_focusable(host, 1);
+    c.gtk_window_set_child(@ptrCast(window), host);
+    const Probe = struct {
+        fn action(user: ?*anyopaque, _: Action) void {
+            const calls = cast.userData(usize, user);
+            calls.* += 1;
+        }
+        fn mapped(widget: *c.GtkWidget) !void {
+            const clock = @import("../util/clock.zig");
+            const deadline = clock.nowMs() + 3000;
+            while (c.gtk_widget_get_mapped(widget) == 0 and clock.nowMs() < deadline) {
+                _ = c.g_main_context_iteration(null, 0);
+                _ = c.usleep(1000);
+            }
+            try std.testing.expect(c.gtk_widget_get_mapped(widget) != 0);
+        }
+    };
+    var calls: usize = 0;
+    try attach(host, t.allocator, &Probe.action, &calls);
+    c.gtk_window_present(@ptrCast(window));
+    try Probe.mapped(host);
+    const ctx = cast.userData(ClickCtx, c.g_object_get_data(@ptrCast(host), CTX_KEY));
+    const sub = ctx.subs[0].?; // Copy More, always visible.
+    for (0..3) |_| {
+        try t.expect(popupAt(host, 20, 20));
+        try Probe.mapped(ctx.popover);
+        c.gtk_popover_popup(@ptrCast(sub));
+        try Probe.mapped(sub);
+        c.gtk_popover_popdown(@ptrCast(sub));
+        try t.expect(c.gtk_widget_get_realized(sub) == 0);
+        try t.expect(c.gtk_widget_get_mapped(ctx.popover) != 0);
+        // Reopen the same submenu, then dismiss the whole menu tree.
+        c.gtk_popover_popup(@ptrCast(sub));
+        try Probe.mapped(sub);
+        c.gtk_popover_popdown(@ptrCast(ctx.popover));
+        try t.expect(c.gtk_widget_get_realized(ctx.popover) == 0);
+        try t.expect(c.gtk_widget_get_realized(sub) == 0);
+        try t.expect(c.gtk_widget_get_parent(ctx.popover) == host);
+        const action = c.g_action_map_lookup_action(@ptrCast(ctx.group), gactionName(.copy_selection).ptr).?;
+        c.g_action_activate(action, null);
+    }
+    try t.expectEqual(@as(usize, 3), calls);
 }

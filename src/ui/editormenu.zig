@@ -171,6 +171,7 @@ pub fn attach(view: *EditorView, widget: *c.GtkWidget, allocator: std.mem.Alloca
     c.g_object_unref(group);
 
     const popover = c.gtk_popover_new();
+    menuchrome.releaseSurfaceOnClose(popover);
     c.gtk_widget_set_parent(popover, widget);
     c.gtk_popover_set_has_arrow(@ptrCast(popover), 0);
 
@@ -217,6 +218,7 @@ pub fn attach(view: *EditorView, widget: *c.GtkWidget, allocator: std.mem.Alloca
             .submenu => |s| {
                 const btn = menuchrome.makeRow(s.icon, s.label, true);
                 const sub_pop = c.gtk_popover_new();
+                menuchrome.releaseSurfaceOnClose(sub_pop);
                 c.gtk_widget_set_parent(sub_pop, btn);
                 c.gtk_popover_set_has_arrow(@ptrCast(sub_pop), 0);
                 c.gtk_popover_set_autohide(@ptrCast(sub_pop), 0);

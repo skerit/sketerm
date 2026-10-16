@@ -28,6 +28,7 @@ const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const mountBypass = @import("../../filebrowser/paths.zig").mountBypass;
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
 const cast = @import("../../util/cast.zig");
+const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 
 pub const PathCompletion = struct {
     req: u32,
@@ -1393,6 +1394,9 @@ pub fn showFrecencyJump(self: *BrowserView) void {
     _ = c.g_signal_connect_data(list, "row-activated", @ptrCast(&onJumpRow), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
     c.gtk_popover_set_child(@ptrCast(pop), box);
     c.gtk_widget_set_parent(pop, @ptrCast(@alignCast(self.path_entry)));
+    // Cancellation (Escape/outside click) must release the native popup
+    // too; submission alone used to unparent it and abandoned GPU fds.
+    connectPopoverAutoUnparent(pop);
     fillJumpList(ctx, "");
     c.gtk_popover_popup(@ptrCast(pop));
     _ = c.gtk_widget_grab_focus(entry);
@@ -1479,6 +1483,7 @@ pub fn showSelectPattern(self: *BrowserView) void {
     _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onPatternActivate), @ptrCast(ctx), @ptrCast(&PatternCtx.free), c.G_CONNECT_DEFAULT);
     c.gtk_popover_set_child(@ptrCast(pop), entry);
     c.gtk_widget_set_parent(pop, @ptrCast(@alignCast(self.path_entry)));
+    connectPopoverAutoUnparent(pop);
     c.gtk_popover_popup(@ptrCast(pop));
     _ = c.gtk_widget_grab_focus(entry);
 }
@@ -1949,4 +1954,48 @@ test "closePathCompletion after the widget tree died dereferences nothing" {
 
     view.closePathCompletion();
     view.cancelPathCompletion();
+}
+
+test "dismissed navigation prompts release their widgets and native surfaces" {
+    const opt_in = c.getenv("SKETERM_TEST_POPOVER_LIFETIME") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, std.mem.span(opt_in), "1")) return error.SkipZigTest;
+    const t = std.testing;
+    try t.expect(c.gtk_init_check() != 0);
+    const window = c.gtk_window_new().?;
+    defer c.gtk_window_destroy(@ptrCast(window));
+    const entry = c.gtk_entry_new().?;
+    c.gtk_window_set_child(@ptrCast(window), entry);
+    c.gtk_window_present(@ptrCast(window));
+
+    var view = BrowserView{ .allocator = t.allocator, .pane = null };
+    view.path_entry = @ptrCast(entry);
+    var spec = [_]u8{'/'};
+    try view.frecency.append(t.allocator, .{ .spec = &spec, .count = 1, .last_ms = wallMs() });
+    defer view.frecency.deinit(t.allocator);
+
+    // Exercise the actual constructors. Esc/outside-click dismisses via
+    // popdown, unlike submission, which already unparented these prompts.
+    // Keeping one test reference lets us inspect teardown without using
+    // a finalized pointer; the testing allocator checks the owned ctxs.
+    for (0..4) |_| {
+        for ([_]*const fn (*BrowserView) void{ showSelectPattern, showFrecencyJump }) |open| {
+            open(&view);
+            const pop = c.gtk_widget_get_last_child(entry) orelse return error.TestUnexpectedResult;
+            try t.expect(c.g_type_check_instance_is_a(@ptrCast(pop), c.gtk_popover_get_type()) != 0);
+            _ = c.g_object_ref(pop);
+            defer {
+                if (c.gtk_widget_get_parent(pop) != null) c.gtk_widget_unparent(pop);
+                c.g_object_unref(pop);
+            }
+            const deadline = @import("../../util/clock.zig").nowMs() + 3000;
+            while (c.gtk_widget_get_mapped(pop) == 0 and @import("../../util/clock.zig").nowMs() < deadline) {
+                _ = c.g_main_context_iteration(null, 0);
+                _ = c.usleep(1000);
+            }
+            try t.expect(c.gtk_widget_get_mapped(pop) != 0);
+            c.gtk_popover_popdown(@ptrCast(pop));
+            try t.expect(c.gtk_widget_get_parent(pop) == null);
+            try t.expect(c.gtk_widget_get_realized(pop) == 0);
+        }
+    }
 }
