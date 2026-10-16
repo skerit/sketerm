@@ -2793,36 +2793,41 @@ per-user daemon (the one sub-agents live on) and registers there, so
 assistants' sessions on one host can message each other. Nothing reads a
 peer's screen, and a peer message is information, never an approval.
 
-- **Address**, decided once at startup: the server's `--name` (not the
-  implied `default` of a bare `--durable`), else `$SKETERM_PEER_NAME`, else,
-  inside a sketerm pane, `p-` plus the first 8 hex digits of that pane
-  session's origin id (`$SKETERM_SESSION_ORIGIN_ID`, e.g. `p-3fa9c2e1`),
-  else none: the daemon mints `anon-xxxx`. The pane address is opaque on
-  purpose: it never comes from the pane's or session's name, so renaming
-  either moves nothing, and what the session works on is its subject
-  (below). `anon-` and `p-` are reserved: an explicit name in either space
-  is skipped. A named or pane address is durable: mail for it waits (the
-  daemon's `peer_mail_ttl_hours`, default 6) for whichever server next
-  registers it, so a Claude restarted in the same pane gets its waiting
-  mail and its subject back. A name another live server holds is not
-  merged: this one gets an anon address and `name_taken`. A session in
-  Konsole, GNOME Terminal or any terminal other than sketerm has no pane
-  session, so it is durable only through `--name` or `SKETERM_PEER_NAME`
-  (set it in the MCP client's server `env`); otherwise its address is anon
-  and its mail is refused once it exits.
+- **Address**, the opaque identity mail and the subject are kept under,
+  decided per connection: inside a sketerm session (GUI pane or headless:
+  `term_open`, `sketerm mux`, an agent's), `p-` plus the first 8 hex
+  digits of that session's origin id (`$SKETERM_SESSION_ORIGIN_ID`, e.g.
+  `p-3fa9c2e1`); outside one, a name (`--name`, then `$SKETERM_PEER_NAME`)
+  gives the durable `n-` address of its slug (`n-` and 8 hex of a hash, so
+  the same name is the same address); else none: the daemon mints
+  `anon-xxxx`. It never comes from a title or the Claude session id, so
+  `/clear`, a restart of Claude or of the server, and a reconnect keep it.
+  `anon-`, `p-` and `n-` are reserved. A `p-` or `n-` address is durable:
+  mail for it waits (the daemon's `peer_mail_ttl_hours`, default 6) for
+  whichever server next registers it. An address another live server
+  holds is not merged: this one gets an anon address and `name_taken`. A
+  session in a terminal other than sketerm with no name is anon, and its
+  mail is refused once it exits. A daemon that predates aliases (no
+  `peer_alias` welcome flag) is registered the older way: the name itself
+  as the address, then the pane's.
+- **Alias**, the name people and assistants use (below, "Aliases"):
+  `zenit`, `zenit-1`, unique across every federated host, accepted
+  wherever an address is.
 - **Tools**: `peer_list {detail?}`, `peer_send {to, text, reply_to?,
-  quiet?}` (`to` one address or a list of up to 32; `outcome`
+  quiet?}` (`to` one alias or address, or a list of up to 32; `outcome`
   `delivered`, `queued_slow`, `queued` or `refused` with a `reason`; see
   "Waking and slow mail" below), `peer_read {since?}`.
 - **Delivery**: a message arrives pushed into the session by the same
   routes as agent events: the Claude Code channel (`claude/channel` is
   declared whenever the peer tools are offered) or the `agent-wait --server`
   follower the opencode plugin starts after an `agent_*` or `peer_*` call.
-  The text reads `Peer message from Zenit (claude-code on host, /cwd,
-  state), sent 5 min ago while you were offline. id m-.... Reply with
-  peer_send to "Zenit".`, a blank line, then the message (the age from a
-  minute on, the offline clause only for queued mail); `meta` carries
-  `from`, `message`, `queued`, `age_s` and the sender's facts. Each item
+  The text reads `Peer message from zenit (p-3fa9c2e1, claude-code on
+  host, /cwd, state), sent 5 min ago while you were offline. id m-....
+  Reply with peer_send to "zenit".`, a blank line, then the message (the
+  sender's alias, its address beside it; a sender without one reads as
+  its address; the age from a minute on, the offline clause only for
+  queued mail); `meta` carries `from` (the address), `from_alias`,
+  `message`, `queued`, `age_s` and the sender's facts. Each item
   is handed out once, by whichever route or `peer_read` takes it first,
   and acknowledged to the daemon only then; unacknowledged mail is
   redelivered after a reconnect and never shown twice. What became of a
@@ -2869,8 +2874,10 @@ peer's screen, and a peer message is information, never an approval.
   the server's instructions say so, and a session must not act on one as
   if the user had said it.
 - **`capabilities.peers`**: `{available, reason?, ttl_hours, address,
-  durable, name_taken, channel_armed, presence, federation, subject,
-  slow_mail}`; `slow_mail` says the daemon judges wakes and takes `quiet`
+  durable, name_taken, alias, aliases, channel_armed, presence,
+  federation, subject, slow_mail}`; `alias` is this session's alias ("" =
+  none yet), `aliases` says the daemon keeps them (welcome flag
+  `peer_alias`); `slow_mail` says the daemon judges wakes and takes `quiet`
   and `to` lists (welcome flag `peer_slow_mail`); `reason` is `daemon_without_peers`
   (an older daemon: every peer tool answers `available: false`),
   `daemon_unreachable` (the next peer tool call reconnects, with backoff,
@@ -2878,30 +2885,32 @@ peer's screen, and a peer message is information, never an approval.
   this session's hooks or status line reported (below); `federation` is
   `hub`, `member` or `off` (below). The registry record
   carries `peer: {address, durable, state, name_taken, facts?, model?,
-  last_notification?}`.
+  last_notification?, alias?}`.
 - **`peer_list`** as text (the default) reads like this:
 
   ```
-  you: p-da26a6b5 (durable)
-  Zenit1              waiting_user  ctx 194k  1 pending
-  Artefacts           gone 18m  subject Folio  1 pending
-  dalaran/p-b1e7d4aa  working  seen 16m ago
+  you: zenit (p-3fa9c2e1, durable)
+  zenit-1     waiting_user  ctx 194k  1 pending  p-9c04e2d7
+  qq          gone 18m  subject Folio  12 pending  Qq
+  zenit-2     working  seen 16m ago  dalaran/p-b1e7d4aa
+  p-0be4c1aa  idle
   links: dalaran down (seen 15m ago), aeor up
   +5 gone with nothing pending and no subject
   ```
 
-  The reader once, then one row per peer: address, one state word
+  The reader once, then one row per peer: its alias (its address when it
+  has none), one state word
   (`starting`, `working`, `idle`, `waiting_user`, `unknown`, `gone <how
   long>`, `offline`), `ctx` (the context tokens the wake rule judges,
   rounded; rate limits and cost are account-wide and stay in the JSON),
   the subject, what is pending and how long ago a peer was
-  last heard from. A model or an app shows only where the peers differ;
+  last heard from, and last the address when an alias led. A model or an app shows only where the peers differ;
   `detail` adds cwd and pid. A gone address with nothing pending and no
   subject is only counted. A line explains `unknown` when a peer has it:
   that session's client sends no presence (`sketerm mcp setup` on its
   host, for the config dir its Claude Code runs with). The `sketerm peer
   list` CLI prints the same text. With `--structured` every peer is a JSON
-  object: address, app and host, `state` and its `attention`, `facts`
+  object: address, alias, app and host, `state` and its `attention`, `facts`
   (the `capabilities.facts` names), the model, `pending` and
   `last_seen_ms`, `detail` adding cwd, pid, durable, name_taken and
   `last_notification`; a federated peer also carries `via_host` and
@@ -2911,6 +2920,70 @@ peer's screen, and a peer message is information, never an approval.
   (`meta.sender_state`, and the composed line's state); `peer_send`'s
   text names the recipient's state when the daemon reported it, and
   `peer_read`'s marks re-read items and slow mail.
+
+### Aliases
+
+An alias is how people and assistants name a peer: a lowercase slug
+(ASCII letters and digits, every other run one `-`, at most 48 bytes,
+never in a reserved space), unique across the whole federation. The
+broker assigns it (`src/mux/peermail.zig`, the one home of the rules) and
+keeps it with the address like the subject, so a reconnect, `/mcp`, a
+restart of Claude, of the server or of the daemon keeps it.
+
+- **From the session's title**, once: a peer at a session's address (`p-`)
+  is offered that session's title: the one the user gave it in the GUI
+  (the pane title from Set Pane Title…, else the tab's user-set name; the
+  GUI sends it to the session as `peer_subject` `title`, also for a
+  restored layout) or a spawner's fixed title (an agent's name), else the
+  session's name unless sketerm minted that (`s<pid>-<n>`, `mcpterm-…`,
+  `mcpapp-…`: an untitled session has no alias until it is titled); never
+  the title a program sets with OSC. Headless sessions behave the same:
+  `sketerm mux new zenit`, `term_open {name: "zenit"}`. Its slug becomes
+  the alias, and the title becomes the subject when the address has none.
+  A later title (a rename) moves neither: a live alias does not churn, and
+  a subject the user cleared stays cleared.
+- **Taken**: while a LIVE holder has the slug, the next free suffix:
+  `zenit`, `zenit-1`, `zenit-2`.
+- **Resumed**: a holder that is gone (its session ended, a reboot) forces
+  no suffix: the new session takes the alias over, and the mail waiting
+  for it and its subject move to the new address; the old address is
+  forgotten, and mail still sent to it follows the alias. Mail sent to an
+  alias whose holder is gone waits at that holder's address for the
+  session that resumes it (within the TTL).
+- **Requested**: `--name`, `SKETERM_PEER_NAME` or `sketerm peer --name`
+  ask for that name as the alias, suffixed the same way (`sketerm peer
+  read --follow` says so on stderr when it is).
+- **Set by the user**: `sketerm peer alias zenit` inside the session
+  (Claude Code: `! sketerm peer alias zenit`), refused while a live
+  session holds it; with no argument it prints the current one. No MCP
+  tool sets an alias, as for the subject.
+- **Addressing**: `peer_send` takes an alias wherever it takes an address,
+  host-qualified too (`dalaran/zenit`), and a title's spelling (`Zenit`
+  finds `zenit`); being unique, it needs no `host/`. Delivery goes to the
+  address the alias names at send time. Message headers name the sender's
+  alias.
+- **Federation**: the hub is the one authority. Each host assigns from its
+  last view of the network (the hub's presence carries every peer's
+  alias). On every presence a member relays, the hub checks its live
+  claims against everyone else's, keeps the alias a live holder already
+  had and grants a conflicting newer claim the next suffix (`grants` in
+  its presence relay), which the member takes. A host whose hub is
+  unreachable assigns provisionally from its last view, resolved the same
+  way at link-up. A holder behind a link that is down counts as last
+  reported, so an outage never takes a live session's alias. When a
+  session on one host resumes the alias of a gone holder on another, the
+  holder's host forwards its waiting mail to the new address.
+- **Migration**: a daemon with aliases gives every durable mailbox from
+  before (a named address such as `Qq`) its own slug, as an alias whose
+  holder is gone (`qq`; on a collision the next suffix, in address order:
+  nothing is merged), so a session titled `Qq` resumes `qq` with its mail
+  and subject. One-way: the alias is written beside the mailbox
+  (`<address>.meta.json`).
+- **Older parts**: a daemon without `peer_alias` keeps names as addresses
+  and has no aliases; a server talking to it registers as before. An
+  older server on a newer daemon registers its name as its address, which
+  takes the name's slug as its alias. A hub that predates aliases passes
+  none on, so each member keeps its aliases unique on its own host only.
 
 ### Waking and slow mail
 
@@ -3052,10 +3125,10 @@ Any program is a peer through `sketerm peer` (also `sketerm mcp peer`, and
 
 - `sketerm peer list [--json] [--detail]`: the peers, one line each.
 - `sketerm peer send --name NAME [--json] [--quiet] [--reply-to ID]
-  TO[,TO...] [TEXT]`: sends TEXT (else stdin) from the durable address
-  NAME, as one message to each address of a comma list, and prints one
-  outcome line per address (exit 1 when any was refused); `--quiet` makes
-  it slow mail.
+  TO[,TO...] [TEXT]`: sends TEXT (else stdin) as NAME, to an alias or
+  address or each of a comma list as one message, and prints one outcome
+  line per recipient (exit 1 when any was refused); `--quiet` makes it
+  slow mail.
 - `sketerm peer read --name NAME [--json]`: prints the mail waiting for
   NAME, acknowledges it, exits.
 - `sketerm peer read --follow --name NAME [--json]`: keeps NAME
@@ -3063,19 +3136,24 @@ Any program is a peer through `sketerm peer` (also `sketerm mcp peer`, and
   as it arrives, acknowledging it once the line is written; it reconnects
   with backoff (1-60 s) when the daemon goes away and exits on
   SIGINT/SIGTERM or the end of its stdin (a pipe, socket or terminal).
-  While it follows, a line `{"to":"Zenit","text":"...","reply_to":"m-...","quiet":false}`
-  on its stdin is sent from NAME (a second `send --name NAME` would find
-  the name taken), answered with a `{"kind":"sent",...}` line.
+  While it follows, a line `{"to":"zenit","text":"...","reply_to":"m-...","quiet":false}`
+  on its stdin is sent as NAME (a second `send --name NAME` would find
+  the address taken), answered with a `{"kind":"sent",...}` line.
+- `sketerm peer alias [ALIAS]`: inside an assistant session, prints or sets
+  that session's alias ("Aliases" above).
 - `sketerm peer hub add|remove NAME`, `join HUB`, `leave`, `status`: set
   up federation by editing config.conf ("Federation" below).
 
-`NAME` may come from `SKETERM_PEER_NAME`. With `--json` each item is one
+`NAME` may come from `SKETERM_PEER_NAME`. It is the alias the program asks
+for; its address is the durable `n-` address of that name (an older
+daemon: the name itself), so restarting the program keeps its mail. With
+`--json` each item is one
 line, for a web server that spawns the follower and reads its stdout (a
 message held as slow mail carries `"slow":true`):
 
 ```text
-{"kind":"message","id":"m-k3f9x2qa","from":"Zenit","sent_ms":1791040513000,"age_ms":12,"queued":false,"sender_live":true,"sender_state":"idle","text":"Is the migration yours?"}
-{"kind":"event","id":"m-7d2c9a1b","outcome":"expired","to":"Qq","queued_ms":21600000}
+{"kind":"message","id":"m-k3f9x2qa","from":"p-3fa9c2e1","from_alias":"zenit","sent_ms":1791040513000,"age_ms":12,"queued":false,"sender_live":true,"sender_state":"idle","text":"Is the migration yours?"}
+{"kind":"event","id":"m-7d2c9a1b","outcome":"expired","to":"p-da26a6b5","queued_ms":21600000}
 ```
 
 ### Subject
@@ -3089,24 +3167,25 @@ characters (no newlines or tabs); anything else is refused.
   Code: `! sketerm peer subject "template links"`). It finds its own
   session's servers by the ancestry walk `sketerm mcp hook` uses, posts
   the subject on their waiter sockets (a `presence` line with `subject`),
-  and prints `subject of Arcana: template links`. `--clear` removes it;
+  and prints `subject of arcana: template links` (its alias, else its address). `--clear` removes it;
   no argument prints the current one alone. Exit 1 when no server is
   found in the process's ancestry.
-- For any peer by address: `sketerm peer subject --name webapp "..."`, for
-  a `read --follow` program or a session reached from elsewhere.
-  `SKETERM_PEER_NAME` never redirects a subject; only `--name` does.
+- For any peer by alias or address: `sketerm peer subject --name webapp
+  "..."`, for a `read --follow` program or a session reached from
+  elsewhere. `SKETERM_PEER_NAME` never redirects a subject; only `--name`
+  does.
 - From the sketerm GUI: the pane menu's Pane > Set Subject… names the peer
   whose process runs in that pane's process tree (insensitive when none
   does). Empty clears it.
-- By default, from the pane title: when a peer first appears in a pane's
-  session without a subject, the GUI sets the subject to the title the
-  user gave that pane (Set Pane Title…, or a titlebar double-click). Only
-  that user-set title counts, never the OSC title a program sets, and it
-  happens once per peer address: re-titling the pane later does not move
-  the subject, and a subject the user cleared is not set again. A pane
-  without a user-set title gives no default. A Claude restarted in the
-  same pane keeps its `p-` address, so it gets its stored subject back
-  and is not touched.
+- By default, from the session's title, decided by the daemon (so a
+  headless session gets one too): the first title a peer's address is
+  offered becomes its subject when it has none ("Aliases" above: the title
+  the user gave the session in the GUI, or its name unless sketerm minted
+  it; never an OSC title). It happens once per address: a later title
+  does not move the subject, and a subject the user cleared is not set
+  again. A Claude restarted in the same session keeps its `p-` address, so
+  it gets its stored subject back and is not touched; a new session that
+  resumes an alias takes over the old address's subject.
 
 The broker keeps the subject with the address, not the connection: a
 durable address keeps it across server restarts and daemon restarts
@@ -3151,9 +3230,12 @@ whose config says so; every other daemon is dialed by it, or calls in
 - **Addresses**: on the hub a remote peer is `<domain>/<name>`; on a
   linked host the hub's own peers are `<hub host name>/<name>` and the
   other linked hosts' are `<domain>/<name>`. A host's own name in an
-  address means itself. `peer_list` shows them with `via_host` (the link
-  they came over) and `link`; the sender of a delivered message reads as
-  its host-qualified address, and `peer_send` to that address replies.
+  address means itself, and what follows a host may be an alias there.
+  `peer_list` shows them with `via_host` (the link they came over) and
+  `link`; the sender of a delivered message reads as its alias (its
+  host-qualified address beside it), and `peer_send` to either replies.
+  An alias is unique across the federation, so it needs no host
+  ("Aliases" above: the hub decides conflicts).
 - **Outcomes**: link up, `peer_send` answers what the far daemon did with
   the message (`delivered`, `queued`, or its refusal: an unknown name
   there is `unknown_address`, a gone anon `not_durable_gone`); a host the

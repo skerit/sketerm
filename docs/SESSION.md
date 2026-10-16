@@ -23102,3 +23102,32 @@ dormant; opencode reads slow mail with `peer_read` only. Unit tests in
 peerwake, peermail, mcp_peer, mcp_hook, mcp_setup and peer_cli; the smoke
 peer stage gained section k (a list, quiet via peer_read and via the
 hook, a dormant peer by faked facts and a 1.5 s rig silence, the cap).
+
+## 2026-10-16: peer aliases, unique across the federation
+
+Peer identity broke in practice: sessions came back under new addresses,
+mail queued to the old names expired unread, subjects were empty. Now an
+address is only the opaque identity (`p-` + the session's origin id; a
+named program's `n-` + the hash of its name's slug; `anon-`), and people
+use an alias: the slug of the session's title (`peeraddr.slugify`),
+assigned once by the broker (`peermail.Store`, the one home of the rules)
+and kept beside the mailbox. A live holder forces `zenit-1`; a gone
+holder's alias is resumed by the new session, and its waiting mail and
+subject move to the new address (`yieldBox`; mail to the old address
+follows). The title is the user's, never an OSC one: the GUI sends its
+pane or tab title to the session (`peer_subject` `title`, worker meta
+`user_title`, also for a restored layout), else the session's name unless
+sketerm minted it (`src/mux/sessname.zig`, the one home of minted
+shapes), so headless sessions get the same; the first title is also the
+default subject, now set daemon-side (the GUI's `offerDefaultSubject` is
+gone). The hub is the authority across hosts: members assign from their
+last view, the hub grants a conflicting newer claim the next suffix in its
+presence relay (`Relay.grants`). `--name`, `SKETERM_PEER_NAME` and
+`sketerm peer --name` are requested aliases; `sketerm peer alias` sets one
+from inside a session. Legacy named mailboxes migrate to aliases whose
+holder is gone. Welcome flag `peer_alias`; older daemons keep names as
+addresses. peer_list text leads with the alias, address last. Unit tests in
+peeraddr, sessname, peermail (title, suffix, explicit, resume, migration,
+hub across two hosts), daemon_peers, agentpush, peer_cli, mcp_peer; the
+smoke peer stage gained f9 (zenit / zenit-1 across two daemons, a new
+session resumes zenit-1 with its waiting mail).
