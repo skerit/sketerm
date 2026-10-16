@@ -3,6 +3,7 @@
 //! the fd to non-blocking and polls it from the GLib loop).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("../c.zig").c;
 const unsetEnv = @import("../util/env.zig").unset;
 const EnvSave = @import("../util/env.zig").Saved;
@@ -539,10 +540,26 @@ pub const Conn = struct {
         return false;
     }
 
+    /// A unit test's autostarted daemon reads its config and state here,
+    /// beside its private socket: `<socket dir>/xdg-config` and
+    /// `xdg-state`, never the user's. Without this every test run's
+    /// daemon read the real config.conf and came up as the user's peer hub.
+    pub fn testDaemonXdg(sock_path: []const u8, config_buf: *[4096:0]u8, state_buf: *[4096:0]u8) error{BadPath}!struct { config: [:0]const u8, state: [:0]const u8 } {
+        const dir = std.fs.path.dirname(sock_path) orelse return error.BadPath;
+        return .{
+            .config = std.fmt.bufPrintZ(config_buf, "{s}/xdg-config", .{dir}) catch return error.BadPath,
+            .state = std.fmt.bufPrintZ(state_buf, "{s}/xdg-state", .{dir}) catch return error.BadPath,
+        };
+    }
+
     /// Like `connectLocalAutostart`, but against `sock_path` when given —
     /// a PRIVATE daemon instance (its aux sockets live next to the socket),
     /// used by `sketerm mcp` isolation. null = the shared per-user daemon.
+    /// In a unit test only a private socket is allowed (`error.TestNeedsPrivateDaemon`
+    /// otherwise: that is the user's live daemon), and the daemon it starts
+    /// gets `testDaemonXdg`'s config and state.
     pub fn connectLocalAutostartAt(allocator: std.mem.Allocator, sock_path: ?[]const u8) !Conn {
+        if (builtin.is_test and sock_path == null) return error.TestNeedsPrivateDaemon;
         const path = if (sock_path) |p|
             try allocator.dupe(u8, p)
         else
@@ -578,10 +595,17 @@ pub const Conn = struct {
             break :blk @ptrCast(v);
         };
         const scrub = sock_path == null and scrub_user_daemon_env;
+        var test_config_buf: [4096:0]u8 = undefined;
+        var test_state_buf: [4096:0]u8 = undefined;
+        const test_xdg = if (builtin.is_test) try testDaemonXdg(path, &test_config_buf, &test_state_buf) else {};
         const pid = c.fork();
         if (pid == 0) {
             _ = c.setsid();
             if (scrub) @import("../util/platform.zig").dropEnvironment(&userDaemonScrubs);
+            if (builtin.is_test) {
+                _ = c.setenv("XDG_CONFIG_HOME", test_xdg.config.ptr, 1);
+                _ = c.setenv("XDG_STATE_HOME", test_xdg.state.ptr, 1);
+            }
             // Detach stdio before exec. The daemon outlives the client
             // that autostarted it, so inheriting its stdout/stderr wedges
             // any pipeline or $(...) that client sits in: the shell waits
@@ -3346,4 +3370,16 @@ test "a per-user daemon an MCP server autostarts inherits neither the assistant'
         "XDG_RUNTIME_DIR=/run/user/1000",
         "CLAUD=1",
     }) |e| try t.expect(!Conn.userDaemonScrubs(e));
+}
+
+test "a unit test never autostarts the per-user daemon, and its private daemon reads config and state beside its socket" {
+    const t = std.testing;
+    // The default socket is the user's live daemon: refused before any connect.
+    try t.expectError(error.TestNeedsPrivateDaemon, Conn.connectLocalAutostartAt(t.allocator, null));
+    var cb: [4096:0]u8 = undefined;
+    var sb: [4096:0]u8 = undefined;
+    const x = try Conn.testDaemonXdg("/tmp/rig/sketerm/mux.sock", &cb, &sb);
+    try t.expectEqualStrings("/tmp/rig/sketerm/xdg-config", x.config);
+    try t.expectEqualStrings("/tmp/rig/sketerm/xdg-state", x.state);
+    try t.expectError(error.BadPath, Conn.testDaemonXdg("mux.sock", &cb, &sb));
 }

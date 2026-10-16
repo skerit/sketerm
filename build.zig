@@ -921,6 +921,7 @@ pub fn build(b: *std.Build) void {
         .use_lld = dev.use_lld,
     });
     const run_tests = b.addRunArtifact(tests);
+    unitTestDaemon(b, run_tests, dev_bins);
     const test_roots = b.addSystemCommand(&.{ "bash" });
     test_roots.addFileArg(b.path("dist/test-test-roots.sh"));
     test_roots.has_side_effects = true;
@@ -1002,7 +1003,9 @@ pub fn build(b: *std.Build) void {
     core_test_step.dependOn(&test_roots.step);
     core_test_step.dependOn(&lint_errdefer.step);
     core_test_step.dependOn(&env_removal.step);
-    core_test_step.dependOn(&b.addRunArtifact(coretests).step);
+    const run_coretests = b.addRunArtifact(coretests);
+    unitTestDaemon(b, run_coretests, dev_bins);
+    core_test_step.dependOn(&run_coretests.step);
 
     // Optional CEF browser helper — `zig build fetch-cef` / `zig build
     // web`. Strictly opt-in: nothing below is reachable from the default
@@ -1059,6 +1062,14 @@ const DevBins = struct {
         run.addArgs(&.{ "--bin-dir", b.getInstallPath(d.dir, "") });
     }
 };
+
+/// A unit-test run autostarts THIS tree's daemon (`SKETERM_MUX_BIN`), never
+/// whatever `sketerm-mux` is on PATH: an installed one predates the
+/// tree under test and once read the user's config as a peer hub.
+fn unitTestDaemon(b: *std.Build, run: *std.Build.Step.Run, d: DevBins) void {
+    run.step.dependOn(d.mux);
+    run.setEnvironmentVariable("SKETERM_MUX_BIN", b.getInstallPath(d.dir, "sketerm-mux"));
+}
 
 /// The commit and commit date dev-profile artifacts carry instead of git's.
 const DEV_STAMP = "dev";
