@@ -16,12 +16,13 @@
 //! pushes it to its viewers as `session_meta` `peer`. A viewer's
 //! `peer_subject` comes back the other way as control `'P'`.
 //!
-//! Aliases: a peer at a pane address (`p-` + its session's origin id) is
-//! offered its session's user title (`sessionTitle`) when it registers
-//! and whenever a worker's name or title changes; the store decides what
-//! the title gives (`peermail.Store.offerTitle`). A viewer's title of the
-//! session arrives on the worker as `peer_subject` `title` and reaches
-//! the broker with the worker's metadata push.
+//! Aliases: a live peer is offered its session's user title
+//! (`sessionTitle`; only a pane address `p-` has a session here) when it
+//! registers and whenever a worker's name or title changes; the store
+//! decides what the title or, without one, the peer's working directory
+//! gives (`peermail.Store.offerTitle`). A viewer's title of the session
+//! arrives on the worker as `peer_subject` `title` and reaches the broker
+//! with the worker's metadata push.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -353,12 +354,11 @@ fn sessionTitleOf(d: *Daemon, address: []const u8) ?[]const u8 {
 }
 
 fn offerTitle(d: *Daemon, s: *peermail.Store, address: []const u8, now: i64) void {
-    const title = sessionTitleOf(d, address) orelse return;
-    s.offerTitle(address, title, now) catch log.warn("peermail: out of memory offering {s} its session title", .{address});
+    s.offerTitle(address, sessionTitleOf(d, address) orelse "", now) catch log.warn("peermail: out of memory offering {s} its default alias", .{address});
 }
 
 /// Every live peer of this host is offered its session's title (only a
-/// first one changes anything, `peermail.Store.offerTitle`).
+/// first alias or title changes anything, `peermail.Store.offerTitle`).
 fn offerTitles(d: *Daemon, s: *peermail.Store, now: i64) void {
     var arena: std.heap.ArenaAllocator = .init(d.allocator);
     defer arena.deinit();

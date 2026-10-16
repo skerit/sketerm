@@ -2965,12 +2965,23 @@ restart of Claude, of the server or of the daemon keeps it.
   GUI sends it to the session as `peer_subject` `title`, also for a
   restored layout) or a spawner's fixed title (an agent's name), else the
   session's name unless sketerm minted that (`s<pid>-<n>`, `mcpterm-…`,
-  `mcpapp-…`: an untitled session has no alias until it is titled); never
-  the title a program sets with OSC. Headless sessions behave the same:
-  `sketerm mux new zenit`, `term_open {name: "zenit"}`. Its slug becomes
-  the alias, and the title becomes the subject when the address has none.
-  A later title (a rename) moves neither: a live alias does not churn, and
-  a subject the user cleared stays cleared.
+  `mcpapp-…`); never the title a program sets with OSC. Headless
+  sessions behave the same: `sketerm mux new zenit`, `term_open {name:
+  "zenit"}`. Its slug becomes the alias, and the title becomes the
+  subject when the address has none. A later title (a rename) moves
+  neither: a live alias does not churn, and a subject the user cleared
+  stays cleared.
+- **Else from the working directory**: a peer with no usable title (an
+  untitled or sketerm-named session, a session outside sketerm that asked
+  for no name) takes the slug of its registered working directory's last
+  component, suffixed by the same rules: two untitled sessions in
+  `/tmp/x/zenit-workspace` are `zenit-workspace` and `zenit-workspace-1`.
+  A title always wins: the first title a directory-named peer is offered
+  replaces its alias, once (mail sent to the old alias in between is
+  refused `unknown_address`); a later `cd` never moves it. A session
+  outside sketerm (an `anon-` address, not durable) never resumes a gone
+  holder's alias, since its mail would die with the connection: it takes
+  the next free suffix. `peermail.defaultAlias` is the one source order.
 - **Taken**: while a LIVE holder has the slug, the next free suffix:
   `zenit`, `zenit-1`, `zenit-2`.
 - **Resumed**: a holder that is gone (its session ended, a reboot) forces

@@ -17,7 +17,8 @@
 //! Aliases: the one home of the alias rules. An alias is a slug
 //! (`peeraddr.slugify`) kept with the address like the subject (persisted
 //! in `META_EXT`), assigned once (a requested alias, else the first user
-//! title the broker offers, else a legacy name's own slug) and never moved
+//! title the broker offers, else its working directory's name, which the
+//! first title replaces once, else a legacy name's own slug) and never moved
 //! by a later title. A live holder forces the next suffix; a gone holder's
 //! alias is RESUMED: its mailbox and subject move to the new address
 //! (`yieldBox`). Uniqueness across hosts is the hub's: a member assigns
@@ -141,6 +142,9 @@ pub const AddressMeta = struct {
     /// The address was offered its session's first title (`offerTitle`):
     /// later titles never set a default subject again.
     titled: bool = false,
+    /// The alias came from the working directory (no title yet): the
+    /// first title replaces it once (`offerTitle`).
+    alias_from_dir: bool = false,
 };
 
 /// `peer_register` body; re-sent whenever a field changes.
@@ -598,6 +602,8 @@ const Box = struct {
     alias: []u8 = &.{},
     /// `AddressMeta.titled`.
     titled: bool = false,
+    /// `AddressMeta.alias_from_dir`.
+    alias_from_dir: bool = false,
     /// The client pid its last live server registered (`RegisterReq.client_pid`).
     client_pid: i32 = 0,
     /// Wall ms of the last hook report while no server was live; 0 = none.
@@ -1550,24 +1556,35 @@ pub const Store = struct {
         return if (self.boxOf(address)) |b| b.alias else "";
     }
 
-    /// The session the live peer `address` runs in carries the user title
-    /// `title` (the owner derives it: `daemon_peers.sessionTitle`). Its
-    /// first title becomes the address's alias when it has none and its
-    /// subject when it has none, once (`titled`): a later title moves
-    /// neither, and a subject the user cleared stays cleared.
+    /// Offer the live peer `address` its default alias and subject: its
+    /// session's user title `title` ("" = none; the owner derives it:
+    /// `daemon_peers.sessionTitle`) and its registered working directory
+    /// (`defaultAlias` is the source order). An address without an alias
+    /// takes it; one whose alias came from the directory takes the first
+    /// usable title instead, once; nothing else moves an alias, so a later
+    /// title or `cd` does not. The first title is also its subject when it
+    /// has none, once (`titled`), and a subject the user cleared stays
+    /// cleared. A non-durable address never resumes a gone holder's alias:
+    /// that would move the holder's durable mail into a box that dies
+    /// with its connection.
     pub fn offerTitle(self: *Store, address: []const u8, title: []const u8, now: i64) error{OutOfMemory}!void {
-        if (title.len == 0) return;
         const p = self.livePeer(address) orelse return;
         if (p.name_taken) return;
         const box = self.boxOf(address) orelse return;
-        if (box.alias.len == 0) {
+        if (box.alias.len == 0 or box.alias_from_dir) {
             var sb: [peeraddr.SLUG_MAX]u8 = undefined;
             var ab: [peeraddr.ALIAS_MAX]u8 = undefined;
-            if (peeraddr.slugify(&sb, title)) |slug| {
-                if (self.chooseAlias(&ab, slug, address, .resume_gone)) |ch| try self.giveAlias(box, ch, now);
-            }
+            if (defaultAlias(&sb, title, p.cwd)) |src| if (box.alias.len == 0 or !src.from_dir) {
+                if (self.chooseAlias(&ab, src.slug, address, if (box.durable) .resume_gone else .free_only)) |ch| {
+                    const flag_moved = box.alias_from_dir != src.from_dir;
+                    box.alias_from_dir = src.from_dir;
+                    const alias_moved = !std.mem.eql(u8, box.alias, ch.alias);
+                    try self.giveAlias(box, ch, now);
+                    if (flag_moved and !alias_moved) self.writeMeta(box);
+                }
+            };
         }
-        if (box.titled) return;
+        if (title.len == 0 or box.titled) return;
         box.titled = true;
         const subject = utf8Prefix(title, SUBJECT_MAX);
         if (box.subject.len == 0 and if (checkSubject(subject)) true else |_| false) {
@@ -1615,6 +1632,7 @@ pub const Store = struct {
             if (self.holderOf(slug, p.address)) |h| p.alias_refused = try self.allocator.dupe(u8, h.address);
             return;
         };
+        box.alias_from_dir = false;
         try self.giveAlias(box, choice, now);
     }
 
@@ -2451,11 +2469,11 @@ pub const Store = struct {
         if (!box.durable or self.dir == null) return;
         var pbuf: [4096]u8 = undefined;
         const path = self.metaPath(&pbuf, box.address) orelse return;
-        if (box.subject.len == 0 and box.alias.len == 0 and !box.titled) return self.unlinkPath(path);
+        if (box.subject.len == 0 and box.alias.len == 0 and !box.titled and !box.alias_from_dir) return self.unlinkPath(path);
         pathz.makeDirs(self.dir.?, 0o700) catch return self.warnf("peermail: cannot create {s}; the subject and alias of {s} are kept in memory only", .{ self.dir.?, box.address });
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
-        std.json.Stringify.value(AddressMeta{ .subject = box.subject, .alias = box.alias, .titled = box.titled }, .{}, &aw.writer) catch return self.warnf("peermail: out of memory writing {s}", .{path});
+        std.json.Stringify.value(AddressMeta{ .subject = box.subject, .alias = box.alias, .titled = box.titled, .alias_from_dir = box.alias_from_dir }, .{}, &aw.writer) catch return self.warnf("peermail: out of memory writing {s}", .{path});
         atomicwrite.writeFileExact(path, aw.written(), 0o600) catch |e| self.warnf("peermail: cannot write {s} ({s})", .{ path, @errorName(e) });
     }
 
@@ -2468,6 +2486,7 @@ pub const Store = struct {
         defer parsed.deinit();
         const m = parsed.value;
         box.titled = m.titled;
+        box.alias_from_dir = m.alias_from_dir;
         if (m.alias.len > 0) {
             if (!peeraddr.validAlias(m.alias)) {
                 self.warnf("peermail: {s}: the alias is not one, ignored", .{path});
@@ -2866,6 +2885,24 @@ fn freeMulti(allocator: std.mem.Allocator, m: *Multi) void {
 fn freeGrant(allocator: std.mem.Allocator, g: Grant) void {
     allocator.free(g.address);
     allocator.free(g.alias);
+}
+
+/// Where a default alias comes from (`defaultAlias`).
+pub const AliasSource = struct {
+    /// Borrowed from the caller's buffer.
+    slug: []const u8,
+    /// The working directory gave it, not a title.
+    from_dir: bool,
+};
+
+/// The one source order of a peer's default alias: the slug of its
+/// session's title, else of its working directory's last component
+/// (`/tmp/x/zenit-workspace` gives `zenit-workspace`); null when neither
+/// has a slug.
+pub fn defaultAlias(buf: *[peeraddr.SLUG_MAX]u8, title: []const u8, cwd: []const u8) ?AliasSource {
+    if (title.len > 0) if (peeraddr.slugify(buf, title)) |s| return .{ .slug = s, .from_dir = false };
+    const s = peeraddr.slugify(buf, pathz.baseName(std.mem.trimEnd(u8, cwd, "/"))) orelse return null;
+    return .{ .slug = s, .from_dir = true };
 }
 
 /// `text` cut to at most `max` bytes, never inside a UTF-8 sequence.
@@ -3508,10 +3545,11 @@ test "aliases: the first title is the alias and the default subject; a live hold
         try s.offerTitle("p-00000001", "Zenit", 40);
         try t.expectEqualStrings("zenit", s.aliasOf("p-00000001"));
         try t.expectEqualStrings("zenit-1", s.aliasOf("p-00000002"));
-        // 6. A title whose slug reads as an address gives no alias.
+        // 6. A title whose slug reads as an address gives no alias of its
+        // own: the working directory's (`/w`) stands in.
         try s.register(4, regPane("00000004"), 50);
         try s.offerTitle("p-00000004", "p-dead", 50);
-        try t.expectEqualStrings("", s.aliasOf("p-00000004"));
+        try t.expectEqualStrings("w", s.aliasOf("p-00000004"));
     }
     // 7. A broker restart: the aliases and the titled mark come back.
     {
@@ -3524,6 +3562,69 @@ test "aliases: the first title is the alias and the default subject; a live hold
         try s.offerTitle("p-00000001", "New title", 0);
         try t.expectEqualStrings("", s.subjectOf("p-00000001"));
         try t.expectEqualStrings("zenit", s.aliasOf("p-00000001"));
+    }
+}
+
+fn regIn(comptime hex8: []const u8, cwd: []const u8) RegisterReq {
+    var r = regPane(hex8);
+    r.cwd = cwd;
+    return r;
+}
+
+test "aliases: an untitled peer takes its working directory's name; the first title replaces it, a cd never does" {
+    var td = pathz.TempDir.make("peermail-diralias") orelse return error.SkipZigTest;
+    defer td.remove();
+    var rec = Rec.init();
+    defer rec.deinit();
+    var idb: [ID_LEN]u8 = undefined;
+    const ws = "/tmp/x/zenit-workspace/";
+    {
+        var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
+        defer s.deinit();
+        // 1. Two untitled sessions in one repo (the trailing slash is no name).
+        try s.register(1, regIn("00000001", ws), 0);
+        try s.offerTitle("p-00000001", "", 0);
+        try t.expectEqualStrings("zenit-workspace", s.aliasOf("p-00000001"));
+        try t.expectEqualStrings("", s.subjectOf("p-00000001"));
+        try s.register(2, regIn("00000002", ws), 0);
+        try s.offerTitle("p-00000002", "", 0);
+        try t.expectEqualStrings("zenit-workspace-1", s.aliasOf("p-00000002"));
+        // 2. A cd (a re-registration with another cwd) does not move it.
+        try s.register(1, regIn("00000001", "/tmp/elsewhere"), 5);
+        try s.offerTitle("p-00000001", "", 5);
+        try t.expectEqualStrings("zenit-workspace", s.aliasOf("p-00000001"));
+        // 3. The first title wins over the directory, once.
+        try s.offerTitle("p-00000002", "Folio", 6);
+        try t.expectEqualStrings("folio", s.aliasOf("p-00000002"));
+        try t.expectEqualStrings("Folio", s.subjectOf("p-00000002"));
+        try s.offerTitle("p-00000002", "Other", 7);
+        try t.expectEqualStrings("folio", s.aliasOf("p-00000002"));
+        // 4. Its holder gone, mail to the directory alias waits for it.
+        s.deregister(1, 10);
+        try t.expectEqual(PeerOutcome.queued, (try sendText(&s, 2, "zenit-workspace", "for the repo", 11, &idb)).outcome);
+        // 5. A session outside sketerm (anon, not durable) in that repo
+        // takes a free suffix, never the gone holder's alias and mail.
+        var anon = regIn("00000000", ws);
+        anon.address = "";
+        try s.register(3, anon, 12);
+        const anon_addr = try t.allocator.dupe(u8, s.addressOf(3).?);
+        defer t.allocator.free(anon_addr);
+        try s.offerTitle(anon_addr, "", 12);
+        try t.expectEqualStrings("zenit-workspace-1", s.aliasOf(anon_addr));
+    }
+    // 6. After a broker restart a new durable session in the repo resumes
+    // the directory alias with its mail; its first title still replaces it.
+    {
+        var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
+        defer s.deinit();
+        s.load();
+        try s.register(4, regIn("00000004", ws), 100);
+        try s.offerTitle("p-00000004", "", 100);
+        try t.expectEqualStrings("zenit-workspace", s.aliasOf("p-00000004"));
+        try t.expectEqualStrings("for the repo", rec.last().text);
+        try t.expectEqualStrings("p-00000004", rec.last().to);
+        try s.offerTitle("p-00000004", "Zenit", 101);
+        try t.expectEqualStrings("zenit", s.aliasOf("p-00000004"));
     }
 }
 

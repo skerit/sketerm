@@ -23203,3 +23203,17 @@ message); in `peer_read` items, the CLI's JSON lines and an `expired_away`
 push's `meta`. Older
 parties ignore the fields and keep the address-only wording. Unit tests
 in peermail and agentpush.
+
+## 2026-10-16: an untitled peer is named after its working directory
+
+Sessions with no title (sketerm-minted names like `s85382-27`, `mcpterm-…`,
+sessions outside sketerm that asked for no name) had no alias, only an
+opaque address. They now take the slug of their registered working
+directory's last component, suffixed as usual (`zenit-workspace`,
+`zenit-workspace-1`). `peermail.defaultAlias` is the one source order
+(title, else directory); `Store.offerTitle` is offered every live peer,
+not only pane addresses. A title always wins: the first one replaces a
+directory alias once (`alias_from_dir`, persisted in the address meta), a
+later `cd` never moves it. A non-durable (anon) peer never resumes a gone
+holder's alias, whose mail would die with its connection. Unit test in
+peermail.
