@@ -23217,3 +23217,15 @@ directory alias once (`alias_from_dir`, persisted in the address meta), a
 later `cd` never moves it. A non-durable (anon) peer never resumes a gone
 holder's alias, whose mail would die with its connection. Unit test in
 peermail.
+
+## 2026-10-16: peers show their working directory
+
+`peer_list` text shows each peer's registered working directory on every
+row (no longer only with `detail`), and a delivered message's header names
+the sender's, both with `~` for home (`agentpush.shownCwd`, over the new
+`pathz.abbreviateHome`, which the GUI title's `{{ RELATIVE_PATH }}` now
+uses too). JSON carries `cwd` without `detail`. Unit tests in pathz and
+peer_cli; smoke peers step 44 (two untitled servers in `.../zenit-workspace`
+are `zenit-workspace` and `zenit-workspace-1`, the directory in the list
+text) and f10 (an untitled session's directory alias, replaced by the
+viewer's title). `mcpproc` spawns take a `cwd`.

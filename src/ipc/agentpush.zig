@@ -24,6 +24,8 @@ const select = @import("../agent/select.zig");
 const agentwait = @import("agentwait.zig");
 const peermail = @import("../mux/peermail.zig");
 const clock = @import("../util/clock.zig");
+const pathz = @import("../util/pathz.zig");
+const env = @import("../util/env.zig");
 
 /// The push route of this server's MCP session (`capabilities.agent_push`).
 pub const Route = enum { channel, none };
@@ -220,7 +222,10 @@ pub fn composePeer(arena: std.mem.Allocator, item: PeerItem) !Push {
             if (m.from.alias.len > 0) try w.print("{s}, ", .{m.from.address});
             try w.writeAll(if (m.from.app.len > 0) m.from.app else "unknown app");
             if (m.from.host.len > 0) try w.print(" on {s}", .{m.from.host});
-            if (m.from.cwd.len > 0) try w.print(", {s}", .{m.from.cwd});
+            if (m.from.cwd.len > 0) {
+                var cb: [512]u8 = undefined;
+                try w.print(", {s}", .{shownCwd(&cb, m.from.cwd)});
+            }
             const presence = senderState(m);
             try w.print(", {s}", .{@tagName(presence)});
             if (m.sender_subject.len > 0) try w.print("; subject: {s}", .{m.sender_subject});
@@ -301,6 +306,12 @@ fn senderState(m: peermail.Deliver) vocab.PeerState {
 
 fn nonEmpty(s: []const u8) ?[]const u8 {
     return if (s.len > 0) s else null;
+}
+
+/// A peer's working directory as every peer text shows it: `~` for this
+/// process's home (one user's sessions share it, also across hosts).
+pub fn shownCwd(buf: []u8, cwd: []const u8) []const u8 {
+    return pathz.abbreviateHome(cwd, env.get("HOME"), buf);
 }
 
 /// A peer as a sentence names it: its alias, its address beside it; just

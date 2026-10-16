@@ -261,15 +261,7 @@ pub fn onTermCwdChanged(ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void {
 /// it, or the result wouldn't fit. `HOMEextra` is a different
 /// directory, so only an exact match or a `HOME/` prefix folds.
 pub fn abbreviateHome(cwd: []const u8, buf: []u8) []const u8 {
-    const home = @import("../util/profile.zig").getenv("HOME") orelse return cwd;
-    if (home.len == 0 or !std.mem.startsWith(u8, cwd, home)) return cwd;
-    const after = cwd[home.len..];
-    if (after.len != 0 and after[0] != '/') return cwd;
-    const total = 1 + after.len;
-    if (total > buf.len) return cwd;
-    buf[0] = '~';
-    @memcpy(buf[1..total], after);
-    return buf[0..total];
+    return @import("../util/pathz.zig").abbreviateHome(cwd, @import("../util/profile.zig").getenv("HOME"), buf);
 }
 
 /// Everything a title template can substitute, gathered for one pane.

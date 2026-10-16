@@ -31,6 +31,8 @@ pub const Options = struct {
     /// Removed from the child's environment, before `set_env` applies.
     unset_env: []const [*:0]const u8 = &.{},
     set_env: []const [2][*:0]const u8 = &.{},
+    /// The child's working directory (null: the rig's).
+    cwd: ?[*:0]const u8 = null,
     /// `--structured`: the rigs assert facts. False runs the text default. Only
     /// a server takes it: `extra` naming a subcommand (`agent-wait`, `peer`)
     /// runs that instead and gets no server flag.
@@ -62,7 +64,10 @@ pub fn Mcp(comptime fail: anytype) type {
             return spawnWith(allocator, exe, .{ .under = parent_args });
         }
 
-        pub fn spawnWith(allocator: std.mem.Allocator, exe: [*:0]const u8, opts: Options) Self {
+        pub fn spawnWith(allocator: std.mem.Allocator, exe_in: [*:0]const u8, opts: Options) Self {
+            // A relative binary path would not survive the child's chdir.
+            var real_buf: [4096]u8 = undefined;
+            const exe: [*:0]const u8 = if (opts.cwd != null) (c.realpath(exe_in, &real_buf) orelse fail("mcpproc: cannot resolve the binary for a cwd spawn")) else exe_in;
             // Build argv before fork (no allocation between fork and exec).
             var argv_buf: [ARGV_MAX:null]?[*:0]const u8 = @splat(null);
             var path: [*:0]const u8 = exe;
@@ -110,6 +115,7 @@ pub fn Mcp(comptime fail: anytype) type {
                 for (opts.unset_env) |k| _ = unsetEnv(k);
                 for (opts.set_env) |kv| _ = c.setenv(kv[0], kv[1], 1);
                 if (opts.runs_dir) |d| _ = c.setenv("MCPPROC_RUNS", d, 1);
+                if (opts.cwd) |d| if (c.chdir(d) != 0) c._exit(126);
                 if (opts.under != null) _ = c.setenv("MCPPROC_FLAGS", if (opts.structured) STRUCTURED else "", 1);
                 _ = c.execv(path, @ptrCast(@constCast(argv_buf)));
                 c._exit(127);

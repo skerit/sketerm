@@ -2822,7 +2822,7 @@ peer's screen, and a peer message is information, never an approval.
   declared whenever the peer tools are offered) or the `agent-wait --server`
   follower the opencode plugin starts after an `agent_*` or `peer_*` call.
   The text reads `Peer message from zenit (p-3fa9c2e1, claude-code on
-  host, /cwd, state), sent 5 min ago while you were offline. id m-....
+  host, ~/src/zenit, state), sent 5 min ago while you were offline. id m-....
   Reply with peer_send to "zenit".`, a blank line, then the message (the
   sender's alias, its address beside it; a sender without one reads as
   its address; the age from a minute on, the offline clause only for
@@ -2917,10 +2917,10 @@ peer's screen, and a peer message is information, never an approval.
 
   ```
   you: zenit (p-3fa9c2e1, durable)
-  zenit-1     waiting_user  ctx 194k  1 pending  p-9c04e2d7
+  zenit-1     waiting_user  ctx 194k  ~/src/zenit  1 pending  p-9c04e2d7
   qq          gone 18m  subject Folio  12 pending  Qq
-  zenit-2     working  seen 16m ago  link down (unreachable)  dalaran/p-b1e7d4aa
-  p-0be4c1aa  idle  polls
+  zenit-2     working  ~/src/zenit  seen 16m ago  link down (unreachable)  dalaran/p-b1e7d4aa
+  p-0be4c1aa  idle  polls  /tmp/x/scratch
   links: dalaran down (unreachable: ssh: connect to host dalaran port 22: Connection refused; retry in 40s; seen 15m ago), aeor up
   +5 gone with nothing pending and no subject
   ```
@@ -2930,9 +2930,11 @@ peer's screen, and a peer message is information, never an approval.
   (`starting`, `working`, `idle`, `waiting_user`, `unknown`, `gone <how
   long>`, `no_mcp`, `offline`), `ctx` (the context tokens the wake rule judges,
   rounded; rate limits and cost are account-wide and stay in the JSON),
-  the subject, what is pending and how long ago a peer was
-  last heard from, and last the address when an alias led. A model or an app shows only where the peers differ;
-  `detail` adds cwd and pid. A gone address with nothing pending and no
+  its working directory (`~` for the reader's home; the one its server
+  registered, also the source of a directory alias), the subject, what
+  is pending and how long ago a peer was last heard from, and last the
+  address when an alias led. A model or an app shows only where the
+  peers differ; `detail` adds the pid. A gone address with nothing pending and no
   subject is only counted. A line explains `unknown` when a peer has it:
   that session's client sends no presence (`sketerm mcp setup` on its
   host, for the config dir its Claude Code runs with), and one explains
@@ -2940,7 +2942,7 @@ peer's screen, and a peer message is information, never an approval.
   list` CLI prints the same text. With `--structured` every peer is a JSON
   object: address, alias, app and host, `state` and its `attention`, `facts`
   (the `capabilities.facts` names), the model, `pending` and
-  `last_seen_ms`, `detail` adding cwd, pid, durable, name_taken and
+  `last_seen_ms` and `cwd`, `detail` adding pid, durable, name_taken and
   `last_notification`; a federated peer also carries `via_host` and
   `link` (and `link_why` while it is not up), and the result `federation`
   and `hosts` (`{host, link, last_seen_ms, why?, detail?, retry_in_ms?,

@@ -20,6 +20,29 @@ pub fn baseName(path: []const u8) []const u8 {
         path;
 }
 
+/// `cwd` with a leading `home` folded to `~`; `cwd` itself when it is not
+/// under `home`, `home` is null or empty, or the result does not fit `buf`.
+pub fn abbreviateHome(cwd: []const u8, home: ?[]const u8, buf: []u8) []const u8 {
+    const h = std.mem.trimEnd(u8, home orelse return cwd, "/");
+    if (h.len == 0 or !std.mem.startsWith(u8, cwd, h)) return cwd;
+    const after = cwd[h.len..];
+    if (after.len != 0 and after[0] != '/') return cwd;
+    const total = 1 + after.len;
+    if (total > buf.len) return cwd;
+    buf[0] = '~';
+    @memcpy(buf[1..total], after);
+    return buf[0..total];
+}
+
+test "abbreviateHome folds only a whole home prefix" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("~/src/zenit", abbreviateHome("/home/u/src/zenit", "/home/u", &buf));
+    try std.testing.expectEqualStrings("~", abbreviateHome("/home/u", "/home/u/", &buf));
+    try std.testing.expectEqualStrings("/home/user2/x", abbreviateHome("/home/user2/x", "/home/u", &buf));
+    try std.testing.expectEqualStrings("/tmp/x", abbreviateHome("/tmp/x", null, &buf));
+    try std.testing.expectEqualStrings("/home/u/x", abbreviateHome("/home/u/x", "", &buf));
+}
+
 /// NUL-terminate `path` into the caller's stack buffer.
 /// @return pointer into `buf`, valid only while `buf` lives.
 pub fn pathZ(buf: *[4096]u8, path: []const u8) Error![*:0]const u8 {

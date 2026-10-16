@@ -326,8 +326,8 @@ fn aliasPart(addr: []const u8) []const u8 {
     return if (std.mem.lastIndexOfScalar(u8, addr, '/')) |i| addr[i + 1 ..] else addr;
 }
 
-/// What `m`'s peer_list text says, into the log (`what` tags it).
-fn printList(m: *Mcp, arena: std.mem.Allocator, comptime what: []const u8) void {
+/// `m`'s peer_list text (the content lane, what a text reader gets).
+fn listText(m: *Mcp, arena: std.mem.Allocator, comptime what: []const u8) []const u8 {
     m.sendToolAllocated("peer_list", "{}");
     const deadline = nowMs() + 20_000;
     while (nowMs() < deadline) {
@@ -337,14 +337,19 @@ fn printList(m: *Mcp, arena: std.mem.Allocator, comptime what: []const u8) void 
         const id = v.object.get("id") orelse continue;
         if (id != .integer or id.integer != m.id) continue;
         const content = ((v.object.get("result") orelse fail(what ++ ": no result")).object.get("content") orelse fail(what ++ ": no content")).array.items;
-        std.debug.print("smoke: peers: " ++ what ++ " peer_list text:\n", .{});
-        for (content) |part| if (part.object.get("text")) |tx| {
-            var it = std.mem.splitScalar(u8, tx.string, '\n');
-            while (it.next()) |l| std.debug.print("    {s}\n", .{l});
-        };
-        return;
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        for (content) |part| if (part.object.get("text")) |tx| aw.writer.writeAll(tx.string) catch fail("oom");
+        return aw.written();
     }
     fail(what ++ ": no peer_list reply");
+}
+
+/// What `m`'s peer_list text says, into the log (`what` tags it).
+fn printList(m: *Mcp, arena: std.mem.Allocator, comptime what: []const u8) void {
+    const text = listText(m, arena, what);
+    std.debug.print("smoke: peers: " ++ what ++ " peer_list text:\n", .{});
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |l| std.debug.print("    {s}\n", .{l});
 }
 
 /// Poll `m`'s peer_list until `address` is offline (`gone_entirely`:
@@ -906,6 +911,27 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
     }
     std.debug.print("smoke: peers: to lists, slow mail, dormancy and the loop cap ok\n", .{});
 
+    // 44. Untitled sessions are named after their working directory: two
+    //     servers that asked for no name, in one repo, are zenit-workspace
+    //     and zenit-workspace-1, and every list row shows the directory.
+    {
+        const ws = std.fmt.allocPrintSentinel(arena, "{s}/x/zenit-workspace", .{std.mem.sliceTo(&root_buf, 0)}, 0) catch fail("oom");
+        mkdirOrFail(std.fmt.allocPrintSentinel(arena, "{s}/x", .{std.mem.sliceTo(&root_buf, 0)}, 0) catch fail("oom"));
+        mkdirOrFail(ws);
+        var w1 = Mcp.spawnWith(allocator, exe, .{ .extra = &.{"--no-record"}, .unset_env = &UNSET, .set_env = stage.env(null), .cwd = ws });
+        w1.initialize();
+        expectStr(registered(&w1, arena, "44. first"), "alias", "zenit-workspace", "44. the first is named after its directory");
+        var w2 = Mcp.spawnWith(allocator, exe, .{ .extra = &.{"--no-record"}, .unset_env = &UNSET, .set_env = stage.env(null), .cwd = ws });
+        w2.initialize();
+        expectStr(registered(&w2, arena, "44. second"), "alias", "zenit-workspace-1", "44. the second takes the next suffix");
+        const text = listText(&w2, arena, "44. text list");
+        contains(text, "zenit-workspace  ", "44. the first's row leads with its alias");
+        contains(text, ws, "44. the row shows its working directory");
+        w2.closeStdinWait();
+        w1.closeStdinWait();
+        std.debug.print("smoke: peers: untitled sessions named zenit-workspace / zenit-workspace-1, cwd listed ok\n", .{});
+    }
+
     dave.closeStdinWait();
     bob2.closeStdinWait();
     alice.closeStdinWait();
@@ -1313,15 +1339,20 @@ pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
         expectStr(readOne(&zm2, arena, 20_000, "f9. the resumed alias's mail"), "text", "for whoever is zenit-1 next", "f9. the waiting mail moved to it");
         printList(&zm2, arena, "f9. on the member, the resumed zenit-1's");
         zm2.closeStdinWait();
-        // 10. A session nobody named (a minted name) has no alias until a
-        //     viewer titles it (what the GUI sends for a pane or tab title):
-        //     the server inside is then told its alias, and the title is
-        //     its subject.
+        // 10. A session nobody named (a minted name) is named after its
+        //     server's working directory until a viewer titles it (what the
+        //     GUI sends for a pane or tab title): the title then replaces
+        //     that alias, the server inside is told, and the title is its
+        //     subject.
         {
             const origin = hub.spawnTitled(allocator, arena, "s4242-1");
             var inner = hub.sessionServer(allocator, arena, exe, origin);
             inner.initialize();
-            expectStr(registered(&inner, arena, "f10. an untitled session"), "alias", "", "f10. an untitled session has no alias");
+            var cwd_buf: [4096]u8 = undefined;
+            const cwd = std.mem.sliceTo(c.getcwd(&cwd_buf, cwd_buf.len) orelse fail("f10. getcwd"), 0);
+            var sb: [peeraddr.SLUG_MAX]u8 = undefined;
+            const dir_alias = (peermail.defaultAlias(&sb, "", cwd) orelse fail("f10. the rig's directory has no slug")).slug;
+            if (!std.mem.startsWith(u8, str(registered(&inner, arena, "f10. an untitled session"), "alias", "f10."), dir_alias)) fail("f10. an untitled session is not named after its directory");
             var viewer = muxclient.Conn.connectProbed(allocator, hub.sock(arena)) catch fail("f10. connect a viewer");
             defer viewer.deinit();
             viewer.sendJson(.attach, .{ .name = "s4242-1" }) catch fail("f10. attach");

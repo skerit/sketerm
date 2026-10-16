@@ -157,6 +157,7 @@ pub fn listLine(pi: peermail.PeerInfo, is_self: bool, detail: bool) ListLine {
         .last_seen_ms = pi.last_seen_ms,
         .model = nonEmpty(pi.model),
         .subject = nonEmpty(pi.subject),
+        .cwd = nonEmpty(pi.cwd),
         .facts = pi.facts,
         .self = if (is_self) true else null,
         .via_host = nonEmpty(pi.via_host),
@@ -164,7 +165,6 @@ pub fn listLine(pi: peermail.PeerInfo, is_self: bool, detail: bool) ListLine {
         .link_why = if (pi.link_why) |w| (if (pi.link != null and pi.link.? != .up) @tagName(w) else null) else null,
     };
     if (detail) {
-        l.cwd = pi.cwd;
         l.pid = pi.pid;
         l.durable = pi.durable;
         l.name_taken = pi.name_taken;
@@ -208,12 +208,13 @@ fn label(pi: peermail.PeerInfo) []const u8 {
 
 /// The whole list as compact text, for the `peer_list` tool and `sketerm peer
 /// list` alike: the reader once (`self`), then one row per peer (its alias,
-/// else its address; one state word, `ctx`, subject, pending, how long ago
-/// it was seen; the address last when an alias led), the federation links,
-/// and a count of the gone peers left out. `ctx` is the context the wake
-/// rule judges (`peerwake.contextOf`); the account-wide rate limits and the
-/// cost stay in the JSON. Model and app show only where they differ
-/// between peers; `detail` adds cwd and pid.
+/// else its address; one state word, `ctx`, its working directory with
+/// `~` for home, subject, pending, how long ago it was seen; the address
+/// last when an alias led), the federation links, and a count of the gone
+/// peers left out. `ctx` is the context the wake rule judges
+/// (`peerwake.contextOf`); the account-wide rate limits and the cost stay
+/// in the JSON. Model and app show only where they differ between peers;
+/// `detail` adds the pid.
 pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []const peermail.HostInfo, self: ?SelfLine, now_ms: i64, detail: bool) !void {
     if (self) |s| {
         const addr = if (s.address.len > 0) s.address else "(not registered yet)";
@@ -273,6 +274,10 @@ pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []c
         if (show_app and pi.app.len > 0) try w.print("  {s}", .{pi.app});
         if (peerwake.contextOf(pi.facts)) |ctx| try w.print("  ctx {s}", .{numtext.count(&buf, ctx)});
         if (show_model and pi.model.len > 0) try w.print("  {s}", .{pi.model});
+        if (pi.cwd.len > 0) {
+            var cb: [512]u8 = undefined;
+            try w.print("  {s}", .{agentpush.shownCwd(&cb, pi.cwd)});
+        }
         if (pi.subject.len > 0) try w.print("  subject {s}", .{pi.subject});
         if (pi.pending > 0) try w.print("  {d} pending", .{pi.pending});
         if (pi.state != .gone or pi.no_mcp) {
@@ -284,7 +289,6 @@ pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []c
             if (pi.link_why) |why| try w.print(" ({s})", .{why.label()});
         };
         if (detail) {
-            if (pi.cwd.len > 0) try w.print("  cwd {s}", .{pi.cwd});
             if (pi.pid > 0) try w.print("  pid {d}", .{pi.pid});
         }
         if (pi.alias.len > 0) try w.print("  {s}", .{pi.address});
@@ -1185,14 +1189,19 @@ test "the list: you once, one state word, rounded facts, gone peers counted, lin
         \\+1 gone with nothing pending and no subject
         \\
     , aw.written());
-    // A model or an app shows only where the peers differ; detail adds cwd and pid.
+    // A model or an app shows only where the peers differ; the working
+    // directory always shows, after the facts; detail adds the pid.
     var other = peers;
     other[4].model = "Haiku 4.5";
-    other[4].cwd = "/w";
+    other[4].cwd = "/w/zenit-workspace";
     other[4].pid = 42;
     aw.clearRetainingCapacity();
-    try writeList(&aw.writer, other[1..], &.{}, null, now, true);
-    try t.expectEqualStrings("p-da26a6b5          idle  ctx 194k  Opus 5.5\nArtefacts           gone 18m  subject Folio  1 pending\ndalaran/p-b1e7d4aa  working  Haiku 4.5  seen 16m ago  link down (unreachable)  cwd /w  pid 42\n+1 gone with nothing pending and no subject\n", aw.written());
+    try writeList(&aw.writer, other[1..], &.{}, null, now, false);
+    try t.expectEqualStrings("p-da26a6b5          idle  ctx 194k  Opus 5.5\nArtefacts           gone 18m  subject Folio  1 pending\ndalaran/p-b1e7d4aa  working  Haiku 4.5  /w/zenit-workspace  seen 16m ago  link down (unreachable)\n+1 gone with nothing pending and no subject\n", aw.written());
+    try t.expectEqualStrings("/w/zenit-workspace", listLine(other[4], false, false).cwd.?);
+    aw.clearRetainingCapacity();
+    try writeList(&aw.writer, other[4..], &.{}, null, now, true);
+    try t.expectEqualStrings("dalaran/p-b1e7d4aa  working  /w/zenit-workspace  seen 16m ago  link down (unreachable)  pid 42\n", aw.written());
     // Every reason reads the same on a host line (`sketerm peer status`):
     // an old daemon names its version; a redial keeps the last failure.
     aw.clearRetainingCapacity();
