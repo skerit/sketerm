@@ -90,6 +90,13 @@ pub const Peer = struct {
         return self.conn.caps.peer_subject;
     }
 
+    /// Whether the broker keeps aliases (welcome flag `peer_alias`): a
+    /// client then registers an opaque address and asks for its name as
+    /// an alias (`RegisterReq.alias`).
+    pub fn aliases(self: *const Peer) bool {
+        return self.conn.caps.peer_alias;
+    }
+
     /// Ask (`subject` null), set or clear (`""`) the subject of `address`.
     pub fn subject(self: *Peer, allocator: std.mem.Allocator, address: []const u8, value: ?[]const u8, timeout_ms: i64) !std.json.Parsed(peermail.SubjectReply) {
         if (!self.subjects()) return error.Unsupported;

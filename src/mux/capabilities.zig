@@ -151,6 +151,13 @@ pub const Flag = enum {
     /// relayed mail by (id, to). Absent = never send `quiet` or `to_list`:
     /// every message wakes its recipient, as before.
     peer_slow_mail,
+    /// The broker keeps an alias per peer address (`peermail` "Aliases"):
+    /// `peer_register` `alias` (a requested one), `alias` in `peer_list`
+    /// (`self` and every peer) and in a delivery's `from`, aliases taken
+    /// as `peer_send` `to`, `peer_subject` `title` from an attached viewer,
+    /// and `grants` in a hub's presence. Absent = a client registers its
+    /// name as its address, as before, and sends no title.
+    peer_alias,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

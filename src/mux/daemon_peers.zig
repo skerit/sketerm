@@ -15,6 +15,13 @@
 //! `sketerm mcp hook` uses) and its subject, as control `'S'`; the worker
 //! pushes it to its viewers as `session_meta` `peer`. A viewer's
 //! `peer_subject` comes back the other way as control `'P'`.
+//!
+//! Aliases: a peer at a pane address (`p-` + its session's origin id) is
+//! offered its session's user title (`sessionTitle`) when it registers
+//! and whenever a worker's name or title changes; the store decides what
+//! the title gives (`peermail.Store.offerTitle`). A viewer's title of the
+//! session arrives on the worker as `peer_subject` `title` and reaches
+//! the broker with the worker's metadata push.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -25,6 +32,8 @@ const peerlink = @import("peerlink.zig");
 const daemon_control = @import("daemon_control.zig");
 const platform = @import("../util/platform.zig");
 const agentsline = @import("../ipc/agentsline.zig");
+const peeraddr = @import("../ipc/peeraddr.zig");
+const sessname = @import("sessname.zig");
 const env = @import("../util/env.zig");
 const xdg = @import("../util/xdg.zig");
 const clock = @import("../util/clock.zig");
@@ -105,6 +114,7 @@ pub fn sweep(d: *Daemon) void {
     s.tick(wall);
     const sig = workersSignature(d);
     if (s.roster_gen != d.peers.mapped_gen or sig != d.peers.mapped_sig) {
+        offerTitles(d, s, wall);
         d.peers.mapped_gen = s.roster_gen;
         d.peers.mapped_sig = sig;
         remap(d, s);
@@ -139,6 +149,7 @@ pub fn handleRegister(d: *Daemon, cl: *Client, payload: []const u8) void {
         error.BadAddress => "peer_register: the address is not a peer name (1-64 of A-Za-z0-9._-, no host)",
         error.NotRegistered, error.OutOfMemory, error.NoEntropy, error.TooManyRecipients => "peer_register failed on the broker",
     }, "peer_register");
+    if (s.addressOf(cl.id)) |addr| offerTitle(d, s, addr, now);
     queueList(d, s, cl, 0);
     s.flush(cl.id, now);
 }
@@ -273,6 +284,7 @@ pub fn handleSubject(d: *Daemon, cl: *Client, payload: []const u8) void {
         if (q.address.len > 0) return cl.queueErrFor("peer_subject on an attached session names no address", frame);
         if (cl.attached == null) return cl.queueErrFor("peer_subject: not attached", frame);
         if (!cl.actsOnSession()) return cl.queueErrFor("a view-only attachment cannot set the subject", frame);
+        if (q.title) |title| setUserTitle(d, title);
         const subject = q.subject orelse return;
         peermail.checkSubject(subject) catch |e| return cl.queueErrFor(peermail.subjectRefusal(e), frame);
         var buf: [1024]u8 = undefined;
@@ -284,14 +296,65 @@ pub fn handleSubject(d: *Daemon, cl: *Client, payload: []const u8) void {
     }
     const s = storeFor(d, cl, frame) orelse return;
     if (q.address.len == 0) return cl.queueErrFor("peer_subject needs the peer's address on a connection that is not attached", frame);
-    var reply = peermail.SubjectReply{ .req = q.req, .address = q.address, .found = s.knows(q.address) };
-    if (q.subject) |subject| s.setSubject(q.address, subject) catch |e| switch (e) {
+    // An alias names the address it holds here.
+    const address = s.resolveLocal(q.address) orelse q.address;
+    var reply = peermail.SubjectReply{ .req = q.req, .address = address, .found = s.knows(address) };
+    if (q.subject) |subject| s.setSubject(address, subject) catch |e| switch (e) {
         error.SubjectTooLong, error.SubjectNotText => reply.refused = peermail.subjectRefusal(@errorCast(e)),
         error.UnknownAddress => {},
         error.OutOfMemory => return cl.queueErrFor("peer_subject failed on the broker", frame),
     };
-    reply.subject = s.subjectOf(q.address);
+    reply.subject = s.subjectOf(address);
     cl.queueJson(.peer_subject_reply, reply);
+}
+
+/// Worker: a viewer named the session (`peer_subject` `title`); the next
+/// metadata push carries it to the broker.
+fn setUserTitle(d: *Daemon, title: []const u8) void {
+    if (d.sessions.items.len == 0) return;
+    const session = d.sessions.items[0];
+    const owned = d.allocator.dupe(u8, peermail.utf8Prefix(title, peermail.SUBJECT_MAX)) catch return;
+    if (session.user_title) |old| d.allocator.free(old);
+    session.user_title = owned;
+}
+
+/// The title a session's peer takes its alias and default subject from:
+/// the one a person gave it (`user_title`: a viewer's pane or tab title,
+/// or a spawner's fixed title), else its name unless sketerm minted that
+/// (`sessname.isMinted`); never the title its program sets. Null = none.
+pub fn sessionTitle(name: []const u8, user_title: []const u8) ?[]const u8 {
+    if (user_title.len > 0) return user_title;
+    if (name.len == 0 or sessname.isMinted(name)) return null;
+    return name;
+}
+
+/// The user title of the session whose pane address `address` is (`p-`
+/// and the first hex of its origin id), null for any other address.
+fn sessionTitleOf(d: *Daemon, address: []const u8) ?[]const u8 {
+    if (!peeraddr.isPaneName(address) or address.len != peeraddr.PANE_NAME_LEN) return null;
+    const prefix = address[peeraddr.PANE_PREFIX.len..];
+    for (d.workers.items) |w| {
+        if (w.dead or !std.mem.startsWith(u8, &w.origin_id, prefix)) continue;
+        return sessionTitle(w.name, w.user_title orelse "");
+    }
+    return null;
+}
+
+fn offerTitle(d: *Daemon, s: *peermail.Store, address: []const u8, now: i64) void {
+    const title = sessionTitleOf(d, address) orelse return;
+    s.offerTitle(address, title, now) catch log.warn("peermail: out of memory offering {s} its session title", .{address});
+}
+
+/// Every live peer of this host is offered its session's title (only a
+/// first one changes anything, `peermail.Store.offerTitle`).
+fn offerTitles(d: *Daemon, s: *peermail.Store, now: i64) void {
+    var arena: std.heap.ArenaAllocator = .init(d.allocator);
+    defer arena.deinit();
+    const live = livePeers(arena.allocator(), s) catch return;
+    for (live) |p| {
+        const addr = arena.allocator().dupe(u8, p.address) catch return;
+        offerTitle(d, s, addr, now);
+    }
 }
 
 /// Broker: control `'P'` from worker `w`, a viewer's `peer_subject`.
@@ -363,12 +426,15 @@ fn livePeers(arena: std.mem.Allocator, s: *peermail.Store) error{OutOfMemory}![]
     return out.items;
 }
 
-/// What `remap` depends on besides the store: which workers run which child.
+/// What `remap` and `offerTitles` depend on besides the store: which
+/// workers run which child, under which name and title.
 fn workersSignature(d: *Daemon) u64 {
     var h = std.hash.Wyhash.init(0);
     for (d.workers.items) |w| {
         const pids = [3]i64{ w.pid, w.child_pid, @intFromBool(w.dead) };
         h.update(std.mem.asBytes(&pids));
+        h.update(w.name);
+        h.update(w.user_title orelse "");
     }
     return h.final();
 }
@@ -582,6 +648,12 @@ fn emit(ctx: *anyopaque, conn: u32, out: peermail.Out) bool {
             cl.queueJson(.peer_event, v);
             return true;
         },
+        .self_changed => {
+            const cl = liveClient(d, conn) orelse return false;
+            const s = if (d.peers.store) |*st| st else return false;
+            queueList(d, s, cl, 0);
+            return true;
+        },
         .reply => |v| {
             const cl = liveClient(d, conn) orelse return false;
             cl.queueJson(.peer_send_reply, v);
@@ -626,6 +698,21 @@ test "only the per-user daemon federates: a private broker with the same config 
     var both = try Config.loadFromBytes(t.allocator, "peer_hub = true\npeer_hub_domain = hub\n[domain.hub]\nhost = h\n");
     defer both.deinit();
     try t.expect(federationRole(&both, "box", true).off == .hub_and_callin);
+}
+
+test "a session's peer title: a viewer's or spawner's title, else its name unless sketerm minted it" {
+    const t = std.testing;
+    // Headless or GUI alike: a session someone named gives its name.
+    try t.expectEqualStrings("zenit", sessionTitle("zenit", "").?);
+    try t.expectEqualStrings("agent-claude-k3f9", sessionTitle("agent-claude-k3f9", "").?);
+    // A title a person gave wins over any name.
+    try t.expectEqualStrings("Zenit", sessionTitle("s85382-27", "Zenit").?);
+    try t.expectEqualStrings("Qq", sessionTitle("work", "Qq").?);
+    // Minted names give nothing.
+    try t.expect(sessionTitle("s85382-27", "") == null);
+    try t.expect(sessionTitle("mcpterm-4242-1", "") == null);
+    try t.expect(sessionTitle("mcpapp-4242-3", "") == null);
+    try t.expect(sessionTitle("", "") == null);
 }
 
 test "the TTL override accepts only non-negative integers" {

@@ -1,14 +1,16 @@
-//! `sketerm peer list|send|read|subject`: any program is a peer by running
-//! this, a client of the same `peer_*` frames the MCP server speaks
+//! `sketerm peer list|send|read|subject|alias`: any program is a peer by
+//! running this, a client of the same `peer_*` frames the MCP server speaks
 //! (`peerclient.Peer`, no wire of its own). `read --follow` registers a
-//! durable address and prints each incoming message as it arrives (one
-//! JSON line with `--json`), acknowledging it only once the line is
-//! written; lines it reads on its stdin are sent from that address.
-//! `subject` sets what a session works on: inside an assistant session it
-//! finds that session's own servers the way `sketerm mcp hook` does and
-//! posts the subject as a presence line; `--name` sets it on the broker
-//! by address. It is also the one home of how a peer list entry reads,
-//! for this CLI and the `peer_list` tool alike (`listLine`, `writeList`).
+//! durable address (`n-`, from its name, which it asks for as its alias)
+//! and prints each incoming message as it arrives (one JSON line with
+//! `--json`), acknowledging it only once the line is written; lines it
+//! reads on its stdin are sent from that address. `subject` and `alias`
+//! set what a session works on and the name it is reached by: inside an
+//! assistant session they find that session's own servers the way
+//! `sketerm mcp hook` does and post a presence line; `subject --name`
+//! sets it on the broker by alias or address. It is also the one home of
+//! how a peer list entry reads, for this CLI and the `peer_list` tool
+//! alike (`listLine`, `writeList`).
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -47,6 +49,8 @@ const STDIN_LINE_MAX: usize = peermail.PEER_TEXT_MAX * 6 + 1024;
 /// One peer as `peer_list` and `sketerm peer list --json` report it.
 pub const ListLine = struct {
     address: []const u8,
+    /// The name to send to; absent when it has none.
+    alias: ?[]const u8 = null,
     host: ?[]const u8 = null,
     app: ?[]const u8 = null,
     state: []const u8,
@@ -103,6 +107,7 @@ fn nonEmpty(s: []const u8) ?[]const u8 {
 pub fn listLine(pi: peermail.PeerInfo, is_self: bool, detail: bool) ListLine {
     var l: ListLine = .{
         .address = pi.address,
+        .alias = nonEmpty(pi.alias),
         .host = nonEmpty(pi.host),
         .app = nonEmpty(pi.app),
         .state = @tagName(pi.state),
@@ -128,7 +133,7 @@ pub fn listLine(pi: peermail.PeerInfo, is_self: bool, detail: bool) ListLine {
 }
 
 /// The session the list is read from, for its one `you:` line.
-pub const SelfLine = struct { address: []const u8, durable: bool, name_taken: bool };
+pub const SelfLine = struct { address: []const u8, alias: []const u8 = "", durable: bool, name_taken: bool };
 
 /// Whether `pi` is worth a row: a gone address with nothing pending and
 /// no subject is only counted.
@@ -155,19 +160,40 @@ fn isSelf(pi: peermail.PeerInfo, self: ?SelfLine) bool {
     return if (self) |s| std.mem.eql(u8, pi.address, s.address) else false;
 }
 
+/// What a row is called: its alias, else its address.
+fn label(pi: peermail.PeerInfo) []const u8 {
+    return if (pi.alias.len > 0) pi.alias else pi.address;
+}
+
 /// The whole list as compact text, for the `peer_list` tool and `sketerm peer
-/// list` alike: the reader once (`self`), then one row per peer (address,
-/// one state word, `ctx`, subject, pending, how long ago it was seen), the
-/// federation links, and a count of the gone peers left out. `ctx` is the
-/// context the wake rule judges (`peerwake.contextOf`); the account-wide rate
-/// limits and the cost stay in the JSON. Model and app show only where they
-/// differ between peers; `detail` adds cwd and pid.
+/// list` alike: the reader once (`self`), then one row per peer (its alias,
+/// else its address; one state word, `ctx`, subject, pending, how long ago
+/// it was seen; the address last when an alias led), the federation links,
+/// and a count of the gone peers left out. `ctx` is the context the wake
+/// rule judges (`peerwake.contextOf`); the account-wide rate limits and the
+/// cost stay in the JSON. Model and app show only where they differ
+/// between peers; `detail` adds cwd and pid.
 pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []const peermail.HostInfo, self: ?SelfLine, now_ms: i64, detail: bool) !void {
-    if (self) |s| try w.print("you: {s}{s}{s}\n", .{
-        if (s.address.len > 0) s.address else "(not registered yet)",
-        if (s.durable) " (durable)" else "",
-        if (s.name_taken) " (the name it asked for is taken)" else "",
-    });
+    if (self) |s| {
+        const addr = if (s.address.len > 0) s.address else "(not registered yet)";
+        var notes: [3][]const u8 = undefined;
+        var n: usize = 0;
+        if (s.alias.len > 0) {
+            notes[n] = addr;
+            n += 1;
+        }
+        if (s.durable) {
+            notes[n] = "durable";
+            n += 1;
+        }
+        if (s.name_taken) {
+            notes[n] = "the name it asked for is taken";
+            n += 1;
+        }
+        try w.print("you: {s}", .{if (s.alias.len > 0) s.alias else addr});
+        for (notes[0..n], 0..) |note, i| try w.print("{s}{s}", .{ if (i == 0) " (" else ", ", note });
+        try w.writeAll(if (n > 0) ")\n" else "\n");
+    }
     const show_model = varies(peers, self, "model");
     const show_app = varies(peers, self, "app");
     var width: usize = 0;
@@ -181,13 +207,13 @@ pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []c
             continue;
         }
         rows += 1;
-        width = @max(width, pi.address.len);
+        width = @max(width, label(pi).len);
     }
     if (rows == 0 and omitted == 0) try w.writeAll("no other peers\n");
     for (peers) |pi| {
         if (isSelf(pi, self) or !listed(pi)) continue;
-        try w.writeAll(pi.address);
-        try w.splatByteAll(' ', width - pi.address.len);
+        try w.writeAll(label(pi));
+        try w.splatByteAll(' ', width - label(pi).len);
         var buf: [48]u8 = undefined;
         if (pi.state == .gone) {
             try w.writeAll("  gone");
@@ -207,6 +233,7 @@ pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []c
             if (pi.cwd.len > 0) try w.print("  cwd {s}", .{pi.cwd});
             if (pi.pid > 0) try w.print("  pid {d}", .{pi.pid});
         }
+        if (pi.alias.len > 0) try w.print("  {s}", .{pi.address});
         try w.writeAll("\n");
     }
     if (hosts.len > 0) {
@@ -232,6 +259,8 @@ const MessageLine = struct {
     kind: []const u8 = "message",
     id: []const u8,
     from: []const u8,
+    /// The sender's alias when it sent; reply to it.
+    from_alias: ?[]const u8 = null,
     sent_ms: i64,
     age_ms: i64,
     queued: bool,
@@ -283,6 +312,7 @@ pub fn itemText(arena: std.mem.Allocator, item: agentpush.PeerItem, json: bool) 
         .message => |m| jsonLine(arena, MessageLine{
             .id = m.id,
             .from = m.from.address,
+            .from_alias = nonEmpty(m.from.alias),
             .sent_ms = m.sent_ms,
             .age_ms = m.age_ms,
             .queued = m.queued,
@@ -339,7 +369,7 @@ fn sendReq(arena: std.mem.Allocator, to: []const u8, text: []const u8, reply_to:
 
 // ── arguments ────────────────────────────────────────────────────
 
-pub const Verb = enum { list, send, read, subject };
+pub const Verb = enum { list, send, read, subject, alias };
 
 pub const Cli = struct {
     verb: ?Verb = null,
@@ -354,17 +384,18 @@ pub const Cli = struct {
     /// `send --quiet`: slow mail, never waking the recipient.
     quiet: bool = false,
     /// `send`: the address (or a comma-separated list), then the text
-    /// (null: read from stdin). `subject`: the text (null: print the
-    /// current one).
+    /// (null: read from stdin). `subject`, `alias`: the text (null: print
+    /// the current one).
     to: ?[]const u8 = null,
     text: ?[]const u8 = null,
     help: bool = false,
 
-    pub const ParseError = error{ UnknownFlag, MissingValue, ExtraArgument, UnknownVerb, NoName, NoAddress, BadName, NotForVerb, TooManyAddresses } || peermail.SubjectError;
+    pub const ParseError = error{ UnknownFlag, MissingValue, ExtraArgument, UnknownVerb, NoName, NoAddress, BadName, NotForVerb, TooManyAddresses, BadAlias } || peermail.SubjectError;
 
     /// `env_name` (SKETERM_PEER_NAME) names the peer for send and read; a
     /// subject is set on another peer only by an explicit `--name`, so
-    /// inside a session it always reaches that session's own server.
+    /// inside a session it always reaches that session's own server, and
+    /// an alias only ever from inside the session.
     pub fn parse(args: []const []const u8, env_name: ?[]const u8) ParseError!Cli {
         var o: Cli = .{};
         var i: usize = 0;
@@ -404,7 +435,7 @@ pub const Cli = struct {
         }
         if (o.help) return o;
         const verb = o.verb orelse return error.UnknownVerb;
-        if (o.name == null and verb != .subject) o.name = env_name;
+        if (o.name == null and verb != .subject and verb != .alias) o.name = env_name;
         switch (verb) {
             .list => if (o.to != null) return error.ExtraArgument,
             .read => if (o.to != null) return error.ExtraArgument,
@@ -416,12 +447,19 @@ pub const Cli = struct {
                 if (o.clear and o.text != null) return error.ExtraArgument;
                 if (o.text) |tx| try peermail.checkSubject(tx);
             },
+            .alias => {
+                if (o.text != null) return error.ExtraArgument;
+                if (o.name != null) return error.NotForVerb;
+                o.text = o.to;
+                o.to = null;
+                if (o.text) |tx| if (!peeraddr.validAlias(tx) or tx.len > peeraddr.SLUG_MAX) return error.BadAlias;
+            },
         }
         if (o.follow and verb != .read) return error.NotForVerb;
         if ((o.reply_to != null or o.quiet) and verb != .send) return error.NotForVerb;
         if (verb == .send and std.mem.count(u8, o.to.?, ",") >= peermail.PEER_TO_MAX) return error.TooManyAddresses;
         if (o.clear and verb != .subject) return error.NotForVerb;
-        if (verb != .list) {
+        if (verb != .list and verb != .alias) {
             const n = o.name orelse if (verb == .subject) return o else return error.NoName;
             const addr = peeraddr.Address.parse(n) catch return error.BadName;
             if (addr.host != null) return error.BadName;
@@ -435,6 +473,7 @@ pub const HELP =
     \\       sketerm peer send --name NAME [--json] [--quiet] [--reply-to ID] TO[,TO...] [TEXT]
     \\       sketerm peer read --name NAME [--json] [--follow]
     \\       sketerm peer subject [--name NAME] [TEXT | --clear]
+    \\       sketerm peer alias [ALIAS]
     \\       sketerm peer hub add NAME [--host SSH_TARGET] [--inbound] [--dry-run]
     \\       sketerm peer hub remove NAME [--dry-run]
     \\       sketerm peer join HUB [--host SSH_TARGET] [--dry-run]
@@ -443,19 +482,21 @@ pub const HELP =
     \\       (--app APP on send and read: the app the peer registers as, default cli)
     \\
     \\Takes part in peer messaging (the peer_* tools of `sketerm mcp`) from any
-    \\program. NAME (or SKETERM_PEER_NAME) is the durable address this program
-    \\is reached at; mail for it waits in the per-user daemon while no reader
-    \\runs. send sends TEXT (or stdin when absent) and prints what became of it,
-    \\one line per address (TO may be a comma-separated list: one message,
-    \\one id); --quiet makes it slow mail, which never wakes an assistant;
-    \\read prints the messages waiting for NAME and exits; read --follow keeps
-    \\NAME registered and prints each message as it arrives (acknowledged once
-    \\printed), reconnecting when the daemon goes away, until SIGINT/SIGTERM or
-    \\the end of its stdin (when stdin is a pipe, socket or terminal). While it
-    \\follows, each line on its stdin {"to":ADDR,"text":TEXT,"reply_to":ID?,
-    \\"quiet":BOOL?} is sent from NAME, answered with a "sent" line. --json
-    \\prints one JSON object per line: messages {"kind":"message","id","from","sent_ms",
-    \\"age_ms","queued","sender_live","sender_state","sender_subject"?,"text",
+    \\program. NAME (or SKETERM_PEER_NAME) is the alias this program asks
+    \\for, and its durable address follows from it; mail for it waits in the
+    \\per-user daemon while no reader runs. TO is an alias or an address
+    \\(peer_list). send sends TEXT (or stdin when absent) and prints what
+    \\became of it, one line per recipient (TO may be a comma-separated list:
+    \\one message, one id); --quiet makes it slow mail, which never wakes an
+    \\assistant; read prints the messages waiting for NAME and exits; read
+    \\--follow keeps NAME registered and prints each message as it arrives
+    \\(acknowledged once printed), reconnecting when the daemon goes away,
+    \\until SIGINT/SIGTERM or the end of its stdin (when stdin is a pipe,
+    \\socket or terminal). While it follows, each line on its stdin
+    \\{"to":TO,"text":TEXT,"reply_to":ID?,"quiet":BOOL?} is sent from NAME,
+    \\answered with a "sent" line. --json prints one JSON object per line:
+    \\messages {"kind":"message","id","from","from_alias"?,"sent_ms","age_ms",
+    \\"queued","sender_live","sender_state","sender_subject"?,"text",
     \\"reply_to"?,"slow"?}, and "event" / "expired_away" for what became of mail.
     \\
     \\subject sets what a session works on, shown by peer_list, in its peer
@@ -463,9 +504,16 @@ pub const HELP =
     \\control characters; --clear removes it, no TEXT prints it. Run inside an
     \\assistant session (Claude Code: `! sketerm peer subject "..."`) it sets
     \\that session's own peer, found through this process's ancestry; --name
-    \\NAME sets the peer NAME instead (a `read --follow` program, or any
-    \\session by its address). The daemon keeps it with the address, across
-    \\server restarts.
+    \\NAME sets the peer NAME (an alias or an address) instead (a `read
+    \\--follow` program, or any session). The daemon keeps it with the
+    \\address, across server restarts.
+    \\
+    \\alias sets the name this session is reached by: lowercase letters,
+    \\digits and single dashes, at most 48 bytes, refused while a live
+    \\session holds it (one whose session is gone hands it over, with its
+    \\waiting mail). Run inside an assistant session (Claude Code: `!
+    \\sketerm peer alias zenit`); no ALIAS prints the current one. A session
+    \\otherwise takes its alias from its title, once.
     \\
     \\hub add, hub remove, join and leave set up federation (peers on other
     \\hosts) by editing config.conf in place, keeping every other line and
@@ -481,8 +529,9 @@ pub const HELP =
     \\
     \\Exit status: 0 done, 1 the daemon could not be reached, the name is held
     \\by another live peer, a send was refused, no server or peer was found
-    \\for subject, or a federation edit was refused (hub and member at once,
-    \\no such domain); 2 bad usage (a refused subject, name or host too).
+    \\for subject or alias, an alias is held by a live session, or a
+    \\federation edit was refused (hub and member at once, no such domain);
+    \\2 bad usage (a refused subject, alias, name or host too).
     \\
 ;
 
@@ -531,6 +580,7 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             error.BadName => "peer: the name must be 1-64 of A-Za-z0-9._- (no host)\n",
             error.NotForVerb => "peer: --follow is for read, --reply-to and --quiet for send, --clear for subject\n",
             error.TooManyAddresses => std.fmt.comptimePrint("peer: send takes at most {d} addresses\n", .{peermail.PEER_TO_MAX}),
+            error.BadAlias => std.fmt.comptimePrint("peer: an alias is lowercase letters, digits and single dashes, at most {d} bytes\n", .{peeraddr.SLUG_MAX}),
             error.SubjectTooLong, error.SubjectNotText => {
                 _ = fail("{s}", .{peermail.subjectRefusal(@errorCast(err))});
                 return 2;
@@ -548,6 +598,7 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     const arena = arena_state.allocator();
     if (o.verb.? == .read and o.follow) return follow(allocator, o);
     if (o.verb.? == .subject) return subject(allocator, arena, o);
+    if (o.verb.? == .alias) return aliasCmd(allocator, arena, o);
 
     var link = Link.open(allocator) catch |e| return fail("{s}", .{linkError(e)});
     defer link.close();
@@ -569,14 +620,14 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         },
         .send => {
             const text = o.text orelse readAllStdin(arena) orelse return fail("could not read the text from stdin", .{});
-            link.register(arena, o) catch |e| return fail("{s}", .{linkError(e)});
+            _ = link.register(arena, o) catch |e| return fail("{s}", .{linkError(e)});
             const req = sendReq(arena, o.to.?, text, o.reply_to, o.quiet) catch return 1;
             const reply = link.peer.send(arena, req, REPLY_MS) catch |e| return fail("{s}", .{sendError(e)});
             say(1, sentText(arena, o.name.?, o.to.?, reply.value, o.json) catch return 1);
             return if (anyRefused(reply.value)) 1 else 0;
         },
         .read => {
-            link.register(arena, o) catch |e| return fail("{s}", .{linkError(e)});
+            _ = link.register(arena, o) catch |e| return fail("{s}", .{linkError(e)});
             // The broker pushes waiting mail right after the registration.
             var ids: std.ArrayList([]const u8) = .empty;
             while (true) {
@@ -588,7 +639,7 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             link.peer.ack(ids.items) catch {};
             return 0;
         },
-        .subject => unreachable,
+        .subject, .alias => unreachable,
     }
 }
 
@@ -620,7 +671,7 @@ fn subject(allocator: std.mem.Allocator, arena: std.mem.Allocator, o: Cli) u8 {
         say(1, subjectText(arena, "this session", value, "") catch return 1);
         return 0;
     };
-    say(1, subjectText(arena, me.address, value, me.subject) catch return 1);
+    say(1, subjectText(arena, if (me.alias.len > 0) me.alias else me.address, value, me.subject) catch return 1);
     return 0;
 }
 
@@ -633,15 +684,56 @@ fn subjectText(arena: std.mem.Allocator, address: []const u8, value: ?[]const u8
 }
 
 /// The live peer of this host one of `own` registered (by its pid).
-fn ownPeer(allocator: std.mem.Allocator, arena: std.mem.Allocator, own: []const @import("mcp_registry.zig").Entry) ?struct { address: []const u8, subject: []const u8 } {
+fn ownPeer(allocator: std.mem.Allocator, arena: std.mem.Allocator, own: []const @import("mcp_registry.zig").Entry) ?struct { address: []const u8, subject: []const u8, alias: []const u8 } {
     var link = Link.open(allocator) catch return null;
     defer link.close();
     const reply = link.peer.list(arena, REPLY_MS) catch return null;
     for (reply.value.peers) |pi| {
         if (!pi.live or pi.via_host.len > 0) continue;
-        for (own) |e| if (e.pid == pi.pid) return .{ .address = pi.address, .subject = pi.subject };
+        for (own) |e| if (e.pid == pi.pid) return .{ .address = pi.address, .subject = pi.subject, .alias = pi.alias };
     }
     return null;
+}
+
+/// How long `alias` waits for the daemon to give the asked alias.
+const ALIAS_WAIT_MS: i64 = 3_000;
+
+/// `sketerm peer alias`: set (`o.text`) or print the alias of this
+/// process's own session, refused while a live session holds it.
+fn aliasCmd(allocator: std.mem.Allocator, arena: std.mem.Allocator, o: Cli) u8 {
+    const own = mcp_hook.serversOfThisClient(arena, null);
+    if (own.len == 0) return fail("no sketerm MCP server in this process's ancestry: run it inside an assistant session (Claude Code: ! sketerm peer alias ...)", .{});
+    var link = Link.open(allocator) catch |e| return fail("{s}", .{linkError(e)});
+    defer link.close();
+    if (!link.peer.aliases()) return fail("the per-user sketerm daemon predates aliases (restart it idle)", .{});
+    const me = ownPeer(allocator, arena, own) orelse return fail("this session's server is not registered as a peer with the per-user daemon", .{});
+    const want = o.text orelse {
+        if (me.alias.len > 0) say(1, std.fmt.allocPrint(arena, "{s}\n", .{me.alias}) catch return 1);
+        return 0;
+    };
+    if (std.mem.eql(u8, me.alias, want)) {
+        say(1, std.fmt.allocPrint(arena, "alias of {s}: {s}\n", .{ me.address, want }) catch return 1);
+        return 0;
+    }
+    const reply = link.peer.list(arena, REPLY_MS) catch return fail("the daemon did not answer the peer list", .{});
+    for (reply.value.peers) |pi| {
+        if (pi.live and std.mem.eql(u8, pi.alias, want) and !std.mem.eql(u8, pi.address, me.address))
+            return fail("{s} is held by a live session ({s}); pick another", .{ want, pi.address });
+    }
+    const line = agentwait.encodePresence(arena, .{ .event = agentwait.ALIAS_EVENT, .alias = want }) catch return 1;
+    var took: usize = 0;
+    for (own) |e| took += @intFromBool(agentwait.postPresence(e.agent_socket, line));
+    if (took == 0) return fail("this session's server did not take the alias", .{});
+    const deadline = clock.nowMs() + ALIAS_WAIT_MS;
+    while (clock.nowMs() < deadline) {
+        _ = c.poll(null, 0, 100);
+        const now = ownPeer(allocator, arena, own) orelse continue;
+        if (std.mem.eql(u8, now.alias, want)) {
+            say(1, std.fmt.allocPrint(arena, "alias of {s}: {s}\n", .{ now.address, want }) catch return 1);
+            return 0;
+        }
+    }
+    return fail("the daemon did not give {s} (a live session may have taken it meanwhile)", .{want});
 }
 
 pub const LinkError = error{ Unreachable, NoPeers, NameTaken, NoAnswer };
@@ -681,11 +773,17 @@ pub const Link = struct {
         self.allocator.destroy(self.conn);
     }
 
-    /// Register `o.name` durable and wait for the broker's answer.
-    fn register(self: *Link, arena: std.mem.Allocator, o: Cli) LinkError!void {
+    /// Register `o.name` and wait for the broker's answer: with aliases,
+    /// at the durable `n-` address of its slug, asking for the name as its
+    /// alias; from an older daemon, at the name itself.
+    /// @return the alias the broker gave ("" = none), in `arena`.
+    fn register(self: *Link, arena: std.mem.Allocator, o: Cli) LinkError![]const u8 {
         var cwd_buf: [4096]u8 = undefined;
         const cwd: []const u8 = if (c.getcwd(&cwd_buf, cwd_buf.len)) |p| std.mem.span(@as([*:0]u8, @ptrCast(p))) else "";
-        self.peer.register(.{ .address = o.name.?, .durable = true, .app = o.app, .cwd = cwd, .pid = @intCast(c.getpid()), .slow_mail = true }) catch return error.Unreachable;
+        var nb: [peeraddr.NAMED_NAME_LEN]u8 = undefined;
+        const name = o.name.?;
+        const named: ?[]const u8 = if (self.peer.aliases()) peeraddr.namedAddress(&nb, name) else null;
+        self.peer.register(.{ .address = named orelse name, .durable = true, .app = o.app, .cwd = cwd, .pid = @intCast(c.getpid()), .slow_mail = true, .alias = if (named != null) name else null }) catch return error.Unreachable;
         const deadline = clock.nowMs() + REPLY_MS;
         while (clock.nowMs() < deadline) {
             const push = (self.peer.nextPush(arena, deadline - clock.nowMs()) catch return error.Unreachable) orelse break;
@@ -693,7 +791,7 @@ pub const Link = struct {
                 .registered => |r| {
                     const s = r.value.self orelse continue;
                     if (s.name_taken) return error.NameTaken;
-                    return;
+                    return arena.dupe(u8, s.alias) catch "";
                 },
                 else => {},
             }
@@ -773,10 +871,15 @@ fn follow(allocator: std.mem.Allocator, o: Cli) u8 {
             continue;
         };
         defer link.close();
-        link.register(arena, o) catch |e| {
+        const got = link.register(arena, o) catch |e| {
             if (e == error.NameTaken) return fail("{s}", .{linkError(e)});
             if (!pause(backoff.fail(clock.nowMs()), watch_stdin)) break;
             continue;
+        };
+        // A live session holding the name suffixes this program's alias.
+        var sb: [peeraddr.SLUG_MAX]u8 = undefined;
+        if (got.len > 0) if (peeraddr.slugify(&sb, o.name.?)) |slug| if (!std.mem.eql(u8, got, slug)) {
+            _ = fail("{s} is held by a live session; this program is reached as {s}", .{ slug, got });
         };
         backoff.reset();
         // Serve this connection until it drops, a signal, or stdin ends.
@@ -908,6 +1011,15 @@ test "arguments: a name for send and read (flag or SKETERM_PEER_NAME), none for 
     try t.expectError(error.SubjectNotText, Cli.parse(&.{ "subject", "two\nlines" }, null));
     try t.expectError(error.BadName, Cli.parse(&.{ "subject", "--name", "h/w", "x" }, null));
     try t.expectError(error.NotForVerb, Cli.parse(&.{ "list", "--clear" }, null));
+    // alias: a valid alias or nothing (print), only for this session.
+    const al = try Cli.parse(&.{ "alias", "zenit-2" }, "env-name");
+    try t.expectEqual(Verb.alias, al.verb.?);
+    try t.expectEqualStrings("zenit-2", al.text.?);
+    try t.expect(al.name == null);
+    try t.expect((try Cli.parse(&.{"alias"}, null)).text == null);
+    try t.expectError(error.BadAlias, Cli.parse(&.{ "alias", "Zenit" }, null));
+    try t.expectError(error.BadAlias, Cli.parse(&.{ "alias", "p-1" }, null));
+    try t.expectError(error.NotForVerb, Cli.parse(&.{ "alias", "--name", "x", "y" }, null));
 }
 
 test "send: --quiet and a comma list of addresses, one line per recipient; the cap" {
@@ -996,6 +1108,23 @@ test "the list: you once, one state word, rounded facts, gone peers counted, lin
     aw.clearRetainingCapacity();
     try writeList(&aw.writer, &.{}, &.{}, null, now, false);
     try t.expectEqualStrings("no other peers\n", aw.written());
+    // Aliases lead, the address follows last; the reader's own too.
+    aw.clearRetainingCapacity();
+    const aliased = [_]peermail.PeerInfo{
+        .{ .address = "p-3fa9c2e1", .alias = "zenit", .state = .idle, .live = true, .last_seen_ms = now },
+        .{ .address = "p-da26a6b5", .alias = "qq", .state = .gone, .pending = 12, .subject = "Folio", .last_seen_ms = now - 18 * min },
+        .{ .address = "dalaran/p-b1e7d4aa", .alias = "zenit-1", .state = .working, .live = true, .last_seen_ms = now, .via_host = "dalaran", .link = .up },
+        .{ .address = "p-00000009", .alias = "me", .state = .idle, .live = true, .last_seen_ms = now },
+    };
+    try writeList(&aw.writer, &aliased, &.{}, .{ .address = "p-00000009", .alias = "me", .durable = true, .name_taken = false }, now, false);
+    try t.expectEqualStrings(
+        \\you: me (p-00000009, durable)
+        \\zenit    idle  p-3fa9c2e1
+        \\qq       gone 18m  subject Folio  12 pending  p-da26a6b5
+        \\zenit-1  working  dalaran/p-b1e7d4aa
+        \\
+    , aw.written());
+    try t.expectEqualStrings("zenit", listLine(aliased[0], false, false).alias.?);
     // A live peer with no presence says why once.
     aw.clearRetainingCapacity();
     try writeList(&aw.writer, &.{.{ .address = "aeor/s85382-4", .state = .unknown, .live = true, .last_seen_ms = now }}, &.{}, null, now, false);

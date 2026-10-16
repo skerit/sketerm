@@ -1743,7 +1743,7 @@ pub const Window = struct {
     var session_seq: u64 = 0;
     pub fn nextSessionName(buf: []u8) []const u8 {
         session_seq += 1;
-        return std.fmt.bufPrint(buf, "s{d}-{d}", .{ c.getpid(), session_seq }) catch "s0";
+        return @import("../mux/sessname.zig").print(buf, .shell, c.getpid(), session_seq) catch "s0";
     }
 
     /// Everything needed to spawn one local pane through the daemon. Built by
@@ -3762,6 +3762,7 @@ fn onRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
         // for presence.
         c.g_object_set_data(@ptrCast(@alignCast(ctx.page)), "sketerm-title-locked", @ptrCast(ctx.page));
     }
+    syncSessionTitles(ctx.window, ctx.page);
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
     // ctx is freed via GDestroyNotify when the
     // signal closure is destroyed.
@@ -3778,6 +3779,7 @@ fn onPaneTitleActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void 
             } else {
                 ref.pane.lockTitle(text);
             }
+            if (tabPageForPane(ref.win, ref.pane)) |page| syncSessionTitles(ref.win, page);
         }
     }
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
@@ -3803,6 +3805,20 @@ fn onPeerSubjectActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) voi
         _ = ref.pane.terminal.setPeerSubject(text);
     }
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
+}
+
+/// Tell the daemon the title the user gave each pane session of `page`
+/// (`Pane.userTitle`: its locked pane title, else the tab's user-set
+/// title): the session's peer takes its alias and default subject from
+/// the first one, so a restored layout's titles find their aliases again.
+pub fn syncSessionTitles(self: *Window, page: *c.AdwTabPage) void {
+    const tree = Window.tabTreeOf(page) orelse return;
+    var panes: std.ArrayList(*Pane) = .empty;
+    defer panes.deinit(self.allocator);
+    tree.appendLeaves(self.allocator, &panes) catch return;
+    const locked = c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-title-locked") != null;
+    const tab_title: ?[]const u8 = if (locked) std.mem.span(c.adw_tab_page_get_title(page)) else null;
+    for (panes.items) |p| p.terminal.setSessionTitle(p.userTitle(tab_title));
 }
 
 /// Walk every tab page and return the one whose widget tree contains

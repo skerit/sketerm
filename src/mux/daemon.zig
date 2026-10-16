@@ -267,6 +267,10 @@ pub const Session = struct {
     no_viewer_since_ms: i64 = 0,
     /// Owned `SpawnReq.title`: listed instead of the app's own title.
     fixed_title: ?[]u8 = null,
+    /// Owned; the title the user gave this session in a viewer (a pane or
+    /// tab title, `SubjectReq.title`), "" / null = none. The source of its
+    /// peer's alias and default subject, with `fixed_title` behind it.
+    user_title: ?[]u8 = null,
     /// The attached client currently allowed to drive this session's
     /// Wayland seat (null = nobody). Every other viewer is read-only:
     /// its input-shaped pipe units are dropped daemon-side. Cleared
@@ -331,8 +335,16 @@ pub const Session = struct {
         return if (self.screen.last_title) |t| t else "";
     }
 
+    /// The title a person or a spawner chose for this session (never the
+    /// one its program sets): `WorkerMeta.user_title`.
+    pub fn peerTitle(self: *const Session) []const u8 {
+        if (self.user_title) |t| if (t.len > 0) return t;
+        return self.fixed_title orelse "";
+    }
+
     pub fn deinit(self: *Session) void {
         if (self.fixed_title) |t| self.allocator.free(t);
+        if (self.user_title) |t| self.allocator.free(t);
         if (self.xwayland) |*xwl| xwl.deinit();
         self.log.deinit();
         if (self.cast_recorder) |*rec| rec.finish();
@@ -503,6 +515,8 @@ pub const Worker = struct {
     /// Owned copies of the worker's last-pushed title / cwd (null = none yet).
     title: ?[]u8 = null,
     cwd: ?[]u8 = null,
+    /// Owned; the session's `peerTitle` as its last metadata push said.
+    user_title: ?[]u8 = null,
     /// Owned session environment paths, learned from the 'Y' ready
     /// datagram (the broker never creates these — the worker owns the
     /// hubs) and refreshed by 'M' pushes so `list` can serve them.
@@ -539,6 +553,7 @@ pub const Worker = struct {
         self.allocator.free(self.origin_name);
         if (self.title) |t| self.allocator.free(t);
         if (self.cwd) |cw| self.allocator.free(cw);
+        if (self.user_title) |t| self.allocator.free(t);
         if (self.spawn_err) |e| self.allocator.free(e);
         if (self.wl_display) |p| self.allocator.free(p);
         if (self.pulse_server) |p| self.allocator.free(p);
@@ -686,6 +701,8 @@ pub const WorkerMeta = struct {
     child_pid: i32 = 0,
     title: []const u8 = "",
     cwd: []const u8 = "",
+    /// `Session.peerTitle`; an older worker sends none.
+    user_title: []const u8 = "",
     /// Session identity/environment the broker cannot observe itself
     /// (it owns no Screen and creates no hubs) but must answer `list`
     /// with. Paths repeat on every push — cheap, and it keeps the

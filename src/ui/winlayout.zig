@@ -62,6 +62,9 @@ pub fn newTabFromSpec(self: *Window, spec: @import("../layout.zig").TabSpec, at_
     // deliberately named tab.
     if (restoresTitleLocked(spec.title_locked)) {
         c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-title-locked", @ptrCast(page));
+        // Its sessions are new after a reboot: the title is how their
+        // peers find their aliases (and waiting mail) again.
+        winmod.syncSessionTitles(self, page);
     }
     if (spec.pinned) c.adw_tab_view_set_page_pinned(self.tab_view, page, 1);
     if (spec.color) |col_str| {

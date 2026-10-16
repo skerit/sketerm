@@ -416,6 +416,11 @@ pub fn brokerOnWorkerControl(self: *Daemon, w: *Worker) void {
                 if (w.cwd) |old| self.allocator.free(old);
                 w.cwd = cw;
             } else |_| {}
+            // A cleared title clears (setOwned would keep the old one).
+            if (self.allocator.dupe(u8, m.user_title)) |ut| {
+                if (w.user_title) |old| self.allocator.free(old);
+                w.user_title = ut;
+            } else |_| {}
             // A dropped lease must clear the cached label, so this
             // one assigns even for "" (unlike setOwned's keep-old).
             if (self.allocator.dupe(u8, m.controller)) |ctrl| {
@@ -529,7 +534,8 @@ pub fn maybePushMeta(self: *Daemon) void {
     }
     const title = s.listTitle();
     const viewers = self.viewerCount(s);
-    const th = std.hash.Wyhash.hash(0, title);
+    const user_title = s.peerTitle();
+    const th = std.hash.Wyhash.hash(std.hash.Wyhash.hash(0, title), user_title);
     var ctrl_buf: [32]u8 = undefined;
     const controller = self.controllerLabel(s, &ctrl_buf);
     const ch = std.hash.Wyhash.hash(0, controller);
@@ -575,6 +581,7 @@ pub fn maybePushMeta(self: *Daemon) void {
         // refused outright once it passes the socket buffer).
         .title = title[0..@min(title.len, 256)],
         .cwd = cwd[0..@min(cwd.len, 1024)],
+        .user_title = user_title[0..@min(user_title.len, 256)],
         .display = s.display,
         .xwayland = s.xwayland != null,
         .gpu = s.gpu,

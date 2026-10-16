@@ -1,5 +1,9 @@
-//! Peer addresses: the ONE grammar home, shared by the MCP server and the
-//! broker. `name` is a peer on the caller's host, `host/name` a peer
+//! Peer addresses and aliases: the ONE grammar home, shared by the MCP
+//! server, the CLI and the broker. An address is the opaque identity mail
+//! and subject are kept under; an alias is the lowercase slug people use
+//! (`slugify`), assigned by the broker (`peermail.Store`, the one home of
+//! the alias rules) and accepted wherever an address is. For addresses,
+//! `name` is a peer on the caller's host, `host/name` a peer
 //! reached through federation. `host` is the `[domain.<host>]` name the
 //! hub knows (or the hub's own host name). A name is also a mailbox file
 //! name, so its charset is closed and it never starts with a dot.
@@ -30,6 +34,19 @@ pub const PANE_PREFIX = "p-";
 pub const PANE_CHARS = 8;
 /// A pane-derived name's length.
 pub const PANE_NAME_LEN = PANE_PREFIX.len + PANE_CHARS;
+/// Names under this prefix are derived from a program's requested alias
+/// (`namedAddress`: `sketerm peer --name`, `SKETERM_PEER_NAME` outside a
+/// sketerm pane), so the same name is the same durable address.
+pub const NAMED_PREFIX = "n-";
+/// Hash hex characters after `n-`.
+pub const NAMED_CHARS = 8;
+pub const NAMED_NAME_LEN = NAMED_PREFIX.len + NAMED_CHARS;
+/// The longest slug a title or name yields; a suffix (`-1` .. `-999`)
+/// stays within `ALIAS_MAX`, itself a valid name length.
+pub const SLUG_MAX = 48;
+/// The highest suffix tried before an alias is given up.
+pub const ALIAS_SUFFIX_MAX: u32 = 999;
+pub const ALIAS_MAX = SLUG_MAX + 4;
 /// The longest formatted address.
 pub const ADDRESS_MAX = HOST_MAX + 1 + NAME_MAX;
 /// Rigs override this host's name in peer addresses (default: gethostname).
@@ -106,15 +123,20 @@ pub fn isAnonName(name: []const u8) bool {
     return std.mem.startsWith(u8, name, ANON_PREFIX);
 }
 
+/// Whether `name` carries the reserved `n-` prefix.
+pub fn isNamedName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, NAMED_PREFIX);
+}
+
 /// Whether `name` carries the reserved `p-` prefix.
 pub fn isPaneName(name: []const u8) bool {
     return std.mem.startsWith(u8, name, PANE_PREFIX);
 }
 
-/// Whether `name` lies in a space only sketerm mints (`anon-`, `p-`),
-/// which an explicit name must not claim.
+/// Whether `name` lies in a space only sketerm mints (`anon-`, `p-`,
+/// `n-`), which an explicit name or an alias must not claim.
 pub fn isReservedName(name: []const u8) bool {
-    return isAnonName(name) or isPaneName(name);
+    return isAnonName(name) or isPaneName(name) or isNamedName(name);
 }
 
 /// The name of a server in the pane whose session origin id is
@@ -123,6 +145,72 @@ pub fn paneName(buf: *[PANE_NAME_LEN]u8, origin_id: []const u8) ?[]const u8 {
     if (!wire.validSessionOriginId(origin_id)) return null;
     @memcpy(buf[0..PANE_PREFIX.len], PANE_PREFIX);
     @memcpy(buf[PANE_PREFIX.len..], origin_id[0..PANE_CHARS]);
+    return buf;
+}
+
+/// The slug of `text`: ASCII letters and digits lowercased, every other
+/// run (spaces, punctuation, non-ASCII bytes) one `-`, no `-` at either
+/// end, cut to `SLUG_MAX`. Null when nothing is left or the slug lies in
+/// a reserved space (it would read as an address).
+pub fn slugify(buf: *[SLUG_MAX]u8, text: []const u8) ?[]const u8 {
+    var n: usize = 0;
+    var dash = false;
+    for (text) |ch| {
+        const lower = std.ascii.toLower(ch);
+        if (std.ascii.isAlphanumeric(ch) and ch < 0x80) {
+            if (dash and n > 0) {
+                if (n + 1 >= SLUG_MAX) break;
+                buf[n] = '-';
+                n += 1;
+            }
+            dash = false;
+            if (n >= SLUG_MAX) break;
+            buf[n] = lower;
+            n += 1;
+        } else dash = true;
+    }
+    const slug = buf[0..n];
+    if (slug.len == 0 or isReservedName(slug)) return null;
+    return slug;
+}
+
+/// Whether `text` is an alias as the broker assigns them: a slug,
+/// possibly suffixed, at most `ALIAS_MAX` bytes.
+pub fn validAlias(text: []const u8) bool {
+    if (text.len == 0 or text.len > ALIAS_MAX) return false;
+    if (text[0] == '-' or text[text.len - 1] == '-' or isReservedName(text)) return false;
+    for (text, 0..) |ch, i| switch (ch) {
+        'a'...'z', '0'...'9' => {},
+        '-' => if (text[i - 1] == '-') return false,
+        else => return false,
+    };
+    return true;
+}
+
+/// Candidate `k` for `base`: `base` itself, then `base-1`, `base-2`, ...
+pub fn aliasCandidate(buf: *[ALIAS_MAX]u8, base: []const u8, k: u32) []const u8 {
+    if (k == 0) return std.fmt.bufPrint(buf, "{s}", .{base[0..@min(base.len, ALIAS_MAX)]}) catch unreachable;
+    const b = base[0..@min(base.len, SLUG_MAX)];
+    return std.fmt.bufPrint(buf, "{s}-{d}", .{ b, @min(k, ALIAS_SUFFIX_MAX) }) catch unreachable;
+}
+
+/// `alias` without a suffix `aliasCandidate` adds (`-` and 1-3 digits),
+/// so a re-suffixed alias counts from its base again.
+pub fn aliasBase(alias: []const u8) []const u8 {
+    const dash = std.mem.lastIndexOfScalar(u8, alias, '-') orelse return alias;
+    const digits = alias[dash + 1 ..];
+    if (dash == 0 or digits.len == 0 or digits.len > 3) return alias;
+    for (digits) |ch| if (!std.ascii.isDigit(ch)) return alias;
+    return alias[0..dash];
+}
+
+/// The durable address of a program that asked for the alias `name`:
+/// `n-` and 8 hex of its slug's hash; null when `name` has no slug.
+pub fn namedAddress(buf: *[NAMED_NAME_LEN]u8, name: []const u8) ?[]const u8 {
+    var sb: [SLUG_MAX]u8 = undefined;
+    const slug = slugify(&sb, name) orelse return null;
+    const h: u32 = @truncate(std.hash.Wyhash.hash(0, slug));
+    _ = std.fmt.bufPrint(buf, NAMED_PREFIX ++ "{x:0>8}", .{h}) catch unreachable;
     return buf;
 }
 
@@ -200,4 +288,52 @@ test "a pane name is p- and the origin id's first 8 hex; both reserved spaces ar
     try t.expect(paneName(&buf, "3FA9C2E17B0D4E5F8A6B1C2D3E4F5A6B") == null);
     try t.expect(paneName(&buf, "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz") == null);
     try t.expect(paneName(&buf, "") == null);
+}
+
+test "slugs: lowercase alphanumerics, one dash per run, trimmed, cut, never reserved" {
+    var b: [SLUG_MAX]u8 = undefined;
+    try t.expectEqualStrings("zenit", slugify(&b, "Zenit").?);
+    try t.expectEqualStrings("template-links", slugify(&b, "  Template links!! ").?);
+    try t.expectEqualStrings("caf-work", slugify(&b, "Caf\u{e9} work").?);
+    try t.expectEqualStrings("qq", slugify(&b, "Qq").?);
+    try t.expect(slugify(&b, "") == null);
+    try t.expect(slugify(&b, "--- !!") == null);
+    // A slug that reads as an address is no alias.
+    try t.expect(slugify(&b, "p-3fa9c2e1") == null);
+    try t.expect(slugify(&b, "Anon-x") == null);
+    try t.expect(slugify(&b, "n-1") == null);
+    // Cut to SLUG_MAX, never ending in a dash.
+    const long = slugify(&b, "a" ** 47 ++ " bcd").?;
+    try t.expectEqual(@as(usize, 47), long.len);
+    try t.expectEqual(@as(usize, SLUG_MAX), slugify(&b, "x" ** 80).?.len);
+    // Every slug is a valid alias and a valid name.
+    try t.expect(validAlias("template-links"));
+    try validName(slugify(&b, "x" ** 80).?);
+    try t.expect(!validAlias("Zenit") and !validAlias("a--b") and !validAlias("-a") and !validAlias("p-1") and !validAlias(""));
+}
+
+test "alias candidates suffix from the base; the base strips a suffix again" {
+    var b: [ALIAS_MAX]u8 = undefined;
+    try t.expectEqualStrings("zenit", aliasCandidate(&b, "zenit", 0));
+    try t.expectEqualStrings("zenit-1", aliasCandidate(&b, "zenit", 1));
+    try t.expectEqualStrings("zenit-12", aliasCandidate(&b, "zenit", 12));
+    try t.expect(validAlias(aliasCandidate(&b, "x" ** SLUG_MAX, ALIAS_SUFFIX_MAX)));
+    try validName(aliasCandidate(&b, "x" ** SLUG_MAX, ALIAS_SUFFIX_MAX));
+    try t.expectEqualStrings("zenit", aliasBase("zenit-1"));
+    try t.expectEqualStrings("zenit", aliasBase("zenit-999"));
+    try t.expectEqualStrings("build-2024", aliasBase("build-2024"));
+    try t.expectEqualStrings("zenit", aliasBase("zenit"));
+    try t.expectEqualStrings("-1", aliasBase("-1"));
+}
+
+test "a named address is n- and the hash of the name's slug: same slug, same address" {
+    var b1: [NAMED_NAME_LEN]u8 = undefined;
+    var b2: [NAMED_NAME_LEN]u8 = undefined;
+    const a = namedAddress(&b1, "webapp").?;
+    try t.expect(isNamedName(a) and isReservedName(a));
+    try validName(a);
+    try t.expectEqual(@as(usize, NAMED_NAME_LEN), a.len);
+    try t.expectEqualStrings(a, namedAddress(&b2, "WebApp").?);
+    try t.expect(!std.mem.eql(u8, a, namedAddress(&b2, "other").?));
+    try t.expect(namedAddress(&b2, "!!") == null);
 }

@@ -213,7 +213,11 @@ pub fn composePeer(arena: std.mem.Allocator, item: PeerItem) !Push {
     const w = &aw.writer;
     switch (item) {
         .message => |m| {
-            try w.print("Peer message from {s} (", .{m.from.address});
+            // The sender reads as its alias (what a reply goes to), its
+            // address beside it; an older broker's sender has no alias.
+            const who = if (m.from.alias.len > 0) m.from.alias else m.from.address;
+            try w.print("Peer message from {s} (", .{who});
+            if (m.from.alias.len > 0) try w.print("{s}, ", .{m.from.address});
             try w.writeAll(if (m.from.app.len > 0) m.from.app else "unknown app");
             if (m.from.host.len > 0) try w.print(" on {s}", .{m.from.host});
             if (m.from.cwd.len > 0) try w.print(", {s}", .{m.from.cwd});
@@ -231,7 +235,7 @@ pub fn composePeer(arena: std.mem.Allocator, item: PeerItem) !Push {
             if (m.queued) try w.writeAll(" while you were offline");
             try w.print(". id {s}.", .{m.id});
             if (m.reply_to) |r| try w.print(" In reply to {s}.", .{r});
-            try w.print(" Reply with peer_send to \"{s}\".", .{m.from.address});
+            try w.print(" Reply with peer_send to \"{s}\".", .{who});
             try w.print("\n\n{s}", .{m.text});
         },
         .event => |e| {
@@ -269,6 +273,7 @@ fn peerMeta(arena: std.mem.Allocator, item: PeerItem) !agentwait.Meta {
             .age_s = try std.fmt.allocPrint(arena, "{d}", .{@divTrunc(@max(m.age_ms, 0), 1000)}),
             .sender_state = @tagName(senderState(m)),
             .sender_subject = nonEmpty(m.sender_subject),
+            .from_alias = nonEmpty(m.from.alias),
             .at = try wallAt(arena, m.sent_ms),
         },
         .event => |e| .{
@@ -441,6 +446,14 @@ test "a peer message reads as the plan's sentence: age from a minute on, offline
     const about = try composePeer(a, .{ .message = .{ .id = "m-8", .from = from, .text = "x", .sender_live = true, .sender_state = .idle, .sender_subject = "template links" } });
     try t.expect(std.mem.startsWith(u8, about.content, "Peer message from Zenit (claude-code on hohenheim, /home/u/zenit-workspace, idle; subject: template links). id m-8."));
     try t.expectEqualStrings("template links", about.meta.sender_subject.?);
+    // A sender with an alias reads as it, its address beside it.
+    var aliased = from;
+    aliased.address = "p-3fa9c2e1";
+    aliased.alias = "zenit";
+    const named = try composePeer(a, .{ .message = .{ .id = "m-7", .from = aliased, .text = "x", .sender_live = true, .sender_state = .idle } });
+    try t.expectEqualStrings("Peer message from zenit (p-3fa9c2e1, claude-code on hohenheim, /home/u/zenit-workspace, idle). id m-7. Reply with peer_send to \"zenit\".\n\nx", named.content);
+    try t.expectEqualStrings("p-3fa9c2e1", named.meta.from.?);
+    try t.expectEqualStrings("zenit", named.meta.from_alias.?);
 
     // Aged but delivered live: the age alone.
     const aged = try composePeer(a, .{ .message = .{ .id = "m-1", .from = from, .text = "x", .age_ms = 5 * 60_000 + 10, .sender_live = true } });

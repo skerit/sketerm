@@ -125,6 +125,8 @@ pub const PeerFacts = struct {
     facts: ?std.json.Value = null,
     model: ?[]const u8 = null,
     last_notification: ?[]const u8 = null,
+    /// The alias the broker gave the address; absent when none.
+    alias: ?[]const u8 = null,
 };
 
 pub const Entry = struct {
@@ -329,6 +331,7 @@ pub const Lease = struct {
             .facts = if (peer.facts) |f| try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, f, .{}), .{}) else null,
             .model = if (peer.model) |m| try a.dupe(u8, m) else null,
             .last_notification = if (peer.last_notification) |n| try a.dupe(u8, n) else null,
+            .alias = if (peer.alias) |al| try a.dupe(u8, al) else null,
         };
     }
 

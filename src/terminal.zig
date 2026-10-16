@@ -3150,6 +3150,17 @@ pub const Terminal = struct {
         return true;
     }
 
+    /// Tell the daemon the title the user gave this session ("" = none):
+    /// its peer takes its alias and default subject from the first one
+    /// (`peermail.Store.offerTitle`). A daemon without `peer_alias`, or a
+    /// view-only attachment, is sent nothing.
+    pub fn setSessionTitle(self: *Terminal, text: []const u8) void {
+        const remote = self.remote orelse return;
+        if (!remote.canSend() or !remote.conn.caps.peer_alias or self.isViewOnly()) return;
+        remote.conn.sendJson(.peer_subject, peermail.SubjectReq{ .title = peermail.utf8Prefix(text, peermail.SUBJECT_MAX) }) catch
+            self.transportLost("peer_subject write failed");
+    }
+
     /// Replay snapshot-restored image placements into the image sink
     /// and drop them. Must run AFTER the pane wired `on_image` (the
     /// sink chain ends in the pane's ImageStore) — Window calls this

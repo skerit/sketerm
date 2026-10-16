@@ -14,6 +14,16 @@
 //! The wire bodies of the `peer_*` frames are declared here too, beside
 //! the state they describe (as `tombstones.zig` does).
 //!
+//! Aliases: the one home of the alias rules. An alias is a slug
+//! (`peeraddr.slugify`) kept with the address like the subject (persisted
+//! in `META_EXT`), assigned once (a requested alias, else the first user
+//! title the broker offers, else a legacy name's own slug) and never moved
+//! by a later title. A live holder forces the next suffix; a gone holder's
+//! alias is RESUMED: its mailbox and subject move to the new address
+//! (`yieldBox`). Uniqueness across hosts is the hub's: a member assigns
+//! from its last view of the network, and the hub answers a conflicting
+//! newer claim with a `Grant` in its presence relay.
+//!
 //! Federation: a `Route` is one link to another host's broker (on the hub,
 //! one per federated domain; on a member, the one uplink to the hub). Each
 //! route has ONE outbound `Box` (`+<domain>`, `+` for the uplink) under the
@@ -88,6 +98,9 @@ pub const From = struct {
     cwd: []const u8 = "",
     app: []const u8 = "",
     pid: i32 = 0,
+    /// The sender's alias when it sent, empty = none (or a broker that
+    /// predates aliases).
+    alias: []const u8 = "",
 };
 
 /// Why a subject is refused.
@@ -115,6 +128,10 @@ pub fn subjectRefusal(e: SubjectError) []const u8 {
 /// What `<address>` + `META_EXT` holds.
 pub const AddressMeta = struct {
     subject: []const u8 = "",
+    alias: []const u8 = "",
+    /// The address was offered its session's first title (`offerTitle`):
+    /// later titles never set a default subject again.
+    titled: bool = false,
 };
 
 /// `peer_register` body; re-sent whenever a field changes.
@@ -145,6 +162,12 @@ pub const RegisterReq = struct {
     /// without it gets every message as a wake and older words
     /// (`PeerOutcome.compat`).
     slow_mail: bool = false,
+    /// The alias this client asks for (its slug is taken; welcome
+    /// `peer_alias`): null = none asked, keep what the address holds. A
+    /// live holder suffixes it, unless `alias_explicit` (the user's own
+    /// `sketerm peer alias`), which is then refused (`SelfInfo.alias_refused`).
+    alias: ?[]const u8 = null,
+    alias_explicit: bool = false,
 };
 
 /// `peer_list_req` body.
@@ -173,6 +196,10 @@ pub const SelfInfo = struct {
     ttl_hours: u32 = 0,
     ttl_ms: i64 = 0,
     expired_while_away: []const Expired = &.{},
+    /// The address's alias, empty = none.
+    alias: []const u8 = "",
+    /// An explicit alias request was refused: the live holder's address.
+    alias_refused: []const u8 = "",
 };
 
 pub const PeerInfo = struct {
@@ -197,6 +224,8 @@ pub const PeerInfo = struct {
     via_host: []const u8 = "",
     /// Federation: the state of the link it is reached through (null = local).
     link: ?PeerLink = null,
+    /// The address's alias, empty = none (or a broker that predates them).
+    alias: []const u8 = "",
 };
 
 /// One federated host as this broker sees it.
@@ -321,6 +350,10 @@ pub const SubjectReq = struct {
     address: []const u8 = "",
     /// Null = only ask; "" = clear it.
     subject: ?[]const u8 = null,
+    /// On an attached session only: the title the user gave it in the
+    /// viewer (pane or tab), the source of its peer's alias and default
+    /// subject (`offerTitle`). Null = unchanged, "" = none.
+    title: ?[]const u8 = null,
 };
 
 /// `peer_subject_reply` body, echoing `req`.
@@ -380,6 +413,16 @@ pub const Relay = struct {
     /// `mail`: slow mail (`SendReq.quiet`); a far broker without
     /// `slow_mail` ignores it and wakes the recipient.
     quiet: bool = false,
+    /// `presence` from the hub: aliases it decided for the receiving
+    /// member's own peers (a newer claim that conflicted), addresses as
+    /// the member names them. A member that predates aliases ignores it.
+    grants: []const Grant = &.{},
+};
+
+/// The alias the hub decided for one peer of a member.
+pub const Grant = struct {
+    address: []const u8,
+    alias: []const u8,
 };
 
 /// The one rule for times on a relay: an age out, a local time back in;
@@ -415,6 +458,9 @@ pub const Out = union(enum) {
     relay: Relay,
     /// A persistence or drop notice for the log; `conn` is 0.
     warn: []const u8,
+    /// The live peer on `conn` was given another alias: it is owed its
+    /// own view again (an unsolicited `peer_list` req 0 carrying `self`).
+    self_changed,
 };
 
 /// The owner's sink. @return whether the item reached a live connection.
@@ -476,6 +522,10 @@ const Box = struct {
     /// Owned; the user-set subject, "" = none. Persisted beside a durable
     /// mailbox (`META_EXT`); a non-durable one lives as long as the box.
     subject: []u8 = &.{},
+    /// Owned; the address's alias, "" = none. Kept like the subject.
+    alias: []u8 = &.{},
+    /// `AddressMeta.titled`.
+    titled: bool = false,
 
     fn messageCount(self: *const Box) usize {
         var n: usize = 0;
@@ -561,6 +611,56 @@ const Peer = struct {
     active_ms: i64,
     /// Its reported context size (`peerwake.contextOf`).
     context_tokens: ?u64,
+    /// Owned; the live holder that refused its last explicit alias
+    /// request (`SelfInfo.alias_refused`), "" = none.
+    alias_refused: []u8 = &.{},
+};
+
+/// An address that yielded to its alias's new holder (`yieldBox`): mail
+/// still sent to it follows the alias.
+const Moved = struct {
+    addr_buf: [peeraddr.ADDRESS_MAX]u8 = undefined,
+    addr_len: u16 = 0,
+    alias_buf: [peeraddr.ALIAS_MAX]u8 = undefined,
+    alias_len: u8 = 0,
+
+    fn address(self: *const Moved) []const u8 {
+        return self.addr_buf[0..self.addr_len];
+    }
+
+    fn alias(self: *const Moved) []const u8 {
+        return self.alias_buf[0..self.alias_len];
+    }
+};
+
+/// Yielded addresses remembered (`Moved`).
+pub const MOVED_RING: usize = 64;
+
+/// Who holds an alias, as this broker sees the network (`holderOf`).
+const Holder = struct {
+    /// As this side names it.
+    address: []const u8,
+    live: bool,
+    /// Its mailbox here; null for a peer of another host.
+    box: ?*Box = null,
+    subject: []const u8 = "",
+};
+
+/// What an alias request may take (`chooseAlias`).
+const Claim = enum {
+    /// The first candidate no LIVE holder has: a gone holder's is resumed.
+    resume_gone,
+    /// The first candidate nobody holds (migration: nothing is merged).
+    free_only,
+    /// The base alone, resumed from a gone holder; null when live-held.
+    explicit,
+};
+
+const Choice = struct {
+    /// Borrowed from the caller's buffer.
+    alias: []const u8,
+    /// The gone holder whose alias is resumed.
+    resumes: ?Holder = null,
 };
 
 const GoneName = struct {
@@ -594,6 +694,10 @@ const Route = struct {
     /// The far broker reads slow mail and keys relays by (id, to) (its
     /// welcome or hello said `slow_mail`); learned anew on every link-up.
     far_slow: bool = false,
+    /// Hub: aliases decided for this link's peers (`Grant`, addresses as
+    /// the hub names them, owned), sent with each presence until the
+    /// member reports them.
+    grants: std.ArrayList(Grant) = .empty,
 
     fn isUplink(self: *const Route) bool {
         return self.name.len == 0;
@@ -608,6 +712,9 @@ const Waiter = union(enum) {
     link: u32,
     /// One recipient of a local `to_list` send: the `Multi` of this serial.
     multi: u32,
+    /// Nobody: mail a gone address forwarded to its alias's new holder
+    /// (`yieldBox`); a refusal reaches its sender as an event.
+    none,
 };
 
 /// A relayed item is identified by its id AND its recipient: one
@@ -740,6 +847,9 @@ pub const Store = struct {
     limiter: peerwake.Limiter = .{},
     multis: std.ArrayList(*Multi) = .empty,
     next_multi: u32 = 0,
+    moved: [MOVED_RING]Moved = undefined,
+    moved_len: usize = 0,
+    moved_head: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, opts: Options) error{OutOfMemory}!Store {
         const dir = if (opts.dir) |d| try allocator.dupe(u8, d) else null;
@@ -801,6 +911,7 @@ pub const Store = struct {
             if (std.mem.eql(u8, p.requested, req.address) and p.asked_durable == req.durable) {
                 try self.updatePeer(p, req, now);
                 if (req.subject) |sj| self.subjectFromRegistration(p.address, sj);
+                if (req.alias) |want| try self.requestAlias(p, want, req.alias_explicit, now);
                 self.presence_dirty = true;
                 return;
             }
@@ -868,6 +979,10 @@ pub const Store = struct {
         self.presence_dirty = true;
         self.roster_gen +%= 1;
         if (req.subject) |sj| self.subjectFromRegistration(p.address, sj);
+        if (name_taken) return;
+        if (req.alias) |want| return self.requestAlias(p, want, req.alias_explicit, now);
+        // An older server's own name (or a migrated mailbox) asks for its slug.
+        if (box.alias.len == 0 and !peeraddr.isReservedName(p.address)) try self.requestAlias(p, p.address, false, now);
     }
 
     /// The connection closed. A durable address keeps its mailbox for the
@@ -985,7 +1100,7 @@ pub const Store = struct {
     fn msgFrom(self: *const Store, sender: *const Peer, req: SendReq, now: i64, id: ?[]const u8) Msg {
         return .{
             .id = id,
-            .from = .{ .address = sender.address, .host = self.host, .cwd = sender.cwd, .app = sender.app, .pid = sender.pid },
+            .from = .{ .address = sender.address, .host = self.host, .cwd = sender.cwd, .app = sender.app, .pid = sender.pid, .alias = self.aliasOf(sender.address) },
             .to = req.to,
             .sent_ms = now,
             .text = req.text,
@@ -994,13 +1109,21 @@ pub const Store = struct {
         };
     }
 
-    /// Route `msg` to a local mailbox or a route's outbound one. A live
+    /// Route `msg` to a local mailbox or a route's outbound one; `to` may
+    /// be an alias, bare or after this host's name (`resolve`). A live
     /// recipient of this host is woken or handed slow mail by
     /// `peerwake.judge`, here, where its presence is known.
-    fn route(self: *Store, msg: Msg, waiter: Waiter, now: i64, id_buf: *[ID_LEN]u8) Error!SendResult {
-        const addr = peeraddr.Address.parse(msg.to) catch return refused(.unknown_address);
+    fn route(self: *Store, msg_in: Msg, waiter: Waiter, now: i64, id_buf: *[ID_LEN]u8) Error!SendResult {
+        var msg = msg_in;
+        msg.to = self.resolve(msg_in.to);
+        var addr = peeraddr.Address.parse(msg.to) catch return refused(.unknown_address);
         if (addr.host) |h| {
             if (!self.isSelfHost(h)) return self.routeRemote(msg, h, waiter, now, id_buf);
+            // This host by name: what follows is resolved like a bare
+            // name (an alias here, or held on another host).
+            msg.to = self.resolve(addr.name);
+            addr = peeraddr.Address.parse(msg.to) catch return refused(.unknown_address);
+            if (addr.host) |h2| if (!self.isSelfHost(h2)) return self.routeRemote(msg, h2, waiter, now, id_buf);
         }
         if (std.mem.eql(u8, addr.name, msg.from.address)) return refused(.self);
 
@@ -1071,6 +1194,9 @@ pub const Store = struct {
         });
         try self.appendItem(r.box, s);
         if (r.conn != 0 and self.relayItem(r, s, now)) {
+            // Forwarded mail has nobody waiting: a far refusal becomes an
+            // event to its sender (`takeStored`).
+            if (waiter == .none) return .{ .id = id, .outcome = .queued };
             try self.addPending(id, msg.to, waiter, r.conn, now);
             return .{ .id = id, .outcome = .queued, .deferred = true };
         }
@@ -1171,6 +1297,7 @@ pub const Store = struct {
                 .model = p.model,
                 .last_notification = p.last_notification,
                 .subject = if (box) |b| b.subject else "",
+                .alias = if (box) |b| b.alias else "",
             });
         }
         for (self.boxes.items) |b| {
@@ -1183,6 +1310,7 @@ pub const Store = struct {
                 .last_seen_ms = b.last_seen_ms,
                 .pending = @intCast(b.items.items.len),
                 .subject = b.subject,
+                .alias = b.alias,
             });
         }
     }
@@ -1210,6 +1338,8 @@ pub const Store = struct {
             .ttl_hours = @intCast(@min(@divTrunc(@max(self.ttl_ms, 0), 3_600_000), std.math.maxInt(u32))),
             .ttl_ms = self.ttl_ms,
             .expired_while_away = expired.items,
+            .alias = self.aliasOf(p.address),
+            .alias_refused = p.alias_refused,
         };
     }
 
@@ -1264,6 +1394,327 @@ pub const Store = struct {
             error.SubjectTooLong, error.SubjectNotText => self.warnf("peermail: {s}'s registration carried a refused subject: {s}", .{ address, subjectRefusal(@errorCast(e)) }),
             error.UnknownAddress, error.OutOfMemory => self.warnf("peermail: {s}'s subject was not kept", .{address}),
         };
+    }
+
+    // ---------------------------------------------------------- aliases
+
+    /// The alias of `address` here, "" when none.
+    pub fn aliasOf(self: *const Store, address: []const u8) []const u8 {
+        return if (self.boxOf(address)) |b| b.alias else "";
+    }
+
+    /// The session the live peer `address` runs in carries the user title
+    /// `title` (the owner derives it: `daemon_peers.sessionTitle`). Its
+    /// first title becomes the address's alias when it has none and its
+    /// subject when it has none, once (`titled`): a later title moves
+    /// neither, and a subject the user cleared stays cleared.
+    pub fn offerTitle(self: *Store, address: []const u8, title: []const u8, now: i64) error{OutOfMemory}!void {
+        if (title.len == 0) return;
+        const p = self.livePeer(address) orelse return;
+        if (p.name_taken) return;
+        const box = self.boxOf(address) orelse return;
+        if (box.alias.len == 0) {
+            var sb: [peeraddr.SLUG_MAX]u8 = undefined;
+            var ab: [peeraddr.ALIAS_MAX]u8 = undefined;
+            if (peeraddr.slugify(&sb, title)) |slug| {
+                if (self.chooseAlias(&ab, slug, address, .resume_gone)) |ch| try self.giveAlias(box, ch, now);
+            }
+        }
+        if (box.titled) return;
+        box.titled = true;
+        const subject = utf8Prefix(title, SUBJECT_MAX);
+        if (box.subject.len == 0 and if (checkSubject(subject)) true else |_| false) {
+            const owned = try self.allocator.dupe(u8, subject);
+            self.allocator.free(box.subject);
+            box.subject = owned;
+            self.presence_dirty = true;
+            self.roster_gen +%= 1;
+        }
+        self.writeMeta(box);
+    }
+
+    /// The address of this host that `name` names (an alias or an
+    /// address); null when it names none.
+    pub fn resolveLocal(self: *const Store, name: []const u8) ?[]const u8 {
+        const r = self.resolve(name);
+        return if (self.knows(r)) r else null;
+    }
+
+    /// What `to` names, as this side addresses it: a host-qualified
+    /// address as it is; the holder of the exact alias `to` (a live one
+    /// first); a known address; the holder of `to`'s slug (so `Zenit`
+    /// finds `zenit`); where a yielded address's alias went (`Moved`);
+    /// else `to` itself. May borrow the store until its next mutation.
+    fn resolve(self: *const Store, to: []const u8) []const u8 {
+        if (std.mem.indexOfScalar(u8, to, '/') != null) return to;
+        if (self.holderOf(to, null)) |h| return h.address;
+        if (self.boxOf(to) != null or self.goneHas(to)) return to;
+        var sb: [peeraddr.SLUG_MAX]u8 = undefined;
+        if (peeraddr.slugify(&sb, to)) |slug| if (self.holderOf(slug, null)) |h| return h.address;
+        if (self.movedAlias(to)) |al| if (self.holderOf(al, null)) |h| return h.address;
+        return to;
+    }
+
+    /// The live peer `p` asks for the alias `want`. Explicit: exactly its
+    /// slug, refused (`alias_refused`) when a live holder has it.
+    fn requestAlias(self: *Store, p: *Peer, want: []const u8, explicit: bool, now: i64) error{OutOfMemory}!void {
+        self.allocator.free(p.alias_refused);
+        p.alias_refused = &.{};
+        const box = self.boxOf(p.address) orelse return;
+        var sb: [peeraddr.SLUG_MAX]u8 = undefined;
+        const slug = if (explicit and peeraddr.validAlias(want)) want else peeraddr.slugify(&sb, want) orelse return;
+        var ab: [peeraddr.ALIAS_MAX]u8 = undefined;
+        const choice = self.chooseAlias(&ab, slug, p.address, if (explicit) .explicit else .resume_gone) orelse {
+            if (self.holderOf(slug, p.address)) |h| p.alias_refused = try self.allocator.dupe(u8, h.address);
+            return;
+        };
+        try self.giveAlias(box, choice, now);
+    }
+
+    /// Who holds `alias` other than `except` (null: anyone): a live holder
+    /// first, local before remote; a gone one only when none is live. A
+    /// peer behind a link that is down counts as it was last reported, so
+    /// a session elsewhere keeps its alias through an outage.
+    fn holderOf(self: *const Store, alias: []const u8, except: ?[]const u8) ?Holder {
+        var gone: ?Holder = null;
+        for (self.boxes.items) |b| {
+            if (b.isRoute() or !std.mem.eql(u8, b.alias, alias)) continue;
+            if (except) |x| if (std.mem.eql(u8, b.address, x)) continue;
+            const h = Holder{ .address = b.address, .live = self.livePeer(b.address) != null, .box = b, .subject = b.subject };
+            if (h.live) return h;
+            if (gone == null) gone = h;
+        }
+        for (self.routes.items) |r| for (r.peers) |p| {
+            if (!std.mem.eql(u8, p.alias, alias)) continue;
+            if (except) |x| if (std.mem.eql(u8, p.address, x)) continue;
+            const h = Holder{ .address = p.address, .live = p.live, .subject = p.subject };
+            if (h.live) return h;
+            if (gone == null) gone = h;
+        };
+        return gone;
+    }
+
+    /// The first of `base`, `base-1`, `base-2`, ... that `address` may take
+    /// under `claim`; one it already holds counts as free.
+    fn chooseAlias(self: *const Store, buf: *[peeraddr.ALIAS_MAX]u8, base: []const u8, address: []const u8, claim: Claim) ?Choice {
+        var k: u32 = 0;
+        while (k <= peeraddr.ALIAS_SUFFIX_MAX) : (k += 1) {
+            const cand = peeraddr.aliasCandidate(buf, base, k);
+            const h = self.holderOf(cand, address) orelse return .{ .alias = cand };
+            switch (claim) {
+                .resume_gone => if (!h.live) return .{ .alias = cand, .resumes = h },
+                .free_only => {},
+                .explicit => return if (h.live) null else .{ .alias = cand, .resumes = h },
+            }
+        }
+        return null;
+    }
+
+    /// `box` takes `choice.alias`. A gone holder's mailbox here yields to
+    /// it at once; a gone holder elsewhere lends its subject, and its own
+    /// broker forwards its mail once it sees the alias held (`reconcile`).
+    fn giveAlias(self: *Store, box: *Box, choice: Choice, now: i64) error{OutOfMemory}!void {
+        if (!std.mem.eql(u8, box.alias, choice.alias)) {
+            const owned = try self.allocator.dupe(u8, choice.alias);
+            self.allocator.free(box.alias);
+            box.alias = owned;
+            self.writeMeta(box);
+            self.presence_dirty = true;
+            self.roster_gen +%= 1;
+            if (self.livePeer(box.address)) |p| _ = self.emit.call(p.conn, .self_changed);
+        }
+        const h = choice.resumes orelse return;
+        if (h.box) |old| return self.yieldBox(old, box.address, now);
+        if (box.subject.len == 0 and h.subject.len > 0) self.subjectFromRegistration(box.address, h.subject);
+    }
+
+    /// The gone mailbox `old` gives its alias up to the holder `to_in` (as
+    /// this side names it): its messages and events go there, by relay when
+    /// `to_in` is on another host, and a local `to_in` without a subject
+    /// takes `old`'s. `old` is then forgotten, files and all; mail still
+    /// sent to its address follows the alias (`Moved`).
+    fn yieldBox(self: *Store, old: *Box, to_in: []const u8, now: i64) void {
+        var tb: [peeraddr.ADDRESS_MAX]u8 = undefined;
+        const n = @min(to_in.len, tb.len);
+        @memcpy(tb[0..n], to_in[0..n]);
+        const to = tb[0..n];
+        self.movedAdd(old.address, old.alias);
+        const local: ?*Box = blk: {
+            const a = peeraddr.Address.parse(to) catch break :blk null;
+            if (a.host) |h| if (!self.isSelfHost(h)) break :blk null;
+            break :blk self.boxOf(a.name);
+        };
+        var items = old.items;
+        old.items = .empty;
+        defer items.deinit(self.allocator);
+        if (local) |nb| {
+            if (nb.subject.len == 0 and old.subject.len > 0) self.subjectFromRegistration(nb.address, old.subject);
+            for (items.items) |s| {
+                if (s.item.kind == .message) s.item.to = s.arena.allocator().dupe(u8, nb.address) catch s.item.to;
+                s.delivered_to = 0;
+                self.appendItem(nb, s) catch {
+                    self.warnf("peermail: {s} lost moving from {s}: out of memory", .{ s.item.id, old.address });
+                    freeStored(self.allocator, s);
+                };
+            }
+            if (self.livePeer(nb.address)) |p| self.flush(p.conn, now);
+        } else for (items.items) |s| {
+            defer freeStored(self.allocator, s);
+            switch (s.item.kind) {
+                .message => {
+                    var idb: [ID_LEN]u8 = undefined;
+                    const res = self.route(.{ .id = s.item.id, .from = s.item.from, .to = to, .sent_ms = s.item.sent_ms, .text = s.item.text, .reply_to = s.item.reply_to, .quiet = s.item.quiet }, .none, now, &idb) catch |e| {
+                        self.warnf("peermail: {s} lost forwarding from {s}: {s}", .{ s.item.id, old.address, @errorName(e) });
+                        continue;
+                    };
+                    if (res.outcome == .refused) self.notifySender(&s.item, .{ .id = s.item.id, .outcome = .refused, .reason = res.reason, .to = to, .queued_ms = now - s.item.sent_ms }, now);
+                },
+                .event => self.deliverEvent(to, .{ .id = s.item.id, .outcome = s.item.outcome, .reason = s.item.reason, .to = s.item.to, .queued_ms = s.item.queued_ms }, now),
+            }
+        }
+        self.dropBox(old);
+    }
+
+    /// Every gone mailbox here whose alias a live holder elsewhere holds
+    /// yields to it (a session that resumed the alias on another host, or
+    /// a member's claim the hub kept).
+    fn reconcile(self: *Store, now: i64) void {
+        var i: usize = 0;
+        while (i < self.boxes.items.len) {
+            const b = self.boxes.items[i];
+            i += 1;
+            if (b.isRoute() or b.alias.len == 0 or self.livePeer(b.address) != null) continue;
+            const h = self.holderOf(b.alias, b.address) orelse continue;
+            if (!h.live) continue;
+            self.yieldBox(b, h.address, now);
+            i = 0;
+        }
+    }
+
+    /// Forget the mailbox `box` and its files.
+    fn dropBox(self: *Store, box: *Box) void {
+        const i = self.boxIndex(box.address) orelse return;
+        _ = self.boxes.orderedRemove(i);
+        if (box.durable) {
+            var pbuf: [4096]u8 = undefined;
+            if (self.filePath(&pbuf, box.address)) |path| self.unlinkPath(path);
+            if (self.metaPath(&pbuf, box.address)) |path| self.unlinkPath(path);
+        }
+        self.presence_dirty = true;
+        self.roster_gen +%= 1;
+        self.freeBox(box);
+    }
+
+    fn unlinkPath(self: *Store, path: []const u8) void {
+        var z: [4096]u8 = undefined;
+        const pz = pathz.pathZ(&z, path) catch return;
+        if (c.unlink(pz) != 0 and std.c._errno().* != c.ENOENT) self.warnf("peermail: cannot remove {s}", .{path});
+    }
+
+    fn movedAdd(self: *Store, address: []const u8, alias: []const u8) void {
+        var m = Moved{};
+        const n = @min(address.len, m.addr_buf.len);
+        @memcpy(m.addr_buf[0..n], address[0..n]);
+        m.addr_len = @intCast(n);
+        const k = @min(alias.len, m.alias_buf.len);
+        @memcpy(m.alias_buf[0..k], alias[0..k]);
+        m.alias_len = @intCast(k);
+        if (self.moved_len < MOVED_RING) {
+            self.moved[self.moved_len] = m;
+            self.moved_len += 1;
+        } else {
+            self.moved[self.moved_head] = m;
+            self.moved_head = (self.moved_head + 1) % MOVED_RING;
+        }
+    }
+
+    /// The alias the yielded `address` moved with, newest first.
+    fn movedAlias(self: *const Store, address: []const u8) ?[]const u8 {
+        var k = self.moved_len;
+        while (k > 0) {
+            k -= 1;
+            const m = &self.moved[(self.moved_head + k) % self.moved_len];
+            if (std.mem.eql(u8, m.address(), address)) return m.alias();
+        }
+        return null;
+    }
+
+    /// Hub: judge the aliases link `r`'s member reported against everyone
+    /// else's. A grant already decided overrides what the member still
+    /// reports and goes once it reports it; a live peer whose alias another
+    /// live holder already has (the newer claim) is granted the next one.
+    fn judgeAliases(self: *Store, r: *Route) error{OutOfMemory}!void {
+        const a = r.arena.allocator();
+        var gi: usize = 0;
+        while (gi < r.grants.items.len) {
+            const g = r.grants.items[gi];
+            const p: ?*PeerInfo = for (r.peers) |*pp| {
+                if (std.mem.eql(u8, pp.address, g.address)) break pp;
+            } else null;
+            if (p == null or std.mem.eql(u8, p.?.alias, g.alias)) {
+                freeGrant(self.allocator, r.grants.orderedRemove(gi));
+                continue;
+            }
+            p.?.alias = try a.dupe(u8, g.alias);
+            gi += 1;
+        }
+        for (r.peers) |*p| {
+            if (!p.live or p.alias.len == 0) continue;
+            const h = self.holderOf(p.alias, p.address) orelse continue;
+            if (!h.live) continue;
+            var ab: [peeraddr.ALIAS_MAX]u8 = undefined;
+            const ch = self.chooseAlias(&ab, peeraddr.aliasBase(p.alias), p.address, .resume_gone) orelse continue;
+            p.alias = try a.dupe(u8, ch.alias);
+            try self.setGrant(r, p.address, p.alias);
+        }
+    }
+
+    fn setGrant(self: *Store, r: *Route, address: []const u8, alias: []const u8) error{OutOfMemory}!void {
+        const owned_alias = try self.allocator.dupe(u8, alias);
+        errdefer self.allocator.free(owned_alias);
+        for (r.grants.items) |*g| if (std.mem.eql(u8, g.address, address)) {
+            self.allocator.free(g.alias);
+            g.alias = owned_alias;
+            return;
+        };
+        const owned_addr = try self.allocator.dupe(u8, address);
+        errdefer self.allocator.free(owned_addr);
+        try r.grants.append(self.allocator, .{ .address = owned_addr, .alias = owned_alias });
+    }
+
+    /// Member: the aliases the hub decided for this host's peers.
+    fn applyGrants(self: *Store, grants: []const Grant, now: i64) void {
+        for (grants) |g| {
+            if (!peeraddr.validAlias(g.alias)) continue;
+            const box = self.boxOf(g.address) orelse continue;
+            if (box.isRoute() or std.mem.eql(u8, box.alias, g.alias)) continue;
+            self.giveAlias(box, .{ .alias = g.alias }, now) catch self.warnf("peermail: out of memory taking the hub's alias {s} for {s}", .{ g.alias, g.address });
+        }
+    }
+
+    /// Migration, once per mailbox: a durable address from before aliases
+    /// (a name, not a minted `p-`/`n-`/`anon-` one) takes its own slug, or
+    /// the next free suffix (nothing is merged), in address order.
+    fn migrateLegacy(self: *Store) void {
+        var legacy: std.ArrayList(*Box) = .empty;
+        defer legacy.deinit(self.allocator);
+        for (self.boxes.items) |b| {
+            if (b.isRoute() or !b.durable or b.alias.len > 0 or peeraddr.isReservedName(b.address)) continue;
+            legacy.append(self.allocator, b) catch return self.warnf("peermail: out of memory migrating mailboxes to aliases", .{});
+        }
+        std.mem.sort(*Box, legacy.items, {}, struct {
+            fn lt(_: void, x: *Box, y: *Box) bool {
+                return std.mem.lessThan(u8, x.address, y.address);
+            }
+        }.lt);
+        for (legacy.items) |b| {
+            var sb: [peeraddr.SLUG_MAX]u8 = undefined;
+            var ab: [peeraddr.ALIAS_MAX]u8 = undefined;
+            const slug = peeraddr.slugify(&sb, b.address) orelse continue;
+            const ch = self.chooseAlias(&ab, slug, b.address, .free_only) orelse continue;
+            b.alias = self.allocator.dupe(u8, ch.alias) catch return self.warnf("peermail: out of memory migrating mailboxes to aliases", .{});
+            self.writeMeta(b);
+        }
     }
 
     // ------------------------------------------------------- federation
@@ -1401,6 +1852,7 @@ pub const Store = struct {
                 .model = try a.dupe(u8, p.model),
                 .last_notification = try a.dupe(u8, p.last_notification),
                 .subject = try a.dupe(u8, p.subject),
+                .alias = try a.dupe(u8, p.alias),
                 .via_host = via,
                 // A hub judges its own links; a member keeps the hub's view.
                 .link = if (self.hub) null else p.link,
@@ -1412,8 +1864,13 @@ pub const Store = struct {
             for (rl.hosts[0..hosts.len], hosts) |h, *o| o.* = .{ .host = try a.dupe(u8, h.host), .link = h.link, .last_seen_ms = RelayAge.seenAt(now, h.last_seen_ms) };
             r.hosts = hosts;
         }
-        // The hub passes every host's peers on to the others.
-        if (self.hub) self.presence_dirty = true;
+        // The hub judges every claim against the network and passes every
+        // host's peers on to the others; a member takes what it decided.
+        if (self.hub) {
+            try self.judgeAliases(r);
+            self.presence_dirty = true;
+        } else self.applyGrants(rl.grants, now);
+        self.reconcile(now);
     }
 
     fn takeMail(self: *Store, r: *Route, rl: Relay, now: i64) Error!void {
@@ -1439,7 +1896,7 @@ pub const Store = struct {
         var idb: [ID_LEN]u8 = undefined;
         const res = try self.route(.{
             .id = rl.id,
-            .from = .{ .address = self.inAddr(&fb, r, rl.from.address), .host = rl.from.host, .cwd = rl.from.cwd, .app = rl.from.app, .pid = rl.from.pid },
+            .from = .{ .address = self.inAddr(&fb, r, rl.from.address), .host = rl.from.host, .cwd = rl.from.cwd, .app = rl.from.app, .pid = rl.from.pid, .alias = rl.from.alias },
             .to = to,
             .sent_ms = RelayAge.at(now, rl.age_ms),
             .text = rl.text,
@@ -1508,7 +1965,12 @@ pub const Store = struct {
             p.address = try a.dupe(u8, self.outAddr(&b, r, p.address));
             p.last_seen_ms = RelayAge.seenAgo(now, p.last_seen_ms);
         }
-        _ = self.emit.call(r.conn, .{ .relay = .{ .kind = .presence, .peers = peers.items, .hosts = hosts.items } });
+        const grants = try a.alloc(Grant, r.grants.items.len);
+        for (r.grants.items, grants) |g, *o| {
+            var b: [peeraddr.ADDRESS_MAX]u8 = undefined;
+            o.* = .{ .address = try a.dupe(u8, self.outAddr(&b, r, g.address)), .alias = g.alias };
+        }
+        _ = self.emit.call(r.conn, .{ .relay = .{ .kind = .presence, .peers = peers.items, .hosts = hosts.items, .grants = grants } });
     }
 
     /// Relay one outbound item on `r`'s live link.
@@ -1520,7 +1982,7 @@ pub const Store = struct {
             .message => .{
                 .kind = .mail,
                 .id = it.id,
-                .from = .{ .address = self.outAddr(&fb, r, it.from.address), .host = it.from.host, .cwd = it.from.cwd, .app = it.from.app, .pid = it.from.pid },
+                .from = .{ .address = self.outAddr(&fb, r, it.from.address), .host = it.from.host, .cwd = it.from.cwd, .app = it.from.app, .pid = it.from.pid, .alias = it.from.alias },
                 .to = self.outAddr(&tb, r, it.to),
                 .age_ms = RelayAge.of(now, it.sent_ms),
                 .text = it.text,
@@ -1565,6 +2027,7 @@ pub const Store = struct {
             .client => |w| _ = self.emit.call(w.conn, .{ .reply = self.replyFor(w.conn, .{ .req = w.req, .id = p.id(), .outcome = ans.outcome, .reason = ans.reason, .to_state = ans.to_state }) }),
             .link => |lc| if (self.routeByConn(lc)) |o| self.answerStored(o, p.id(), .message, p.to(), ans),
             .multi => |serial| self.answerMulti(serial, p.to(), ans),
+            .none => {},
         }
     }
 
@@ -1718,6 +2181,8 @@ pub const Store = struct {
 
     fn freeRoute(self: *Store, r: *Route) void {
         r.arena.deinit();
+        for (r.grants.items) |g| freeGrant(self.allocator, g);
+        r.grants.deinit(self.allocator);
         self.allocator.free(r.name);
         self.allocator.free(r.host);
         self.allocator.destroy(r);
@@ -1756,6 +2221,7 @@ pub const Store = struct {
             };
             self.loadFile(address);
         }
+        self.migrateLegacy();
     }
 
     fn metaPath(self: *Store, buf: []u8, address: []const u8) ?[]const u8 {
@@ -1768,16 +2234,11 @@ pub const Store = struct {
         if (!box.durable or self.dir == null) return;
         var pbuf: [4096]u8 = undefined;
         const path = self.metaPath(&pbuf, box.address) orelse return;
-        if (box.subject.len == 0) {
-            var z: [4096]u8 = undefined;
-            const pz = pathz.pathZ(&z, path) catch return;
-            if (c.unlink(pz) != 0 and std.c._errno().* != c.ENOENT) self.warnf("peermail: cannot remove {s}", .{path});
-            return;
-        }
-        pathz.makeDirs(self.dir.?, 0o700) catch return self.warnf("peermail: cannot create {s}; the subject of {s} is kept in memory only", .{ self.dir.?, box.address });
+        if (box.subject.len == 0 and box.alias.len == 0 and !box.titled) return self.unlinkPath(path);
+        pathz.makeDirs(self.dir.?, 0o700) catch return self.warnf("peermail: cannot create {s}; the subject and alias of {s} are kept in memory only", .{ self.dir.?, box.address });
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
-        std.json.Stringify.value(AddressMeta{ .subject = box.subject }, .{}, &aw.writer) catch return self.warnf("peermail: out of memory writing {s}", .{path});
+        std.json.Stringify.value(AddressMeta{ .subject = box.subject, .alias = box.alias, .titled = box.titled }, .{}, &aw.writer) catch return self.warnf("peermail: out of memory writing {s}", .{path});
         atomicwrite.writeFileExact(path, aw.written(), 0o600) catch |e| self.warnf("peermail: cannot write {s} ({s})", .{ path, @errorName(e) });
     }
 
@@ -1788,8 +2249,18 @@ pub const Store = struct {
         const path = self.metaPath(&pbuf, box.address) orelse return;
         const parsed = readfile.json(AddressMeta, self.allocator, path, 4096) orelse return;
         defer parsed.deinit();
-        checkSubject(parsed.value.subject) catch return self.warnf("peermail: {s}: the subject is refused, ignored", .{path});
-        const owned = self.allocator.dupe(u8, parsed.value.subject) catch return;
+        const m = parsed.value;
+        box.titled = m.titled;
+        if (m.alias.len > 0) {
+            if (!peeraddr.validAlias(m.alias)) {
+                self.warnf("peermail: {s}: the alias is not one, ignored", .{path});
+            } else if (self.allocator.dupe(u8, m.alias)) |owned| {
+                self.allocator.free(box.alias);
+                box.alias = owned;
+            } else |_| {}
+        }
+        checkSubject(m.subject) catch return self.warnf("peermail: {s}: the subject is refused, ignored", .{path});
+        const owned = self.allocator.dupe(u8, m.subject) catch return;
         self.allocator.free(box.subject);
         box.subject = owned;
     }
@@ -1994,6 +2465,7 @@ pub const Store = struct {
             .cwd = try a.dupe(u8, item.from.cwd),
             .app = try a.dupe(u8, item.from.app),
             .pid = item.from.pid,
+            .alias = try a.dupe(u8, item.from.alias),
         };
         it.to = try a.dupe(u8, item.to);
         it.text = try a.dupe(u8, item.text);
@@ -2135,6 +2607,7 @@ pub const Store = struct {
         self.allocator.free(p.facts_json);
         self.allocator.free(p.model);
         self.allocator.free(p.last_notification);
+        self.allocator.free(p.alias_refused);
         self.allocator.destroy(p);
     }
 
@@ -2143,6 +2616,7 @@ pub const Store = struct {
         b.items.deinit(self.allocator);
         self.allocator.free(b.address);
         self.allocator.free(b.subject);
+        self.allocator.free(b.alias);
         self.allocator.destroy(b);
     }
 };
@@ -2155,6 +2629,19 @@ fn freeStored(allocator: std.mem.Allocator, s: *Stored) void {
 fn freeMulti(allocator: std.mem.Allocator, m: *Multi) void {
     m.arena.deinit();
     allocator.destroy(m);
+}
+
+fn freeGrant(allocator: std.mem.Allocator, g: Grant) void {
+    allocator.free(g.address);
+    allocator.free(g.alias);
+}
+
+/// `text` cut to at most `max` bytes, never inside a UTF-8 sequence.
+pub fn utf8Prefix(text: []const u8, max: usize) []const u8 {
+    if (text.len <= max) return text;
+    var n = max;
+    while (n > 0 and (text[n] & 0xc0) == 0x80) n -= 1;
+    return text[0..n];
 }
 
 /// What `peerwake` judges of a live peer.
@@ -2238,6 +2725,7 @@ const Rec = struct {
         req: u32 = 0,
         relay: ?RelayKind = null,
         sender_subject: []const u8 = "",
+        from_alias: []const u8 = "",
         quiet: bool = false,
         results: []const RecipientResult = &.{},
     };
@@ -2259,11 +2747,12 @@ const Rec = struct {
         const a = self.arena.allocator();
         for (self.dead.items) |d| if (d == conn) return false;
         const g: Got = switch (out) {
-            .deliver => |d| .{ .conn = conn, .kind = .deliver, .id = a.dupe(u8, d.id) catch "", .to = a.dupe(u8, d.to) catch "", .queued = d.queued, .age_ms = d.age_ms, .text = a.dupe(u8, d.text) catch "", .from = a.dupe(u8, d.from.address) catch "", .sender_state = d.sender_state, .sender_subject = a.dupe(u8, d.sender_subject) catch "", .quiet = d.quiet },
+            .deliver => |d| .{ .conn = conn, .kind = .deliver, .id = a.dupe(u8, d.id) catch "", .to = a.dupe(u8, d.to) catch "", .queued = d.queued, .age_ms = d.age_ms, .text = a.dupe(u8, d.text) catch "", .from = a.dupe(u8, d.from.address) catch "", .sender_state = d.sender_state, .sender_subject = a.dupe(u8, d.sender_subject) catch "", .quiet = d.quiet, .from_alias = a.dupe(u8, d.from.alias) catch "" },
             .event => |e| .{ .conn = conn, .kind = .event, .id = a.dupe(u8, e.id) catch "", .outcome = e.outcome, .reason = e.reason, .to = a.dupe(u8, e.to) catch "", .queued_ms = e.queued_ms, .quiet = e.quiet },
             .reply => |r| .{ .conn = conn, .kind = .reply, .id = a.dupe(u8, r.id) catch "", .outcome = r.outcome, .reason = r.reason, .to_state = r.to_state, .req = r.req, .results = dupeResults(a, r.results) },
             .relay => |r| .{ .conn = conn, .kind = .relay, .id = a.dupe(u8, r.id) catch "", .relay = r.kind, .outcome = r.outcome, .reason = r.reason },
             .warn => |w| .{ .conn = conn, .kind = .warn, .text = a.dupe(u8, w) catch "" },
+            .self_changed => .{ .conn = conn, .kind = .self_changed },
         };
         self.got.append(a, g) catch return false;
         return out != .warn;
@@ -2530,8 +3019,9 @@ test "TTL expiry: the recipient keeps a tombstone, an offline sender finds the e
     s.sweep(1099);
     try t.expectEqual(@as(usize, 0), rec.count(0, .event));
     // 2. Due: nobody live to tell, so the event waits in Zenit's mailbox.
+    const emitted = rec.got.items.len;
     s.sweep(1100);
-    try t.expectEqual(@as(usize, 0), rec.got.items.len);
+    try t.expectEqual(emitted, rec.got.items.len);
     // 3. Zenit comes back and gets the event.
     try s.register(3, reg("Zenit", true), 1200);
     s.flush(3, 1200);
@@ -2728,6 +3218,260 @@ test "federation: a peer's subject crosses the hub with its presence and its mai
     try net.mem.setSubject("alice", "");
     try net.pump(300);
     try t.expectEqualStrings("", (listed(&net.hub, a, "box/alice") orelse return error.TestUnexpectedResult).subject);
+}
+
+/// A current server in the pane session whose origin id starts `hex8`.
+fn regPane(comptime hex8: []const u8) RegisterReq {
+    return regSlow(peeraddr.PANE_PREFIX ++ hex8);
+}
+
+test "aliases: the first title is the alias and the default subject; a live holder forces a suffix; the same address keeps it" {
+    var td = pathz.TempDir.make("peermail-alias") orelse return error.SkipZigTest;
+    defer td.remove();
+    var rec = Rec.init();
+    defer rec.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var idb: [ID_LEN]u8 = undefined;
+    {
+        var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
+        defer s.deinit();
+        // 1. A pane peer offered its session's title (by the daemon, no GUI
+        // involved): the slug is its alias, the title its subject.
+        try s.register(1, regPane("00000001"), 0);
+        try t.expectEqualStrings("", s.aliasOf("p-00000001"));
+        try s.offerTitle("p-00000001", "Zenit", 0);
+        try t.expectEqualStrings("zenit", s.aliasOf("p-00000001"));
+        try t.expectEqualStrings("Zenit", s.subjectOf("p-00000001"));
+        try t.expectEqualStrings("zenit", (try s.selfInfo(a, 1)).?.alias);
+        try t.expectEqualStrings("zenit", (listed(&s, a, "p-00000001") orelse return error.TestUnexpectedResult).alias);
+        // 2. A second LIVE session of the same title: zenit-1, then zenit-2.
+        try s.register(2, regPane("00000002"), 0);
+        try s.offerTitle("p-00000002", "zenit", 0);
+        try t.expectEqualStrings("zenit-1", s.aliasOf("p-00000002"));
+        try s.register(5, regPane("00000005"), 0);
+        try s.offerTitle("p-00000005", "ZENIT!", 0);
+        try t.expectEqualStrings("zenit-2", s.aliasOf("p-00000005"));
+        // 3. A later title moves neither the alias nor the subject, and a
+        // cleared subject stays cleared.
+        try s.setSubject("p-00000001", "");
+        try s.offerTitle("p-00000001", "Other", 10);
+        try t.expectEqualStrings("zenit", s.aliasOf("p-00000001"));
+        try t.expectEqualStrings("", s.subjectOf("p-00000001"));
+        // 4. Mail by alias (its slug finds it too), stamped with the sender's alias.
+        try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 2, "zenit", "hi", 20, &idb)).outcome);
+        try t.expectEqualStrings("p-00000002", rec.last().from);
+        try t.expectEqualStrings("zenit-1", rec.last().from_alias);
+        try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 2, "Zenit", "hi", 21, &idb)).outcome);
+        try t.expectEqualStrings("p-00000001", rec.last().to);
+        try t.expectEqual(@as(?RefuseReason, .self), (try sendText(&s, 2, "zenit-1", "me", 22, &idb)).reason);
+        // 5. The same address on a new connection (a reconnect, /mcp) keeps it.
+        s.deregister(1, 30);
+        try s.register(3, regPane("00000001"), 40);
+        try s.offerTitle("p-00000001", "Zenit", 40);
+        try t.expectEqualStrings("zenit", s.aliasOf("p-00000001"));
+        try t.expectEqualStrings("zenit-1", s.aliasOf("p-00000002"));
+        // 6. A title whose slug reads as an address gives no alias.
+        try s.register(4, regPane("00000004"), 50);
+        try s.offerTitle("p-00000004", "p-dead", 50);
+        try t.expectEqualStrings("", s.aliasOf("p-00000004"));
+    }
+    // 7. A broker restart: the aliases and the titled mark come back.
+    {
+        var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
+        defer s.deinit();
+        s.load();
+        try t.expectEqualStrings("zenit", s.aliasOf("p-00000001"));
+        try t.expectEqualStrings("zenit-1", s.aliasOf("p-00000002"));
+        try s.register(1, regPane("00000001"), 0);
+        try s.offerTitle("p-00000001", "New title", 0);
+        try t.expectEqualStrings("", s.subjectOf("p-00000001"));
+        try t.expectEqualStrings("zenit", s.aliasOf("p-00000001"));
+    }
+}
+
+test "aliases: an explicit request takes a gone holder's alias and is refused a live one's; a requested one is suffixed" {
+    var rec = Rec.init();
+    defer rec.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var s = try Store.init(t.allocator, .{ .host = "h", .emit = rec.emit() });
+    defer s.deinit();
+    try s.register(1, regPane("00000001"), 0);
+    try s.offerTitle("p-00000001", "zenit", 0);
+    // 1. Explicit, live-held: refused, naming the holder.
+    var ask = regPane("00000002");
+    ask.alias = "zenit";
+    ask.alias_explicit = true;
+    try s.register(2, ask, 0);
+    const me = (try s.selfInfo(a, 2)).?;
+    try t.expectEqualStrings("", me.alias);
+    try t.expectEqualStrings("p-00000001", me.alias_refused);
+    // 2. Requested (a --name): the next suffix.
+    ask.alias_explicit = false;
+    try s.register(2, ask, 1);
+    try t.expectEqualStrings("zenit-1", s.aliasOf("p-00000002"));
+    try t.expectEqualStrings("", (try s.selfInfo(a, 2)).?.alias_refused);
+    // 3. The holder leaves: an explicit request resumes it and the peer is
+    // told its own view again (`self_changed`).
+    s.deregister(1, 2);
+    ask.alias_explicit = true;
+    const before = rec.count(2, .self_changed);
+    try s.register(2, ask, 3);
+    try t.expectEqualStrings("zenit", s.aliasOf("p-00000002"));
+    try t.expect(rec.count(2, .self_changed) > before);
+    try t.expect(!s.knows("p-00000001"));
+}
+
+test "aliases: a new session resumes a gone holder's alias with its mail and subject; its old address follows the alias" {
+    var td = pathz.TempDir.make("peermail-resume") orelse return error.SkipZigTest;
+    defer td.remove();
+    var rec = Rec.init();
+    defer rec.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var idb: [ID_LEN]u8 = undefined;
+    {
+        var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
+        defer s.deinit();
+        try s.register(1, regPane("00000001"), 0);
+        try s.offerTitle("p-00000001", "Zenit", 0);
+        try s.setSubject("p-00000001", "template links");
+        try s.register(9, regPane("00000009"), 0);
+        // 1. The session ends (a reboot): mail to its alias waits.
+        s.deregister(1, 10);
+        for ([_][]const u8{ "one", "two" }, 0..) |text, k| {
+            const r = try sendText(&s, 9, "zenit", text, @intCast(20 + k), &idb);
+            try t.expectEqual(PeerOutcome.queued, r.outcome);
+        }
+    }
+    // 2. After a broker restart a NEW session titled Zenit resumes zenit
+    // (not zenit-1): the mail and the subject move to its address.
+    {
+        var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
+        defer s.deinit();
+        s.load();
+        try s.register(9, regPane("00000009"), 100);
+        try s.register(2, regPane("00000002"), 100);
+        try s.offerTitle("p-00000002", "Zenit", 100);
+        try t.expectEqualStrings("zenit", s.aliasOf("p-00000002"));
+        try t.expectEqualStrings("template links", s.subjectOf("p-00000002"));
+        try t.expectEqual(@as(usize, 2), rec.count(2, .deliver));
+        try t.expectEqualStrings("two", rec.last().text);
+        try t.expect(rec.last().queued);
+        try t.expect(!s.knows("p-00000001"));
+        try t.expect(listed(&s, a, "p-00000001") == null);
+        // 3. Mail still sent to the old address follows the alias.
+        try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 9, "p-00000001", "late", 110, &idb)).outcome);
+        try t.expectEqualStrings("p-00000002", rec.last().to);
+        try t.expectEqual(@as(usize, 2), s.ack(2, &.{ (try a.dupe(u8, rec.got.items[rec.got.items.len - 2].id)), try a.dupe(u8, rec.last().id) }));
+    }
+    // 4. The old address's files are gone; the new one keeps what moved.
+    {
+        var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
+        defer s.deinit();
+        s.load();
+        try t.expect(!s.knows("p-00000001"));
+        try t.expectEqualStrings("zenit", s.aliasOf("p-00000002"));
+        try t.expectEqual(@as(u32, 1), (listed(&s, a, "p-00000002") orelse return error.TestUnexpectedResult).pending);
+    }
+}
+
+test "aliases: migration gives a named mailbox from before aliases its slug, which a session of that title resumes" {
+    var td = pathz.TempDir.make("peermail-migrate") orelse return error.SkipZigTest;
+    defer td.remove();
+    var rec = Rec.init();
+    defer rec.deinit();
+    var pbuf: [4096]u8 = undefined;
+    // An older broker's files: "Qq" with 1 pending and a subject, and "qq".
+    const line = "{\"kind\":\"message\",\"id\":\"m-00000001\",\"from\":{\"address\":\"alice\"},\"to\":\"Qq\",\"sent_ms\":5,\"text\":\"for qq\",\"queued\":true}\n";
+    try pathz.makeDirs(td.path(), 0o700);
+    try atomicwrite.writeFileExact(try std.fmt.bufPrint(&pbuf, "{s}/Qq.jsonl", .{td.path()}), line, 0o600);
+    try atomicwrite.writeFileExact(try std.fmt.bufPrint(&pbuf, "{s}/Qq.meta.json", .{td.path()}), "{\"subject\":\"Folio\"}", 0o600);
+    try atomicwrite.writeFileExact(try std.fmt.bufPrint(&pbuf, "{s}/qq.jsonl", .{td.path()}), "", 0o600);
+    {
+        var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
+        defer s.deinit();
+        s.load();
+        // 1. Each takes its slug, the later in address order a suffix: nothing merged.
+        try t.expectEqualStrings("qq", s.aliasOf("Qq"));
+        try t.expectEqualStrings("qq-1", s.aliasOf("qq"));
+        try t.expectEqualStrings("Folio", s.subjectOf("Qq"));
+    }
+    var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
+    defer s.deinit();
+    s.load();
+    // 2. One-way: the restart reads the aliases back.
+    try t.expectEqualStrings("qq", s.aliasOf("Qq"));
+    try t.expectEqualStrings("qq-1", s.aliasOf("qq"));
+    // 3. A session titled "Qq" resumes qq and gets the mail and the subject.
+    try s.register(1, regPane("00000001"), 100);
+    try s.offerTitle("p-00000001", "Qq", 100);
+    try t.expectEqualStrings("qq", s.aliasOf("p-00000001"));
+    try t.expectEqualStrings("Folio", s.subjectOf("p-00000001"));
+    try t.expectEqualStrings("for qq", rec.last().text);
+    try t.expect(!s.knows("Qq"));
+    // 4. An older server registering its name gets its slug the same way.
+    try s.register(2, reg("Artefacts", true), 110);
+    try t.expectEqualStrings("artefacts", s.aliasOf("Artefacts"));
+}
+
+test "aliases: the hub keeps an alias unique across hosts, and a session on another host resumes a gone one with its mail" {
+    var net: Net = undefined;
+    try net.init(null);
+    defer net.deinit();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var idb: [ID_LEN]u8 = undefined;
+    // 1. Unlinked, each host gives its own "zenit" session zenit (provisional).
+    try net.hub.register(1, regPane("000000a1"), 0);
+    try net.hub.offerTitle("p-000000a1", "zenit", 0);
+    try net.mem.register(1, regPane("000000b1"), 0);
+    try net.mem.offerTitle("p-000000b1", "zenit", 0);
+    try t.expectEqualStrings("zenit", net.mem.aliasOf("p-000000b1"));
+    // 2. Link-up: the hub keeps the alias it held and suffixes the member's
+    // newer claim, which the member takes; both sides list both.
+    try net.connect(100);
+    try net.pump(100);
+    try net.pump(110);
+    try t.expectEqualStrings("zenit", net.hub.aliasOf("p-000000a1"));
+    try t.expectEqualStrings("zenit-1", net.mem.aliasOf("p-000000b1"));
+    try t.expectEqualStrings("zenit-1", (listed(&net.hub, a, "box/p-000000b1") orelse return error.TestUnexpectedResult).alias);
+    try t.expectEqualStrings("zenit", (listed(&net.mem, a, "hub/p-000000a1") orelse return error.TestUnexpectedResult).alias);
+    try t.expect(net.mem_rec.count(1, .self_changed) > 0);
+    // 3. An alias needs no host: the member reaches the hub's zenit by it.
+    _ = try net.mem.send(1, .{ .to = "zenit", .text = "hi hub" }, 200, &idb);
+    try net.pump(200);
+    const d = lastOf(&net.hub_rec, 1, .deliver) orelse return error.TestUnexpectedResult;
+    try t.expectEqualStrings("hi hub", d.text);
+    try t.expectEqualStrings("box/p-000000b1", d.from);
+    try t.expectEqualStrings("zenit-1", d.from_alias);
+    // 4. A new member session of the same title, linked: zenit-2.
+    try net.mem.register(2, regPane("000000b2"), 300);
+    try net.mem.offerTitle("p-000000b2", "zenit", 300);
+    try t.expectEqualStrings("zenit-2", net.mem.aliasOf("p-000000b2"));
+    try net.pump(300);
+    try t.expectEqualStrings("zenit-2", net.mem.aliasOf("p-000000b2"));
+    // 5. The hub's zenit ends; mail to zenit waits for it there.
+    try net.hub.register(2, regPane("000000a2"), 400);
+    net.hub.deregister(1, 400);
+    try net.pump(400);
+    try t.expectEqual(PeerOutcome.queued, (try net.hub.send(2, .{ .to = "zenit", .text = "waiting" }, 410, &idb)).outcome);
+    // 6. A new member session titled zenit resumes it across hosts: the
+    // hub forwards the waiting mail to it and forgets the old address.
+    try net.mem.register(3, regPane("000000b3"), 500);
+    try net.mem.offerTitle("p-000000b3", "zenit", 500);
+    try t.expectEqualStrings("zenit", net.mem.aliasOf("p-000000b3"));
+    try net.pump(500);
+    try net.pump(510);
+    const fwd = lastOf(&net.mem_rec, 3, .deliver) orelse return error.TestUnexpectedResult;
+    try t.expectEqualStrings("waiting", fwd.text);
+    try t.expect(!net.hub.knows("p-000000a1"));
+    try t.expectEqualStrings("zenit", (listed(&net.hub, a, "box/p-000000b3") orelse return error.TestUnexpectedResult).alias);
 }
 
 test "the wire bodies round-trip their vocabulary by name" {

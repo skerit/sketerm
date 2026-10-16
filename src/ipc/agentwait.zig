@@ -145,6 +145,8 @@ pub const Meta = struct {
     sender_state: ?[]const u8 = null,
     /// Peer: the sender's user-set subject, absent when none.
     sender_subject: ?[]const u8 = null,
+    /// Peer: the sender's alias when it sent, absent when none.
+    from_alias: ?[]const u8 = null,
 };
 
 /// `Presence.kind`: the first line is a presence post, not a subscription.
@@ -153,6 +155,8 @@ pub const PRESENCE_KIND = "presence";
 pub const STATUSLINE_EVENT = "statusline";
 /// `Presence.event` of `sketerm peer subject`'s post.
 pub const SUBJECT_EVENT = "subject";
+/// `Presence.event` of `sketerm peer alias`'s post.
+pub const ALIAS_EVENT = "alias";
 
 /// One presence post: what a hook or the statusline saw. The server maps
 /// `event` (+ `notification`) to a `vocab.PeerState` (`mcp_hook.stateFor`);
@@ -171,6 +175,9 @@ pub const Presence = struct {
     /// rides this line rather than a line kind of its own: one parse, one
     /// handler, one re-registration.
     subject: ?[]const u8 = null,
+    /// The alias the user set (`sketerm peer alias`), null leaves it: a
+    /// presence fact like the subject, asked of the broker explicitly.
+    alias: ?[]const u8 = null,
     /// The session's next turn begins: answer with its slow peer mail
     /// (`content` of the end line).
     take_slow: bool = false,
