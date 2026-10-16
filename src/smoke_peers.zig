@@ -439,6 +439,10 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
     // 4. alice -> bob: delivered.
     const hello = send(&alice, arena, "bob", "hello bob, this is the body", "4. send to live bob");
     expectStr(hello, "outcome", "delivered", "4. outcome to a live server");
+    // bob's client is no Claude Code with the channel and runs no follower:
+    // nothing is pushed into its session, and the sender is told so.
+    if (!boolOf(hello, "to_polls", "4.")) fail("4. a recipient nothing is pushed into does not read as polling");
+    if (!boolOf(listed(&alice, arena, "bob", "4. list") orelse fail("4. bob not listed"), "polls", "4.")) fail("4. peer_list does not mark bob polls");
     const hello_id = str(hello, "id", "4.");
     // 5. bob's peer_read returns it with the composed text.
     {
@@ -622,6 +626,23 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
     // 20. handed out by the channel: peer_read does not repeat it.
     expectNothing(&dave, arena, "20. dave peer_read after the channel");
     std.debug.print("smoke: peers: Claude Code channel delivery ok\n", .{});
+    // 20a. A Claude Code started without our channel (its nearest channel
+    //      option names another server): its instructions say so once,
+    //      with the launch line, and a message to it reads as polling.
+    {
+        var erin = stage.server("erin", &.{ "--channels", "server:not-sketerm" });
+        const reply = erin.initializeAs("claude-code");
+        contains(reply, "Peer messages are NOT pushed into this session", "20a. the instructions tell the session");
+        contains(reply, "--dangerously-load-development-channels server:sketerm", "20a. the launch line");
+        if (boolOf(registered(&erin, arena, "20a. erin"), "pushed", "20a.")) fail("20a. a session without the channel reads as pushed");
+        const r = send(&alice, arena, "erin", "you poll", "20a. send to erin");
+        expectStr(r, "outcome", "delivered", "20a. outcome");
+        if (!boolOf(r, "to_polls", "20a.")) fail("20a. the sender is not told the recipient polls");
+        // dave has the channel: nothing to tell its senders.
+        if (send(&alice, arena, "dave", "you are pushed to", "20a. send to dave").get("to_polls") != null) fail("20a. a channel session reads as polling");
+        erin.closeStdinWait();
+    }
+    std.debug.print("smoke: peers: a session nothing is pushed into reads as polling ok\n", .{});
 
     // -- h. presence from the session's own hooks and status line --
     const hook_in = struct {

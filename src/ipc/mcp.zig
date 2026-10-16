@@ -1207,7 +1207,7 @@ fn writeOut(line: []const u8) void {
 }
 
 /// The name a Claude Code channel entry must give this server.
-var channel_name: []const u8 = agentpush.DEFAULT_CHANNEL_NAME;
+pub var channel_name: []const u8 = agentpush.DEFAULT_CHANNEL_NAME;
 
 /// The push route for a session whose `initialize` came from
 /// `client_name`: a channel only when the agent tools are offered, the
@@ -1380,9 +1380,11 @@ pub fn handleMessage(arena: std.mem.Allocator, backend: Backend, line: []const u
         // system prompt, so they only name tools this connection can use.
         if (agents_offered or peers_offered) {
             w.writeAll(",\"instructions\":") catch return null;
-            const text = if (agents_offered and peers_offered)
+            const both = if (agents_offered and peers_offered)
                 std.fmt.allocPrint(arena, "{s} {s}", .{ mcp_agent.instructions(route), mcp_peer.INSTRUCTIONS }) catch return null
             else if (agents_offered) mcp_agent.instructions(route) else mcp_peer.INSTRUCTIONS;
+            // A Claude Code session started without the channel learns it once, here.
+            const text = if (peers_offered) (if (mcp_peer.pollsNote(arena, channel_name)) |note| std.fmt.allocPrint(arena, "{s} {s}", .{ both, note }) catch return null else both) else both;
             std.json.Stringify.value(text, .{}, w) catch return null;
         }
         w.writeAll("}") catch return null;

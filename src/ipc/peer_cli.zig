@@ -54,6 +54,9 @@ pub const ListLine = struct {
     host: ?[]const u8 = null,
     app: ?[]const u8 = null,
     state: []const u8,
+    /// Its session gets no pushed messages: mail waits for its next turn
+    /// or `peer_read`. Absent when it is pushed to, or not known.
+    polls: ?bool = null,
     /// Absent while the state is unknown.
     attention: ?[]const u8 = null,
     live: bool,
@@ -113,6 +116,7 @@ pub fn listLine(pi: peermail.PeerInfo, is_self: bool, detail: bool) ListLine {
         .state = @tagName(pi.state),
         .attention = if (pi.state.attention()) |at| @tagName(at) else null,
         .live = pi.live,
+        .polls = if (pi.live and pi.polls) true else null,
         .pending = pi.pending,
         .last_seen_ms = pi.last_seen_ms,
         .model = nonEmpty(pi.model),
@@ -200,6 +204,7 @@ pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []c
     var rows: usize = 0;
     var omitted: usize = 0;
     var unknown = false;
+    var polling = false;
     for (peers) |pi| {
         if (isSelf(pi, self)) continue;
         if (!listed(pi)) {
@@ -220,6 +225,10 @@ pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []c
             if (pi.last_seen_ms > 0) try w.print(" {s}", .{clock.span(&buf, now_ms - pi.last_seen_ms, .short)});
         } else try w.print("  {s}", .{if (pi.live) @tagName(pi.state) else "offline"});
         if (pi.live and pi.state == .unknown) unknown = true;
+        if (pi.live and pi.polls) {
+            polling = true;
+            try w.writeAll("  polls");
+        }
         if (show_app and pi.app.len > 0) try w.print("  {s}", .{pi.app});
         if (peerwake.contextOf(pi.facts)) |ctx| try w.print("  ctx {s}", .{numtext.count(&buf, ctx)});
         if (show_model and pi.model.len > 0) try w.print("  {s}", .{pi.model});
@@ -251,6 +260,23 @@ pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []c
     // The state comes only from a peer's own hooks; on a host whose client
     // config never got them, every peer there reads unknown.
     if (unknown) try w.writeAll("unknown = its client sends no presence: run `sketerm mcp setup` on its host, for the config dir it runs with\n");
+    if (polling) try w.writeAll(POLLS_LINE ++ "\n");
+}
+
+/// What `polls` in a list means, once per list.
+pub const POLLS_LINE = "polls = no message is pushed into its session (Claude Code started without the sketerm channel): mail waits for its next turn or peer_read";
+
+/// One recipient's outcome as a sender reads it, for `peer_send` and
+/// `sketerm peer send` alike: the id, the recipient, the outcome and its
+/// reason, the recipient's state, and whether it polls.
+pub fn sentLine(arena: std.mem.Allocator, id: []const u8, x: peermail.RecipientResult) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.print("{s} to {s}: {s}", .{ if (id.len > 0) id else "message", x.to, @tagName(x.outcome) });
+    if (x.reason) |why| try w.print(" ({s}: {s})", .{ @tagName(why), why.describe() });
+    if (x.to_state) |s| try w.print(", it is {s}", .{@tagName(s)});
+    if (x.to_polls) try w.writeAll("; it polls (nothing is pushed into its session), so this may wait for its next turn");
+    return aw.written();
 }
 
 // ── what a received item prints as ──────────────────────────────
@@ -298,6 +324,7 @@ const SentLine = struct {
     outcome: []const u8,
     reason: ?[]const u8 = null,
     to_state: ?[]const u8 = null,
+    to_polls: ?bool = null,
 };
 
 fn jsonLine(arena: std.mem.Allocator, v: anytype) error{OutOfMemory}![]const u8 {
@@ -331,7 +358,7 @@ pub fn itemText(arena: std.mem.Allocator, item: agentpush.PeerItem, json: bool) 
 /// What a send printed: one line per recipient (a `to_list` send answers in
 /// `results`, one id for all).
 fn sentText(arena: std.mem.Allocator, from: []const u8, to: []const u8, r: peermail.SendReply, json: bool) ![]const u8 {
-    const one = [_]peermail.RecipientResult{.{ .to = to, .outcome = r.outcome, .reason = r.reason, .to_state = r.to_state }};
+    const one = [_]peermail.RecipientResult{.{ .to = to, .outcome = r.outcome, .reason = r.reason, .to_state = r.to_state, .to_polls = r.to_polls }};
     const each: []const peermail.RecipientResult = if (r.results.len > 0) r.results else &one;
     var out: std.ArrayList(u8) = .empty;
     for (each) |x| {
@@ -342,10 +369,8 @@ fn sentText(arena: std.mem.Allocator, from: []const u8, to: []const u8, r: peerm
             .outcome = @tagName(x.outcome),
             .reason = if (x.reason) |why| @tagName(why) else null,
             .to_state = if (x.to_state) |st| @tagName(st) else null,
-        }) else if (x.reason) |why|
-            try std.fmt.allocPrint(arena, "{s} to {s}: {s} ({s}: {s})\n", .{ if (r.id.len > 0) r.id else "message", x.to, @tagName(x.outcome), @tagName(why), why.describe() })
-        else
-            try std.fmt.allocPrint(arena, "{s} to {s}: {s}\n", .{ r.id, x.to, @tagName(x.outcome) });
+            .to_polls = if (x.to_polls) true else null,
+        }) else try std.fmt.allocPrint(arena, "{s}\n", .{try sentLine(arena, r.id, x)});
         try out.appendSlice(arena, line);
     }
     return out.items;
@@ -1042,6 +1067,10 @@ test "send: --quiet and a comma list of addresses, one line per recipient; the c
     try t.expect(std.mem.startsWith(u8, text, "m-1 to alice: queued_slow (dormant: "));
     try t.expect(std.mem.indexOf(u8, text, "\nm-1 to bob: refused (unknown_address: ") != null);
     try t.expect(anyRefused(r));
+    // A recipient that polls: delivered, and the sender reads that it may wait.
+    const polled = try sentText(a, "w", "zenit", .{ .id = "m-2", .outcome = .delivered, .to_state = .idle, .to_polls = true }, false);
+    try t.expectEqualStrings("m-2 to zenit: delivered, it is idle; it polls (nothing is pushed into its session), so this may wait for its next turn\n", polled);
+    try t.expect(std.mem.indexOf(u8, try sentText(a, "w", "zenit", .{ .id = "m-2", .outcome = .delivered, .to_polls = true }, true), "\"to_polls\":true") != null);
 }
 
 test "subject prints a confirmation, or the current subject alone" {
@@ -1136,4 +1165,10 @@ test "the list: you once, one state word, rounded facts, gone peers counted, lin
     try t.expect(listLine(.{ .address = "bob", .last_notification = "x" }, false, false).last_notification == null);
     try t.expectEqualStrings("template links", listLine(.{ .address = "carol", .subject = "template links" }, false, false).subject.?);
     try t.expect(listLine(.{ .address = "carol" }, false, false).subject == null);
+    // A peer that polls is marked, and the mark explained once.
+    aw.clearRetainingCapacity();
+    try writeList(&aw.writer, &.{ .{ .address = "zenit", .state = .idle, .live = true, .polls = true, .last_seen_ms = now }, .{ .address = "qq", .state = .idle, .live = true, .polls = true, .last_seen_ms = now } }, &.{}, null, now, false);
+    try t.expectEqualStrings("zenit  idle  polls\nqq     idle  polls\n" ++ POLLS_LINE ++ "\n", aw.written());
+    try t.expect(listLine(.{ .address = "zenit", .live = true, .polls = true }, false, false).polls.?);
+    try t.expect(listLine(.{ .address = "zenit", .live = false, .polls = true }, false, false).polls == null);
 }

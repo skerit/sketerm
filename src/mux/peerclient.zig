@@ -97,6 +97,11 @@ pub const Peer = struct {
         return self.conn.caps.peer_alias;
     }
 
+    /// Whether the broker reports which peers poll (welcome flag `peer_polls`).
+    pub fn polls(self: *const Peer) bool {
+        return self.conn.caps.peer_polls;
+    }
+
     /// Ask (`subject` null), set or clear (`""`) the subject of `address`.
     pub fn subject(self: *Peer, allocator: std.mem.Allocator, address: []const u8, value: ?[]const u8, timeout_ms: i64) !std.json.Parsed(peermail.SubjectReply) {
         if (!self.subjects()) return error.Unsupported;

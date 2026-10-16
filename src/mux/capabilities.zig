@@ -158,6 +158,11 @@ pub const Flag = enum {
     /// and `grants` in a hub's presence. Absent = a client registers its
     /// name as its address, as before, and sends no title.
     peer_alias,
+    /// The broker keeps whether each peer's server can push messages into
+    /// its session (`peer_register` `armed`) and reports the ones that
+    /// cannot: `polls` in `peer_list`, `to_polls` in `peer_send_reply` and
+    /// relays. Absent = nothing is known: no peer is marked.
+    peer_polls,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

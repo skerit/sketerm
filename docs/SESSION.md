@@ -23131,3 +23131,23 @@ peeraddr, sessname, peermail (title, suffix, explicit, resume, migration,
 hub across two hosts), daemon_peers, agentpush, peer_cli, mcp_peer; the
 smoke peer stage gained f9 (zenit / zenit-1 across two daemons, a new
 session resumes zenit-1 with its waiting mail).
+
+## 2026-10-16: peers that poll are visible to their senders
+
+A Claude Code started without the sketerm channel never got a push, while
+its senders read `delivered` for hours. Its server now registers whether
+anything pushes into its session (`RegisterReq.armed`: a channel, or an
+`agent-wait --server` follower such as the opencode plugin's; re-sent when
+a follower comes or goes; null from older servers = unknown). The broker
+marks the others: `polls` in `peer_list` (text and JSON, relayed across
+federation) and `to_polls` beside `to_state` in `peer_send` (per recipient
+of a list, and in a hub's `stored` answers); the outcome stays `delivered`,
+since the message did reach the live server. The text reads `...:
+delivered, it is idle; it polls (nothing is pushed into its session), so
+this may wait for its next turn` (one `peer_cli.sentLine` for the tool
+and the CLI now). The polling session is told once, in its instructions
+(else its first peer tool result), how to launch with the channel, and its
+`UserPromptSubmit` hook now hands it every waiting message, not only slow
+mail. Welcome flag `peer_polls`; `capabilities.peers.polls` and `pushed`.
+Unit tests in peermail, peer_cli, mcp_peer; smoke peer stage steps 4 and
+20a.

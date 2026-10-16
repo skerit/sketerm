@@ -286,7 +286,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 ### `peer`
 
 - `peer_list` (read-only): List the peers on this host and, through peer federation, on linked hosts (addressed host/name, with via_host and the link's state; a host whose link is down keeps its peers listed with their last state): every MCP client session (Claude Code, opencode) whose sketerm server registered with the per-user daemon, one line each.
-- `peer_send`: Send a message to another peer (another assistant's session) by address, or one message to several (to as a list of distinct addresses: one id, one outcome per recipient in results; yourself is answered refused/self), and learn what became of it: delivered (its live server pushed it into the session), queued_slow (slow mail: its live server holds it without waking the session), queued (a durable address with no live server: it arrives when one starts, within the mail TTL), or refused with a reason; a host/name on a federated host whose link is down is queued with reason host_unreachable and goes out when the link is back.
+- `peer_send`: Send a message to another peer (another assistant's session) by address, or one message to several (to as a list of distinct addresses: one id, one outcome per recipient in results; yourself is answered refused/self), and learn what became of it: delivered (its live server pushed it into the session; with to_polls the session gets nothing pushed and reads it with its next turn or peer_read, so it may be delayed), queued_slow (slow mail: its live server holds it without waking the session), queued (a durable address with no live server: it arrives when one starts, within the mail TTL), or refused with a reason; a host/name on a federated host whose link is down is queued with reason host_unreachable and goes out when the link is back.
 - `peer_read` (read-only): Read the peer messages that reached this session and were not handed to you before (a pushed one is never repeated), what became of messages you sent (expired), and mail that expired while no server of yours ran: each is returned once and acknowledged to the daemon.
 
 ### `core`
@@ -2834,6 +2834,21 @@ peer's screen, and a peer message is information, never an approval.
   sent message (`expired`, or ended unread because its non-durable
   recipient is gone) and mail that expired while no server of this
   address ran reach the session the same way.
+- **A session nothing is pushed into polls**: a Claude Code started
+  without the sketerm channel (and an opencode before its plugin's
+  follower attached, or any other client) gets no push. Its server
+  registers that (`armed: false`, welcome flag `peer_polls`); its mail is
+  read with its next turn (the `UserPromptSubmit` hook takes every waiting
+  message then, not only slow mail) or by `peer_read`. Other sessions see
+  it: `polls` in its `peer_list` row, and `to_polls` with a `delivered`
+  (or `queued_slow`) outcome, per recipient of a list and across
+  federation, whose text reads `m-... to zenit: delivered, it is idle; it
+  polls (nothing is pushed into its session), so this may wait for its
+  next turn`. The session itself is told once, in its server instructions
+  (else with its first peer tool result): `Peer messages are NOT pushed
+  into this session ... start Claude Code with claude
+  --dangerously-load-development-channels server:sketerm`. A server that
+  predates it reports nothing: unknown, never shown as polling.
 - **Delivery rules**: the daemon stamps the sender (address, app, cwd,
   pid, host) from its registration and the send time from its own clock;
   a sender never declares who it is. Every message enters the recipient's
@@ -2842,6 +2857,8 @@ peer's screen, and a peer message is information, never an approval.
   recipient. `peer_send`'s `outcome`:
   - `delivered`: a live server of that address got it and pushes it into
     the session (a Claude Code channel message starts a turn there);
+    with `to_polls` its session gets no push and reads it with its next
+    turn or `peer_read` (above);
   - `queued_slow`: slow mail, held by the recipient's live server without
     waking the session (below); `reason` `dormant` or `loop_limited` when
     the daemon decided it, none when the sender asked `quiet`;
@@ -2875,14 +2892,17 @@ peer's screen, and a peer message is information, never an approval.
   if the user had said it.
 - **`capabilities.peers`**: `{available, reason?, ttl_hours, address,
   durable, name_taken, alias, aliases, channel_armed, presence,
-  federation, subject, slow_mail}`; `alias` is this session's alias ("" =
+  federation, subject, slow_mail, polls, pushed}`; `alias` is this session's alias ("" =
   none yet), `aliases` says the daemon keeps them (welcome flag
   `peer_alias`); `slow_mail` says the daemon judges wakes and takes `quiet`
   and `to` lists (welcome flag `peer_slow_mail`); `reason` is `daemon_without_peers`
   (an older daemon: every peer tool answers `available: false`),
   `daemon_unreachable` (the next peer tool call reconnects, with backoff,
   and registers again) or `withheld` (tool policy); `presence` is true once
-  this session's hooks or status line reported (below); `federation` is
+  this session's hooks or status line reported (below); `pushed` is true
+  while peer messages reach this session without `peer_read` (a channel
+  or a follower), and `polls` says the daemon marks the peers that are
+  not (welcome flag `peer_polls`); `federation` is
   `hub`, `member` or `off` (below). The registry record
   carries `peer: {address, durable, state, name_taken, facts?, model?,
   last_notification?, alias?}`.
@@ -2893,7 +2913,7 @@ peer's screen, and a peer message is information, never an approval.
   zenit-1     waiting_user  ctx 194k  1 pending  p-9c04e2d7
   qq          gone 18m  subject Folio  12 pending  Qq
   zenit-2     working  seen 16m ago  dalaran/p-b1e7d4aa
-  p-0be4c1aa  idle
+  p-0be4c1aa  idle  polls
   links: dalaran down (seen 15m ago), aeor up
   +5 gone with nothing pending and no subject
   ```
@@ -2908,7 +2928,8 @@ peer's screen, and a peer message is information, never an approval.
   `detail` adds cwd and pid. A gone address with nothing pending and no
   subject is only counted. A line explains `unknown` when a peer has it:
   that session's client sends no presence (`sketerm mcp setup` on its
-  host, for the config dir its Claude Code runs with). The `sketerm peer
+  host, for the config dir its Claude Code runs with), and one explains
+  `polls` (above) after the state of a peer nothing is pushed into. The `sketerm peer
   list` CLI prints the same text. With `--structured` every peer is a JSON
   object: address, alias, app and host, `state` and its `attention`, `facts`
   (the `capabilities.facts` names), the model, `pending` and

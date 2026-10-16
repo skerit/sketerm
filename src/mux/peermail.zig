@@ -168,6 +168,12 @@ pub const RegisterReq = struct {
     /// `sketerm peer alias`), which is then refused (`SelfInfo.alias_refused`).
     alias: ?[]const u8 = null,
     alias_explicit: bool = false,
+    /// Messages reach the session without its asking: a Claude Code
+    /// channel, or a follower such as the opencode plugin's (welcome
+    /// `peer_polls`). false = the session polls: mail waits for its next
+    /// turn or `peer_read`. null = a server that predates it (unknown,
+    /// never read as polling).
+    armed: ?bool = null,
 };
 
 /// `peer_list_req` body.
@@ -214,6 +220,10 @@ pub const PeerInfo = struct {
     last_seen_ms: i64 = 0,
     pending: u32 = 0,
     name_taken: bool = false,
+    /// Its server reported it cannot push messages into the session
+    /// (`RegisterReq.armed` false): mail waits for its next turn or
+    /// `peer_read`.
+    polls: bool = false,
     /// What the peer's registration reported (`RegisterReq`).
     facts: ?std.json.Value = null,
     model: []const u8 = "",
@@ -269,6 +279,9 @@ pub const RecipientResult = struct {
     outcome: PeerOutcome,
     reason: ?RefuseReason = null,
     to_state: ?PeerState = null,
+    /// The recipient polls (`PeerInfo.polls`): handed to its server, read
+    /// only with its next turn or `peer_read`.
+    to_polls: bool = false,
 };
 
 /// `peer_send_reply` body; `id` is empty when refused. A `to_list` send
@@ -279,6 +292,7 @@ pub const SendReply = struct {
     outcome: PeerOutcome = .refused,
     reason: ?RefuseReason = null,
     to_state: ?PeerState = null,
+    to_polls: bool = false,
     results: []const RecipientResult = &.{},
 };
 
@@ -404,6 +418,8 @@ pub const Relay = struct {
     outcome: PeerOutcome = .delivered,
     reason: ?RefuseReason = null,
     to_state: ?PeerState = null,
+    /// `stored`: the recipient polls (`SendReply.to_polls`).
+    to_polls: bool = false,
     /// `event`: how long the message waited (already a duration).
     queued_ms: i64 = 0,
     /// `stored`: whether `id` named a message or an event.
@@ -614,6 +630,8 @@ const Peer = struct {
     /// Owned; the live holder that refused its last explicit alias
     /// request (`SelfInfo.alias_refused`), "" = none.
     alias_refused: []u8 = &.{},
+    /// `RegisterReq.armed`: null = unknown.
+    armed: ?bool = null,
 };
 
 /// An address that yielded to its alias's new holder (`yieldBox`): mail
@@ -803,6 +821,7 @@ pub const SendResult = struct {
     outcome: PeerOutcome,
     reason: ?RefuseReason = null,
     to_state: ?PeerState = null,
+    to_polls: bool = false,
     /// The answer comes later as `Out.reply` (a relayed send whose link is up).
     deferred: bool = false,
 };
@@ -961,6 +980,7 @@ pub const Store = struct {
             // A new server: its client started now, as far as we know.
             .active_ms = now,
             .context_tokens = null,
+            .armed = req.armed,
         };
         errdefer self.allocator.free(p.address);
         p.requested = try self.allocator.dupe(u8, req.address);
@@ -1078,7 +1098,7 @@ pub const Store = struct {
             var one = req;
             one.to = to;
             const res = try self.route(self.msgFrom(sender, one, now, id), .{ .multi = serial }, now, &scratch);
-            r.* = .{ .to = to, .outcome = res.outcome, .reason = res.reason, .to_state = res.to_state };
+            r.* = .{ .to = to, .outcome = res.outcome, .reason = res.reason, .to_state = res.to_state, .to_polls = res.to_polls };
             outstanding += @intFromBool(res.deferred);
         }
         if (outstanding == 0) return .{ .id = id, .results = results };
@@ -1157,14 +1177,15 @@ pub const Store = struct {
         });
         try self.appendItem(box, s);
         if (live) |l| {
+            const polls = l.armed == false;
             if (self.push(l.conn, s, now)) {
                 s.delivered_to = l.conn;
                 return switch (verdict) {
-                    .wake => .{ .id = id, .outcome = .delivered, .to_state = l.state },
-                    .slow => |why| .{ .id = id, .outcome = .queued_slow, .reason = why, .to_state = l.state },
+                    .wake => .{ .id = id, .outcome = .delivered, .to_state = l.state, .to_polls = polls },
+                    .slow => |why| .{ .id = id, .outcome = .queued_slow, .reason = why, .to_state = l.state, .to_polls = polls },
                 };
             }
-            return .{ .id = id, .outcome = .queued, .to_state = l.state };
+            return .{ .id = id, .outcome = .queued, .to_state = l.state, .to_polls = polls };
         }
         return .{ .id = id, .outcome = .queued, .to_state = .gone };
     }
@@ -1293,6 +1314,7 @@ pub const Store = struct {
                 .last_seen_ms = p.last_seen_ms,
                 .pending = if (box) |b| @intCast(b.items.items.len) else 0,
                 .name_taken = p.name_taken,
+                .polls = p.armed == false,
                 .facts = if (p.facts_json.len > 0) std.json.parseFromSliceLeaky(std.json.Value, arena, p.facts_json, .{}) catch null else null,
                 .model = p.model,
                 .last_notification = p.last_notification,
@@ -1848,6 +1870,7 @@ pub const Store = struct {
                 .last_seen_ms = RelayAge.seenAt(now, p.last_seen_ms),
                 .pending = p.pending,
                 .name_taken = p.name_taken,
+                .polls = p.polls,
                 .facts = if (p.facts) |f| try cloneJson(a, f) else null,
                 .model = try a.dupe(u8, p.model),
                 .last_notification = try a.dupe(u8, p.last_notification),
@@ -1903,7 +1926,7 @@ pub const Store = struct {
             .reply_to = rl.reply_to,
             .quiet = rl.quiet,
         }, .{ .link = r.conn }, now, &idb);
-        if (!res.deferred) self.answerStored(r, rl.id, .message, to, .{ .outcome = res.outcome, .reason = res.reason, .to_state = res.to_state });
+        if (!res.deferred) self.answerStored(r, rl.id, .message, to, .{ .outcome = res.outcome, .reason = res.reason, .to_state = res.to_state, .to_polls = res.to_polls });
     }
 
     fn takeEvent(self: *Store, r: *Route, rl: Relay, now: i64) void {
@@ -1921,7 +1944,7 @@ pub const Store = struct {
     }
 
     fn takeStored(self: *Store, r: *Route, rl: Relay, now: i64) void {
-        const ans: Answer = .{ .outcome = rl.outcome, .reason = rl.reason, .to_state = rl.to_state };
+        const ans: Answer = .{ .outcome = rl.outcome, .reason = rl.reason, .to_state = rl.to_state, .to_polls = rl.to_polls };
         var tb: [peeraddr.ADDRESS_MAX]u8 = undefined;
         // A far broker that predates (id, to) keys names no recipient.
         const to: ?[]const u8 = if (rl.to.len > 0) self.inAddr(&tb, r, rl.to) else null;
@@ -2019,12 +2042,13 @@ pub const Store = struct {
             .outcome = if (r.far_slow) ans.outcome else ans.outcome.compat(),
             .reason = if (r.far_slow) ans.reason else if (ans.reason) |why| why.compat() else null,
             .to_state = ans.to_state,
+            .to_polls = ans.to_polls,
         } });
     }
 
     fn answer(self: *Store, p: Pending, ans: Answer) void {
         switch (p.waiter) {
-            .client => |w| _ = self.emit.call(w.conn, .{ .reply = self.replyFor(w.conn, .{ .req = w.req, .id = p.id(), .outcome = ans.outcome, .reason = ans.reason, .to_state = ans.to_state }) }),
+            .client => |w| _ = self.emit.call(w.conn, .{ .reply = self.replyFor(w.conn, .{ .req = w.req, .id = p.id(), .outcome = ans.outcome, .reason = ans.reason, .to_state = ans.to_state, .to_polls = ans.to_polls }) }),
             .link => |lc| if (self.routeByConn(lc)) |o| self.answerStored(o, p.id(), .message, p.to(), ans),
             .multi => |serial| self.answerMulti(serial, p.to(), ans),
             .none => {},
@@ -2042,6 +2066,7 @@ pub const Store = struct {
             r.outcome = ans.outcome;
             r.reason = ans.reason;
             r.to_state = ans.to_state;
+            r.to_polls = ans.to_polls;
             m.outstanding -|= 1;
             break;
         };
@@ -2049,7 +2074,7 @@ pub const Store = struct {
         _ = self.multis.orderedRemove(mi);
         defer freeMulti(self.allocator, m);
         const first = if (m.results.len > 0) m.results[0] else RecipientResult{ .to = "", .outcome = .refused };
-        _ = self.emit.call(m.conn, .{ .reply = self.replyFor(m.conn, .{ .req = m.req, .id = m.id_buf[0..m.id_len], .outcome = first.outcome, .reason = first.reason, .to_state = first.to_state, .results = m.results }) });
+        _ = self.emit.call(m.conn, .{ .reply = self.replyFor(m.conn, .{ .req = m.req, .id = m.id_buf[0..m.id_len], .outcome = first.outcome, .reason = first.reason, .to_state = first.to_state, .to_polls = first.to_polls, .results = m.results }) });
     }
 
     fn addPending(self: *Store, id: []const u8, to: []const u8, waiter: Waiter, route_conn: u32, now: i64) error{OutOfMemory}!void {
@@ -2500,6 +2525,7 @@ pub const Store = struct {
         if (peerwake.working(p.state) or peerwake.working(req.state)) p.active_ms = now;
         p.state = req.state;
         p.slow_mail = req.slow_mail;
+        p.armed = req.armed;
         p.last_seen_ms = now;
         try self.setPresence(p, req);
     }
@@ -2658,6 +2684,7 @@ const Answer = struct {
     outcome: PeerOutcome,
     reason: ?RefuseReason = null,
     to_state: ?PeerState = null,
+    to_polls: bool = false,
 };
 
 /// Peers taken from one presence snapshot at most (a bound, not a quota).
@@ -2728,6 +2755,7 @@ const Rec = struct {
         from_alias: []const u8 = "",
         quiet: bool = false,
         results: []const RecipientResult = &.{},
+        to_polls: bool = false,
     };
 
     fn init() Rec {
@@ -2749,7 +2777,7 @@ const Rec = struct {
         const g: Got = switch (out) {
             .deliver => |d| .{ .conn = conn, .kind = .deliver, .id = a.dupe(u8, d.id) catch "", .to = a.dupe(u8, d.to) catch "", .queued = d.queued, .age_ms = d.age_ms, .text = a.dupe(u8, d.text) catch "", .from = a.dupe(u8, d.from.address) catch "", .sender_state = d.sender_state, .sender_subject = a.dupe(u8, d.sender_subject) catch "", .quiet = d.quiet, .from_alias = a.dupe(u8, d.from.alias) catch "" },
             .event => |e| .{ .conn = conn, .kind = .event, .id = a.dupe(u8, e.id) catch "", .outcome = e.outcome, .reason = e.reason, .to = a.dupe(u8, e.to) catch "", .queued_ms = e.queued_ms, .quiet = e.quiet },
-            .reply => |r| .{ .conn = conn, .kind = .reply, .id = a.dupe(u8, r.id) catch "", .outcome = r.outcome, .reason = r.reason, .to_state = r.to_state, .req = r.req, .results = dupeResults(a, r.results) },
+            .reply => |r| .{ .conn = conn, .kind = .reply, .id = a.dupe(u8, r.id) catch "", .outcome = r.outcome, .reason = r.reason, .to_state = r.to_state, .to_polls = r.to_polls, .req = r.req, .results = dupeResults(a, r.results) },
             .relay => |r| .{ .conn = conn, .kind = .relay, .id = a.dupe(u8, r.id) catch "", .relay = r.kind, .outcome = r.outcome, .reason = r.reason },
             .warn => |w| .{ .conn = conn, .kind = .warn, .text = a.dupe(u8, w) catch "" },
             .self_changed => .{ .conn = conn, .kind = .self_changed },
@@ -4097,4 +4125,51 @@ test "federation: the outbound mailbox and membership survive a restart" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     for (try s.list(arena.allocator())) |p| try t.expect(!std.mem.startsWith(u8, p.address, ROUTE_PREFIX));
+}
+
+test "a polling recipient: its delivery and its list entry say so, across the hub too; an older server is unknown, never polling" {
+    var net: Net = undefined;
+    try net.init(null);
+    defer net.deinit();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var zenit = regSlow("Zenit");
+    zenit.armed = false;
+    var qq = regSlow("Qq");
+    qq.armed = true;
+    try net.hub.register(1, zenit, 0);
+    try net.hub.register(2, qq, 0);
+    try net.hub.register(3, regSlow("Old"), 0);
+    // 1. Delivered either way; only the unarmed recipient polls.
+    var idb: [ID_LEN]u8 = undefined;
+    const to_z = try net.hub.send(2, .{ .to = "Zenit", .text = "x" }, 10, &idb);
+    try t.expectEqual(PeerOutcome.delivered, to_z.outcome);
+    try t.expect(to_z.to_polls);
+    try t.expect(!(try net.hub.send(1, .{ .to = "Qq", .text = "x" }, 10, &idb)).to_polls);
+    try t.expect(!(try net.hub.send(1, .{ .to = "Old", .text = "x" }, 10, &idb)).to_polls);
+    try t.expect((listed(&net.hub, a, "Zenit") orelse return error.TestUnexpectedResult).polls);
+    try t.expect(!(listed(&net.hub, a, "Qq") orelse return error.TestUnexpectedResult).polls);
+    try t.expect(!(listed(&net.hub, a, "Old") orelse return error.TestUnexpectedResult).polls);
+    // 2. Its server arms (a follower attached): the mark goes, and comes back.
+    zenit.armed = true;
+    try net.hub.register(1, zenit, 20);
+    try t.expect(!(listed(&net.hub, a, "Zenit") orelse return error.TestUnexpectedResult).polls);
+    zenit.armed = false;
+    try net.hub.register(1, zenit, 30);
+    // 3. A to_list answers it per recipient.
+    const many = try net.hub.sendMany(a, 2, .{ .to_list = &.{ "Zenit", "Old" }, .text = "both" }, 40, &idb);
+    try t.expect(many.results[0].to_polls and !many.results[1].to_polls);
+    // 4. Across the hub: the member's sender is told, and lists it so.
+    try net.mem.register(1, regSlow("alice"), 50);
+    try net.connect(50);
+    try net.pump(50);
+    try t.expect((listed(&net.mem, a, "hub/Zenit") orelse return error.TestUnexpectedResult).polls);
+    try t.expect(!(listed(&net.mem, a, "hub/Qq") orelse return error.TestUnexpectedResult).polls);
+    const far = try net.mem.send(1, .{ .req = 9, .to = "hub/Zenit", .text = "from afar" }, 60, &idb);
+    try t.expect(far.deferred);
+    try net.pump(60);
+    const rep = lastOf(&net.mem_rec, 1, .reply) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(PeerOutcome.delivered, rep.outcome);
+    try t.expect(rep.to_polls);
 }
