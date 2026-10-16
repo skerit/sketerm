@@ -127,28 +127,31 @@ fn idOf(item: PeerItem) []const u8 {
 }
 
 fn dupeItem(a: std.mem.Allocator, item: PeerItem) !PeerItem {
-    switch (item) {
-        .message => |m| {
-            var o = m;
-            o.id = try a.dupe(u8, m.id);
-            o.from = .{ .address = try a.dupe(u8, m.from.address), .host = try a.dupe(u8, m.from.host), .cwd = try a.dupe(u8, m.from.cwd), .app = try a.dupe(u8, m.from.app), .pid = m.from.pid };
-            o.to = try a.dupe(u8, m.to);
-            o.text = try a.dupe(u8, m.text);
-            o.reply_to = if (m.reply_to) |r| try a.dupe(u8, r) else null;
-            return .{ .message = o };
+    return dupeDeep(PeerItem, a, item);
+}
+
+/// Copy `value` with every slice it reaches duplicated into `a`, by its
+/// type: a hand-written field list missed `sender_subject` once, so a held
+/// item aliased the freed push it came from (the 0.2.3 `sketerm mcp` SIGSEGV).
+fn dupeDeep(comptime T: type, a: std.mem.Allocator, value: T) error{OutOfMemory}!T {
+    switch (@typeInfo(T)) {
+        .bool, .int, .float, .@"enum" => return value,
+        .optional => |o| return if (value) |v| try dupeDeep(o.child, a, v) else null,
+        .@"struct" => |s| {
+            var out: T = undefined;
+            inline for (s.fields) |f| @field(out, f.name) = try dupeDeep(f.type, a, @field(value, f.name));
+            return out;
         },
-        .event => |e| {
-            var o = e;
-            o.id = try a.dupe(u8, e.id);
-            o.to = try a.dupe(u8, e.to);
-            return .{ .event = o };
+        .@"union" => switch (value) {
+            inline else => |v, tag| return @unionInit(T, @tagName(tag), try dupeDeep(@TypeOf(v), a, v)),
         },
-        .expired_away => |x| {
-            var o = x;
-            o.id = try a.dupe(u8, x.id);
-            o.from = try a.dupe(u8, x.from);
-            return .{ .expired_away = o };
+        .pointer => |p| {
+            if (p.size != .slice or p.sentinel_ptr != null) @compileError("dupeDeep: cannot own " ++ @typeName(T));
+            const out = try a.alloc(p.child, value.len);
+            for (out, value) |*d, s| d.* = try dupeDeep(p.child, a, s);
+            return out;
         },
+        else => @compileError("dupeDeep: cannot own " ++ @typeName(T)),
     }
 }
 
@@ -827,6 +830,41 @@ test "the handed history is bounded" {
     }
     _ = try m.read(arena_state.allocator(), null);
     try t.expectEqual(@as(usize, HISTORY_MAX), m.history.items.len);
+}
+
+test "a held item owns every string: nothing aliases the push it was taken from" {
+    // The push's parse arena is freed right after `take` (`drain`'s
+    // defer), before `flush` composes the item: the 0.2.3 SIGSEGV.
+    var m = Mailbox.init(t.allocator);
+    defer m.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    var src = "m-1|Zenit|archdev|/src|claude|Qq|hello|m-0|about|m-2|Rr|m-3|Ss".*;
+    var parts: [13][]const u8 = undefined;
+    var it = std.mem.splitScalar(u8, &src, '|');
+    for (&parts) |*p| p.* = it.next().?;
+    _ = try m.add(.{ .message = .{ .id = parts[0], .from = .{ .address = parts[1], .host = parts[2], .cwd = parts[3], .app = parts[4] }, .to = parts[5], .text = parts[6], .reply_to = parts[7], .sender_subject = parts[8] } });
+    _ = try m.add(.{ .event = .{ .id = parts[9], .to = parts[10] } });
+    _ = try m.add(.{ .expired_away = .{ .id = parts[11], .from = parts[12], .sent_ms = 1, .expired_ms = 2 } });
+    @memset(&src, 'X');
+    const msg = m.pending.items[0].item.message;
+    try t.expectEqualStrings("m-1", msg.id);
+    try t.expectEqualStrings("Zenit", msg.from.address);
+    try t.expectEqualStrings("archdev", msg.from.host);
+    try t.expectEqualStrings("/src", msg.from.cwd);
+    try t.expectEqualStrings("claude", msg.from.app);
+    try t.expectEqualStrings("Qq", msg.to);
+    try t.expectEqualStrings("hello", msg.text);
+    try t.expectEqualStrings("m-0", msg.reply_to.?);
+    try t.expectEqualStrings("about", msg.sender_subject);
+    const pushed = try agentpush.composePeer(arena_state.allocator(), m.pending.items[0].item);
+    try t.expect(std.mem.indexOf(u8, pushed.content, "; subject: about)") != null);
+    const ev = m.pending.items[1].item.event;
+    try t.expectEqualStrings("m-2", ev.id);
+    try t.expectEqualStrings("Rr", ev.to);
+    const x = m.pending.items[2].item.expired_away;
+    try t.expectEqualStrings("m-3", x.id);
+    try t.expectEqualStrings("Ss", x.from);
 }
 
 test "capabilities.peers matches its declared schema in every state" {
