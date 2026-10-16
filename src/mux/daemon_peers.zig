@@ -449,26 +449,19 @@ fn ensure(d: *Daemon) ?*peermail.Store {
     const host = @import("../ipc/peeraddr.zig").selfHost(&host_buf);
     var cfg = Config.load(d.allocator);
     defer cfg.deinit();
-    // A hub or a call-in member, never both.
-    var both = false;
-    const callin = cfg.peerHubDomain() catch |e| blk: {
-        switch (e) {
-            error.HubAndCallin => {
-                both = true;
-                log.warn("peer federation: peer_hub and peer_hub_domain are both set; a hub never calls in to another, so federation is off", .{});
-            },
-            error.NoSuchDomain => log.warn("peer federation: peer_hub_domain = {s} names no [domain.<name>] with a host; nothing is dialed", .{cfg.peer_hub_domain}),
-        }
-        break :blk null;
-    };
-    // The hub's own peers are `<host>/name` elsewhere: no host, no hub.
-    const hub = cfg.peer_hub and !both and blk: {
-        @import("../ipc/peeraddr.zig").validHost(host) catch {
-            log.warn("peer federation: this host's name \"{s}\" is not an address host; peer_hub is ignored", .{host});
-            break :blk false;
-        };
-        break :blk true;
-    };
+    const fed = federationRole(&cfg, host, perUserSocket(d.allocator, d.sock_path));
+    switch (fed) {
+        .hub, .callin => {},
+        .off => |why| switch (why) {
+            // Every private broker would say this at every start.
+            .not_configured, .private_daemon => {},
+            .hub_and_callin => log.warn("peer federation: peer_hub and peer_hub_domain are both set; a hub never calls in to another, so federation is off", .{}),
+            .no_such_domain => log.warn("peer federation: peer_hub_domain = {s} names no [domain.<name>] with a host; nothing is dialed", .{cfg.peer_hub_domain}),
+            .bad_host => log.warn("peer federation: this host's name \"{s}\" is not an address host; peer_hub is ignored", .{host}),
+        },
+    }
+    const hub = fed == .hub;
+    const callin: ?*const @import("../config.zig").Domain = if (fed == .callin) fed.callin else null;
     if (hub) {
         d.peers.links = peerlink.Links.init(d.allocator, &cfg, host) catch blk: {
             log.warn("peer federation: out of memory reading the domains", .{});
@@ -505,6 +498,40 @@ fn ensure(d: *Daemon) ?*peermail.Store {
     if (hub) log.info("peer federation: hub {s}, {d} domain(s)", .{ host, domains.len });
     if (callin) |dom| log.info("peer federation: call-in member {s}, dialing hub domain {s}", .{ host, dom.name });
     return s;
+}
+
+/// What this broker is in the federation, and why it is in none.
+pub const FederationRole = union(enum) {
+    off: enum { not_configured, private_daemon, hub_and_callin, no_such_domain, bad_host },
+    hub,
+    callin: *const @import("../config.zig").Domain,
+};
+
+/// The federation role config gives a broker; only the per-user daemon
+/// federates. A private broker (an MCP server's instance, a rig's) reads
+/// the same config.conf, and as a second hub it would dial every member and
+/// take its one uplink away from the real hub, whose relays the member then
+/// refuses ("relay before hello") until the next redial.
+pub fn federationRole(cfg: *const Config, host: []const u8, per_user: bool) FederationRole {
+    const callin = cfg.peerHubDomain() catch |e| return .{ .off = switch (e) {
+        error.HubAndCallin => .hub_and_callin,
+        error.NoSuchDomain => .no_such_domain,
+    } };
+    if (!cfg.peer_hub and callin == null) return .{ .off = .not_configured };
+    if (!per_user) return .{ .off = .private_daemon };
+    if (callin) |dom| return .{ .callin = dom };
+    // The hub's own peers are `<host>/name` elsewhere: no host, no hub.
+    @import("../ipc/peeraddr.zig").validHost(host) catch return .{ .off = .bad_host };
+    return .hub;
+}
+
+/// Whether canonical `sock_path` is the per-user daemon's default socket.
+fn perUserSocket(allocator: std.mem.Allocator, sock_path: []const u8) bool {
+    const def = @import("sockpath.zig").defaultSocketPath(allocator) catch return false;
+    defer allocator.free(def);
+    const canon = dmod.canonicalSocketPath(allocator, def) catch return false;
+    defer allocator.free(canon);
+    return std.mem.eql(u8, canon, sock_path);
 }
 
 /// `<state dir>/peermail/<socket namespace>`: rigs and private instance
@@ -574,6 +601,31 @@ fn emit(ctx: *anyopaque, conn: u32, out: peermail.Out) bool {
 fn liveClient(d: *Daemon, id: u32) ?*Client {
     for (d.clients.items) |cl| if (cl.id == id and !cl.dead) return cl;
     return null;
+}
+
+test "only the per-user daemon federates: a private broker with the same config stays off" {
+    const t = std.testing;
+    var hub_cfg = try Config.loadFromBytes(t.allocator, "peer_hub = true\n[domain.box]\nhost = b\npeers = true\n");
+    defer hub_cfg.deinit();
+    try t.expect(federationRole(&hub_cfg, "arch", true) == .hub);
+    // An MCP server's private daemon or a rig's broker reads this same
+    // config: as a second hub it would steal every member's uplink.
+    const private = federationRole(&hub_cfg, "arch", false);
+    try t.expect(private == .off and private.off == .private_daemon);
+    try t.expect(federationRole(&hub_cfg, "not a host!", true).off == .bad_host);
+
+    var member_cfg = try Config.loadFromBytes(t.allocator, "peer_hub_domain = hub\n[domain.hub]\nhost = h\n");
+    defer member_cfg.deinit();
+    const member = federationRole(&member_cfg, "box", true);
+    try t.expectEqualStrings("hub", member.callin.name);
+    try t.expect(federationRole(&member_cfg, "box", false).off == .private_daemon);
+
+    var plain = try Config.loadFromBytes(t.allocator, "");
+    defer plain.deinit();
+    try t.expect(federationRole(&plain, "box", true).off == .not_configured);
+    var both = try Config.loadFromBytes(t.allocator, "peer_hub = true\npeer_hub_domain = hub\n[domain.hub]\nhost = h\n");
+    defer both.deinit();
+    try t.expect(federationRole(&both, "box", true).off == .hub_and_callin);
 }
 
 test "the TTL override accepts only non-negative integers" {

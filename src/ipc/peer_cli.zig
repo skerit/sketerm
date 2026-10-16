@@ -173,6 +173,7 @@ pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []c
     var width: usize = 0;
     var rows: usize = 0;
     var omitted: usize = 0;
+    var unknown = false;
     for (peers) |pi| {
         if (isSelf(pi, self)) continue;
         if (!listed(pi)) {
@@ -192,6 +193,7 @@ pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []c
             try w.writeAll("  gone");
             if (pi.last_seen_ms > 0) try w.print(" {s}", .{clock.span(&buf, now_ms - pi.last_seen_ms, .short)});
         } else try w.print("  {s}", .{if (pi.live) @tagName(pi.state) else "offline"});
+        if (pi.live and pi.state == .unknown) unknown = true;
         if (show_app and pi.app.len > 0) try w.print("  {s}", .{pi.app});
         if (peerwake.contextOf(pi.facts)) |ctx| try w.print("  ctx {s}", .{numtext.count(&buf, ctx)});
         if (show_model and pi.model.len > 0) try w.print("  {s}", .{pi.model});
@@ -219,6 +221,9 @@ pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []c
         try w.writeAll("\n");
     }
     if (omitted > 0) try w.print("+{d} gone with nothing pending and no subject\n", .{omitted});
+    // The state comes only from a peer's own hooks; on a host whose client
+    // config never got them, every peer there reads unknown.
+    if (unknown) try w.writeAll("unknown = its client sends no presence: run `sketerm mcp setup` on its host, for the config dir it runs with\n");
 }
 
 // ── what a received item prints as ──────────────────────────────
@@ -991,6 +996,10 @@ test "the list: you once, one state word, rounded facts, gone peers counted, lin
     aw.clearRetainingCapacity();
     try writeList(&aw.writer, &.{}, &.{}, null, now, false);
     try t.expectEqualStrings("no other peers\n", aw.written());
+    // A live peer with no presence says why once.
+    aw.clearRetainingCapacity();
+    try writeList(&aw.writer, &.{.{ .address = "aeor/s85382-4", .state = .unknown, .live = true, .last_seen_ms = now }}, &.{}, null, now, false);
+    try t.expect(std.mem.startsWith(u8, aw.written(), "aeor/s85382-4  unknown\nunknown = its client sends no presence"));
     // The JSON lines keep every fact.
     const l = listLine(.{ .address = "bob", .state = .unknown, .live = false, .last_notification = "idle_prompt" }, false, true);
     try t.expect(l.attention == null);

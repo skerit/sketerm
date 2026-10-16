@@ -3150,6 +3150,40 @@ fn exchangeOver(link: PeerLinkDirection) !void {
     try t.expectEqual(PeerOutcome.delivered, (try net.mem.send(1, .{ .to = "box/bob", .text = "local" }, 300, &idb)).outcome);
 }
 
+test "federation: presence facts cross the link, and the far broker judges a dormant recipient" {
+    var net: Net = undefined;
+    try net.init(null);
+    defer net.deinit();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const MIN: i64 = 60_000;
+    try net.hub.register(1, regSlow("Zenit"), 0);
+    var bob = regSlow("bob");
+    bob.model = "Opus";
+    bob.facts = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"context_used_tokens\":400000}", .{});
+    try net.mem.register(1, bob, 0);
+    try net.connect(100);
+    try net.pump(100);
+    // 1. The hub lists box/bob with the state, model and facts his own
+    // broker holds, not as unknown.
+    const on_hub = listed(&net.hub, a, "box/bob") orelse return error.TestUnexpectedResult;
+    try t.expectEqual(PeerState.idle, on_hub.state);
+    try t.expectEqualStrings("Opus", on_hub.model);
+    try t.expectEqual(@as(i64, 400000), on_hub.facts.?.object.get("context_used_tokens").?.integer);
+    // 2. Silent an hour with 400k of context: mail from the hub reaches him
+    // as slow mail, judged where his presence lives.
+    var idb: [ID_LEN]u8 = undefined;
+    const r = try net.hub.send(1, .{ .req = 4, .to = "box/bob", .text = "later is fine" }, 61 * MIN, &idb);
+    try t.expect(r.deferred);
+    try net.pump(61 * MIN);
+    const got = lastOf(&net.mem_rec, 1, .deliver) orelse return error.TestUnexpectedResult;
+    try t.expect(got.quiet);
+    const rep = lastOf(&net.hub_rec, 1, .reply) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(PeerOutcome.queued_slow, rep.outcome);
+    try t.expectEqual(@as(?RefuseReason, .dormant), rep.reason);
+}
+
 test "federation: a dropped link queues host_unreachable and delivers once when it is back, across skewed clocks" {
     var net: Net = undefined;
     try net.init(null);
