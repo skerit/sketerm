@@ -538,7 +538,7 @@ fn ttyNew(allocator: std.mem.Allocator, host: ?[]const u8) mux_tty.Outcome {
     var attempts: u8 = 0;
     while (attempts < 16) : (attempts += 1) {
         tty_session_seq += 1;
-        const name = std.fmt.bufPrint(&name_buf, "s{d}-{d}", .{ c.getpid(), tty_session_seq }) catch return .failed;
+        const name = @import("../mux/sessname.zig").print(&name_buf, .shell, c.getpid(), tty_session_seq) catch return .failed;
         switch (spawnOn(allocator, &conn, host, name, null, rows, cols, &.{})) {
             .ok => return mux_tty.attach(allocator, &conn, name, ttyOptions(.default)),
             .name_taken => continue,

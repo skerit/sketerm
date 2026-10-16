@@ -806,7 +806,7 @@ pub const Term = struct {
             allocator.dupe(u8, n) catch return Error.OutOfMemory
         else blk: {
             name_counter += 1;
-            break :blk std.fmt.allocPrint(allocator, "mcpterm-{d}-{d}", .{ c.getpid(), name_counter }) catch
+            break :blk @import("../mux/sessname.zig").alloc(allocator, .mcpterm, c.getpid(), name_counter) catch
                 return Error.OutOfMemory;
         };
         errdefer allocator.free(name);
@@ -882,7 +882,7 @@ pub const Term = struct {
             allocator.dupe(u8, n) catch return Error.OutOfMemory
         else blk: {
             name_counter += 1;
-            break :blk std.fmt.allocPrint(allocator, "mcpterm-{d}-{d}", .{ c.getpid(), name_counter }) catch
+            break :blk @import("../mux/sessname.zig").alloc(allocator, .mcpterm, c.getpid(), name_counter) catch
                 return Error.OutOfMemory;
         };
         errdefer allocator.free(name);

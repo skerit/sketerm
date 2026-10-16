@@ -703,7 +703,7 @@ pub const App = struct {
             return Error.SpawnFailed;
         }).deinit(allocator);
         name_counter += 1;
-        const name = std.fmt.allocPrint(allocator, "mcpapp-{d}-{d}", .{ c.getpid(), name_counter }) catch
+        const name = @import("../mux/sessname.zig").alloc(allocator, .mcpapp, c.getpid(), name_counter) catch
             return Error.OutOfMemory;
         errdefer allocator.free(name);
 
