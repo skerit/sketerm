@@ -9,6 +9,30 @@ headless terminals of the server's own daemon otherwise; the `term_*`,
 (private per server by default, see `--name`/`--durable`). `capabilities`
 is the one preflight: it reports what this server can reach right now.
 
+## Results: text by default, `--structured` for programs
+
+A tool result is TEXT by default: one short prose block written for a
+model to read (plus image blocks), with large payloads (a screen, a file,
+a tree) behind a `--- name ---` divider. Lists put one row per item and
+leave out what is default, empty or false; times are relative (`16m ago`)
+and counts rounded (`194k`). A failure keeps `isError: true` and its text
+starts `error <code>: ` (`error timeout (retryable): ...`), the code from
+the same vocabulary the structured shape uses, so a reader can branch.
+Binary bytes that the structured lane would carry (a `file_read` of a
+binary file, a binary `web_capture` body) ride the text as base64 behind
+their divider.
+
+`sketerm mcp --structured` is for programmatic consumers (sketerm-java and
+the like): every result also carries `structuredContent`, the JSON facts,
+and tools/list declares each tool's `outputSchema`. Without the flag no
+`outputSchema` is declared at all, since MCP requires `structuredContent`
+from a tool that declares one. Claude Code shows a model only the
+`structuredContent` of a result that has one, so the default keeps an
+agent from paying for the JSON. `capabilities` reports the mode as
+`result_mode` (`text` or `structured`) and in a text line. `sketerm mcp
+setup` registers the default. The structured contract is
+`docs/mcp-structured-results.md`.
+
 ## Headless hosts: `sketerm-mcp`
 
 `sketerm mcp` lives in the GUI binary, which links GTK 4.14+ and libadwaita.
@@ -2855,16 +2879,38 @@ peer's screen, and a peer message is information, never an approval.
   `hub`, `member` or `off` (below). The registry record
   carries `peer: {address, durable, state, name_taken, facts?, model?,
   last_notification?}`.
-- **`peer_list`** shows one line per peer: address, app and host, `state`
-  (`starting`, `working`, `idle`, `waiting_user`, `unknown`, `gone`) and its
-  `attention`, the status line facts by their compact labels (`context
-  14%, 7d limit 98%`; the JSON `facts` object uses the
-  `capabilities.facts` names), the model, `pending` and `last_seen_ms`;
-  `detail` adds cwd, pid, durable, name_taken and `last_notification`.
-  A federated peer also carries `via_host` and `link`, and the result
-  `federation` and `hosts` (`{host, link, last_seen_ms}` per linked host).
+- **`peer_list`** as text (the default) reads like this:
+
+  ```
+  you: p-da26a6b5 (durable)
+  Zenit1              waiting_user  ctx 194k  1 pending
+  Artefacts           gone 18m  subject Folio  1 pending
+  dalaran/p-b1e7d4aa  working  seen 16m ago
+  links: dalaran down (seen 15m ago), aeor up
+  +5 gone with nothing pending and no subject
+  ```
+
+  The reader once, then one row per peer: address, one state word
+  (`starting`, `working`, `idle`, `waiting_user`, `unknown`, `gone <how
+  long>`, `offline`), `ctx` (the context tokens the wake rule judges,
+  rounded; rate limits and cost are account-wide and stay in the JSON),
+  the subject, what is pending and how long ago a peer was
+  last heard from. A model or an app shows only where the peers differ;
+  `detail` adds cwd and pid. A gone address with nothing pending and no
+  subject is only counted. A line explains `unknown` when a peer has it:
+  that session's client sends no presence (`sketerm mcp setup` on its
+  host, for the config dir its Claude Code runs with). The `sketerm peer
+  list` CLI prints the same text. With `--structured` every peer is a JSON
+  object: address, app and host, `state` and its `attention`, `facts`
+  (the `capabilities.facts` names), the model, `pending` and
+  `last_seen_ms`, `detail` adding cwd, pid, durable, name_taken and
+  `last_notification`; a federated peer also carries `via_host` and
+  `link`, and the result `federation` and `hosts` (`{host, link,
+  last_seen_ms}` per linked host).
   A delivered message carries the sender's state at delivery
-  (`meta.sender_state`, and the composed line's state).
+  (`meta.sender_state`, and the composed line's state); `peer_send`'s
+  text names the recipient's state when the daemon reported it, and
+  `peer_read`'s marks re-read items and slow mail.
 
 ### Waking and slow mail
 
@@ -3086,6 +3132,10 @@ whose config says so; every other daemon is dialed by it, or calls in
   transport (SSH, UDP or Tor, as `sketerm mux <name>` would connect) and
   redials a dropped one after 2 s, doubling up to 60 s. Nothing is
   configured on the other hosts.
+  Only the per-user daemon (the default `mux.sock`) federates: the
+  private daemon of an MCP server or a test rig reads the same
+  config.conf, and federating there made it a second hub that took each
+  member's one uplink from the real one.
 - **Setup**: `sketerm peer hub add NAME [--host SSH_TARGET]` makes this
   daemon the hub and links `[domain.NAME]` (setting `peer_hub = true`,
   `peers = true` and `host`, default NAME; an existing `host` is kept

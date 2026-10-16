@@ -1,5 +1,23 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-16: MCP results are text by default; `--structured` opts into the facts lane
+
+`sketerm mcp` answers with the text block (plus images) alone and declares no
+`outputSchema`; `--structured` restores `structuredContent` and the schemas
+byte for byte (`mcp.result_mode`, read by `Res`, `errResDetails` and
+`mcpfilter.filterToolsJson`; `capabilities.result_mode`). An error's text starts
+`error <code>: `, binary payloads ride a divider (`Res.bulk`), and web_stream,
+web_download, web_policy and web_act's scope state gained text. `peer_list`'s text
+is a compact table (`peer_cli.writeList`, shared with `sketerm peer list`):
+you once, one state word, `ctx` in rounded tokens (what the wake rule judges;
+no rate limits or cost), gone peers with nothing pending counted. `clock.span`/
+`clock.ago` and `util/numtext.zig` are the homes for relative times and counts.
+Only the per-user daemon federates now (`daemon_peers.federationRole`): every
+private broker used to read config.conf and dial the members as a second hub,
+taking their uplink from the real one. Remote peers read `unknown` when their
+host's Claude config dir lacks the presence hooks, which `peer_list` now says.
+smoke-mcp stage 0 checks both modes; the rigs pass `--structured`.
+
 ## 2026-10-16: pane peers get an opaque address and default to the pane title
 
 A peer's address no longer comes from its pane's session name: `chooseName`

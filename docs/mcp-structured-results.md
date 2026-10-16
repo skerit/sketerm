@@ -12,6 +12,17 @@ module (`mcp_panes`, `mcp_app`, `mcp_term`, `mcp_files`, `mcp_web`,
 find it by content. The tool count grew past the 112 quoted below;
 `docs/mcp.md` carries the current list, drift-tested against the table.
 
+Since 2026-10-16 the structured lane is OPT-IN: `sketerm mcp --structured`
+(`mcp.result_mode`, reported as `capabilities.result_mode`). By default a
+result is its text block (plus images) alone, tools/list declares no
+`outputSchema`, and an error's text starts `error <code>: `. Claude Code
+shows a model only `structuredContent` when a result has one, so a default
+that always sent it made every agent pay for verbose JSON. Everything below
+still binds in structured mode, byte for byte, and the text lane is now
+what agents read: it must carry every fact an agent needs (compact rows,
+relative times, rounded counts, defaults left out), and bytes the facts
+lane carries go behind a divider in text mode (`Res.bulk`).
+
 ## Goal
 
 Every tool result carries BOTH lanes, each doing the one job it is good at:
