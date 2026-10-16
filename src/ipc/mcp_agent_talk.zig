@@ -684,7 +684,7 @@ pub fn readTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]co
         select.Detail.selected;
     if (!detail.selects()) return activityRead(arena, args, e);
     const explicit = argInt(args, "since");
-    // Only the newest job's last assistant message.
+    // Only the newest job's answer (the message its done named).
     const final = argBool(args, "final");
     if (final and detail == .all) return errRes(arena, .invalid_args, "final returns one message: it does not combine with detail \"all\"");
     const limit: usize = @intCast(std.math.clamp(argInt(args, "limit") orelse READ_DEFAULT, 1, READ_MAX));
@@ -979,7 +979,7 @@ fn listCompact(arena: std.mem.Allocator, until: i64, shown: []const *Entry, hidd
         conversation: ?[]const u8,
         relaunchable: ?bool,
         gone_reason: ?[]const u8,
-        /// The newest job's last assistant message, first line, clipped.
+        /// The newest job's answer, first line, clipped.
         preview: ?[]const u8,
         facts: ?std.json.Value,
     };

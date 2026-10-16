@@ -92,14 +92,14 @@ fn lastMessage(records: []const Record, job: u32) ?usize {
     return null;
 }
 
-/// The index of the newest job's last assistant message (what a `final`
-/// read returns), or null when that job has none yet. Looking it up hands
-/// nothing out.
+/// The index of the newest job's answer (`answerIndex`: what a `final`
+/// read returns and its `done` named), or null when that job has none
+/// yet. Looking it up hands nothing out.
 pub fn newestFinal(records: []const Record) ?usize {
     if (records.len == 0) return null;
     var newest: u32 = 0;
     for (records) |r| newest = @max(newest, r.job);
-    return lastMessage(records, newest);
+    return answerIndex(records, newest);
 }
 
 /// The job's answer: its most recent selected message of at least
@@ -274,8 +274,8 @@ pub const Options = struct {
     /// `jobs` with `keep_empty` (a done's own job, to point at it).
     handed: ?*const Handed = null,
     keep_empty: bool = false,
-    /// `selected` only: each job's last assistant message and nothing else
-    /// (`agent_read final`).
+    /// `selected` only: each job's answer (`answerIndex`, the record its
+    /// `done` named) and nothing else (`agent_read final`).
     final_only: bool = false,
 };
 
@@ -342,7 +342,7 @@ pub fn select(alloc: std.mem.Allocator, records: []const Record, jobs: []const u
             // `all` pages by id: what is at or below `since` was read.
             if (opts.detail == .all and r.id <= opts.since) continue;
             const take = visible(r.kind, opts.include_tools) and switch (opts.detail) {
-                .selected => if (opts.final_only) i == last else r.kind != .assistant or i == last or substantive(r),
+                .selected => if (opts.final_only) i == ans else r.kind != .assistant or i == last or substantive(r),
                 .all => true,
                 .activity => false,
             };
@@ -365,10 +365,13 @@ pub fn select(alloc: std.mem.Allocator, records: []const Record, jobs: []const u
 
     switch (opts.detail) {
         .selected => {
-            // The newest job's last message stays whole, when it is returned.
+            // The newest job's last message (a final read: its answer)
+            // stays whole, when it is returned.
             var keep: ?usize = null;
             if (summaries.items.len > 0) {
-                if (lastMessage(records, summaries.items[summaries.items.len - 1].job)) |k| {
+                const newest = summaries.items[summaries.items.len - 1].job;
+                const whole = if (opts.final_only) answerIndex(records, newest) else lastMessage(records, newest);
+                if (whole) |k| {
                     if (std.mem.indexOfScalar(usize, picked.items, k) != null) keep = k;
                 }
             }
@@ -873,7 +876,7 @@ test "the cap's cut records are not handed out: the next read returns them" {
     try t.expectEqualSlices(u64, &.{1}, ids);
 }
 
-test "final only: the job's last assistant message, once, then a pointer at it" {
+test "final only: the job's answer (the done's), once, then a pointer at it" {
     var records = [_]Record{
         rec(1, 0, .user, "do it"),
         rec(2, 0, .assistant, filled(1600, 'l')),
@@ -888,20 +891,23 @@ test "final only: the job's last assistant message, once, then a pointer at it" 
     defer first.deinit(t.allocator);
     const ids = try pickedIds(&records, first);
     defer t.allocator.free(ids);
-    try t.expectEqualSlices(u64, &.{5}, ids);
+    // A short last word after a substantive final: the answer is the final,
+    // exactly the record a done names.
+    try t.expectEqualSlices(u64, &.{2}, ids);
+    try t.expectEqual(records[answerIndex(&records, 0).?].id, ids[0]);
     try t.expectEqual(@as(u32, 1), first.jobs[0].omitted_messages);
     try handed.markSelection(t.allocator, &records, first);
     // Handed out: nothing new, one pointer; a re-read (no handed state) returns it.
     const again = try select(t.allocator, &records, &one, .{ .handed = &handed, .keep_empty = true, .final_only = true });
     defer again.deinit(t.allocator);
     try t.expectEqual(@as(usize, 0), again.picked.len);
-    try t.expectEqual(@as(u64, 5), again.jobs[0].earlier.?.id);
+    try t.expectEqual(@as(u64, 2), again.jobs[0].earlier.?.id);
     const reread = try select(t.allocator, &records, &one, .{ .final_only = true });
     defer reread.deinit(t.allocator);
     try t.expectEqual(@as(usize, 1), reread.picked.len);
 }
 
-test "the newest job's final: its last assistant message, none while it has not answered" {
+test "the newest job's final: its answer, none while it has not answered" {
     var records = [_]Record{
         rec(1, 0, .user, "one"),
         rec(2, 0, .assistant, "first answer"),

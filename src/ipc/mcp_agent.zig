@@ -157,7 +157,7 @@ pub const INSTRUCTIONS =
     "instead of polling with agent_wait; to watch several agents at once use agent-wait --any with their ids (--all: one wake-up once every one settled). " ++
     "A wake-up the waiter printed is not repeated by agent_* results; it carries a done's answer in full when short, and agent_read returns what it did not carry. " ++
     "agent_send to a busy agent queues the prompt for its next turn without interrupting it (interrupt:true stops it first; agents:[...] sends to several at once), and agent_answer takes text when a prompt's right answer is none of its options. " ++
-    "agent_read final:true returns just the newest job's last message, and agent_list is compact unless detail:true. " ++
+    "agent_read final:true returns just the newest job's answer (the message its done named), and agent_list is compact unless detail:true. " ++
     "Rules every brief repeats belong in a template (agent_template_save, then template + vars on agent_send/agent_open). " ++
     "agent_open returns an id; after a restart, agent_attach {agent: id} resumes it, and relaunch:true starts a gone one again under the same id.";
 
@@ -1225,7 +1225,7 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     try testing.expectEqual(@as(u8, 0x3a), citem.get("active_at").?.string[2]);
     try testing.expect(citem.get("sessions") == null and citem.get("recordings") == null and citem.get("pending") == null);
 
-    // final: the newest job's last message, under the handed-out state.
+    // final: the newest job's answer, under the handed-out state.
     const fin = try shaped(a, "agent_read", try rig.call(.agent_read, "{\"final\":true}"));
     try testing.expect(fin.get("final").?.bool);
     try testing.expectEqual(@as(usize, 0), fin.get("records").?.array.items.len);

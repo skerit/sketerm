@@ -2208,8 +2208,8 @@ TUI attached to that server for a human to watch is optional, see below).
   or not; `detail: "all"` returns every assistant message and notice
   above `since` (or above what the previous detail-all read covered) by
   id, paged by `limit` with `next_since`/`more`. `final: true`
-  (`capabilities.agent_read_final`) returns only the newest job's last
-  assistant message, whole, under the same delivery rule: once, then a
+  (`capabilities.agent_read_final`) returns only the newest job's answer
+  (the message its done named), whole, under the same delivery rule: once, then a
   read names the job with a `jobs[].earlier` pointer at it; with `since`
   the newest job above it, handed out or not; refused with `detail:
   "all"`. It replaces reading an app's own transcript files (opencode's
@@ -2714,8 +2714,8 @@ TUI attached to that server for a human to watch is optional, see below).
   `local`), `cwd` (which clone a worker is in), `idle_s` (seconds since
   the app last drew or sent anything), `queued` (prompts its app holds),
   `pending` (the prompt it waits on: `kind` and `title`), `preview` (the
-  first line, at most 120 bytes, of its newest job's last assistant
-  message, `select.newestFinal`: a glance that hands nothing out, so
+  first line, at most 120 bytes, of its newest job's answer through
+  `select.newestFinal`: a glance that hands nothing out, so
   `agent_read final` still returns it whole; absent before that job has
   one; `capabilities.agent_list_preview`), `conversation` and `facts`
   (above); `detail: false` says which. `detail: true` gives every
@@ -2791,7 +2791,7 @@ The server's `instructions` (initialize result) tell the assistant to use
 `agent_open` for Claude Code and opencode, to run `watch_command` in the
 background instead of polling (`--any` for several agents, `--all` for
 one wake-up once all settled), that `agent_send` takes `interrupt` and
-`agents`, that `agent_read final:true` returns just the last message and
+`agents`, that `agent_read final:true` returns just the job's answer (the message its done named) and
 `agent_list` is compact unless `detail:true`, and that `agent_open`
 returns an id that `agent_attach {agent: id}` resumes after a restart
 (`relaunch: true` for a gone one), whenever the agent tools are offered.

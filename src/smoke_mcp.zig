@@ -10828,7 +10828,7 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         expectFact(rs[1].object, "outcome", "idle", "agent_wait all: fan-b was idle all along");
         if (std.mem.indexOf(u8, scStr(both, "watch_command", "agent_wait all"), " --all ") == null) fail("agent_wait all: watch_command is not an --all waiter");
 
-        // final: just the last message, once; then a pointer; since re-reads.
+        // final: just the answer, once; then a pointer; since re-reads.
         const fin = agentCall(&m, arena, "agent_read", "{\"agent\":\"fan-a\",\"final\":true}", "agent_read final", false, 15_000);
         const fin_recs = fin.get("records").?.array.items;
         if (fin_recs.len != 1 or !std.mem.eql(u8, fin_recs[0].object.get("text").?.string, "echo: handed off")) fail("agent_read final: not exactly the last message");

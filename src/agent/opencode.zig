@@ -54,7 +54,8 @@ const EventType = enum {
     @"question.rejected",
 };
 
-/// Part types that become records; every other type is ignored.
+/// Part types that become records; every other type (`reasoning`, step
+/// markers, ...) is ignored, its streamed deltas included (`skipped`).
 const PartType = enum { text, tool, subtask, compaction };
 
 const SessionStatus = enum { idle, busy, retry };
@@ -186,6 +187,9 @@ pub const Source = struct {
     sessions: std.StringHashMapUnmanaged(Session) = .empty,
     messages: std.StringHashMapUnmanaged(Message) = .empty,
     live: std.StringHashMapUnmanaged(LiveText) = .empty,
+    /// Root parts of a type that never becomes a record: 1.x streams a
+    /// `reasoning` part's summary as `text` deltas like an answer's.
+    skipped: std.StringHashMapUnmanaged(void) = .empty,
 
     records: std.ArrayList(Record) = .empty,
     /// The opencode part (or message) id each record came from.
@@ -259,6 +263,9 @@ pub const Source = struct {
             e.value_ptr.text.deinit(a);
         }
         self.live.deinit(a);
+        var kit = self.skipped.keyIterator();
+        while (kit.next()) |k| a.free(k.*);
+        self.skipped.deinit(a);
         for (self.records.items) |r| r.deinit(a);
         self.records.deinit(a);
         for (self.refs.items) |r| a.free(r);
@@ -703,7 +710,7 @@ pub const Source = struct {
         const sid = str(part, "sessionID") orelse return;
         if (!self.isRoot(sid)) return;
         const mid = str(part, "messageID") orelse "";
-        const ptype = std.meta.stringToEnum(PartType, str(part, "type") orelse return) orelse return;
+        const ptype = std.meta.stringToEnum(PartType, str(part, "type") orelse return) orelse return self.skipPart(pid);
         // A compaction summary is never returned, not even as detail all.
         if (self.messages.get(mid)) |m| if (m.summary) return;
         switch (ptype) {
@@ -774,9 +781,21 @@ pub const Source = struct {
         if (self.messages.get(mid)) |m| {
             if (m.role == .user or m.summary) return;
         }
-        if (self.by_ref.contains(pid)) return; // already final
+        if (self.by_ref.contains(pid) or self.skipped.contains(pid)) return; // already final, or never a record
         const lt = try self.liveEntry(pid, mid);
         try lt.text.appendSlice(self.allocator, str(props, "delta") orelse "");
+    }
+
+    /// A part that never becomes a record: what its deltas built is dropped
+    /// and later ones are ignored.
+    fn skipPart(self: *Source, pid: []const u8) !void {
+        self.dropLive(pid);
+        const gop = try self.skipped.getOrPut(self.allocator, pid);
+        if (gop.found_existing) return;
+        gop.key_ptr.* = self.allocator.dupe(u8, pid) catch |err| {
+            self.skipped.removeByPtr(gop.key_ptr);
+            return err;
+        };
     }
 
     fn liveEntry(self: *Source, pid: []const u8, mid: []const u8) !*LiveText {
@@ -2637,6 +2656,51 @@ test "a text part cut off by its message completing keeps what the deltas built"
     try rig.feed(4, "{\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"ses_root\",\"messageID\":\"msg_a1\",\"partID\":\"prt_a1\",\"field\":\"text\",\"delta\":\"partial answer\"}}");
     try feedAssistant(&rig, 5, "msg_a1", true);
     try t.expectEqualStrings("partial answer", rig.src.records.items[1].text);
+}
+
+test "reasoning parts (openai summaries streamed as text deltas) are never records: final and default reads return the answer the done named" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    try connectRoot(&rig);
+    try feedPrompt(&rig, 1, 1, "review the claim semantics");
+    try feedStatus(&rig, 2, "ses_root", "busy");
+    try feedAssistant(&rig, 3, "msg_a1", false);
+    // Recorded 1.18 order: the answer text part ends, then reasoning parts
+    // announce themselves, stream their titles and end, one only after its
+    // deltas, one never before its message completes.
+    const report = "R" ** 1600;
+    const answer_ev = try std.fmt.allocPrint(t.allocator,
+        \\{{"type":"message.part.updated","properties":{{"sessionID":"ses_root","part":{{"type":"text","text":"{s}","time":{{"start":4,"end":5}},"messageID":"msg_a1","sessionID":"ses_root","id":"prt_ans"}}}}}}
+    , .{report});
+    defer t.allocator.free(answer_ev);
+    try rig.feed(5, answer_ev);
+    try rig.feed(6, "{\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_root\",\"part\":{\"type\":\"reasoning\",\"text\":\"\",\"time\":{\"start\":6},\"messageID\":\"msg_a1\",\"sessionID\":\"ses_root\",\"id\":\"prt_r1\"}}}");
+    try rig.feed(6, "{\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"ses_root\",\"messageID\":\"msg_a1\",\"partID\":\"prt_r1\",\"field\":\"text\",\"delta\":\"**Refining recipient classification**\"}}");
+    try rig.feed(6, "{\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_root\",\"part\":{\"type\":\"reasoning\",\"text\":\"**Refining recipient classification**\",\"time\":{\"start\":6,\"end\":6},\"messageID\":\"msg_a1\",\"sessionID\":\"ses_root\",\"id\":\"prt_r1\"}}}");
+    try rig.feed(6, "{\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"ses_root\",\"messageID\":\"msg_a1\",\"partID\":\"prt_r2\",\"field\":\"text\",\"delta\":\"**Refining claim semantics**\"}}");
+    try rig.feed(6, "{\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_root\",\"part\":{\"type\":\"reasoning\",\"text\":\"**Refining claim semantics**\",\"time\":{\"start\":6,\"end\":6},\"messageID\":\"msg_a1\",\"sessionID\":\"ses_root\",\"id\":\"prt_r2\"}}}");
+    try rig.feed(6, "{\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_root\",\"part\":{\"type\":\"reasoning\",\"text\":\"\",\"time\":{\"start\":6},\"messageID\":\"msg_a1\",\"sessionID\":\"ses_root\",\"id\":\"prt_r3\"}}}");
+    try rig.feed(6, "{\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"ses_root\",\"messageID\":\"msg_a1\",\"partID\":\"prt_r3\",\"field\":\"text\",\"delta\":\"**Clarify interest-state access**\"}}");
+    try feedAssistant(&rig, 6, "msg_a1", true);
+    try feedStatus(&rig, 7, "ses_root", "idle");
+
+    const kinds = [_]vocab.RecordKind{ .user, .assistant };
+    try t.expectEqual(kinds.len, rig.src.records.items.len);
+    for (rig.src.records.items, kinds) |r, k| try t.expectEqual(k, r.kind);
+    const answer_id = rig.src.records.items[1].id;
+    try t.expectEqual(@as(usize, 1), rig.count(.done));
+    try t.expectEqual(@as(?u64, answer_id), rig.last(.done).?.record);
+    const recs = rig.src.records.items;
+    const jobs = try select.jobsAfter(t.allocator, recs, 0);
+    defer t.allocator.free(jobs);
+    for ([_]bool{ true, false }) |final| {
+        const sel = try select.select(t.allocator, recs, jobs, .{ .final_only = final });
+        defer sel.deinit(t.allocator);
+        try t.expectEqual(@as(usize, 1), sel.picked.len);
+        try t.expectEqual(answer_id, recs[sel.picked[0]].id);
+    }
+    try t.expectEqual(answer_id, recs[select.newestFinal(recs).?].id);
 }
 
 test "a permission is needs_input with once/always/reject options, answered by label or word" {
