@@ -1396,11 +1396,15 @@ pub fn handleMessage(arena: std.mem.Allocator, backend: Backend, line: []const u
         if (params == .object) if (params.object.get("requestId")) |rid| mcp_webfetch.cancel(arena, rid);
         return null;
     }
+    // The client finished its handshake: its push route goes live after a
+    // grace even if it never calls a tool (`noteHandshake`).
+    if (std.mem.eql(u8, method, "notifications/initialized")) mcp_agent.noteHandshake(clock.nowMs());
     if (std.mem.startsWith(u8, method, "notifications/")) return null;
     if (std.mem.eql(u8, method, "ping")) {
         return rpcResult(arena, id, "{}");
     }
     if (std.mem.eql(u8, method, "tools/list")) {
+        mcp_agent.noteHandshake(clock.nowMs());
         const tools = renderedToolsJson(arena) catch return null;
         const result = std.fmt.allocPrint(arena, "{{\"tools\":{s}}}", .{tools}) catch return null;
         return rpcResult(arena, id, result);
@@ -2963,4 +2967,43 @@ test "docs/mcp.md carries the tool reference the table renders" {
         std.debug.print("docs/mcp.md tool reference is stale; replace the block between the markers with the contents of {s}\n", .{out});
         return error.StaleToolReference;
     }
+}
+
+test "a channel session's pushes start after the handshake, before any tool call" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const waiter = @import("mcp_agent_waiter.zig");
+    const saved = .{ mcp_agent.state.push, mcp_agent.state.push_live, mcp_agent.state.push_arm_at_ms, mcp_agent.state.push_sink };
+    defer {
+        mcp_agent.state.push = saved[0];
+        mcp_agent.state.push_live = saved[1];
+        mcp_agent.state.push_arm_at_ms = saved[2];
+        mcp_agent.state.push_sink = saved[3];
+    }
+    var fake = FakeBackend{ .responses = &.{}, .allocator = t.allocator };
+    defer fake.deinit();
+    // `initialize` armed the channel route; the client sends its
+    // `initialized` notification and lists the tools, then goes quiet.
+    mcp_agent.armPush(.channel, null);
+    try t.expect(!waiter.looseRouteReady());
+    try t.expect(handleMessage(arena, fake.backend(), "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}") == null);
+    _ = handleMessage(arena, fake.backend(), "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}");
+    const now = clock.nowMs();
+    // Within the grace its listener may not exist yet: nothing is pushed,
+    // and the loop wakes when the grace ends.
+    waiter.tickPush(now);
+    try t.expect(!waiter.looseRouteReady());
+    const due = mcp_agent.dueInMs(now) orelse return error.TestUnexpectedResult;
+    try t.expect(due <= waiter.PUSH_ARM_GRACE_MS);
+    // Past it the route is live with no tool call made.
+    mcp_agent.service(now + waiter.PUSH_ARM_GRACE_MS + 1);
+    try t.expect(waiter.looseRouteReady());
+    try t.expect(mcp_agent.state.push_arm_at_ms == null);
+    // A client with no push route never goes live this way.
+    mcp_agent.armPush(.none, null);
+    waiter.noteHandshake(now);
+    waiter.tickPush(now + waiter.PUSH_ARM_GRACE_MS + 1);
+    try t.expect(!mcp_agent.state.push_live);
 }

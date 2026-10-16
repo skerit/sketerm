@@ -2339,8 +2339,13 @@ TUI attached to that server for a human to watch is optional, see below).
     Claude Code (`clientInfo.name` `claude-code`) and its parent, or an
     ancestor up to 8 levels, has that option naming this server's
     channel on its argv (Linux; elsewhere `agent_push` stays `none`),
-    and only from the session's first tool call on (Claude Code
-    registers its listener after the handshake). A session whose channel
+    and only once its listener exists: Claude Code registers it after the
+    handshake and says nothing when it did, so the route goes live 3 s
+    after the client's last handshake message (`notifications/initialized`
+    or its `tools/list`), or at its first tool call when that comes first
+    (`PUSH_ARM_GRACE_MS`); a session that makes no tool call still gets
+    its pushes (before 2026-10, peer mail for one waited for its first
+    tool call or prompt). A session whose channel
     Claude Code nevertheless refused (feature gate, org policy, a declined
     dialog) loses the pushed events: `agent_read` still returns the
     records.

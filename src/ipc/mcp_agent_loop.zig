@@ -124,6 +124,11 @@ pub fn dueInMs(now_ms: i64) ?i64 {
     // A reconnect thread cannot wake the loop: look at it often.
     if (state.reconnects.items.len > 0) due = if (due) |y| @min(TICK_MS, y) else TICK_MS;
     if (state.waiter.dueIn(now_ms)) |x| due = if (due) |y| @min(x, y) else x;
+    // The push route goes live when the handshake's grace passed.
+    if (state.push_arm_at_ms) |at| {
+        const x = @max(0, at - now_ms);
+        due = if (due) |y| @min(x, y) else x;
+    }
     return due;
 }
 
@@ -138,6 +143,7 @@ fn screenNeedsTick(e: *const screen_source.Engine) bool {
 /// a lost remote link is retried by a background thread.
 pub fn service(now_ms: i64) void {
     serviceReconnects(now_ms);
+    mcp_agent_waiter.tickPush(now_ms);
     for (state.entries.items) |e| {
         if (serviceEntry(e, now_ms)) |_| {
             e.service_failed = null;

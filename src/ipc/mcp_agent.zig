@@ -85,6 +85,7 @@ pub const factsCapability = mcp_agent_hosts.factsCapability;
 pub const outcomeOf = mcp_agent_results.outcomeOf;
 pub const armPush = mcp_agent_waiter.armPush;
 pub const startPush = mcp_agent_waiter.startPush;
+pub const noteHandshake = mcp_agent_waiter.noteHandshake;
 pub const instructions = mcp_agent_waiter.instructions;
 pub const followers = mcp_agent_waiter.followers;
 const Waiter = mcp_agent_waiter.Waiter;
@@ -445,9 +446,11 @@ const State = struct {
     /// wait running out is what it asked for, never `timed_out`.
     no_wait: bool = false,
     /// This MCP session's push route (`armPush`) and whether it pushes yet
-    /// (`startPush`: the session made its first tool call).
+    /// (`startPush`: the session made its first tool call, or the
+    /// handshake's grace passed at `push_arm_at_ms`, `noteHandshake`).
     push: agentpush.Route = .none,
     push_live: bool = false,
+    push_arm_at_ms: ?i64 = null,
     /// Where a channel notification line goes (the MCP server's stdout).
     push_sink: ?*const fn ([]const u8) void = null,
     /// A retry is typing its continue prompt: the service it pumps does

@@ -37,17 +37,40 @@ const MAX_SUBS = 32;
 // ── push delivery ────────────────────────────────────────────────
 
 /// Set this MCP session's push route (at `initialize`): `sink` gets each
-/// channel notification line once `startPush` ran.
+/// channel notification line once the route is live (`startPush`, or the
+/// handshake's grace: `noteHandshake`).
 pub fn armPush(route: agentpush.Route, sink: ?*const fn ([]const u8) void) void {
     state.push = route;
     state.push_sink = sink;
     state.push_live = false;
+    state.push_arm_at_ms = null;
 }
 
-/// The session is up (its first tool call): Claude Code registers its
-/// channel listener after the handshake, and a push before that is lost.
+/// After the client's last handshake message (`notifications/initialized`,
+/// its tool listing) the route goes live once this much passed: Claude
+/// Code registers its channel listener only once the server's connection
+/// is fully set up, after it sent those, and says nothing when it did.
+pub const PUSH_ARM_GRACE_MS: i64 = 3_000;
+
+/// The client sent a handshake message at `now_ms`: the route goes live
+/// `PUSH_ARM_GRACE_MS` after the last one (`tickPush`), so a session that
+/// makes no tool call still gets its pushes.
+pub fn noteHandshake(now_ms: i64) void {
+    if (state.push == .none or state.push_live) return;
+    state.push_arm_at_ms = now_ms + PUSH_ARM_GRACE_MS;
+}
+
+/// The route goes live once the handshake's grace passed (the loop wakes
+/// for `push_arm_at_ms`: `mcp_agent_loop.dueInMs`).
+pub fn tickPush(now_ms: i64) void {
+    const at = state.push_arm_at_ms orelse return;
+    if (now_ms >= at) startPush();
+}
+
+/// The session made a tool call: its listener is registered by now.
 pub fn startPush() void {
     if (state.push != .none) state.push_live = true;
+    state.push_arm_at_ms = null;
 }
 
 /// Server instructions for an MCP session on push `route`.

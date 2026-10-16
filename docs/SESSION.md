@@ -23229,3 +23229,17 @@ peer_cli; smoke peers step 44 (two untitled servers in `.../zenit-workspace`
 are `zenit-workspace` and `zenit-workspace-1`, the directory in the list
 text) and f10 (an untitled session's directory alias, replaced by the
 viewer's title). `mcpproc` spawns take a `cwd`.
+
+## 2026-10-16: channel pushes start after the handshake, not the first tool call
+
+A Claude Code session WITH the sketerm channel got no push (peer mail,
+agent events) until it made its first tool call: `startPush` was the only
+thing that made the route live, because Claude Code registers its channel
+listener after the handshake and a push before that is dropped. Its
+bundled client (2.1.301) registers it once the server's connection is set
+up and announces nothing, so the route now goes live
+`PUSH_ARM_GRACE_MS` (3 s) after the client's last handshake message
+(`notifications/initialized`, `tools/list`: `noteHandshake`), or at the
+first tool call when sooner; the MCP loop wakes for it
+(`mcp_agent_loop.dueInMs`). Unit test in mcp.zig drives
+`handleMessage` through the handshake with no tool call.
