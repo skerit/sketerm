@@ -509,6 +509,9 @@ fn register() void {
         .alias = ask,
         .alias_explicit = link.alias_explicit and ask != null,
         .armed = arm,
+        // The client that started this server, as the registry records it:
+        // its hooks report to the daemon while this server is gone (`no_mcp`).
+        .client_pid = @intCast(c.getppid()),
     }) catch return lost();
     link.armed_sent = arm;
     if (aliases) {
@@ -861,6 +864,7 @@ const ResultLine = struct {
     reason: ?[]const u8 = null,
     to_state: ?[]const u8 = null,
     to_polls: ?bool = null,
+    to_no_mcp: ?bool = null,
 };
 
 fn peerSend(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
@@ -907,12 +911,13 @@ fn peerSend(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             if (r.reason) |why| try res.fact("reason", @tagName(why));
             if (r.to_state) |st| try res.fact("to_state", @tagName(st));
             if (r.to_polls) try res.fact("to_polls", true);
-            try res.text(try peer_cli.sentLine(arena, r.id, .{ .to = addr, .outcome = r.outcome, .reason = r.reason, .to_state = r.to_state, .to_polls = r.to_polls }));
+            if (r.to_no_mcp) try res.fact("to_no_mcp", true);
+            try res.text(try peer_cli.sentLine(arena, r.id, .{ .to = addr, .outcome = r.outcome, .reason = r.reason, .to_state = r.to_state, .to_polls = r.to_polls, .to_no_mcp = r.to_no_mcp }));
         },
         .many => {
             const lines = try arena.alloc(ResultLine, r.results.len);
             for (r.results, lines) |x, *l| {
-                l.* = .{ .to = x.to, .outcome = @tagName(x.outcome), .reason = if (x.reason) |why| @tagName(why) else null, .to_state = if (x.to_state) |st| @tagName(st) else null, .to_polls = if (x.to_polls) true else null };
+                l.* = .{ .to = x.to, .outcome = @tagName(x.outcome), .reason = if (x.reason) |why| @tagName(why) else null, .to_state = if (x.to_state) |st| @tagName(st) else null, .to_polls = if (x.to_polls) true else null, .to_no_mcp = if (x.to_no_mcp) true else null };
                 try res.text(try peer_cli.sentLine(arena, r.id, x));
             }
             try res.raw("results", try jsonOf(arena, lines));
@@ -1016,6 +1021,9 @@ pub const CapFact = struct {
     slow_mail: bool,
     /// The daemon reports which peers poll (welcome `peer_polls`).
     polls: bool,
+    /// The daemon lists an address whose server is gone while its session's
+    /// hooks still report as no_mcp (welcome `peer_hook_presence`).
+    no_mcp: bool,
     /// Peer messages reach this session without peer_read now: a Claude
     /// Code channel or an agent-wait --server follower.
     pushed: bool,
@@ -1039,6 +1047,7 @@ pub fn capability() CapFact {
         .subject = if (link.peer) |*p| link.status == .up and p.subjects() else false,
         .slow_mail = if (link.peer) |*p| link.status == .up and p.slowMail() else false,
         .polls = if (link.peer) |*p| link.status == .up and p.polls() else false,
+        .no_mcp = if (link.peer) |*p| link.status == .up and p.conn.caps.peer_hook_presence else false,
         .pushed = armed() orelse false,
     };
 }

@@ -88,6 +88,12 @@ pub const PENDING_MS: i64 = 5_000;
 pub const ROUTE_PREFIX = "+";
 /// Addresses one `peer_send` `to_list` may name (after duplicates collapse).
 pub const PEER_TO_MAX: usize = 32;
+/// An address with no live server whose session's hooks or status line
+/// reported within this long (wall ms) reads `no_mcp`: the session runs,
+/// its MCP server is down. Far above the 5 s status line refresh, so a
+/// few missed runs never flip it; a session that ended without its
+/// `SessionEnd` hook reads gone at most this long after.
+pub const HOOK_FRESH_MS: i64 = 120_000;
 
 // ---------------------------------------------------------------- wire
 
@@ -174,6 +180,9 @@ pub const RegisterReq = struct {
     /// turn or `peer_read`. null = a server that predates it (unknown,
     /// never read as polling).
     armed: ?bool = null,
+    /// The process that started this server (its MCP client), whose hooks
+    /// report the session's presence (`HookPresence`); 0 = not given.
+    client_pid: i32 = 0,
 };
 
 /// `peer_list_req` body.
@@ -224,6 +233,10 @@ pub const PeerInfo = struct {
     /// (`RegisterReq.armed` false): mail waits for its next turn or
     /// `peer_read`.
     polls: bool = false,
+    /// No server of this address is live, but its session's hooks or status
+    /// line reported within `HOOK_FRESH_MS`: the session runs, its MCP
+    /// server is down (`state` stays `gone`; `last_seen_ms` is that report).
+    no_mcp: bool = false,
     /// What the peer's registration reported (`RegisterReq`).
     facts: ?std.json.Value = null,
     model: []const u8 = "",
@@ -282,6 +295,8 @@ pub const RecipientResult = struct {
     /// The recipient polls (`PeerInfo.polls`): handed to its server, read
     /// only with its next turn or `peer_read`.
     to_polls: bool = false,
+    /// The recipient has no live server but its session runs (`PeerInfo.no_mcp`).
+    to_no_mcp: bool = false,
 };
 
 /// `peer_send_reply` body; `id` is empty when refused. A `to_list` send
@@ -293,6 +308,7 @@ pub const SendReply = struct {
     reason: ?RefuseReason = null,
     to_state: ?PeerState = null,
     to_polls: bool = false,
+    to_no_mcp: bool = false,
     results: []const RecipientResult = &.{},
 };
 
@@ -380,6 +396,18 @@ pub const SubjectReply = struct {
     refused: ?[]const u8 = null,
 };
 
+/// `peer_hook_presence` body: a session's hook or status line found no
+/// live server of its own and reports to the broker instead. The broker
+/// matches `ancestry` (the reporting process's, nearest first) against the
+/// client pid each gone address's last server registered with
+/// (`RegisterReq.client_pid`), the rule the hook uses to find its servers
+/// in the registry. No reply.
+pub const HookPresence = struct {
+    ancestry: []const i32 = &.{},
+    /// The state the hook event means; null = no change (a status line).
+    state: ?PeerState = null,
+};
+
 /// The peer running in a session's process tree, as the session's worker
 /// tells its viewers (`session_meta` `peer`); empty address = none.
 pub const SessionPeer = struct {
@@ -420,6 +448,8 @@ pub const Relay = struct {
     to_state: ?PeerState = null,
     /// `stored`: the recipient polls (`SendReply.to_polls`).
     to_polls: bool = false,
+    /// `stored`: the recipient has no live server but its session runs.
+    to_no_mcp: bool = false,
     /// `event`: how long the message waited (already a duration).
     queued_ms: i64 = 0,
     /// `stored`: whether `id` named a message or an event.
@@ -542,6 +572,15 @@ const Box = struct {
     alias: []u8 = &.{},
     /// `AddressMeta.titled`.
     titled: bool = false,
+    /// The client pid its last live server registered (`RegisterReq.client_pid`).
+    client_pid: i32 = 0,
+    /// Wall ms of the last hook report while no server was live; 0 = none.
+    hook_ms: i64 = 0,
+
+    /// Its session runs while its server is down (`PeerInfo.no_mcp`).
+    fn noMcp(self: *const Box, now: i64) bool {
+        return self.hook_ms > 0 and now - self.hook_ms <= HOOK_FRESH_MS;
+    }
 
     fn messageCount(self: *const Box) usize {
         var n: usize = 0;
@@ -632,6 +671,8 @@ const Peer = struct {
     alias_refused: []u8 = &.{},
     /// `RegisterReq.armed`: null = unknown.
     armed: ?bool = null,
+    /// `RegisterReq.client_pid`.
+    client_pid: i32 = 0,
 };
 
 /// An address that yielded to its alias's new holder (`yieldBox`): mail
@@ -822,6 +863,7 @@ pub const SendResult = struct {
     reason: ?RefuseReason = null,
     to_state: ?PeerState = null,
     to_polls: bool = false,
+    to_no_mcp: bool = false,
     /// The answer comes later as `Out.reply` (a relayed send whose link is up).
     deferred: bool = false,
 };
@@ -957,6 +999,7 @@ pub const Store = struct {
             self.touchFile(box);
         }
         box.last_seen_ms = now;
+        box.hook_ms = 0;
         self.goneRemove(effective);
 
         const p = try self.allocator.create(Peer);
@@ -981,6 +1024,7 @@ pub const Store = struct {
             .active_ms = now,
             .context_tokens = null,
             .armed = req.armed,
+            .client_pid = req.client_pid,
         };
         errdefer self.allocator.free(p.address);
         p.requested = try self.allocator.dupe(u8, req.address);
@@ -1018,6 +1062,7 @@ pub const Store = struct {
         const bi = self.boxIndex(p.address) orelse return;
         const box = self.boxes.items[bi];
         box.last_seen_ms = now;
+        box.client_pid = p.client_pid;
         if (box.durable) return;
         _ = self.boxes.orderedRemove(bi);
         defer self.freeBox(box);
@@ -1098,7 +1143,7 @@ pub const Store = struct {
             var one = req;
             one.to = to;
             const res = try self.route(self.msgFrom(sender, one, now, id), .{ .multi = serial }, now, &scratch);
-            r.* = .{ .to = to, .outcome = res.outcome, .reason = res.reason, .to_state = res.to_state, .to_polls = res.to_polls };
+            r.* = .{ .to = to, .outcome = res.outcome, .reason = res.reason, .to_state = res.to_state, .to_polls = res.to_polls, .to_no_mcp = res.to_no_mcp };
             outstanding += @intFromBool(res.deferred);
         }
         if (outstanding == 0) return .{ .id = id, .results = results };
@@ -1187,7 +1232,7 @@ pub const Store = struct {
             }
             return .{ .id = id, .outcome = .queued, .to_state = l.state, .to_polls = polls };
         }
-        return .{ .id = id, .outcome = .queued, .to_state = .gone };
+        return .{ .id = id, .outcome = .queued, .to_state = .gone, .to_no_mcp = box.noMcp(now) };
     }
 
     /// `msg` for `host`: into its route's outbound mailbox, relayed now when
@@ -1288,9 +1333,9 @@ pub const Store = struct {
     /// Every live peer, then every durable address with no live server,
     /// then every federated host's peers. Strings borrow the store; valid
     /// until its next mutation.
-    pub fn list(self: *Store, arena: std.mem.Allocator) error{OutOfMemory}![]PeerInfo {
+    pub fn list(self: *Store, arena: std.mem.Allocator, now: i64) error{OutOfMemory}![]PeerInfo {
         var out: std.ArrayList(PeerInfo) = .empty;
-        try self.listLocal(arena, &out);
+        try self.listLocal(arena, &out, now);
         for (self.routes.items) |r| for (r.peers) |p| {
             var e = p;
             e.link = linkOf(r, p.link);
@@ -1299,7 +1344,7 @@ pub const Store = struct {
         return out.items;
     }
 
-    fn listLocal(self: *Store, arena: std.mem.Allocator, out: *std.ArrayList(PeerInfo)) error{OutOfMemory}!void {
+    fn listLocal(self: *Store, arena: std.mem.Allocator, out: *std.ArrayList(PeerInfo), now: i64) error{OutOfMemory}!void {
         for (self.peers.items) |p| {
             const box = self.boxOf(p.address);
             try out.append(arena, .{
@@ -1324,15 +1369,17 @@ pub const Store = struct {
         }
         for (self.boxes.items) |b| {
             if (!b.durable or b.isRoute() or self.livePeer(b.address) != null) continue;
+            const no_mcp = b.noMcp(now);
             try out.append(arena, .{
                 .address = b.address,
                 .host = self.host,
                 .state = .gone,
                 .durable = true,
-                .last_seen_ms = b.last_seen_ms,
+                .last_seen_ms = if (no_mcp) b.hook_ms else b.last_seen_ms,
                 .pending = @intCast(b.items.items.len),
                 .subject = b.subject,
                 .alias = b.alias,
+                .no_mcp = no_mcp,
             });
         }
     }
@@ -1407,6 +1454,27 @@ pub const Store = struct {
     pub fn knows(self: *const Store, address: []const u8) bool {
         const box = self.boxOf(address) orelse return false;
         return !box.isRoute() and (box.durable or self.livePeer(address) != null);
+    }
+
+    /// A session's hook or status line reported with no live server of its
+    /// own (`HookPresence`): the durable address whose last server's client
+    /// is the nearest process of `ancestry` reads `no_mcp` from now on, until
+    /// `HOOK_FRESH_MS` without another report, a server registers it again,
+    /// or `state` says the session ended (`gone`).
+    /// @return the address it named, null when none matched.
+    pub fn hookPresence(self: *Store, ancestry: []const i32, state: ?PeerState, now: i64) ?[]const u8 {
+        for (ancestry) |pid| {
+            if (pid <= 1) continue;
+            for (self.boxes.items) |b| {
+                if (b.client_pid != pid or !b.durable or b.isRoute() or self.livePeer(b.address) != null) continue;
+                const was = b.noMcp(now);
+                const ended = if (state) |s| s == .gone else false;
+                b.hook_ms = if (ended) 0 else now;
+                if (was != b.noMcp(now)) self.presence_dirty = true;
+                return b.address;
+            }
+        }
+        return null;
     }
 
     /// A registration carried a subject: one the rule refuses costs only
@@ -1820,9 +1888,14 @@ pub const Store = struct {
     }
 
     /// Periodic federation work: sends whose far answer is overdue learn
-    /// `queued`, and each live link gets the presence snapshot it is owed.
+    /// `queued`, a `no_mcp` past `HOOK_FRESH_MS` lapses, and each live link
+    /// gets the presence snapshot it is owed.
     pub fn tick(self: *Store, now: i64) void {
         self.answerPending(.{ .overdue = now });
+        for (self.boxes.items) |b| if (b.hook_ms > 0 and !b.noMcp(now)) {
+            b.hook_ms = 0;
+            self.presence_dirty = true;
+        };
         if (!self.presence_dirty) return;
         self.presence_dirty = false;
         for (self.routes.items) |r| {
@@ -1871,6 +1944,7 @@ pub const Store = struct {
                 .pending = p.pending,
                 .name_taken = p.name_taken,
                 .polls = p.polls,
+                .no_mcp = p.no_mcp,
                 .facts = if (p.facts) |f| try cloneJson(a, f) else null,
                 .model = try a.dupe(u8, p.model),
                 .last_notification = try a.dupe(u8, p.last_notification),
@@ -1926,7 +2000,7 @@ pub const Store = struct {
             .reply_to = rl.reply_to,
             .quiet = rl.quiet,
         }, .{ .link = r.conn }, now, &idb);
-        if (!res.deferred) self.answerStored(r, rl.id, .message, to, .{ .outcome = res.outcome, .reason = res.reason, .to_state = res.to_state, .to_polls = res.to_polls });
+        if (!res.deferred) self.answerStored(r, rl.id, .message, to, .{ .outcome = res.outcome, .reason = res.reason, .to_state = res.to_state, .to_polls = res.to_polls, .to_no_mcp = res.to_no_mcp });
     }
 
     fn takeEvent(self: *Store, r: *Route, rl: Relay, now: i64) void {
@@ -1944,7 +2018,7 @@ pub const Store = struct {
     }
 
     fn takeStored(self: *Store, r: *Route, rl: Relay, now: i64) void {
-        const ans: Answer = .{ .outcome = rl.outcome, .reason = rl.reason, .to_state = rl.to_state, .to_polls = rl.to_polls };
+        const ans: Answer = .{ .outcome = rl.outcome, .reason = rl.reason, .to_state = rl.to_state, .to_polls = rl.to_polls, .to_no_mcp = rl.to_no_mcp };
         var tb: [peeraddr.ADDRESS_MAX]u8 = undefined;
         // A far broker that predates (id, to) keys names no recipient.
         const to: ?[]const u8 = if (rl.to.len > 0) self.inAddr(&tb, r, rl.to) else null;
@@ -1972,7 +2046,7 @@ pub const Store = struct {
         defer arena_state.deinit();
         const a = arena_state.allocator();
         var peers: std.ArrayList(PeerInfo) = .empty;
-        try self.listLocal(a, &peers);
+        try self.listLocal(a, &peers, now);
         var hosts: std.ArrayList(HostInfo) = .empty;
         if (self.hub) for (self.routes.items) |o| {
             if (o == r) continue;
@@ -2043,12 +2117,13 @@ pub const Store = struct {
             .reason = if (r.far_slow) ans.reason else if (ans.reason) |why| why.compat() else null,
             .to_state = ans.to_state,
             .to_polls = ans.to_polls,
+            .to_no_mcp = ans.to_no_mcp,
         } });
     }
 
     fn answer(self: *Store, p: Pending, ans: Answer) void {
         switch (p.waiter) {
-            .client => |w| _ = self.emit.call(w.conn, .{ .reply = self.replyFor(w.conn, .{ .req = w.req, .id = p.id(), .outcome = ans.outcome, .reason = ans.reason, .to_state = ans.to_state, .to_polls = ans.to_polls }) }),
+            .client => |w| _ = self.emit.call(w.conn, .{ .reply = self.replyFor(w.conn, .{ .req = w.req, .id = p.id(), .outcome = ans.outcome, .reason = ans.reason, .to_state = ans.to_state, .to_polls = ans.to_polls, .to_no_mcp = ans.to_no_mcp }) }),
             .link => |lc| if (self.routeByConn(lc)) |o| self.answerStored(o, p.id(), .message, p.to(), ans),
             .multi => |serial| self.answerMulti(serial, p.to(), ans),
             .none => {},
@@ -2067,6 +2142,7 @@ pub const Store = struct {
             r.reason = ans.reason;
             r.to_state = ans.to_state;
             r.to_polls = ans.to_polls;
+            r.to_no_mcp = ans.to_no_mcp;
             m.outstanding -|= 1;
             break;
         };
@@ -2074,7 +2150,7 @@ pub const Store = struct {
         _ = self.multis.orderedRemove(mi);
         defer freeMulti(self.allocator, m);
         const first = if (m.results.len > 0) m.results[0] else RecipientResult{ .to = "", .outcome = .refused };
-        _ = self.emit.call(m.conn, .{ .reply = self.replyFor(m.conn, .{ .req = m.req, .id = m.id_buf[0..m.id_len], .outcome = first.outcome, .reason = first.reason, .to_state = first.to_state, .to_polls = first.to_polls, .results = m.results }) });
+        _ = self.emit.call(m.conn, .{ .reply = self.replyFor(m.conn, .{ .req = m.req, .id = m.id_buf[0..m.id_len], .outcome = first.outcome, .reason = first.reason, .to_state = first.to_state, .to_polls = first.to_polls, .to_no_mcp = first.to_no_mcp, .results = m.results }) });
     }
 
     fn addPending(self: *Store, id: []const u8, to: []const u8, waiter: Waiter, route_conn: u32, now: i64) error{OutOfMemory}!void {
@@ -2526,6 +2602,7 @@ pub const Store = struct {
         p.state = req.state;
         p.slow_mail = req.slow_mail;
         p.armed = req.armed;
+        p.client_pid = req.client_pid;
         p.last_seen_ms = now;
         try self.setPresence(p, req);
     }
@@ -2685,6 +2762,7 @@ const Answer = struct {
     reason: ?RefuseReason = null,
     to_state: ?PeerState = null,
     to_polls: bool = false,
+    to_no_mcp: bool = false,
 };
 
 /// Peers taken from one presence snapshot at most (a bound, not a quota).
@@ -2913,7 +2991,7 @@ test "a durable offline address queues in FIFO order; unknown, self, too large a
     // 5. The list shows both, with pending counts.
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
-    const peers = try s.list(arena.allocator());
+    const peers = try s.list(arena.allocator(), 0);
     try t.expectEqual(@as(usize, 2), peers.len);
     try t.expectEqual(@as(u32, 4), peers[1].pending);
 }
@@ -3018,7 +3096,7 @@ test "a minted anon address survives its connection's re-registrations; an addre
     try s.register(2, .{ .app = "claude-code", .pid = 42, .state = .working }, 20);
     try s.register(2, .{ .app = "claude-code", .pid = 42, .state = .idle, .model = "Opus" }, 30);
     try t.expectEqualStrings(minted, (try s.selfInfo(a, 2)).?.address);
-    try t.expectEqual(@as(usize, 2), (try s.list(a)).len);
+    try t.expectEqual(@as(usize, 2), (try s.list(a, 0)).len);
     // 3. Mail to it, sent after those re-registrations, is delivered.
     const r = try sendText(&s, 1, minted, "to the anon peer", 40, &idb);
     try t.expectEqual(PeerOutcome.delivered, r.outcome);
@@ -3126,7 +3204,7 @@ test "durable mailboxes survive a restart: append, compaction on ack, unreadable
     // Known after restart: Qq (mail), Idle (registered, no mail), Zenit.
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
-    const peers = try s.list(arena.allocator());
+    const peers = try s.list(arena.allocator(), 0);
     try t.expectEqual(@as(usize, 3), peers.len);
     try s.register(7, reg("Zenit", true), 50);
     try t.expectEqual(PeerOutcome.queued, (try sendText(&s, 7, "Idle", "x", 50, &idb)).outcome);
@@ -3527,14 +3605,14 @@ test "presence: a re-registration's state, facts, model and notification reach p
     // 1. Registered without presence: unknown, no facts.
     try s.register(1, .{ .address = "alice", .durable = true, .app = "claude-code" }, 1000);
     try s.register(2, reg("bob", true), 1000);
-    var list = try s.list(a);
+    var list = try s.list(a, 0);
     try t.expectEqual(PeerState.unknown, list[0].state);
     try t.expect(list[0].facts == null);
     // 2. A presence update arrives as a re-registration with the same
     // address: state, facts, model, notification and last_seen change.
     const facts = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"context_used_percent\":42,\"cost_usd\":1.5}", .{});
     try s.register(1, .{ .address = "alice", .durable = true, .app = "claude-code", .state = .working, .facts = facts, .model = "Opus", .last_notification = "permission_prompt" }, 2000);
-    list = try s.list(a);
+    list = try s.list(a, 0);
     try t.expectEqual(PeerState.working, list[0].state);
     try t.expectEqual(@as(i64, 2000), list[0].last_seen_ms);
     try t.expectEqualStrings("Opus", list[0].model);
@@ -3558,7 +3636,7 @@ test "presence: a re-registration's state, facts, model and notification reach p
     try t.expectEqual(@as(?PeerState, .gone), rec.last().sender_state);
     // 5. A facts document that is not an object is dropped, not refused.
     try s.register(4, .{ .address = "carol", .facts = .{ .integer = 7 } }, 3000);
-    for (try s.list(a)) |p| if (std.mem.eql(u8, p.address, "carol")) try t.expect(p.facts == null);
+    for (try s.list(a, 0)) |p| if (std.mem.eql(u8, p.address, "carol")) try t.expect(p.facts == null);
 }
 
 test "wake rules: quiet, a dormant recipient and the loop cap become slow mail; older clients read older words" {
@@ -3841,7 +3919,7 @@ const Net = struct {
 };
 
 fn listed(s: *Store, arena: std.mem.Allocator, address: []const u8) ?PeerInfo {
-    for (s.list(arena) catch return null) |p| if (std.mem.eql(u8, p.address, address)) return p;
+    for (s.list(arena, 0) catch return null) |p| if (std.mem.eql(u8, p.address, address)) return p;
     return null;
 }
 
@@ -4124,7 +4202,7 @@ test "federation: the outbound mailbox and membership survive a restart" {
     // A peer list never shows the outbound mailbox as a peer.
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
-    for (try s.list(arena.allocator())) |p| try t.expect(!std.mem.startsWith(u8, p.address, ROUTE_PREFIX));
+    for (try s.list(arena.allocator(), 0)) |p| try t.expect(!std.mem.startsWith(u8, p.address, ROUTE_PREFIX));
 }
 
 test "a polling recipient: its delivery and its list entry say so, across the hub too; an older server is unknown, never polling" {
@@ -4172,4 +4250,61 @@ test "a polling recipient: its delivery and its list entry say so, across the hu
     const rep = lastOf(&net.mem_rec, 1, .reply) orelse return error.TestUnexpectedResult;
     try t.expectEqual(PeerOutcome.delivered, rep.outcome);
     try t.expect(rep.to_polls);
+}
+
+/// The local entry for `address` in a list taken at `now`.
+fn listedAt(s: *Store, arena: std.mem.Allocator, address: []const u8, now: i64) ?PeerInfo {
+    for (s.list(arena, now) catch return null) |p| if (std.mem.eql(u8, p.address, address)) return p;
+    return null;
+}
+
+test "a session whose server is gone but whose hooks still report reads no_mcp, for HOOK_FRESH_MS, across the hub too" {
+    var net: Net = undefined;
+    try net.init(null);
+    defer net.deinit();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = &net.hub;
+    var zenit = regSlow("Zenit");
+    zenit.client_pid = 4242;
+    try s.register(1, zenit, 0);
+    try s.register(2, regSlow("Qq"), 0);
+    s.deregister(1, 100);
+    // 1. Gone, and nothing reported yet.
+    try t.expect(!(listedAt(s, a, "Zenit", 200) orelse return error.TestUnexpectedResult).no_mcp);
+    // 2. A process under another client matches nothing; one under its
+    // client (the nearest ancestor that started its server) names it.
+    try t.expect(s.hookPresence(&.{ 999, 1 }, .working, 300) == null);
+    try t.expectEqualStrings("Zenit", s.hookPresence(&.{ 5000, 4242, 1 }, .working, 300) orelse return error.TestUnexpectedResult);
+    const p = listedAt(s, a, "Zenit", 400) orelse return error.TestUnexpectedResult;
+    try t.expect(p.no_mcp and !p.live);
+    try t.expectEqual(PeerState.gone, p.state);
+    try t.expectEqual(@as(i64, 300), p.last_seen_ms);
+    // 3. A message to it waits, and the sender is told why.
+    var idb: [ID_LEN]u8 = undefined;
+    const r = try s.send(2, .{ .to = "Zenit", .text = "x" }, 500, &idb);
+    try t.expectEqual(PeerOutcome.queued, r.outcome);
+    try t.expect(r.to_no_mcp);
+    // 4. Across the hub, with its presence.
+    try net.mem.register(1, regSlow("alice"), 500);
+    try net.connect(500);
+    try net.pump(500);
+    try t.expect((listed(&net.mem, a, "hub/Zenit") orelse return error.TestUnexpectedResult).no_mcp);
+    // 5. Stale past HOOK_FRESH_MS: gone again, and the members hear it.
+    const late = 300 + HOOK_FRESH_MS + 1;
+    try t.expect(!(listedAt(s, a, "Zenit", late) orelse return error.TestUnexpectedResult).no_mcp);
+    try net.pump(late);
+    try t.expect(!(listed(&net.mem, a, "hub/Zenit") orelse return error.TestUnexpectedResult).no_mcp);
+    try t.expect(!(try s.send(2, .{ .to = "Zenit", .text = "y" }, late, &idb)).to_no_mcp);
+    // 6. Its SessionEnd hook ends it at once.
+    _ = s.hookPresence(&.{4242}, .working, late + 10);
+    _ = s.hookPresence(&.{4242}, .gone, late + 20);
+    try t.expect(!(listedAt(s, a, "Zenit", late + 30) orelse return error.TestUnexpectedResult).no_mcp);
+    // 7. A server back at the address is simply live; hooks go to it.
+    _ = s.hookPresence(&.{4242}, null, late + 40);
+    try s.register(3, zenit, late + 50);
+    const back = listedAt(s, a, "Zenit", late + 60) orelse return error.TestUnexpectedResult;
+    try t.expect(back.live and !back.no_mcp);
+    try t.expect(s.hookPresence(&.{4242}, .working, late + 70) == null);
 }

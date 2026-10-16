@@ -188,7 +188,7 @@ pub fn handleSend(d: *Daemon, cl: *Client, payload: []const u8) void {
         const m = s.sendMany(arena.allocator(), cl.id, req, clock.wallMs(), &id_buf) catch |e| return cl.queueErrFor(failed.text(e), "peer_send");
         if (m.deferred) return;
         const first = if (m.results.len > 0) m.results[0] else peermail.RecipientResult{ .to = "", .outcome = .refused };
-        cl.queueJson(.peer_send_reply, s.replyFor(cl.id, .{ .req = req.req, .id = m.id, .outcome = first.outcome, .reason = first.reason, .to_state = first.to_state, .to_polls = first.to_polls, .results = m.results }));
+        cl.queueJson(.peer_send_reply, s.replyFor(cl.id, .{ .req = req.req, .id = m.id, .outcome = first.outcome, .reason = first.reason, .to_state = first.to_state, .to_polls = first.to_polls, .to_no_mcp = first.to_no_mcp, .results = m.results }));
         return;
     }
     const r = s.send(cl.id, req, clock.wallMs(), &id_buf) catch |e| return cl.queueErrFor(failed.text(e), "peer_send");
@@ -200,6 +200,7 @@ pub fn handleSend(d: *Daemon, cl: *Client, payload: []const u8) void {
         .reason = r.reason,
         .to_state = r.to_state,
         .to_polls = r.to_polls,
+        .to_no_mcp = r.to_no_mcp,
     }));
 }
 
@@ -210,6 +211,16 @@ pub fn handleAck(d: *Daemon, cl: *Client, payload: []const u8) void {
         return cl.queueErrFor("bad peer_ack request", "peer_ack");
     defer parsed.deinit();
     _ = s.ack(cl.id, parsed.value.ids);
+}
+
+/// `peer_hook_presence`: a session's hook or status line that found no
+/// live server of its own; the address it names reads `no_mcp`. No reply.
+pub fn handleHookPresence(d: *Daemon, cl: *Client, payload: []const u8) void {
+    const s = storeFor(d, cl, "peer_hook_presence") orelse return;
+    var parsed = std.json.parseFromSlice(peermail.HookPresence, d.allocator, payload, .{ .ignore_unknown_fields = true }) catch
+        return cl.queueErrFor("bad peer_hook_presence request", "peer_hook_presence");
+    defer parsed.deinit();
+    _ = s.hookPresence(parsed.value.ancestry, parsed.value.state, clock.wallMs());
 }
 
 /// `peer_hub_hello`: a hub's link announces itself. Accepted only on a
@@ -421,7 +432,7 @@ pub fn peerInTree(peers: []const peermail.PeerInfo, root: c.pid_t, parentOf: *co
 /// The live peers of this host (no federated entries).
 fn livePeers(arena: std.mem.Allocator, s: *peermail.Store) error{OutOfMemory}![]const peermail.PeerInfo {
     var out: std.ArrayList(peermail.PeerInfo) = .empty;
-    for (try s.list(arena)) |p| {
+    for (try s.list(arena, clock.wallMs())) |p| {
         if (p.live and p.via_host.len == 0) try out.append(arena, p);
     }
     return out.items;
@@ -500,7 +511,7 @@ fn queueList(d: *Daemon, s: *peermail.Store, cl: *Client, req: u32) void {
     var arena: std.heap.ArenaAllocator = .init(d.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const peers = s.list(a) catch return cl.queueErrFor("peer list failed on the broker", "peer_list_req");
+    const peers = s.list(a, clock.wallMs()) catch return cl.queueErrFor("peer list failed on the broker", "peer_list_req");
     const hosts = s.hostList(a) catch return cl.queueErrFor("peer list failed on the broker", "peer_list_req");
     const me = if (req == 0) (s.selfInfo(a, cl.id) catch null) else null;
     cl.queueJson(.peer_list, peermail.ListReply{ .req = req, .self = me, .peers = peers, .hosts = hosts, .federation = s.federation() });

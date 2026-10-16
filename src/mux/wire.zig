@@ -310,6 +310,10 @@ pub const FrameType = enum(u8) {
     /// on the same connection, or `.err` naming why it was refused. From
     /// then on `peer_hub_relay` comes back and `peer_member_relay` goes out.
     peer_member_hello = 45,
+    /// A session's hook or status line found no live server of its own
+    /// (`peermail.HookPresence`), only to daemons advertising
+    /// `peer_hook_presence`. No reply.
+    peer_hook_presence = 46,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -1198,6 +1202,7 @@ test "wire: append-only frame and event values include panel RPC" {
     try std.testing.expectEqual(@as(u8, 44), @intFromEnum(FrameType.peer_subject));
     try std.testing.expectEqual(@as(u8, 106), @intFromEnum(FrameType.peer_subject_reply));
     try std.testing.expectEqual(@as(u8, 45), @intFromEnum(FrameType.peer_member_hello));
+    try std.testing.expectEqual(@as(u8, 46), @intFromEnum(FrameType.peer_hook_presence));
     try std.testing.expectEqual(@as(u8, 7), @intFromEnum(ChannelKind.web_helper));
     try std.testing.expectEqual(@as(u8, 64), @intFromEnum(FrameType.welcome));
     try std.testing.expectEqual(@as(u8, 94), @intFromEnum(FrameType.play_state));

@@ -2864,9 +2864,11 @@ peer's screen, and a peer message is information, never an approval.
     the daemon decided it, none when the sender asked `quiet`;
   - `queued`: a durable address with no live server; it arrives when one
     next registers, worded `sent ... while you were offline` (the age from
-    a minute on). With `reason: host_unreachable`: a `host/name` whose
-    host's link is down; it goes out when the link is back (Federation,
-    below);
+    a minute on). With `to_no_mcp`: the session runs but its MCP server
+    is down (`no_mcp`, "Presence" below), worded `it is running with its
+    MCP server down, so this waits until the server is back`. With
+    `reason: host_unreachable`: a `host/name` whose host's link is down;
+    it goes out when the link is back (Federation, below);
   - `refused`, `reason` one of `unknown_address` (never seen on that
     host, or an unknown host), `not_durable_gone` (an anon address whose
     server is gone), `too_large` (over 64 KiB), `mailbox_full` (256
@@ -2892,7 +2894,7 @@ peer's screen, and a peer message is information, never an approval.
   if the user had said it.
 - **`capabilities.peers`**: `{available, reason?, ttl_hours, address,
   durable, name_taken, alias, aliases, channel_armed, presence,
-  federation, subject, slow_mail, polls, pushed}`; `alias` is this session's alias ("" =
+  federation, subject, slow_mail, polls, no_mcp, pushed}`; `alias` is this session's alias ("" =
   none yet), `aliases` says the daemon keeps them (welcome flag
   `peer_alias`); `slow_mail` says the daemon judges wakes and takes `quiet`
   and `to` lists (welcome flag `peer_slow_mail`); `reason` is `daemon_without_peers`
@@ -2902,7 +2904,9 @@ peer's screen, and a peer message is information, never an approval.
   this session's hooks or status line reported (below); `pushed` is true
   while peer messages reach this session without `peer_read` (a channel
   or a follower), and `polls` says the daemon marks the peers that are
-  not (welcome flag `peer_polls`); `federation` is
+  not (welcome flag `peer_polls`); `no_mcp` says the daemon takes hook
+  reports for a session whose server died (welcome flag
+  `peer_hook_presence`, "Presence" below); `federation` is
   `hub`, `member` or `off` (below). The registry record
   carries `peer: {address, durable, state, name_taken, facts?, model?,
   last_notification?, alias?}`.
@@ -2921,7 +2925,7 @@ peer's screen, and a peer message is information, never an approval.
   The reader once, then one row per peer: its alias (its address when it
   has none), one state word
   (`starting`, `working`, `idle`, `waiting_user`, `unknown`, `gone <how
-  long>`, `offline`), `ctx` (the context tokens the wake rule judges,
+  long>`, `no_mcp`, `offline`), `ctx` (the context tokens the wake rule judges,
   rounded; rate limits and cost are account-wide and stay in the JSON),
   the subject, what is pending and how long ago a peer was
   last heard from, and last the address when an alias led. A model or an app shows only where the peers differ;
@@ -3138,6 +3142,25 @@ rendering. Without them a peer is listed `unknown`, never guessed.
 
 The server applies a post to its registry record and re-registers with the
 daemon, so every other peer's `peer_list` shows it at once.
+
+**A session whose MCP server died** keeps running, and so do its hooks and
+status line, which then find no live server of their own in the
+registry. They report to the per-user daemon instead (frame
+`peer_hook_presence`, welcome flag `peer_hook_presence`; connect only,
+never autostarted, within the hook's 300 ms): their ancestry, which the
+daemon matches against the client pid each address's last server
+registered (`RegisterReq.client_pid`, the registry's `ppid`), the same
+rule the hook uses to find its servers. That address then reads
+`no_mcp` in `peer_list` (`state` stays `gone` in JSON, with `no_mcp:
+true`; text `zenit  no_mcp  1 pending`, explained once: `no_mcp = its
+session runs (its hooks report) but its sketerm MCP server is down: mail
+waits until the server is back (/mcp in that session reconnects it)`),
+its mail is `queued` with `to_no_mcp`, and federated hosts see it with
+its presence. Fresh means a report within 2 minutes
+(`peermail.HOOK_FRESH_MS`, far above the 5 s status line refresh); its
+`SessionEnd` hook, a server registering the address again or 2 minutes
+of silence end it (a hooks-only session idle that long reads `gone`
+again). An anon address has no mailbox left to mark.
 
 ### Non-MCP peers: `sketerm peer`
 

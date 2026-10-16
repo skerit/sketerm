@@ -23151,3 +23151,20 @@ and the CLI now). The polling session is told once, in its instructions
 mail. Welcome flag `peer_polls`; `capabilities.peers.polls` and `pushed`.
 Unit tests in peermail, peer_cli, mcp_peer; smoke peer stage steps 4 and
 20a.
+
+## 2026-10-16: a session whose MCP server died reads no_mcp, not gone
+
+A session whose sketerm MCP server had died looked `gone` for hours while
+it ran. Its hooks and status line keep running: when they find no live
+server of their own in the registry, they now report to the per-user
+daemon (`peer_hook_presence`, frame 46, welcome flag of the same name;
+connect only, within the hook's 300 ms; `Conn.connectProbedWithin`). The
+identity is the one the hook already uses: its ancestry against the client
+pid each server registers (`RegisterReq.client_pid` = the registry's
+`ppid`), kept on the address's mailbox when its server goes. A report
+within `peermail.HOOK_FRESH_MS` (2 min; the status line refreshes every
+5 s) makes the address `no_mcp` in `peer_list` (JSON `state: gone,
+no_mcp: true`, a footnote in text) and `to_no_mcp` on sends to it, relayed
+across federation; `SessionEnd`, a server registering it again or 2 min of
+silence end it. Unit test in peermail; smoke peer stage step 27a kills a
+server by its exact pid and runs its client's hook.

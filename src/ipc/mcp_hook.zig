@@ -30,6 +30,9 @@ const statusline = @import("../agent/statusline.zig");
 const registry = @import("mcp_registry.zig");
 const agentwait = @import("agentwait.zig");
 const agentsline = @import("agentsline.zig");
+const sockpath = @import("../mux/sockpath.zig");
+const muxclient = @import("../mux/client.zig");
+const peermail = @import("../mux/peermail.zig");
 const PeerState = vocab.PeerState;
 
 /// The argv words after `mcp` that select these commands.
@@ -159,39 +162,65 @@ pub fn serverSockets(arena: std.mem.Allocator, entries: []const registry.Entry, 
     return out;
 }
 
+/// The processes whose servers are this client's, nearest first: this
+/// process's ancestry, or `parent` alone when given.
+fn clientChain(buf: *[agentsline.MAX_ANCESTRY]c.pid_t, parent: ?c.pid_t) []const c.pid_t {
+    if (parent) |p| {
+        buf[0] = p;
+        return buf[0..1];
+    }
+    return agentsline.ancestry(buf, c.getpid(), platform.parentOf);
+}
+
 /// The servers this process's client started, found by walking this
 /// process's ancestry against the registry (`parent` overrides the walk).
 /// An unreadable registry reads as none.
 pub fn serversOfThisClient(arena: std.mem.Allocator, parent: ?c.pid_t) []const registry.Entry {
     var buf: [agentsline.MAX_ANCESTRY]c.pid_t = undefined;
-    var one: [1]c.pid_t = undefined;
-    const starters: []const c.pid_t = if (parent) |p| blk: {
-        one[0] = p;
-        break :blk &one;
-    } else agentsline.ancestry(&buf, c.getpid(), platform.parentOf);
     const entries = registry.list(arena, false) catch return &.{};
-    return ownServers(arena, entries, starters) catch &.{};
+    return ownServers(arena, entries, clientChain(&buf, parent)) catch &.{};
 }
 
-/// Post `line` to every server of this process's client.
+/// Post `line` to each of `servers`.
 /// @return how many took it.
-pub fn postToServers(arena: std.mem.Allocator, parent: ?c.pid_t, line: []const u8) usize {
+pub fn postToServers(servers: []const registry.Entry, line: []const u8) usize {
     var n: usize = 0;
-    for (serversOfThisClient(arena, parent)) |e| n += @intFromBool(agentwait.postPresence(e.agent_socket, line));
+    for (servers) |e| n += @intFromBool(agentwait.postPresence(e.agent_socket, line));
     return n;
 }
 
-/// Ask every server of this process's client (`take_slow` in `line`)
-/// until `deadline_ms`: the slow peer mail they hand this turn, joined.
+/// Ask each of `servers` (`take_slow` in `line`) until `deadline_ms`: the
+/// slow peer mail they hand this turn, joined.
 /// @return "" when none answered with any (or on any failure).
-pub fn askServers(arena: std.mem.Allocator, parent: ?c.pid_t, line: []const u8, deadline_ms: i64) []const u8 {
+pub fn askServers(arena: std.mem.Allocator, servers: []const registry.Entry, line: []const u8, deadline_ms: i64) []const u8 {
     var out: std.ArrayList(u8) = .empty;
-    for (serversOfThisClient(arena, parent)) |e| {
+    for (servers) |e| {
         const got = agentwait.askPresence(arena, e.agent_socket, line, deadline_ms) orelse continue;
         if (out.items.len > 0) out.appendSlice(arena, "\n\n") catch return "";
         out.appendSlice(arena, got) catch return "";
     }
     return out.items;
+}
+
+/// No server of this client is live: tell the per-user daemon the
+/// session's presence instead (`peer_hook_presence`), which it matches
+/// to the address of the server this client last started, by the same
+/// ancestry rule (`ownServers`): that address reads `no_mcp`, not gone.
+/// Never autostarts a daemon; bounded by `deadline_ms`.
+/// @return whether a daemon that takes it was told.
+pub fn postToDaemon(arena: std.mem.Allocator, parent: ?c.pid_t, p: agentwait.Presence, deadline_ms: i64) bool {
+    const left = deadline_ms - clock.nowMs();
+    if (left <= 0) return false;
+    const sock = sockpath.defaultSocketPath(arena) catch return false;
+    var conn = muxclient.Conn.connectProbedWithin(arena, sock, left) catch return false;
+    defer conn.deinit();
+    if (!conn.caps.peer_hook_presence) return false;
+    var buf: [agentsline.MAX_ANCESTRY]c.pid_t = undefined;
+    const chain = clientChain(&buf, parent);
+    const ancestry = arena.alloc(i32, chain.len) catch return false;
+    for (chain, ancestry) |pid, *o| o.* = @intCast(pid);
+    conn.sendJson(.peer_hook_presence, peermail.HookPresence{ .ancestry = ancestry, .state = stateFor(p) }) catch return false;
+    return true;
 }
 
 /// The hook's post for its stdin document; null when it is not one.
@@ -409,13 +438,19 @@ pub fn hookCli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     const asks = if (ev) |e| e.blocking() else false;
     p.take_slow = asks;
     const line = agentwait.encodePresence(arena, p) catch return 0;
+    const servers = serversOfThisClient(arena, o.parent);
+    if (servers.len == 0) {
+        // Its server is gone (or never ran): the daemon hears it instead.
+        if (!postToDaemon(arena, o.parent, p, deadline)) debug("no sketerm MCP server of this session, and no daemon took the {s} post", .{p.event});
+        return 0;
+    }
     if (!asks) {
-        if (postToServers(arena, o.parent, line) == 0) debug("no sketerm MCP server of this session took the {s} post", .{p.event});
+        if (postToServers(servers, line) == 0) debug("no sketerm MCP server of this session took the {s} post", .{p.event});
         return 0;
     }
     // The turn's slow peer mail becomes its context; anything short of a
     // whole answer within the budget prints nothing.
-    const slow = askServers(arena, o.parent, line, deadline);
+    const slow = askServers(arena, servers, line, deadline);
     if (slow.len > 0) _ = fdio.writeAll(1, slow) else debug("no slow peer mail for this turn", .{});
     return 0;
 }
@@ -444,8 +479,11 @@ pub fn statuslineCli(allocator: std.mem.Allocator, args: []const []const u8) u8 
     const set = adapter.Set.loadDefault(arena) catch adapter.Set.init(arena);
     const f: ?adapter.Facts = if (set.get(ADAPTER_ID)) |l| l.spec.facts else null;
     if (f) |ff| if (statusPresence(arena, ff.map, in.bytes)) |p| {
-        if (agentwait.encodePresence(arena, p)) |line| {
-            _ = postToServers(arena, o.parent, line);
+        const servers = serversOfThisClient(arena, o.parent);
+        if (servers.len == 0) {
+            _ = postToDaemon(arena, o.parent, p, clock.nowMs() + HOOK_BUDGET_MS);
+        } else if (agentwait.encodePresence(arena, p)) |line| {
+            _ = postToServers(servers, line);
         } else |_| {}
     };
     const cmd = o.user_command orelse userCommand(arena, f, in.bytes);

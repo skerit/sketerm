@@ -163,6 +163,12 @@ pub const Flag = enum {
     /// cannot: `polls` in `peer_list`, `to_polls` in `peer_send_reply` and
     /// relays. Absent = nothing is known: no peer is marked.
     peer_polls,
+    /// The broker takes `peer_hook_presence` from a session's hook or
+    /// status line whose own server is gone, matched to the address by the
+    /// client pid that server registered (`peer_register` `client_pid`),
+    /// and lists that address `no_mcp` (`to_no_mcp` in `peer_send_reply`).
+    /// Absent = never send it; such an address reads gone.
+    peer_hook_presence,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

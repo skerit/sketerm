@@ -368,6 +368,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
         .peer_list_req => daemon_peers.handleListReq(self, cl, frame.payload),
         .peer_send => daemon_peers.handleSend(self, cl, frame.payload),
         .peer_ack => daemon_peers.handleAck(self, cl, frame.payload),
+        .peer_hook_presence => daemon_peers.handleHookPresence(self, cl, frame.payload),
         // Federation: a hub's link (the broker keeps the routes).
         .peer_hub_hello => daemon_peers.handleHubHello(self, cl, frame.payload),
         // A call-in member's link (on a hub).

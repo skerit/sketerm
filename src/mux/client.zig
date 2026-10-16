@@ -474,8 +474,14 @@ pub const Conn = struct {
     /// NO autostart and no stale-daemon retire: a failed handshake is
     /// an error and never triggers daemon replacement.
     pub fn connectProbed(allocator: std.mem.Allocator, sock_path: []const u8) !Conn {
+        return connectProbedWithin(allocator, sock_path, PROBE_MS);
+    }
+
+    /// `connectProbed` whose welcome wait is `timeout_ms` (a hook that must
+    /// never hold up its client).
+    pub fn connectProbedWithin(allocator: std.mem.Allocator, sock_path: []const u8, timeout_ms: i64) !Conn {
         const conn = try Conn.connect(allocator, sock_path);
-        return probe(allocator, conn);
+        return probeWithin(allocator, conn, timeout_ms);
     }
 
     /// Connect to the local daemon, spawning it (sibling binary,
@@ -611,12 +617,20 @@ pub const Conn = struct {
     /// hello → welcome round trip; consumes the welcome so the
     /// stream is clean for the caller's own frames.
     pub fn probe(allocator: std.mem.Allocator, conn_in: Conn) !Conn {
+        return probeWithin(allocator, conn_in, PROBE_MS);
+    }
+
+    /// How long `probe` waits for the welcome.
+    pub const PROBE_MS: i64 = 10_000;
+
+    /// `probe` waiting at most `timeout_ms` for the welcome.
+    pub fn probeWithin(allocator: std.mem.Allocator, conn_in: Conn, timeout_ms: i64) !Conn {
         var conn = conn_in;
         errdefer conn.deinit();
         try conn.sendHello();
         // Bounded: a daemon that accepts but never answers (wedged,
         // swap-thrashing) must fail the connect, not hang the caller.
-        const w = try conn.recvExpectFor(&.{.welcome}, 10_000);
+        const w = try conn.recvExpectFor(&.{.welcome}, timeout_ms);
         defer w.deinit(allocator);
         conn.applyWelcome(allocator, w.payload);
         return conn;

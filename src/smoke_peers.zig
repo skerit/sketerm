@@ -702,6 +702,34 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
     expectStr(send(&alice, arena, "bob", "with presence", "27. send"), "outcome", "delivered", "27. outcome");
     contains(str(readOne(&bob2, arena, 5_000, "27. bob2 peer_read"), "content", "27."), ", idle). id m-", "27. the sender's state in the composed line");
     std.debug.print("smoke: peers: hook and status line presence ok\n", .{});
+    // 27a. A session whose MCP server dies while its client runs: the
+    //      client's hook finds no server of its own and reports to the
+    //      daemon, which lists the address no_mcp, and a send says so.
+    {
+        var gina = stage.server("gina", &.{});
+        gina.initialize();
+        _ = registered(&gina, arena, "27a. gina");
+        const entry = listed(&alice, arena, "gina", "27a.") orelse fail("27a. gina not listed");
+        const server_pid = (entry.get("pid") orelse fail("27a. no pid")).integer;
+        // Its exact pid: the parent shell (its client) lives on until reaped.
+        if (c.kill(@intCast(server_pid), c.SIGKILL) != 0) fail("27a. kill gina's server");
+        awaitOffline(&alice, arena, "gina", false, "27a. gina's server gone");
+        const hook = std.fmt.allocPrint(arena, "'{{exe}}' mcp hook --parent {d} < '{s}'", .{ gina.pid, prompt_in }) catch fail("oom");
+        expectSilentOk(runInTree(arena, runs, exe, hook, "27a. hook"), "27a. hook");
+        const deadline = nowMs() + 10_000;
+        while (true) {
+            const p = listed(&alice, arena, "gina", "27a.") orelse fail("27a. gina not listed");
+            if (p.get("no_mcp")) |v| if (v == .bool and v.bool) break;
+            if (nowMs() > deadline) fail("27a. gina never read no_mcp");
+            _ = c.usleep(50_000);
+        }
+        const r = send(&alice, arena, "gina", "your server is down", "27a. send");
+        expectStr(r, "outcome", "queued", "27a. outcome");
+        if (!boolOf(r, "to_no_mcp", "27a.")) fail("27a. the sender is not told the session runs without its server");
+        printList(&alice, arena, "27a.");
+        gina.closeStdinWait();
+    }
+    std.debug.print("smoke: peers: a session whose MCP server died reads no_mcp ok\n", .{});
 
     // -- i. a non-MCP peer: sketerm peer --
     // 28. `peer read --follow --json --name webapp` as a child: once it is
