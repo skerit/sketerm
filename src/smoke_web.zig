@@ -322,6 +322,22 @@ const form_page =
     "document.getElementById('lbl').textContent='after'\">Go</button></form>" ++
     "<p id=lbl>before</p><p id=long>" ++ long_text ++ "</p></body></html>";
 
+/// Stage 10b: a horizontally scrolled table whose last column is
+/// `position:sticky; right:0` (an "Actions" column), plus a button far
+/// below the fold. The sticky button sits at the wrapper's right edge,
+/// well off its centre: centring it scrolls the table to its end while
+/// the button itself stays put (measured). Each button's title records
+/// the scroll state at the moment the trusted click arrived.
+const sticky_page =
+    "data:text/html,<html><body style=\"margin:0\">" ++
+    "<div id=wrap style=\"width:500px;overflow-x:auto\"><table style=\"border-collapse:collapse;white-space:nowrap\"><tr>" ++
+    "<td style=\"min-width:1500px\">wide cell</td>" ++
+    "<td style=\"position:sticky;right:0;background:white\"><button id=row onclick=\"document.title=" ++
+    "'sticky:'+document.getElementById('wrap').scrollLeft+':'+event.isTrusted\">Row Action</button></td>" ++
+    "</tr></table></div><div style=\"height:4000px\"></div>" ++
+    "<button id=far onclick=\"document.title='far:'+event.isTrusted+':'+(scrollY>0&&'moved'||'still')\">Far Button</button>" ++
+    "</body></html>";
+
 /// Two pages sharing a byte-identical nav block: the cross-navigation
 /// fingerprint match must carry that block's ids.
 const shared_nav =
@@ -10077,6 +10093,53 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
     pass("stage 10 sem_expand");
+
+    // ── Stage 10b: act never scrolls a target that is already hit ──
+    // Centring a sticky-column button scrolled its table to the far end;
+    // a visible, hit target must be clicked where it is, and a target
+    // below the fold must still be brought into view.
+    {
+        cl.resetTitle();
+        cl.navigate(sticky_page);
+        cl.resetSem();
+        cl.snapshot(@intFromEnum(proto.SnapMode.full), 1);
+        if (!cl.waitSem("button \"Far Button\"", 20_000)) {
+            std.debug.print("smoke-web: snapshot was:\n{s}\n", .{cl.semLog()});
+            fail("stage 10b sticky: no snapshot of the sticky table page");
+        }
+        const row_id = cl.idOfLine("button \"Row Action\"") orelse fail("stage 10b sticky: no id on the row button");
+        const far_id = cl.idOfLine("button \"Far Button\"") orelse fail("stage 10b sticky: no id on the far button");
+        const acts = [_]struct { id: u32, action: proto.SemAct }{
+            .{ .id = row_id, .action = .scroll_into_view },
+            .{ .id = row_id, .action = .click },
+        };
+        for (acts) |a| {
+            const seq = cl.act_seq;
+            cl.send(proto.SemAction{ .view = view_id, .id = a.id, .action = @intFromEnum(a.action), .arg = "" });
+            if (!cl.waitSeq(&cl.act_seq, seq, 20_000) or cl.act_ok != 1) fail("stage 10b sticky: the act on the row button failed");
+            if (a.action == .scroll_into_view and std.mem.indexOf(u8, cl.act_msg[0..cl.act_msg_len], "already in view") == null) {
+                std.debug.print("smoke-web: scroll_into_view said \"{s}\"\n", .{cl.act_msg[0..cl.act_msg_len]});
+                fail("stage 10b sticky: scroll_into_view moved a button that was already in view");
+            }
+        }
+        if (!cl.waitTitle("sticky:0:true", 15_000)) {
+            std.debug.print("smoke-web: title was \"{s}\"\n", .{cl.titleSlice()});
+            fail("stage 10b sticky: the click scrolled the table (or did not land, or was untrusted)");
+        }
+        const after = cl.evalWait("document.getElementById('wrap').scrollLeft+','+scrollY", false, 15_000);
+        if (std.mem.indexOf(u8, after, "\"value\":\"0,0\"") == null) {
+            std.debug.print("smoke-web: scrollLeft,scrollY after the click: {s}\n", .{after});
+            fail("stage 10b sticky: acting on a visible sticky-column button moved the page");
+        }
+        const seq = cl.act_seq;
+        cl.send(proto.SemAction{ .view = view_id, .id = far_id, .action = @intFromEnum(proto.SemAct.click), .arg = "" });
+        if (!cl.waitSeq(&cl.act_seq, seq, 20_000) or cl.act_ok != 1) fail("stage 10b sticky: the act on the far button failed");
+        if (!cl.waitTitle("far:true:moved", 15_000)) {
+            std.debug.print("smoke-web: title was \"{s}\"\n", .{cl.titleSlice()});
+            fail("stage 10b sticky: a button below the fold was not scrolled into view and clicked");
+        }
+    }
+    pass("stage 10b act leaves a visible sticky-column target in place, scrolls an offscreen one");
 
     // ── Stage 11: cross-navigation id carrying ─────────────────────
     cl.navigate(nav_page_a);

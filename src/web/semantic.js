@@ -692,11 +692,43 @@
     return byId.get(eid) || null;
   }
 
-  function rectReply(req, el) {
-    if (!el) return send({ op: "rect", req: req, ok: 0 });
+  // Whether a pointer at el's centre (the point every act clicks) lands
+  // on el or something inside it, open shadow roots included.
+  function hitAtCentre(el) {
+    var r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    var x = r.left + r.width / 2;
+    var y = r.top + r.height / 2;
+    if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return false;
+    var hit = document.elementFromPoint(x, y);
+    while (hit && hit.shadowRoot) {
+      var inner = hit.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === hit) break;
+      hit = inner;
+    }
+    for (var n = hit; n; n = parentOf(n)) {
+      if (n === el) return true;
+    }
+    return false;
+  }
+
+  // Make el hittable at its centre while moving the page as little as
+  // possible. An element already hit there is left alone: centring a
+  // cell of a sticky table column scrolled the table to its far end,
+  // which reads as a bug in the page. "nearest" can leave el under a
+  // sticky header or footer; only then is it centred.
+  function reveal(el) {
     try {
+      if (hitAtCentre(el)) return;
+      el.scrollIntoView({ block: "nearest", inline: "nearest" });
+      if (hitAtCentre(el)) return;
       el.scrollIntoView({ block: "center", inline: "center" });
     } catch (e) {}
+  }
+
+  function rectReply(req, el) {
+    if (!el) return send({ op: "rect", req: req, ok: 0 });
+    reveal(el);
     var r = el.getBoundingClientRect();
     send({
       op: "rect",
@@ -1211,9 +1243,7 @@
       var opts = visibleOptions();
       var hit = bestMatch(opts, arg, optionText);
       if (hit) {
-        try {
-          hit.scrollIntoView({ block: "center", inline: "center" });
-        } catch (e) {}
+        reveal(hit);
         var r = hit.getBoundingClientRect();
         return send({
           op: "optrect",
@@ -1259,9 +1289,7 @@
   function setValue(req, eid, arg) {
     var el = elFor(eid);
     if (!el) return send({ op: "setvalue", req: req, ok: 0, typeable: 0, msg: "unknown id" });
-    try {
-      el.scrollIntoView({ block: "center", inline: "center" });
-    } catch (e) {}
+    reveal(el);
     // A native select -- including one inside a custom element's open
     // shadow root -- is picked by option text or value.
     var sel = nativeSelect(el);
@@ -1365,7 +1393,7 @@
         // Say whether anything MOVED: "scroll" alone cannot distinguish
         // an element already in view from one brought into it.
         var before = el.getBoundingClientRect();
-        el.scrollIntoView({ block: "center", inline: "center" });
+        reveal(el);
         var after = el.getBoundingClientRect();
         var moved = Math.round(Math.abs(after.top - before.top) + Math.abs(after.left - before.left));
         msg = moved > 0 ? "scrolled into view (moved " + moved + "px)" : "already in view (nothing moved)";

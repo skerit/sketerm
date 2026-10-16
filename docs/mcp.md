@@ -532,7 +532,11 @@ CDP: input is delivered as real engine events, so a page sees
   two pages of one site reports the shared chrome as carried rather
   than re-sending it.
 - `web_act` acts on an id rather than a selector, and echoes what it
-  actually hit.
+  actually hit. It scrolls only a target that a pointer at its centre
+  would not hit: a button already on screen (a sticky table column
+  included) is clicked where it is, anything else is scrolled the least
+  distance into view, and centred only if that still leaves it covered
+  (a sticky header or footer). `scroll_into_view` follows the same rule.
 - `web_expand` fetches text that a snapshot truncated; `web_read`
   returns the main content as prose (paged, scoped by a selector, or as
   the source, regex matches, the links or the scripts and iframes; see
