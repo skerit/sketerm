@@ -23287,3 +23287,25 @@ instructions and the tool description tell agents what to put there. Unit
 tests in peermail (set/clear/refusals/staleness/gone, federation with a skewed
 clock), peer_cli, agentpush; smoke peers 38b/38c set it with the tool and
 read it in another session's list and in a message header.
+
+## 2026-10-16: one daemon per federation link; beats bound a dead one
+
+archdev's hub logged "aeor called in again; its older link is closed" every
+2.2 s all day: several aeor daemons (each `sketerm mcp`'s private broker in
+builds before the per-user rule) called in as `aeor`, the hub kept only the
+newest, and the evicted one redialed after 2 s and evicted the other, dropping
+the peers the other carried each time. `src/mux/peerhold.zig` is now the one
+rule on the accepting side (hub call-in, member hub hello): each hello names
+its daemon (`instance`: pid, socket, an id minted per broker); the same daemon
+replaces its own link, another one is refused while the holder lives (`.err`
+`link_held`, logged once per refused daemon), and the refused side lists the
+link `taken` and waits `HELD_RETRY_MS` (20 s) instead of 2 s. Liveness is
+bounded by `peer_link_beat` (frame 47, welcome flag `peer_link_beat`): a beat
+every 15 s to a far side that said `beat`, and a link silent for 45 s is
+closed. A holder that names no instance or does not beat (an older build) is
+replaced as before, and a link replaced more than 3 times within 60 s logs ONE
+`FLAPPING` warning naming both daemons and lists `flapping` while up. Unit
+tests in peerhold, peermail, peerlink, backoff; smoke peers f7 (a second hub
+refused while the first holds a member's uplink) and f8b (a second call-in
+daemon of one host refused for a whole retry while the first keeps its peers
+listed, then let in once the first stops).
