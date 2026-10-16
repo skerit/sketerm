@@ -421,6 +421,10 @@ pub const Spec = struct {
     errors: []const ErrorRule = &.{},
     retry: Retry = .{},
     facts: ?Facts = null,
+    /// The MCP `clientInfo.name` its app's sketerm server registers as a
+    /// peer (`peermail.RegisterReq.app`): the daemon reads such a peer's
+    /// screen with this adapter (`mux/peerwork.zig`). Null = none.
+    mcp_client: ?[]const u8 = null,
 
     /// Some generation of its server has a visible client (`attach_args`).
     pub fn hasTui(self: *const Spec) bool {
@@ -973,6 +977,16 @@ pub const Set = struct {
     pub fn get(self: *const Set, id: []const u8) ?*const Loaded {
         for (self.items.items) |l| {
             if (std.mem.eql(u8, l.spec.id, id)) return l;
+        }
+        return null;
+    }
+
+    /// The screen adapter whose app registers as the MCP client `name`
+    /// (`Spec.mcp_client`); null when none reads that app's screen.
+    pub fn byMcpClient(self: *const Set, name: []const u8) ?*const Loaded {
+        for (self.items.items) |l| {
+            const want = l.spec.mcp_client orelse continue;
+            if (l.screen != null and std.mem.eql(u8, want, name)) return l;
         }
         return null;
     }

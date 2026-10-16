@@ -542,7 +542,6 @@ pub fn build(b: *std.Build) void {
     configureSysDeps(b, replay_mod, cbindings_mod);
     replay_mod.addImport("build_options", glib_opts_mod);
     addVideo(b, replay_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-    addAgentAdapters(b, replay_mod); // `replay --agent` runs a shipped adapter
     addMcpToolsJson(b, replay_mod);
     const replay = b.addExecutable(.{
         .name = "sketerm-replay",
@@ -915,7 +914,6 @@ pub fn build(b: *std.Build) void {
     // doc against its code vocabulary embed it this way.
     tests_mod.addAnonymousImport("docs_config_md", .{ .root_source_file = b.path("docs/config.md") });
     tests_mod.addAnonymousImport("docs_mcp_md", .{ .root_source_file = b.path("docs/mcp.md") });
-    addAgentAdapters(b, tests_mod);
     addMcpToolsJson(b, tests_mod);
     const tests = b.addTest(.{
         .root_module = tests_mod,
@@ -994,7 +992,6 @@ pub fn build(b: *std.Build) void {
     addTreeSitter(b, coretests_mod, tree_sitter);
     // config.zig's drift test embeds docs/config.md, as in tests_mod.
     coretests_mod.addAnonymousImport("docs_config_md", .{ .root_source_file = b.path("docs/config.md") });
-    addAgentAdapters(b, coretests_mod);
     addMcpToolsJson(b, coretests_mod);
     const coretests = b.addTest(.{
         .root_module = coretests_mod,
@@ -1115,7 +1112,6 @@ fn guiExe(b: *std.Build, d: BinDeps, p: Profile) *std.Build.Step.Compile {
     configureSysDeps(b, mod, d.cbindings);
     mod.addImport("build_options", p.glib_opts);
     addVideo(b, mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-    addAgentAdapters(b, mod); // `sketerm mcp`'s agent_* tools
     addMcpToolsJson(b, mod);
     // NSAccessibility bridge (live on macOS: GTK4 has no NSAccessibility
     // backend, so every pane hangs an element on the window's content
@@ -1150,7 +1146,6 @@ fn mcpExe(b: *std.Build, d: BinDeps, p: Profile) *std.Build.Step.Compile {
     configureShippableCoreDeps(b, mod, d.core_cbindings);
     mod.addImport("build_options", p.noglib_opts);
     addVideo(b, mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-    addAgentAdapters(b, mod); // the agent_* tools load the shipped adapters
     addMcpToolsJson(b, mod);
     return p.executable(b, "sketerm-mcp", mod);
 }
@@ -1986,6 +1981,7 @@ fn configureCoreDeps(
     });
     addZstd(b, mod);
     mod.addIncludePath(b.path("vendor"));
+    addAgentAdapters(b, mod); // the daemon reads its peers' screens (mux/peerwork.zig)
 }
 
 /// `configureCoreDeps` minus the fribidi LINK, for binaries copied to other
@@ -2004,6 +2000,7 @@ fn configureShippableCoreDeps(
     });
     addZstd(b, mod);
     mod.addIncludePath(b.path("vendor"));
+    addAgentAdapters(b, mod);
 }
 
 /// Vendored single-file zstd, compiled statically into every artifact
@@ -2239,7 +2236,8 @@ fn addVideo(b: *std.Build, mod: *std.Build.Module) void {
 /// `src/agent/adapter.zig` reads: shipping a screen app is dropping a JSON
 /// file there, no list to keep in sync. `facts.json` is not an adapter but
 /// the facts vocabulary (`src/agent/facts.zig`), embedded as `facts_json`.
-/// Every module that loads adapters needs this call.
+/// Every `configure*Deps` adds it: the agent tools, `replay --agent` and
+/// the daemon's peer screen reader (`mux/peerwork.zig`) all load adapters.
 fn addAgentAdapters(b: *std.Build, mod: *std.Build.Module) void {
     mod.addAnonymousImport("agent_adapters", .{ .root_source_file = agentAdaptersSource(b) });
 }
@@ -2374,6 +2372,7 @@ fn configureSysDeps(
     mod.addCSourceFile(.{ .file = b.path("vendor/vpxenc_shim.c"), .flags = &.{"-O2"} });
     addZstd(b, mod);
     mod.addIncludePath(b.path("vendor"));
+    addAgentAdapters(b, mod);
 }
 
 /// Whether GUI targets link gtk4-layer-shell (`-Dlayer-shell`, Linux

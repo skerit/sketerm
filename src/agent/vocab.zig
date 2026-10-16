@@ -85,6 +85,68 @@ pub const PeerState = enum {
     }
 };
 
+/// What a peer's session runs besides its main turn, as the daemon reads
+/// it off the session's screen (`grammar.work`): every field is a count
+/// named in the plural, and its singular (the name without its last `s`,
+/// `_` read as a space) is the noun the screen and the text use.
+pub const PeerWork = struct {
+    subagents: u32 = 0,
+    shells: u32 = 0,
+    monitors: u32 = 0,
+    /// Background work the screen counts under a noun no field names.
+    other_tasks: u32 = 0,
+
+    pub fn isEmpty(self: PeerWork) bool {
+        inline for (std.meta.fields(PeerWork)) |f| if (@field(self, f.name) != 0) return false;
+        return true;
+    }
+
+    pub fn eql(a: PeerWork, b: PeerWork) bool {
+        return std.meta.eql(a, b);
+    }
+
+    /// Add `n` to the field whose noun `word` is (singular or plural).
+    /// @return false when no field names it.
+    pub fn addTerm(self: *PeerWork, n: u32, word: []const u8) bool {
+        inline for (std.meta.fields(PeerWork)) |f| {
+            const one = comptime singular(f.name);
+            if (std.mem.eql(u8, word, one) or (word.len == one.len + 1 and std.mem.startsWith(u8, word, one) and word[one.len] == 's')) {
+                @field(self, f.name) +|= n;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// `2 subagents, 1 shell`: the counts that are not 0, in field order.
+    pub fn write(self: PeerWork, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        var first = true;
+        inline for (std.meta.fields(PeerWork)) |f| {
+            const n = @field(self, f.name);
+            if (n != 0) {
+                if (!first) try w.writeAll(", ");
+                first = false;
+                const noun = comptime spaced(f.name);
+                try w.print("{d} {s}", .{ n, if (n == 1) noun[0 .. noun.len - 1] else noun });
+            }
+        }
+    }
+
+    fn spaced(comptime name: []const u8) []const u8 {
+        comptime {
+            var out: [name.len]u8 = undefined;
+            for (name, 0..) |ch, i| out[i] = if (ch == '_') ' ' else ch;
+            const final = out;
+            return &final;
+        }
+    }
+
+    fn singular(comptime name: []const u8) []const u8 {
+        const s = spaced(name);
+        return s[0 .. s.len - 1];
+    }
+};
+
 /// What became of one peer message; `peer_send` answers with one and
 /// every later `peer_event` reuses it.
 pub const PeerOutcome = enum {

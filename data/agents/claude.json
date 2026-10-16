@@ -1,6 +1,7 @@
 {
   "id": "claude",
   "name": "Claude Code",
+  "mcp_client": "claude-code",
   "source": "screen",
   "launch": {
     "binary": "claude",

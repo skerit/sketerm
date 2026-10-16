@@ -28,6 +28,9 @@ const atomicwrite = @import("util/atomicwrite.zig");
 const readfile = @import("util/readfile.zig");
 const envutil = @import("util/env.zig");
 const facts = @import("agent/facts.zig");
+const peerwork = @import("mux/peerwork.zig");
+const agentpush = @import("ipc/agentpush.zig");
+const version = @import("version.zig");
 
 fn fail(comptime msg: []const u8) noreturn {
     std.debug.print("smoke peers stage: FAIL: " ++ msg ++ "\n", .{});
@@ -930,6 +933,50 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
         w2.closeStdinWait();
         w1.closeStdinWait();
         std.debug.print("smoke: peers: untitled sessions named zenit-workspace / zenit-workspace-1, cwd listed ok\n", .{});
+    }
+    // 45. The daemon reads what a Claude Code peer runs besides its turn
+    //     off its session's screen: a real session prints a recorded
+    //     Claude Code screen with two background subagents, two shells and
+    //     a monitor, then runs a server that says it is claude-code; every
+    //     other peer lists its work after its state.
+    {
+        const screen_path = std.fmt.allocPrintSentinel(arena, "{s}/claude.screen", .{std.mem.sliceTo(&root_buf, 0)}, 0) catch fail("oom");
+        writeFileOrFail(screen_path, peerwork.fixture_claude_busy, 0o600);
+        var real_buf: [4096]u8 = undefined;
+        const mcp_real = std.mem.sliceTo(c.realpath(exe, &real_buf) orelse fail("45. resolve the server binary"), 0);
+        const init_line = std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"{s}\",\"version\":\"0\"}}}}}}", .{ version.mcp_protocol, agentpush.CLAUDE_CODE_CLIENT }) catch fail("oom");
+        const script = std.fmt.allocPrint(arena, "cat '{s}'; {{ printf '%s\\n' '{s}'; sleep 120; }} | '{s}' mcp --no-record >/dev/null 2>&1", .{ screen_path, init_line, mcp_real }) catch fail("oom");
+        const env = [_][]const u8{
+            std.fmt.allocPrint(arena, "XDG_RUNTIME_DIR={s}", .{std.mem.sliceTo(&rt_buf, 0)}) catch fail("oom"),
+            std.fmt.allocPrint(arena, "XDG_STATE_HOME={s}", .{std.mem.sliceTo(&st_buf, 0)}) catch fail("oom"),
+            std.fmt.allocPrint(arena, "XDG_CONFIG_HOME={s}", .{std.mem.sliceTo(&cfg_buf, 0)}) catch fail("oom"),
+        };
+        var conn = muxclient.Conn.connectProbed(allocator, sock_path) catch fail("45. connect to the rig broker");
+        defer conn.deinit();
+        conn.sendJson(.spawn, .{ .name = "claude-work", .argv = [_][]const u8{ "/bin/sh", "-c", script }, .env = &env, .rows = @as(u16, 24), .cols = @as(u16, 100) }) catch fail("45. spawn send");
+        (conn.recvExpectFor(&.{.ok}, 10_000) catch fail("45. spawn ok")).deinit(allocator);
+        var obs = stage.server(null, null);
+        obs.initialize();
+        _ = registered(&obs, arena, "45. observer");
+        const deadline = nowMs() + 20_000;
+        const work = while (nowMs() < deadline) : (_ = c.usleep(200_000)) {
+            const r = call(&obs, arena, "peer_list", "{}", "45. peer_list");
+            const found = for ((r.get("peers") orelse fail("45. no peers")).array.items) |p| {
+                const app = if (p.object.get("app")) |v| v.string else continue;
+                if (!std.mem.eql(u8, app, agentpush.CLAUDE_CODE_CLIENT)) continue;
+                if (p.object.get("work")) |wk| break wk.object;
+            } else null;
+            if (found) |wk| break wk;
+        } else {
+            printList(&obs, arena, "45. no work listed");
+            fail("45. the claude-code peer's work never reached peer_list");
+        };
+        if (work.get("subagents").?.integer != 2 or work.get("shells").?.integer != 2 or work.get("monitors").?.integer != 1) fail("45. the counts read off the screen are wrong");
+        contains(listText(&obs, arena, "45. text"), "  2 subagents, 2 shells, 1 monitor", "45. the text row names the work");
+        conn.sendJson(.kill, .{ .name = "claude-work" }) catch fail("45. kill send");
+        (conn.recvExpectFor(&.{.ok}, 10_000) catch fail("45. kill ok")).deinit(allocator);
+        obs.closeStdinWait();
+        std.debug.print("smoke: peers: a claude-code peer's subagents, shells and monitor read off its session's screen ok\n", .{});
     }
 
     dave.closeStdinWait();

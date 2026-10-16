@@ -526,3 +526,12 @@ test "what became of a sent message, and mail that expired while away, read as o
     try t.expectEqualStrings("Peer message m-10 from qq (p-9c04e2d7) expired unread while you were away (7 h after it was sent).", away_aliased.content);
     try t.expectEqualStrings("qq", away_aliased.meta.from_alias.?);
 }
+
+test "the Claude Code client name is the one the shipped claude adapter reads peers of" {
+    const adapter = @import("../agent/adapter.zig");
+    var set = adapter.Set.init(t.allocator);
+    defer set.deinit();
+    try set.loadShipped();
+    const l = set.byMcpClient(CLAUDE_CODE_CLIENT) orelse return error.TestUnexpectedResult;
+    try t.expectEqualStrings("claude", l.spec.id);
+}

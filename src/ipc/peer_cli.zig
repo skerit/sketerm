@@ -62,6 +62,9 @@ pub const ListLine = struct {
     no_mcp: ?bool = null,
     /// Absent while the state is unknown.
     attention: ?[]const u8 = null,
+    /// What its session runs besides its main turn, read off its screen by
+    /// its daemon; absent when nothing runs or it is not read.
+    work: ?vocab.PeerWork = null,
     live: bool,
     pending: u32,
     last_seen_ms: i64,
@@ -150,6 +153,7 @@ pub fn listLine(pi: peermail.PeerInfo, is_self: bool, detail: bool) ListLine {
         .app = nonEmpty(pi.app),
         .state = @tagName(pi.state),
         .attention = if (pi.state.attention()) |at| @tagName(at) else null,
+        .work = if (pi.work) |wk| (if (pi.live and !wk.isEmpty()) wk else null) else null,
         .live = pi.live,
         .polls = if (pi.live and pi.polls) true else null,
         .no_mcp = if (!pi.live and pi.no_mcp) true else null,
@@ -266,6 +270,10 @@ pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []c
             try w.writeAll("  gone");
             if (pi.last_seen_ms > 0) try w.print(" {s}", .{clock.span(&buf, now_ms - pi.last_seen_ms, .short)});
         } else try w.print("  {s}", .{if (pi.live) @tagName(pi.state) else "offline"});
+        if (pi.work) |wk| if (pi.live and !wk.isEmpty()) {
+            try w.writeAll("  ");
+            try wk.write(w);
+        };
         if (pi.live and pi.state == .unknown) unknown = true;
         if (pi.live and pi.polls) {
             polling = true;
@@ -1161,6 +1169,22 @@ test "a received message prints as one JSON line with the documented fields" {
     // Without --json: the composed text the MCP routes carry.
     const text = try itemText(a, .{ .message = .{ .id = "m-2", .from = .{ .address = "alice" }, .text = "x", .sender_live = true } }, false);
     try t.expect(std.mem.startsWith(u8, text, "Peer message from alice ("));
+}
+
+test "the list: a live peer's subagents and background work follow its state; a gone one shows none" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const now: i64 = 10_000_000_000;
+    const peers = [_]peermail.PeerInfo{
+        .{ .address = "p-3fa9c2e1", .alias = "zenit", .state = .idle, .live = true, .last_seen_ms = now, .work = .{ .subagents = 2, .shells = 1 } },
+        .{ .address = "p-9c04e2d7", .alias = "qq", .state = .gone, .pending = 1, .last_seen_ms = now, .work = .{ .subagents = 1 } },
+    };
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try writeList(&aw.writer, &peers, &.{}, null, now, false);
+    try t.expectEqualStrings("zenit  idle  2 subagents, 1 shell  p-3fa9c2e1\nqq     gone 0s  1 pending  p-9c04e2d7\n", aw.written());
+    try t.expectEqual(@as(u32, 2), listLine(peers[0], false, false).work.?.subagents);
+    try t.expect(listLine(peers[1], false, false).work == null);
 }
 
 test "the list: you once, one state word, rounded facts, gone peers counted, links last" {

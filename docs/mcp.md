@@ -2795,8 +2795,10 @@ returns an id that `agent_attach {agent: id}` resumes after a restart
 
 Every `sketerm mcp` is a peer: at startup it opens one connection to the
 per-user daemon (the one sub-agents live on) and registers there, so
-assistants' sessions on one host can message each other. Nothing reads a
-peer's screen, and a peer message is information, never an approval.
+assistants' sessions on one host can message each other. A peer's state
+comes from its own hooks; its daemon reads a sketerm session's screen only
+to count what a Claude Code peer runs besides its turn ("Work", below). A
+peer message is information, never an approval.
 
 - **Address**, the opaque identity mail and the subject are kept under,
   decided per connection: inside a sketerm session (GUI pane or headless:
@@ -3087,7 +3089,8 @@ which never pushes it, and read by the session with its next turn.
 
 A peer's state comes from its own Claude Code hooks and status line, never
 from its screen, so Claude Code keeps its normal (alternate-buffer)
-rendering. Without them a peer is listed `unknown`, never guessed.
+rendering. Without them a peer is listed `unknown`, never guessed. Only
+what it runs besides its turn is read off the screen ("Work", below).
 
 - `sketerm mcp hook` is the hook command: it reads the hook's JSON on
   stdin, finds the sketerm MCP server its Claude Code started (walking its
@@ -3183,6 +3186,50 @@ its presence. Fresh means a report within 2 minutes
 `SessionEnd` hook, a server registering the address again or 2 minutes
 of silence end it (a hooks-only session idle that long reads `gone`
 again). An anon address has no mailbox left to mark.
+
+### Work: subagents and background tasks
+
+A Claude Code peer often reads `idle` while its subagents or background
+shells work. Its daemon owns every sketerm session's screen (GUI pane or
+headless alike), so the session's worker reads it with the `agent_*`
+tools' own screen reader (`grammar.work`, `screen_source.workOf`) and
+publishes the counts: `peer_list` text shows them after the state,
+
+```
+zenit  idle  2 subagents, 1 shell  ~/src/zenit  p-3fa9c2e1
+```
+
+and JSON as `work: {subagents, shells, monitors, other_tasks}` (absent
+when nothing runs). Subagents are the `◯` agent rows (or the count on a
+`Waiting for N background agents` line, when more); shells and monitors
+come from the mode line's `· 2 shells, 1 monitor`; a count under a noun no
+field names is `other_tasks`. A turn's footer (`... · 2 shells still
+running`) is never the live count.
+
+- **Which sessions**: only a registered peer's own session (the broker
+  tells each worker the peer in its process tree, with its app), and only
+  an app whose adapter names its MCP client (`mcp_client` in
+  `data/agents/claude.json`: `claude-code`) and reads a screen. opencode
+  has no screen reader (its adapter is API-based), and a session outside
+  sketerm has no screen here: neither gets counts, and no hook-based
+  guess stands in for them.
+- **Cost**: the visible rows are read at most once a second
+  (`peerwork.READ_EVERY_MS`) and only after the session printed something
+  since the last read; the worker reports to the broker (control `'W'`,
+  `peermail.WorkReport`) only when the counts change. The broker keeps them
+  with the address while a server of it is live (a new server starts
+  clean) and relays them in federation presence (`PeerInfo.work`).
+- **Not a wake input**: the dormancy rule ("Waking and slow mail") does
+  not count them as activity. Background work makes no API call on the
+  session's own context, so its prompt cache ages the same, and when the
+  work ends the session wakes on its own anyway.
+- **Limits**: the patterns were measured in Claude Code's screen-reader
+  mode (`--ax-screen-reader`, what `agent_open` runs); a session in its
+  normal rendering is read with the same patterns, so a redesign of its
+  footer or agent rows can hide counts there until the adapter is updated.
+  `peer_send` results do not carry them.
+- **Older parts**: an older daemon reads nothing (no `work`); an older
+  server or hub ignores the field.
 
 ### Non-MCP peers: `sketerm peer`
 

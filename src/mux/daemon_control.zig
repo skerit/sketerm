@@ -41,7 +41,9 @@ const daemon_peers = @import("daemon_peers.zig");
 // (brokerOnWorkerControl): 'Y' ready, 'E' spawn-failure reason, 'M'
 // metadata push, 'N' an attached client's rename forwarded by the worker,
 // 'T' why the session ends (`tombstones.End`, sent before the session
-// goes), 'P' an attached client's `peer_subject` (`peermail.SubjectReq`).
+// goes), 'P' an attached client's `peer_subject` (`peermail.SubjectReq`),
+// 'W' what the session's peer runs besides its main turn, read off its
+// screen (`peermail.WorkReport`, `peerwork.zig`).
 
 /// Longest control datagram a worker reads ('S' carries a subject).
 const WORKER_CONTROL_BUF: usize = 1024;
@@ -446,6 +448,7 @@ pub fn brokerOnWorkerControl(self: *Daemon, w: *Worker) void {
         'N' => self.brokerWorkerRename(w, buf[0..@intCast(n)]),
         'D' => daemon_adopt.brokerOnAdoptRecord(self, w, buf[1..@intCast(n)]),
         'P' => daemon_peers.workerSubject(self, w, buf[1..@intCast(n)]),
+        'W' => daemon_peers.workerWork(self, w, buf[1..@intCast(n)]),
         else => {},
     }
 }

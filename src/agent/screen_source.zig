@@ -414,43 +414,24 @@ pub const Engine = struct {
     fn readRows(self: *Engine, screen: *const Screen, now_ms: i64) !void {
         freeLines(self.allocator, &self.rows);
         var h = std.hash.Wyhash.init(0);
-        var r: i32 = 0;
-        while (r < screen.rows) : (r += 1) {
-            const l = try readLine(self.allocator, screen, r);
-            h.update(l.text);
-            h.update(std.mem.asBytes(&l.id));
-            try self.rows.append(self.allocator, l);
-        }
-        // Trailing blank rows are no content.
-        while (self.rows.items.len > 0 and self.rows.items[self.rows.items.len - 1].text.len == 0) {
-            const l = self.rows.pop().?;
-            self.allocator.free(l.text);
-        }
+        try readRowsInto(self.allocator, screen, &self.rows, &h);
         const hash = h.final();
         if (hash != self.rows_hash) {
             self.rows_hash = hash;
             self.last_change_ms = now_ms;
         }
         const sc = self.sc;
-        // A side panel drawn last replaced the input box (an idle app): a
-        // `$` line in its answer is no input box.
-        const panel_last = if (sc.side) |s| self.rows.items.len > 0 and s.footer.matches(self.rows.items[self.rows.items.len - 1].text) else false;
-        self.input_row = if (panel_last) null else grammar.findInput(sc, self.rows.items, INPUT_SEARCH_ROWS);
+        self.input_row = markInputRegion(sc, self.rows.items, &self.status_rows);
         self.allocator.free(self.input_text);
         self.input_text = &.{};
         self.queued_visible = 0;
         if (self.input_row) |in| {
-            if (grammar.measureStatusRows(sc, self.rows.items, in, MAX_STATUS_ROWS)) |n| self.status_rows = n;
-            grammar.markLive(sc, self.rows.items, in, self.status_rows);
             self.queued_visible = grammar.markQueued(sc, self.rows.items, in);
             self.input_text = try grammar.inputText(self.allocator, sc, self.rows.items, in);
         }
-        self.side_panel = grammar.findSidePanel(sc, self.rows.items);
-        if (self.side_panel) |p| {
-            for (self.rows.items[p.top .. p.footer + 1]) |*l| l.live = true;
-        }
-        self.subagent_visible = self.subagentInTail();
-        self.background_tasks = self.backgroundInTail();
+        self.side_panel = markSidePanel(sc, self.rows.items);
+        self.subagent_visible = grammar.subagentLine(sc, self.rows.items, self.side_panel) != null;
+        self.background_tasks = grammar.background(sc, self.rows.items, self.side_panel).tasks(self.rows.items);
 
         _ = self.interaction_arena.reset(.retain_capacity);
         self.interaction = try grammar.parseInteraction(self.interaction_arena.allocator(), sc, self.rows.items);
@@ -458,21 +439,6 @@ pub const Engine = struct {
         if (self.interaction) |it| {
             for (self.rows.items[it.rows_start..it.rows_end]) |*l| l.live = true;
         }
-    }
-
-    /// A subagent line after the last record start: a finished wait stays
-    /// on screen above the records that follow it.
-    fn subagentInTail(self: *const Engine) bool {
-        const m = self.sc.subagent orelse return false;
-        var i = self.rows.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (self.inSidePanel(i)) continue;
-            const l = self.rows.items[i];
-            if (m.matches(l.text)) return true;
-            if (grammar.classify(self.sc, l) == .record) return false;
-        }
-        return false;
     }
 
     /// Row `i` of `rows` is part of the side panel (whatever it says).
@@ -490,34 +456,6 @@ pub const Engine = struct {
     pub fn sideAnswer(self: *const Engine, alloc: std.mem.Allocator, asked: []const u8) !?grammar.SideAnswer {
         const p = self.side_panel orelse return null;
         return grammar.sideAnswer(alloc, self.sc, self.rows.items, p, asked);
-    }
-
-    /// The background tasks shown after the last record start: the numbers
-    /// on the background line summed (1 without one), plus one per
-    /// background agent row; 0 when none shows.
-    fn backgroundInTail(self: *const Engine) u32 {
-        var n: u32 = 0;
-        var seen_line = false;
-        var i = self.rows.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (self.inSidePanel(i)) continue;
-            const l = self.rows.items[i];
-            if (self.sc.background_agent) |m| if (m.matches(l.text)) {
-                n += 1;
-                continue;
-            };
-            // A turn's footer says what still ran when it ended, and keeps
-            // saying it after they ended: never the live count.
-            if (self.sc.footer) |m| if (m.matches(l.text)) continue;
-            if (self.sc.background) |m| if (!seen_line and m.matches(l.text)) {
-                seen_line = true;
-                n += @max(1, sumNumbers(l.text));
-                continue;
-            };
-            if (grammar.classify(self.sc, l) == .record) break;
-        }
-        return n;
     }
 
     /// Milliseconds until the background cap fires its quiet `done`, or null.
@@ -1137,21 +1075,60 @@ fn freeLines(allocator: std.mem.Allocator, list: *std.ArrayList(Line)) void {
     if (list.capacity > 4096) list.clearAndFree(allocator) else list.clearRetainingCapacity();
 }
 
-/// Every decimal number in `text`, summed (0 without one).
-fn sumNumbers(text: []const u8) u32 {
-    var sum: u32 = 0;
-    var i: usize = 0;
-    while (i < text.len) {
-        if (!std.ascii.isDigit(text[i])) {
-            i += 1;
-            continue;
+/// The visible rows of `screen` appended to `out` as `Line`s, trailing
+/// blank rows dropped (they are no content); `h` takes each row's text
+/// and id.
+fn readRowsInto(allocator: std.mem.Allocator, screen: *const Screen, out: *std.ArrayList(Line), h: ?*std.hash.Wyhash) !void {
+    var r: i32 = 0;
+    while (r < screen.rows) : (r += 1) {
+        const l = try readLine(allocator, screen, r);
+        errdefer allocator.free(l.text);
+        if (h) |hh| {
+            hh.update(l.text);
+            hh.update(std.mem.asBytes(&l.id));
         }
-        var end = i;
-        while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
-        sum +|= std.fmt.parseInt(u32, text[i..end], 10) catch 0;
-        i = end;
+        try out.append(allocator, l);
     }
-    return sum;
+    while (out.items.len > 0 and out.items[out.items.len - 1].text.len == 0) {
+        const l = out.pop().?;
+        allocator.free(l.text);
+    }
+}
+
+/// Mark the input box and the status block above it live; @return the
+/// input row. `status_height` keeps the last measured status block height
+/// (a draw that hides it keeps the last one).
+fn markInputRegion(sc: *const adapter.Screen, rows: []Line, status_height: *usize) ?usize {
+    // A side panel drawn last replaced the input box (an idle app): a `$`
+    // line in its answer is no input box.
+    const panel_last = if (sc.side) |s| rows.len > 0 and s.footer.matches(rows[rows.len - 1].text) else false;
+    if (panel_last) return null;
+    const in = grammar.findInput(sc, rows, INPUT_SEARCH_ROWS) orelse return null;
+    if (grammar.measureStatusRows(sc, rows, in, MAX_STATUS_ROWS)) |n| status_height.* = n;
+    grammar.markLive(sc, rows, in, status_height.*);
+    return in;
+}
+
+/// Mark the side panel's rows live; @return it, null when none shows.
+fn markSidePanel(sc: *const adapter.Screen, rows: []Line) ?grammar.SidePanel {
+    const p = grammar.findSidePanel(sc, rows) orelse return null;
+    for (rows[p.top .. p.footer + 1]) |*l| l.live = true;
+    return p;
+}
+
+/// What `screen`'s visible rows show running besides the main turn
+/// (`grammar.work`), read the way the engine reads them, with none of its
+/// state: the daemon's per-peer reader (`mux/peerwork.zig`).
+pub fn workOf(allocator: std.mem.Allocator, sc: *const adapter.Screen, screen: *const Screen) !vocab.PeerWork {
+    var rows: std.ArrayList(Line) = .empty;
+    defer {
+        for (rows.items) |l| allocator.free(l.text);
+        rows.deinit(allocator);
+    }
+    try readRowsInto(allocator, screen, &rows, null);
+    var status_height: usize = 0;
+    if (markInputRegion(sc, rows.items, &status_height)) |in| _ = grammar.markQueued(sc, rows.items, in);
+    return grammar.work(sc, rows.items, markSidePanel(sc, rows.items));
 }
 
 fn titleBusy(sc: *const adapter.Screen, title: ?[]const u8) bool {

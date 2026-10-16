@@ -50,6 +50,7 @@ pub const PeerLink = vocab.PeerLink;
 pub const PeerFederation = vocab.PeerFederation;
 pub const PeerLinkDirection = vocab.PeerLinkDirection;
 pub const PeerLinkWhy = vocab.PeerLinkWhy;
+pub const PeerWork = vocab.PeerWork;
 /// Longest `HostInfo.detail` kept (bytes of UTF-8).
 pub const LINK_DETAIL_MAX: usize = 200;
 
@@ -260,6 +261,11 @@ pub const PeerInfo = struct {
     link_why: ?PeerLinkWhy = null,
     /// The address's alias, empty = none (or a broker that predates them).
     alias: []const u8 = "",
+    /// What its session runs besides its main turn, as its daemon reads
+    /// its screen (`mux/peerwork.zig`); null = nothing, or not read (a
+    /// session outside sketerm, an app without a screen reader, an older
+    /// daemon).
+    work: ?PeerWork = null,
 };
 
 /// One federated host as this broker sees it.
@@ -437,6 +443,19 @@ pub const HookPresence = struct {
 pub const SessionPeer = struct {
     address: []const u8 = "",
     subject: []const u8 = "",
+    /// The peer's app (`RegisterReq.app`): the worker reads the session's
+    /// screen for an app with a screen reader (`mux/peerwork.zig`).
+    app: []const u8 = "",
+    /// The peer's server pid: a new server of the same address is a new
+    /// peer to report to (the broker tells the worker again).
+    pid: i32 = 0,
+};
+
+/// A worker's control `'W'` payload: what the session of `address` runs
+/// besides its main turn, read off its screen.
+pub const WorkReport = struct {
+    address: []const u8 = "",
+    work: PeerWork = .{},
 };
 
 /// What one `peer_hub_relay` / `peer_member_relay` carries.
@@ -608,6 +627,8 @@ const Box = struct {
     client_pid: i32 = 0,
     /// Wall ms of the last hook report while no server was live; 0 = none.
     hook_ms: i64 = 0,
+    /// What its live session runs besides its main turn (`setWork`).
+    work: PeerWork = .{},
 
     /// Its session runs while its server is down (`PeerInfo.no_mcp`).
     fn noMcp(self: *const Box, now: i64) bool {
@@ -1123,6 +1144,7 @@ pub const Store = struct {
         const box = self.boxes.items[bi];
         box.last_seen_ms = now;
         box.client_pid = p.client_pid;
+        box.work = .{};
         if (box.durable) return;
         _ = self.boxes.orderedRemove(bi);
         defer self.freeBox(box);
@@ -1427,6 +1449,7 @@ pub const Store = struct {
                 .last_notification = p.last_notification,
                 .subject = if (box) |b| b.subject else "",
                 .alias = if (box) |b| b.alias else "",
+                .work = if (box) |b| (if (b.work.isEmpty()) null else b.work) else null,
             });
         }
         for (self.boxes.items) |b| {
@@ -1547,6 +1570,15 @@ pub const Store = struct {
             error.SubjectTooLong, error.SubjectNotText => self.warnf("peermail: {s}'s registration carried a refused subject: {s}", .{ address, subjectRefusal(@errorCast(e)) }),
             error.UnknownAddress, error.OutOfMemory => self.warnf("peermail: {s}'s subject was not kept", .{address}),
         };
+    }
+
+    /// The worker reading `address`'s session screen reports what it runs
+    /// besides its main turn; it shows while a server of the address is live.
+    pub fn setWork(self: *Store, address: []const u8, work: PeerWork) void {
+        const box = self.boxOf(address) orelse return;
+        if (box.work.eql(work)) return;
+        box.work = work;
+        self.presence_dirty = true;
     }
 
     // ---------------------------------------------------------- aliases
@@ -2074,6 +2106,7 @@ pub const Store = struct {
                 .last_notification = try a.dupe(u8, p.last_notification),
                 .subject = try a.dupe(u8, p.subject),
                 .alias = try a.dupe(u8, p.alias),
+                .work = p.work,
                 .via_host = via,
                 // A hub judges its own links; a member keeps the hub's view.
                 .link = if (self.hub) null else p.link,
@@ -2740,6 +2773,9 @@ pub const Store = struct {
         const app = try self.allocator.dupe(u8, req.app);
         errdefer self.allocator.free(app);
         const cwd = try self.allocator.dupe(u8, req.cwd);
+        // Its app (known only after its client's `initialize`) or server
+        // decides how its session's worker reads it: the roster changed.
+        if (!std.mem.eql(u8, p.app, app) or p.pid != req.pid) self.roster_gen +%= 1;
         self.allocator.free(p.app);
         self.allocator.free(p.cwd);
         p.app = app;
@@ -4263,6 +4299,42 @@ test "federation: presence facts cross the link, and the far broker judges a dor
     const rep = lastOf(&net.hub_rec, 1, .reply) orelse return error.TestUnexpectedResult;
     try t.expectEqual(PeerOutcome.queued_slow, rep.outcome);
     try t.expectEqual(@as(?RefuseReason, .dormant), rep.reason);
+}
+
+test "work: what a worker reads off a live peer's screen lists with it, crosses the hub, and ends with its server" {
+    var net: Net = undefined;
+    try net.init(null);
+    defer net.deinit();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try net.hub.register(1, regSlow("Zenit"), 0);
+    try net.mem.register(1, regSlow("bob"), 0);
+    try net.connect(100);
+    // 1. Nothing read yet: no work listed.
+    try t.expect((listed(&net.mem, a, "bob") orelse return error.TestUnexpectedResult).work == null);
+    // 2. Bob's worker reports two subagents and a shell: his broker lists
+    // them and its presence carries them to the hub.
+    net.mem.setWork("bob", .{ .subagents = 2, .shells = 1 });
+    try net.pump(200);
+    try t.expectEqual(PeerWork{ .subagents = 2, .shells = 1 }, (listed(&net.mem, a, "bob") orelse return error.TestUnexpectedResult).work.?);
+    try t.expectEqual(PeerWork{ .subagents = 2, .shells = 1 }, (listed(&net.hub, a, "box/bob") orelse return error.TestUnexpectedResult).work.?);
+    // 3. All of it ended: nothing listed.
+    net.mem.setWork("bob", .{});
+    try net.pump(300);
+    try t.expect((listed(&net.hub, a, "box/bob") orelse return error.TestUnexpectedResult).work == null);
+    // 4. A report outlives no server: a later one of the address starts clean.
+    net.mem.setWork("bob", .{ .monitors = 1 });
+    net.mem.deregister(1, 400);
+    try net.mem.register(2, regSlow("bob"), 500);
+    try t.expect((listed(&net.mem, a, "bob") orelse return error.TestUnexpectedResult).work == null);
+    // 5. Its app arrives with its client's `initialize`, as an update: the
+    // roster changed, so its session's worker is told which reader to use.
+    const gen = net.mem.roster_gen;
+    var named = regSlow("bob");
+    named.app = "opencode";
+    try net.mem.register(2, named, 600);
+    try t.expect(net.mem.roster_gen != gen);
 }
 
 test "federation: a dropped link queues host_unreachable and delivers once when it is back, across skewed clocks" {

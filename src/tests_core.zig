@@ -239,6 +239,7 @@ comptime {
     _ = @import("mux/capabilities.zig");
     _ = @import("mux/tombstones.zig");
     _ = @import("mux/peermail.zig");
+    _ = @import("mux/peerwork.zig");
     _ = @import("mux/peerwake.zig");
     _ = @import("mux/sessname.zig");
     _ = @import("mux/peerclient.zig");

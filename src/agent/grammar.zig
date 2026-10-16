@@ -374,6 +374,110 @@ pub fn findSidePanel(sc: *const adapter.Screen, lines: []const Line) ?SidePanel 
     return .{ .top = top, .footer = f };
 }
 
+// ── work besides the main turn ───────────────────────────────────
+
+/// Every decimal number in `text`, summed (0 without one).
+pub fn sumNumbers(text: []const u8) u32 {
+    var sum: u32 = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (!std.ascii.isDigit(text[i])) {
+            i += 1;
+            continue;
+        }
+        var end = i;
+        while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
+        sum +|= std.fmt.parseInt(u32, text[i..end], 10) catch 0;
+        i = end;
+    }
+    return sum;
+}
+
+/// The subagent wait line after the last record start, outside `panel`
+/// (a finished wait stays on screen above the records that follow it);
+/// null when none shows.
+pub fn subagentLine(sc: *const adapter.Screen, lines: []const Line, panel: ?SidePanel) ?usize {
+    const m = sc.subagent orelse return null;
+    var i = lines.len;
+    while (i > 0) {
+        i -= 1;
+        if (panel) |p| if (p.contains(i)) continue;
+        if (m.matches(lines[i].text)) return i;
+        if (classify(sc, lines[i]) == .record) return null;
+    }
+    return null;
+}
+
+/// The background work after the last record start, outside the side panel.
+pub const Background = struct {
+    /// One row per background subagent.
+    agent_rows: u32 = 0,
+    /// The background line (its numbers count shells and monitors).
+    line: ?usize = null,
+
+    /// The tasks the done rule waits for: the line's numbers summed (1
+    /// without one) plus the agent rows; 0 when none shows.
+    pub fn tasks(self: Background, lines: []const Line) u32 {
+        return self.agent_rows + if (self.line) |i| @max(1, sumNumbers(lines[i].text)) else 0;
+    }
+};
+
+/// What the screen shows of background work. A turn's footer says what
+/// still ran when it ended, and keeps saying it after they ended: never
+/// the live count.
+pub fn background(sc: *const adapter.Screen, lines: []const Line, panel: ?SidePanel) Background {
+    var b: Background = .{};
+    var i = lines.len;
+    while (i > 0) {
+        i -= 1;
+        if (panel) |p| if (p.contains(i)) continue;
+        const l = lines[i];
+        if (sc.background_agent) |m| if (m.matches(l.text)) {
+            b.agent_rows += 1;
+            continue;
+        };
+        if (sc.footer) |m| if (m.matches(l.text)) continue;
+        if (sc.background) |m| if (b.line == null and m.matches(l.text)) {
+            b.line = i;
+            continue;
+        };
+        if (classify(sc, l) == .record) break;
+    }
+    return b;
+}
+
+/// What the screen shows running besides the main turn, by kind: the
+/// subagents (agent rows, or the wait line's count when more), and the
+/// background line's `N <noun>` terms; a count no field names, or a line
+/// without numbers, is `other_tasks`, so the total matches `Background.tasks`.
+pub fn work(sc: *const adapter.Screen, lines: []const Line, panel: ?SidePanel) vocab.PeerWork {
+    const b = background(sc, lines, panel);
+    var w: vocab.PeerWork = .{};
+    const waiting = if (subagentLine(sc, lines, panel)) |i| sumNumbers(lines[i].text) else 0;
+    w.subagents = @max(b.agent_rows, waiting);
+    const i = b.line orelse return w;
+    const text = lines[i].text;
+    var named: u32 = 0;
+    var k: usize = 0;
+    while (k < text.len) {
+        if (!std.ascii.isDigit(text[k])) {
+            k += 1;
+            continue;
+        }
+        var end = k;
+        while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
+        const n = std.fmt.parseInt(u32, text[k..end], 10) catch 0;
+        var ws = end;
+        while (ws < text.len and text[ws] == ' ') ws += 1;
+        var we = ws;
+        while (we < text.len and std.ascii.isAlphabetic(text[we])) we += 1;
+        if (w.addTerm(n, text[ws..we])) named +|= n;
+        k = we;
+    }
+    w.other_tasks +|= @max(1, sumNumbers(text)) -| named;
+    return w;
+}
+
 pub const SideAnswer = struct {
     /// Allocated from the caller's allocator; "" while nothing is drawn.
     text: []u8,

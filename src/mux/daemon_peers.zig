@@ -40,6 +40,7 @@ const xdg = @import("../util/xdg.zig");
 const clock = @import("../util/clock.zig");
 const Config = @import("../config.zig").Config;
 const wire = @import("wire.zig");
+const peerwork = @import("peerwork.zig");
 const dmod = @import("daemon.zig");
 const Daemon = dmod.Daemon;
 const Client = dmod.Client;
@@ -66,6 +67,9 @@ pub const State = struct {
     /// Worker: the peer in this session's tree, as the broker last said
     /// (owned); null = never said.
     session_peer: ?SessionPeer = null,
+    /// Worker: what that peer's session runs besides its main turn, read
+    /// off this session's screen and reported to the broker (`'W'`).
+    reader: peerwork.Reader = .{},
 };
 
 /// The `'S'` control payload, also the `session_meta` `peer` member.
@@ -86,12 +90,14 @@ pub fn deinit(d: *Daemon) void {
     for (d.peers.told.items) |tl| d.allocator.free(tl.json);
     d.peers.told.deinit(d.allocator);
     freeSessionPeer(d);
+    d.peers.reader.deinit();
 }
 
 fn freeSessionPeer(d: *Daemon) void {
     const sp = d.peers.session_peer orelse return;
     d.allocator.free(sp.address);
     d.allocator.free(sp.subject);
+    d.allocator.free(sp.app);
     d.peers.session_peer = null;
 }
 
@@ -106,8 +112,10 @@ pub fn clientGone(d: *Daemon, id: u32) void {
 
 /// Expire queued mail past its TTL (called from reap, next to `ttlSweep`),
 /// tick the links, send the presence the links are owed and tell the
-/// workers whose session's peer changed.
+/// workers whose session's peer changed. A worker reads its session's
+/// screen for its peer instead (`workerSweep`).
 pub fn sweep(d: *Daemon) void {
+    if (d.isWorker()) return workerSweep(d);
     const s = if (d.peers.store) |*st| st else return;
     const now = clock.nowMs();
     const wall = clock.wallMs();
@@ -387,18 +395,56 @@ pub fn workerSubject(d: *Daemon, w: *Worker, payload: []const u8) void {
 pub fn workerApplyPeer(d: *Daemon, payload: []const u8) void {
     var parsed = std.json.parseFromSlice(SessionPeer, d.allocator, payload, .{ .ignore_unknown_fields = true }) catch return;
     defer parsed.deinit();
-    const address = d.allocator.dupe(u8, parsed.value.address) catch return;
-    const subject = d.allocator.dupe(u8, parsed.value.subject) catch {
+    const v = parsed.value;
+    const address = d.allocator.dupe(u8, v.address) catch return;
+    const subject = d.allocator.dupe(u8, v.subject) catch {
         d.allocator.free(address);
         return;
     };
+    const app = d.allocator.dupe(u8, v.app) catch {
+        d.allocator.free(address);
+        d.allocator.free(subject);
+        return;
+    };
+    // Only a new peer (or a new server of it) is read and reported afresh;
+    // a subject change keeps what was reported.
+    const same = if (d.peers.session_peer) |old| std.mem.eql(u8, old.address, v.address) and std.mem.eql(u8, old.app, v.app) and old.pid == v.pid else false;
     freeSessionPeer(d);
-    d.peers.session_peer = .{ .address = address, .subject = subject };
+    d.peers.session_peer = .{ .address = address, .subject = subject, .app = app, .pid = v.pid };
+    if (!same) d.peers.reader.setApp(d.allocator, if (address.len > 0) app else "");
     if (d.sessions.items.len == 0) return;
     const session = d.sessions.items[0];
     for (d.clients.items) |cl| {
         if (!cl.dead and Daemon.terminalViewer(cl, session)) queueSessionPeer(d, cl);
     }
+}
+
+/// Worker: report what the session's peer runs besides its main turn when
+/// a read is due and the counts changed (`peerwork.Reader`).
+fn workerSweep(d: *Daemon) void {
+    const sp = d.peers.session_peer orelse return;
+    if (sp.address.len == 0 or d.sessions.items.len == 0) return;
+    const session = d.sessions.items[0];
+    const work = d.peers.reader.poll(d.allocator, session.screen, session.last_activity_ms, clock.nowMs()) orelse return;
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.writeByte('W') catch return;
+    std.json.Stringify.value(peermail.WorkReport{ .address = sp.address, .work = work }, .{}, &w) catch return;
+    // A full control channel loses this report: read and report again.
+    if (!daemon_control.controlSend(d.control_fd, w.buffered(), -1)) d.peers.reader.retry();
+}
+
+/// Broker: control `'W'` from worker `w`. Taken only for the peer this
+/// broker last told that worker runs in its session.
+pub fn workerWork(d: *Daemon, w: *Worker, payload: []const u8) void {
+    const s = if (d.peers.store) |*st| st else return;
+    const k = toldIndex(d, w.pid) orelse return;
+    var parsed = std.json.parseFromSlice(peermail.WorkReport, d.allocator, payload, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+    var told = std.json.parseFromSlice(SessionPeer, d.allocator, d.peers.told.items[k].json, .{ .ignore_unknown_fields = true }) catch return;
+    defer told.deinit();
+    if (told.value.address.len == 0 or !std.mem.eql(u8, told.value.address, parsed.value.address)) return;
+    s.setWork(parsed.value.address, parsed.value.work);
 }
 
 /// Worker: tell an attaching viewer the session's peer, once known.
@@ -459,7 +505,7 @@ fn remap(d: *Daemon, s: *peermail.Store) void {
     const live = livePeers(a, s) catch return;
     for (d.workers.items) |w| {
         if (w.dead or w.child_pid <= 0) continue;
-        const sp: SessionPeer = if (peerInTree(live, w.child_pid, platform.parentOf)) |i| .{ .address = live[i].address, .subject = live[i].subject } else .{};
+        const sp: SessionPeer = if (peerInTree(live, w.child_pid, platform.parentOf)) |i| .{ .address = live[i].address, .subject = live[i].subject, .app = live[i].app, .pid = live[i].pid } else .{};
         const json = std.json.Stringify.valueAlloc(a, sp, .{}) catch continue;
         const ti = toldIndex(d, w.pid);
         if (ti) |k| {

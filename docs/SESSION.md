@@ -23243,3 +23243,25 @@ up and announces nothing, so the route now goes live
 first tool call when sooner; the MCP loop wakes for it
 (`mcp_agent_loop.dueInMs`). Unit test in mcp.zig drives
 `handleMessage` through the handshake with no tool call.
+
+## 2026-10-16: the daemon reads what a Claude Code peer runs besides its turn
+
+Peers had only hook-based state, so most read `idle` while their subagents
+worked. The daemon owns every sketerm session's screen, so the worker of a
+session whose peer is a Claude Code (`adapter.Spec.mcp_client`, new:
+`claude-code` in `data/agents/claude.json`) reads it with the agent tools'
+own reader: `grammar.subagentLine`/`background`/`work` (moved out of
+`screen_source.Engine`, which now calls them) over
+`screen_source.workOf`. `vocab.PeerWork` (`subagents`, `shells`,
+`monitors`, `other_tasks`; nouns derived from the field names) travels as
+control `'W'` (`peermail.WorkReport`) to the broker, which keeps it with
+the address while a server is live and lists/relays it as `PeerInfo.work`.
+`peerwork.Reader` reads at most once a second, only after new output, and
+reports only changes. `SessionPeer` gains `app`/`pid`, and an app arriving
+with `initialize` (a registration update) now bumps `roster_gen` so the
+worker is told. `peer_list` text: `zenit  idle  2 subagents, 1 shell ...`.
+Not fed into dormancy (background work does not touch the session's own
+prompt cache). Every `configure*Deps` now embeds the shipped adapters.
+Unit tests in peerwork (a recorded Claude Code screen through the worker's
+reader), peermail, peer_cli, agentpush; smoke peers step 45 runs a real
+session printing that screen with a `claude-code` server inside it.
