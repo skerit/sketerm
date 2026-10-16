@@ -130,17 +130,18 @@ pub fn writeWhy(w: *std.Io.Writer, h: peermail.HostInfo) !void {
 }
 
 /// One line: the host (or "the hub" before it said hello), its link
-/// state and why it is not up, and when it was last heard from then.
+/// state and why it is not up (or why an up link is suspect: flapping),
+/// and when it was last heard from then.
 pub fn writeHostText(w: *std.Io.Writer, h: peermail.HostInfo) !void {
     try w.print("host {s}: link {s}", .{ if (h.host.len > 0) h.host else "(the hub, not heard from yet)", @tagName(h.link) });
+    if (h.why != null) {
+        try w.writeAll(" (");
+        try writeWhy(w, h);
+        try w.writeAll(")");
+    }
     switch (h.link) {
         .up => {},
         .down, .unsupported => {
-            if (h.why != null) {
-                try w.writeAll(" (");
-                try writeWhy(w, h);
-                try w.writeAll(")");
-            }
             var buf: [clock.ISO_LEN]u8 = undefined;
             if (h.last_seen_ms > 0) if (clock.isoLocal(&buf, h.last_seen_ms)) |iso| try w.print(", last heard {s}", .{iso});
         },

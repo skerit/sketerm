@@ -11,11 +11,14 @@
 //! `peer_member_hello` and waits for the hub's `peer_hub_hello` back.
 //! Relays then flow as on any link: `peer_hub_relay` from the hub,
 //! `peer_member_relay` from the member, all through `peermail.Store`.
-//! A failed or dropped link redials after a 2-60 s `Backoff`; a daemon
+//! A failed or dropped link redials after a 2-60 s `Backoff` (`waitAfter`;
+//! refused because another daemon holds it: `peerhold.HELD_RETRY_MS` at
+//! least, never the 2 s floor); a daemon
 //! without the flags it needs is marked unsupported and retried at the
 //! ceiling. An inbound domain (`peer_link = inbound`) is never dialed:
 //! its member's call-in arrives as a broker client (`callin`), which
-//! then is that domain's link, through the same `up` step.
+//! then is that domain's link, through the same `up` step. Who may hold a
+//! link, beats and silence are `peerhold`'s, kept on the store's routes.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -27,6 +30,7 @@ const wire = @import("wire.zig");
 const scmrights = @import("../util/scmrights.zig");
 const platform = @import("../util/platform.zig");
 const Backoff = @import("../util/backoff.zig").Backoff;
+const peerhold = @import("peerhold.zig");
 const Config = @import("../config.zig").Config;
 const Domain = @import("../config.zig").Domain;
 const PeerLinkDirection = peermail.PeerLinkDirection;
@@ -54,6 +58,7 @@ pub const DialResult = struct {
     peer_federation: bool = false,
     peer_callin: bool = false,
     peer_slow_mail: bool = false,
+    peer_link_beat: bool = false,
     /// A failed dial: why (`dialWhy`), and what said so.
     why: ?PeerLinkWhy = null,
     detail: []const u8 = "",
@@ -121,10 +126,10 @@ pub const Link = struct {
     /// is the connection, `conn_id` its client id).
     conn: ?muxclient.Conn = null,
     conn_id: u32 = 0,
-    /// A queue failed inside the store's sink; dropped on the next tick.
+    /// A queue failed inside the store's sink, or the store hung the link
+    /// up; dropped on the next tick, for `hangup` when the store said why.
     broken: bool = false,
-    /// The far broker reads slow mail (its welcome or hello said so).
-    far_slow: bool = false,
+    hangup: ?[]const u8 = null,
 };
 
 pub const Links = struct {
@@ -223,7 +228,7 @@ pub const Links = struct {
                 var st: c_int = 0;
                 if (c.waitpid(l.dial_pid, &st, c.WNOHANG) != 0) l.dial_pid = -1;
             }
-            if (l.broken) self.drop(l, store, now, wall, .dropped, "its connection stopped taking data");
+            if (l.broken) self.drop(l, store, now, wall, .dropped, l.hangup orelse "its connection stopped taking data");
             if (l.phase == .dialing and now - l.dial_started_ms > DIAL_TIMEOUT_MS) {
                 if (l.dial_pid > 0) _ = c.kill(l.dial_pid, c.SIGKILL);
                 self.dialFailed(l, store, now, wall, .dial_failed, std.fmt.comptimePrint("no answer within {d} s", .{@divExact(DIAL_TIMEOUT_MS, 1000)}));
@@ -251,17 +256,10 @@ pub const Links = struct {
     }
 
     /// Hub: broker client `client_id` is `l`'s call-in now (its
-    /// `peer_hub_hello` already queued), its hello saying whether it reads
-    /// slow mail. @return the client id of the link it replaces, or 0.
-    pub fn acceptCallin(self: *Links, l: *Link, client_id: u32, far_slow: bool, store: *peermail.Store, wall: i64) u32 {
-        const old: u32 = if (l.phase == .up) l.conn_id else 0;
-        if (old != 0) {
-            store.connGone(old, wall);
-            log.warn("peer federation: {s} called in again; its older link is closed", .{l.domain});
-        }
-        l.far_slow = far_slow;
-        self.up(l, client_id, store, wall);
-        return old;
+    /// `peer_hub_hello` already queued, `peermail.Store.admit` asked
+    /// first), to `far`. A live older link is replaced by the store.
+    pub fn acceptCallin(self: *Links, l: *Link, client_id: u32, far: peermail.Far, store: *peermail.Store, wall: i64, mono: i64) void {
+        self.up(l, client_id, far, store, wall, mono);
     }
 
     /// Broker client `id` went away: an inbound link it carried is down
@@ -271,20 +269,21 @@ pub const Links = struct {
             if (l.direction != .inbound or l.conn_id != id or id == 0) continue;
             l.conn_id = 0;
             l.phase = .waiting;
-            log.warn("peer federation: link to {s} down (the member hung up); waiting for it to call in", .{l.domain});
+            log.warn("peer federation: link to {s} down (its connection closed); waiting for it to call in", .{l.domain});
         }
     }
 
     /// The one "a link is up" step, whichever side dialed: on a hub the
     /// domain's mail now routes over `conn_id`; a member's store already
-    /// took the hub's hello.
-    fn up(self: *Links, l: *Link, conn_id: u32, store: *peermail.Store, wall: i64) void {
+    /// took the hub's hello. A flapping link is not logged every time.
+    fn up(self: *Links, l: *Link, conn_id: u32, far: peermail.Far, store: *peermail.Store, wall: i64, mono: i64) void {
         l.conn_id = conn_id;
         l.phase = .up;
         l.broken = false;
+        l.hangup = null;
         l.backoff.reset();
-        log.info("peer federation: link to {s} up ({s})", .{ l.domain, @tagName(l.direction) });
-        if (self.hub) store.linkUp(l.domain, conn_id, l.far_slow, wall);
+        if (self.hub) store.linkUp(l.domain, conn_id, far, wall, mono);
+        if (!store.linkFlapping(l.domain)) log.info("peer federation: link to {s} up ({s})", .{ l.domain, @tagName(l.direction) });
     }
 
     /// One pollfd per link, in link order (fd -1 when it has none now).
@@ -318,17 +317,39 @@ pub const Links = struct {
 
     /// Queue one relay on dialed link `conn_id`; false when it has no live link.
     pub fn queue(self: *Links, conn_id: u32, relay: peermail.Relay) bool {
+        const l = self.dialed(conn_id) orelse return false;
+        return queued(l, l.conn.?.queueJson(relayFrame(self.hub), relay));
+    }
+
+    /// Queue one `peer_link_beat` on dialed link `conn_id`.
+    pub fn queueBeat(self: *Links, conn_id: u32) bool {
+        const l = self.dialed(conn_id) orelse return false;
+        return queued(l, l.conn.?.queueFrame(.peer_link_beat, ""));
+    }
+
+    /// The store closed dialed link `conn_id` (replaced, or silent): it is
+    /// dropped on the next tick, `why` (static) naming it.
+    pub fn hangup(self: *Links, conn_id: u32, why: []const u8) void {
+        const l = self.dialed(conn_id) orelse return;
+        l.broken = true;
+        l.hangup = why;
+    }
+
+    /// The dialed link `conn_id` names, while it takes data.
+    fn dialed(self: *Links, conn_id: u32) ?*Link {
         for (self.items.items) |l| {
-            if (l.conn_id != conn_id or l.broken) continue;
-            const conn = if (l.conn) |*cc| cc else return false;
-            conn.queueJson(relayFrame(self.hub), relay) catch {
-                l.broken = true;
-                return false;
-            };
-            if (conn.wbuf.items.len > WBUF_MAX) l.broken = true;
-            return !l.broken;
+            if (l.conn_id == conn_id and !l.broken and l.conn != null) return l;
         }
-        return false;
+        return null;
+    }
+
+    fn queued(l: *Link, res: anyerror!void) bool {
+        res catch {
+            l.broken = true;
+            return false;
+        };
+        if (l.conn.?.wbuf.items.len > WBUF_MAX) l.broken = true;
+        return !l.broken;
     }
 
     fn startDial(self: *Links, d: *Daemon, store: *peermail.Store, l: *Link, now: i64, wall: i64) void {
@@ -384,7 +405,7 @@ pub const Links = struct {
             .unsupported => {
                 if (fd >= 0) _ = c.close(fd);
                 l.phase = .waiting;
-                const wait = l.backoff.failLong(now);
+                const wait = waitAfter(&l.backoff, .unsupported, now);
                 var db: [256]u8 = undefined;
                 const detail = unsupportedDetail(&db, res, !self.hub);
                 store.linkUnsupported(l.domain, wall);
@@ -404,13 +425,14 @@ pub const Links = struct {
                 l.conn.?.caps.peer_federation = res.peer_federation;
                 l.conn.?.caps.peer_callin = res.peer_callin;
                 l.conn.?.caps.peer_slow_mail = res.peer_slow_mail;
-                l.far_slow = res.peer_slow_mail;
+                l.conn.?.caps.peer_link_beat = res.peer_link_beat;
+                const far: peermail.Far = .{ .beats = res.peer_link_beat, .slow = res.peer_slow_mail };
                 const hello = if (self.hub)
-                    l.conn.?.queueJson(.peer_hub_hello, peermail.HubHello{ .host = store.host, .as = l.domain, .slow_mail = true })
+                    l.conn.?.queueJson(.peer_hub_hello, peermail.HubHello{ .host = store.host, .as = l.domain, .slow_mail = true, .instance = store.selfInstance(), .beat = true })
                 else
-                    l.conn.?.queueJson(.peer_member_hello, peermail.MemberHello{ .host = store.host, .slow_mail = true });
+                    l.conn.?.queueJson(.peer_member_hello, peermail.MemberHello{ .host = store.host, .slow_mail = true, .instance = store.selfInstance(), .beat = true });
                 hello catch return self.drop(l, store, now, wall, .dropped, "the hello could not be sent");
-                if (self.hub) return self.up(l, id, store, wall);
+                if (self.hub) return self.up(l, id, far, store, wall, now);
                 l.phase = .greeting;
                 l.dial_started_ms = now;
                 store.linkWhy(l.domain, .greeting, "", 0, wall);
@@ -428,6 +450,7 @@ pub const Links = struct {
             const f = conn.takeFrame() catch return self.drop(l, store, now, wall, .dropped, "a malformed frame arrived");
             const frame = f orelse break;
             defer frame.deinit(self.allocator);
+            store.linkHeard(l.conn_id, now);
             switch (frame.ftype) {
                 .peer_member_relay, .peer_hub_relay => {
                     if (frame.ftype != relayFrame(!self.hub)) {
@@ -448,19 +471,31 @@ pub const Links = struct {
                     const parsed = std.json.parseFromSlice(peermail.HubHello, self.allocator, frame.payload, .{ .ignore_unknown_fields = true }) catch
                         return self.drop(l, store, now, wall, .dropped, "the hub's hello did not parse");
                     defer parsed.deinit();
-                    store.uplinkUp(l.conn_id, parsed.value, .outbound, wall) catch |e|
+                    switch (store.admit(l.domain, parsed.value.instance)) {
+                        .take, .replace => {},
+                        .refuse => |r| {
+                            var hb: [256]u8 = undefined;
+                            var db: [peermail.LINK_DETAIL_MAX]u8 = undefined;
+                            const detail = std.fmt.bufPrint(&db, "another hub holds this host's uplink ({s})", .{r.holder.describe(&hb)}) catch "another hub holds this host's uplink";
+                            return self.drop(l, store, now, wall, .taken, detail);
+                        },
+                    }
+                    store.uplinkUp(l.conn_id, parsed.value, .outbound, wall, now) catch |e|
                         return self.drop(l, store, now, wall, .refused, @errorName(e));
                     log.info("peer federation: hub {s} linked, calling this host {s}", .{ parsed.value.host, parsed.value.as });
-                    self.up(l, l.conn_id, store, wall);
+                    self.up(l, l.conn_id, parsed.value.far(), store, wall, now);
                 },
+                // Only liveness: `linkHeard` above took it.
+                .peer_link_beat => {},
                 .err => {
-                    // Its words: `.err` carries `{"error": ..., "for": ...}`.
-                    const Said = struct { @"error": []const u8 = "" };
-                    const parsed = std.json.parseFromSlice(Said, self.allocator, frame.payload, .{ .ignore_unknown_fields = true }) catch null;
+                    // Its words: `.err` carries `{"error": ..., "for": ...}`,
+                    // and `link_held` when another daemon holds the link.
+                    const parsed = std.json.parseFromSlice(peermail.LinkRefused, self.allocator, frame.payload, .{ .ignore_unknown_fields = true }) catch null;
                     defer if (parsed) |p| p.deinit();
                     const said = if (parsed) |p| p.value.@"error" else std.mem.trim(u8, frame.payload[0..@min(frame.payload.len, 200)], " \r\n");
+                    const held = if (parsed) |p| p.value.link_held else false;
                     log.warn("peer federation: {s} refused the link: {s}", .{ l.domain, said });
-                    return self.drop(l, store, now, wall, .refused, said);
+                    return self.drop(l, store, now, wall, if (held) .taken else .refused, said);
                 },
                 else => {},
             }
@@ -476,7 +511,7 @@ pub const Links = struct {
             l.dial_fd = -1;
         }
         l.phase = .waiting;
-        const wait = l.backoff.fail(now);
+        const wait = waitAfter(&l.backoff, why, now);
         store.linkWhy(l.domain, why, detail, wait, wall);
         log.warn("peer federation: dialing {s} failed ({s}: {s}); retrying in {d} s", .{ l.domain, why.label(), detail, @divTrunc(wait, 1000) });
     }
@@ -488,13 +523,25 @@ pub const Links = struct {
         l.conn = null;
         l.conn_id = 0;
         l.broken = false;
+        l.hangup = null;
         l.phase = .waiting;
-        const wait = l.backoff.fail(now);
+        const wait = waitAfter(&l.backoff, why, now);
         log.warn("peer federation: link to {s} down ({s}: {s}); redialing in {d} s", .{ l.domain, why.label(), detail, @divTrunc(wait, 1000) });
         store.connGone(id, wall);
         store.linkWhy(l.domain, why, detail, wait, wall);
     }
 };
+
+/// How long a link waits before dialing again after failing for `why`:
+/// another daemon holding it is not retried at the floor, a daemon too
+/// old waits the ceiling.
+fn waitAfter(b: *Backoff, why: PeerLinkWhy, now: i64) i64 {
+    return switch (why) {
+        .taken => b.failAtLeast(now, peerhold.HELD_RETRY_MS),
+        .unsupported => b.failLong(now),
+        .dialing, .@"unreachable", .auth_failed, .dial_failed, .refused, .dropped, .awaiting_dial, .greeting, .flapping => b.fail(now),
+    };
+}
 
 /// The forked dialer: connect, hand the socket and a `DialResult` to the
 /// broker, exit. Never returns.
@@ -517,6 +564,7 @@ fn dialChild(spec: []const u8, out_fd: c_int) noreturn {
             .peer_federation = conn.caps.peer_federation,
             .peer_callin = conn.caps.peer_callin,
             .peer_slow_mail = conn.caps.peer_slow_mail,
+            .peer_link_beat = conn.caps.peer_link_beat,
             .version = conn.serverVersion(),
         };
         conn_fd = conn.fd;
@@ -608,9 +656,11 @@ test "the hub takes a call-in only from a configured inbound domain, and a newer
     defer links.deinit();
     var rec: struct {
         relays: u32 = 0,
-        fn emit(ctx: *anyopaque, _: u32, out: peermail.Out) bool {
+        hungup: u32 = 0,
+        fn emit(ctx: *anyopaque, conn: u32, out: peermail.Out) bool {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             if (out == .relay) self.relays += 1;
+            if (out == .hangup) self.hungup = conn;
             return true;
         }
     } = .{};
@@ -623,13 +673,16 @@ test "the hub takes a call-in only from a configured inbound domain, and a newer
     try t.expectError(error.NotInbound, links.callin("box"));
     // 2. The inbound member calls in: its link is up over that client.
     const l = try links.callin("aeor");
-    try t.expectEqual(@as(u32, 0), links.acceptCallin(l, 7, true, &store, 100));
+    links.acceptCallin(l, 7, .{ .slow = true }, &store, 100, 0);
     const hosts = try store.hostList(arena.allocator(), 0);
     try t.expectEqual(PeerLink.up, hosts[1].link);
     try t.expectEqual(@as(?PeerLinkDirection, .inbound), hosts[1].direction);
-    // 3. It calls in again before the old client is gone: the new one
-    // replaces it, and the old one's late hang-up changes nothing.
-    try t.expectEqual(@as(u32, 7), links.acceptCallin(l, 9, true, &store, 200));
+    // 3. It calls in again before the old client is gone (an older build:
+    // no instance): the new one replaces it, the store hangs the old one
+    // up, and its late hang-up changes nothing.
+    try std.testing.expect(store.admit("aeor", .{}) == .replace);
+    links.acceptCallin(l, 9, .{ .slow = true }, &store, 200, 1);
+    try t.expectEqual(@as(u32, 7), rec.hungup);
     links.clientGone(7);
     store.connGone(7, 210);
     try t.expectEqual(PeerLink.up, (try store.hostList(arena.allocator(), 0))[1].link);
@@ -638,6 +691,15 @@ test "the hub takes a call-in only from a configured inbound domain, and a newer
     store.connGone(9, 300);
     try t.expectEqual(PeerLink.down, (try store.hostList(arena.allocator(), 0))[1].link);
     try t.expectEqual(@as(u32, 0), l.conn_id);
+}
+
+test "a link refused because another daemon holds it waits HELD_RETRY_MS, never the 2 s floor" {
+    var b = RECONNECT;
+    try t.expectEqual(peerhold.HELD_RETRY_MS, waitAfter(&b, .taken, 0));
+    b.reset();
+    try t.expectEqual(RECONNECT.min_ms, waitAfter(&b, .dropped, 0));
+    b.reset();
+    try t.expectEqual(RECONNECT.max_ms, waitAfter(&b, .unsupported, 0));
 }
 
 test "a failed dial names why: unreachable, a refused login, a route's hop, else what ssh said or the error; an old daemon names its version" {

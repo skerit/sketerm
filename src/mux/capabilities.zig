@@ -175,6 +175,15 @@ pub const Flag = enum {
     /// and the federation presence carry it. Absent = never send it; the
     /// `peer_set_note` tool answers unavailable.
     peer_note,
+    /// The broker beats on its federation links: it sends
+    /// `peer_link_beat` every `peerhold.BEAT_MS` to a far side that says
+    /// it takes them, takes them itself, and closes a link whose beating
+    /// far side fell silent. Its hellos name its daemon (`instance`), and
+    /// it refuses a second daemon of one host while the first holds the
+    /// link (`.err` with `link_held`). Absent = never send the beat (an
+    /// older daemon answers an unknown frame with `.err`); its links are
+    /// live until the transport closes, as before.
+    peer_link_beat,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

@@ -262,6 +262,13 @@ pub const PeerLinkWhy = enum {
     awaiting_dial,
     /// A call-in member waiting for its hub's hello.
     greeting,
+    /// Another daemon of the same host holds the link and is live: this
+    /// one was refused (detail: the far side's words, naming the holder)
+    /// and dials again later (`peerhold.HELD_RETRY_MS`).
+    taken,
+    /// The link is up but keeps being replaced by daemons of one host
+    /// taking turns (detail: how often, and which daemons); shown while up.
+    flapping,
 
     /// The words a list shows (its detail follows after a colon).
     pub fn label(self: PeerLinkWhy) []const u8 {
@@ -275,6 +282,8 @@ pub const PeerLinkWhy = enum {
             .dropped => "dropped",
             .awaiting_dial => "waiting for it to dial in",
             .greeting => "waiting for the hub's hello",
+            .taken => "another daemon of that host holds the link",
+            .flapping => "flapping: two daemons keep replacing each other",
         };
     }
 };

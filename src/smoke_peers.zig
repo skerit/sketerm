@@ -22,6 +22,7 @@ const daemon_peers = @import("mux/daemon_peers.zig");
 const peeraddr = @import("ipc/peeraddr.zig");
 const peermail = @import("mux/peermail.zig");
 const peerwake = @import("mux/peerwake.zig");
+const peerhold = @import("mux/peerhold.zig");
 const muxclient = @import("mux/client.zig");
 const nowMs = @import("util/clock.zig").nowMs;
 const atomicwrite = @import("util/atomicwrite.zig");
@@ -1033,6 +1034,8 @@ const FED_TTL_TEXT = "8000";
 const FED_DOMAIN = "fedbox";
 /// The hub's name for the call-in member, which is also its own host name.
 const FED_CALLIN = "cin";
+/// A call-in member's config: it dials the hub's host, `fedhub`.
+const CALLIN_CONFIG = "peer_hub_domain = fedhub\n\n[domain.fedhub]\nhost = fedhub\ntransport = ssh\n";
 
 /// One isolated daemon's directories.
 const FedHost = struct {
@@ -1198,14 +1201,20 @@ fn mailBothWays(from: *Mcp, to: *Mcp, arena: std.mem.Allocator, to_addr: []const
     expectStr(back, "reply_to", str(it, "id", tag), tag ++ " reply_to");
 }
 
-/// The link through `ssh` is cut (its proxy, by its exact pid) and kept
-/// down: `far` stays listed on `hub` with link down; a send is queued
-/// host_unreachable; restored, it arrives once with its age.
-fn cutAndRestore(hub: *Mcp, far: *Mcp, arena: std.mem.Allocator, ssh: *const FakeSsh, far_addr: []const u8, hub_addr: []const u8, comptime want_why: []const u8, comptime tag: []const u8) void {
+/// Cut the link through `ssh` and keep it down: its proxy is stopped by
+/// its exact pid, and the fake ssh refuses until `down` is removed.
+fn cutLink(arena: std.mem.Allocator, ssh: *const FakeSsh, comptime tag: []const u8) void {
     writeFileOrFail(ssh.down, "", 0o600);
     const pid_text = readfile.capped(arena, ssh.pid_file, 64) orelse fail(tag ++ " the fake ssh left no pid");
     const link_pid = std.fmt.parseInt(c.pid_t, std.mem.trim(u8, pid_text, " \n"), 10) catch fail(tag ++ " the fake ssh pid is not a number");
     if (c.kill(link_pid, c.SIGTERM) != 0) fail(tag ++ " could not stop the link's proxy");
+}
+
+/// The link through `ssh` is cut (its proxy, by its exact pid) and kept
+/// down: `far` stays listed on `hub` with link down; a send is queued
+/// host_unreachable; restored, it arrives once with its age.
+fn cutAndRestore(hub: *Mcp, far: *Mcp, arena: std.mem.Allocator, ssh: *const FakeSsh, far_addr: []const u8, hub_addr: []const u8, comptime want_why: []const u8, comptime tag: []const u8) void {
+    cutLink(arena, ssh, tag);
     _ = awaitListed(hub, arena, far_addr, "down", 20_000, tag ++ " the hub lists the far peer down");
     // The host line says why it is down, from where the link failed.
     {
@@ -1289,8 +1298,7 @@ pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
     const cin_ssh = FakeSsh.make(arena, root, "cin", &hub, mux_bin);
     writeFileOrFail(std.fmt.allocPrintSentinel(arena, "{s}/sketerm/config.conf", .{hub.cfg}, 0) catch fail("oom"),
         "peer_hub = true\n\n[domain." ++ FED_DOMAIN ++ "]\nhost = " ++ FED_DOMAIN ++ "\ntransport = ssh\npeers = true\n\n[domain." ++ FED_CALLIN ++ "]\npeers = true\npeer_link = inbound\n", 0o600);
-    writeFileOrFail(std.fmt.allocPrintSentinel(arena, "{s}/sketerm/config.conf", .{cin.cfg}, 0) catch fail("oom"),
-        "peer_hub_domain = fedhub\n\n[domain.fedhub]\nhost = fedhub\ntransport = ssh\n", 0o600);
+    writeFileOrFail(std.fmt.allocPrintSentinel(arena, "{s}/sketerm/config.conf", .{cin.cfg}, 0) catch fail("oom"), CALLIN_CONFIG, 0o600);
 
     const mem_pid = startFedDaemon(arena, &mem, mux_bin, null, null);
     const hub_pid = startFedDaemon(arena, &hub, mux_bin, ssh.path.ptr, null);
@@ -1352,9 +1360,11 @@ pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
     std.debug.print("smoke: peers: federation TTL expiry reaches the sender across the link ok\n", .{});
 
     // 7. The member trusts its private socket, not the far process: a
-    //    relay on a plain local connection without hello is refused; a
-    //    plain local connection that says hello is a link, and its mail
-    //    is stored and delivered.
+    //    relay on a plain local connection without hello is refused. A
+    //    second hub's hello is refused while the real hub holds the
+    //    uplink (it names the holder), and the real link stays up. With
+    //    the real link cut, a plain local connection that says hello is a
+    //    link, and its mail is stored and delivered.
     {
         const sock = std.fmt.allocPrint(arena, "{s}/sketerm/mux.sock", .{mem.rt}) catch fail("oom");
         var bare = muxclient.Conn.connectProbed(allocator, sock) catch fail("f7. connect to the member");
@@ -1363,6 +1373,20 @@ pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
         const refusal = bare.recvExpectFor(&.{.err}, 10_000) catch fail("f7. a relay without hello was not refused");
         defer refusal.deinit(allocator);
         contains(refusal.payload, "before peer_hub_hello", "f7. the refusal names the missing hello");
+
+        {
+            var stray = muxclient.Conn.connectProbed(allocator, sock) catch fail("f7. connect a second hub");
+            defer stray.deinit();
+            stray.sendJson(.peer_hub_hello, peermail.HubHello{ .host = "lochub", .as = FED_DOMAIN }) catch fail("f7. send the second hub's hello");
+            const held = stray.recvExpectFor(&.{.err}, 10_000) catch fail("f7. a second hub's hello was not refused");
+            defer held.deinit(allocator);
+            contains(held.payload, "another hub holds this host's uplink", "f7. the refusal says the uplink is held");
+            contains(held.payload, "\"link_held\":true", "f7. the refusal is marked link_held");
+            std.debug.print("smoke: peers: f7. a second hub was refused: {s}\n", .{held.payload});
+        }
+        _ = awaitListed(&mia, arena, zed_on_mem, "up", 5_000, "f7. the real hub keeps the uplink");
+        cutLink(arena, &ssh, "f7.");
+        _ = awaitListed(&mia, arena, zed_on_mem, "down", 20_000, "f7. the real hub's uplink is cut");
 
         var link = muxclient.Conn.connectProbed(allocator, sock) catch fail("f7. connect to the member again");
         defer link.deinit();
@@ -1379,7 +1403,11 @@ pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
         expectStr(it, "from", "lochub/lena", "f7. from");
         expectStr(it, "text", "relayed after a local hello", "f7. text");
     }
-    std.debug.print("smoke: peers: federation trusts a local hello and refuses a relay without one ok\n", .{});
+    // The local link closed: the real hub dials the member again.
+    if (c.unlink(ssh.down.ptr) != 0) fail("f7. could not restore the link");
+    _ = awaitListed(&mia, arena, zed_on_mem, "up", 90_000, "f7. the real hub's uplink is back");
+    _ = awaitListed(&zed, arena, mia_on_hub, "up", 20_000, "f7. the hub lists mia up again");
+    std.debug.print("smoke: peers: federation trusts a local hello, refuses a second hub's while the first holds the uplink, and a relay without one ok\n", .{});
 
     // 8. A call-in member: its daemon dials the hub's inbound domain; both
     //    sides list each other up; mail crosses both ways; its link is cut
@@ -1397,6 +1425,62 @@ pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
         cid.closeStdinWait();
     }
     std.debug.print("smoke: peers: federation call-in member presence, mail, cut and redial ok\n", .{});
+
+    // 8b. A second daemon of the call-in host (a stray: another build, a
+    //     private broker) calls in under the same domain while the first
+    //     holds the link: it is refused naming the holder and dials again
+    //     only after HELD_RETRY_MS, while the first keeps the link and its
+    //     peers stay listed throughout. Once the first is gone, it gets in.
+    var cin2_pid: c.pid_t = -1;
+    {
+        const t0 = nowMs();
+        const log_path = std.fmt.allocPrint(arena, "{s}/sketerm/mux.log", .{hub.st}) catch fail("oom");
+        const log_from = if (readfile.capped(arena, log_path, 64 << 20)) |b| b.len else 0;
+        var cia = cin.server(allocator, arena, exe, "cia");
+        cia.initialize();
+        _ = registered(&cia, arena, "f8b. cia");
+        const cia_on_hub = FED_CALLIN ++ "/cia";
+        _ = awaitListed(&zed, arena, cia_on_hub, "up", 60_000, "f8b. zed lists cia");
+        const cin2 = FedHost.make(arena, root, "fc2");
+        const cin2_ssh = FakeSsh.make(arena, root, "cin2", &hub, mux_bin);
+        writeFileOrFail(std.fmt.allocPrintSentinel(arena, "{s}/sketerm/config.conf", .{cin2.cfg}, 0) catch fail("oom"), CALLIN_CONFIG, 0o600);
+        cin2_pid = startFedDaemon(arena, &cin2, mux_bin, cin2_ssh.path.ptr, FED_CALLIN);
+        var cib = cin2.server(allocator, arena, exe, "cib");
+        cib.initialize();
+        _ = registered(&cib, arena, "f8b. cib");
+        const h = awaitHostWhy(&cib, arena, "", "taken", 60_000, "f8b. the second daemon is refused");
+        const detail = str(h, "detail", "f8b. refusal detail");
+        contains(detail, "another daemon of this host holds its link to the hub", "f8b. the refusal says why");
+        contains(detail, "instance", "f8b. the refusal names the holder");
+        printList(&cib, arena, "f8b. on the refused daemon,");
+        const refused_at = nowMs();
+        // The first keeps the link across the stray's next dial: cia is
+        // listed up on the hub at every poll.
+        var polls: u32 = 0;
+        while (nowMs() < refused_at + peerhold.HELD_RETRY_MS + 5_000) : (polls += 1) {
+            const p = listed(&zed, arena, cia_on_hub, "f8b. poll") orelse fail("f8b. cia vanished from the hub's list while the stray retried");
+            if (!std.mem.eql(u8, if (p.get("link")) |v| v.string else "", "up")) fail("f8b. cia's link left up while the stray retried");
+            _ = c.usleep(250_000);
+        }
+        // The hub logged the stray once, and never replaced the link.
+        const whole = readfile.capped(arena, log_path, 64 << 20) orelse fail("f8b. the hub's log is unreadable");
+        const text = whole[@min(log_from, whole.len)..];
+        if (std.mem.count(u8, text, "peer federation: refused " ++ FED_CALLIN ++ " ") != 1) {
+            std.debug.print("{s}\n", .{text});
+            fail("f8b. the hub did not log the stray exactly once");
+        }
+        if (std.mem.indexOf(u8, text, "linked again") != null or std.mem.indexOf(u8, text, "FLAPPING") != null) fail("f8b. the stray replaced the link");
+        std.debug.print("smoke: peers: f8b. the first daemon kept the link for {d} polls over {d} ms, the second was refused once in the hub's log\n", .{ polls, nowMs() - refused_at });
+        // The first goes: the second gets in on its next dial.
+        cia.closeStdinWait();
+        const stopped_at = nowMs();
+        stopFedDaemon(cin_pid);
+        _ = awaitListed(&zed, arena, FED_CALLIN ++ "/cib", "up", 3 * peerhold.HELD_RETRY_MS + 30_000, "f8b. the second daemon gets in once the first is gone");
+        _ = awaitListed(&cib, arena, zed_on_mem, "up", 20_000, "f8b. cib lists zed");
+        std.debug.print("smoke: peers: f8b. the second daemon got in {d} ms after the first stopped\n", .{nowMs() - stopped_at});
+        cib.closeStdinWait();
+        std.debug.print("smoke: peers: federation keeps the first call-in daemon's link against a second one of the same host ok ({d} ms)\n", .{nowMs() - t0});
+    }
 
     // 9. Aliases across the federation, no GUI anywhere: a session named
     //    zenit on each host gives its server the alias zenit on the hub
@@ -1457,7 +1541,7 @@ pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
 
     mia.closeStdinWait();
     zed.closeStdinWait();
-    stopFedDaemon(cin_pid);
+    stopFedDaemon(cin2_pid);
     stopFedDaemon(hub_pid);
     stopFedDaemon(mem_pid);
     std.debug.print("smoke: peers federation stage ok ({d} ms)\n", .{nowMs() - started});

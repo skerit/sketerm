@@ -49,6 +49,15 @@ pub const Backoff = struct {
         return self.delay_ms;
     }
 
+    /// A failure that must not be retried before `floor_ms` (another
+    /// party holds what was asked for): the usual wait, but at least that.
+    pub fn failAtLeast(self: *Backoff, now: i64, floor_ms: i64) i64 {
+        self.delay_ms = @max(self.next(), floor_ms);
+        self.attempts +|= 1;
+        self.retry_at_ms = now + self.delay_ms;
+        return self.delay_ms;
+    }
+
     pub fn reset(self: *Backoff) void {
         self.attempts = 0;
         self.delay_ms = 0;
@@ -82,6 +91,12 @@ test "the wait doubles from the floor to the ceiling and resets on success" {
     try t.expectEqual(@as(i64, 60_000), b.failLong(10));
     try t.expectEqual(@as(i64, 60_010), b.retry_at_ms);
     try t.expectEqual(@as(i64, 60_000), b.next());
+    // A floor below the usual wait changes nothing; above it, it wins.
+    b.reset();
+    try t.expectEqual(@as(i64, 20_000), b.failAtLeast(0, 20_000));
+    try t.expectEqual(@as(i64, 20_000), b.retry_at_ms);
+    for (0..5) |_| _ = b.fail(0);
+    try t.expectEqual(@as(i64, 60_000), b.failAtLeast(0, 20_000));
 }
 
 test "a limited backoff is exhausted after its failures; waitAt matches fail" {

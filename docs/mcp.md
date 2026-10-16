@@ -3418,12 +3418,38 @@ whose config says so; every other daemon is dialed by it, or calls in
   welcome), `refused` (the far daemon's own words), `dropped` (how an up
   link ended), `awaiting_dial` (the far side dials it: a call-in member,
   or a member's hub) and `greeting` (a call-in member waiting for its
-  hub's hello). The host line adds when it is dialed again (`retry in
+  hub's hello), `taken` (another daemon of that host holds the link and
+  is live: this one was refused, the far side's words naming the holder's
+  pid, socket and instance; it dials again after 20 s, never at the 2 s
+  floor) and `flapping` (the one reason an UP link carries: it keeps
+  being replaced by daemons taking turns; the detail names them). The
+  host line adds when it is dialed again (`retry in
   40s`) or that a redial is under way (the last failure's reason stays);
   each peer behind it shows `link down (unreachable)`. A hub passes its
   links' reasons on to its members (without its retry schedule); a
   member whose uplink is down shows the uplink's reason on every host
   behind it. `sketerm peer status` prints the same line per host.
+- **One daemon per link** (`src/mux/peerhold.zig`): a link names a
+  host, but a host can run several daemons that link under its name (a
+  build before the per-user rule federated from every private broker),
+  and when each newer link simply replaced the older one, two of them
+  evicted each other every 2 s, and every eviction dropped the peers the
+  other carried. So each hello names its daemon (`instance`: pid, socket
+  and an id minted when its broker starts), and the side that accepts a
+  link (a hub taking a call-in, a member taking a hub's hello) keeps it:
+  the same daemon again (a reconnect) replaces its own link; another
+  daemon, or one that names none, is refused while the holder is live
+  (`.err` with `link_held`, logged once per refused daemon), and the
+  refused side waits 20 s before it dials again and lists the link
+  `taken`. A holder that predates instances, or does not beat, is
+  replaced as before. Liveness is bounded: daemons with the welcome flag
+  `peer_link_beat` send `peer_link_beat` (frame 47) every 15 s on each
+  link whose far side said `beat`, and a link not heard from for 45 s is
+  closed, so the real daemon gets back in after a half-dead link at
+  most that long later. A link replaced more than 3 times within 60 s
+  is flapping: one loud warning names both daemons, the link lists
+  `flapping` while up, and the replacements stop being logged until it
+  has been left alone for 60 s.
 - **Clocks**: no wall-clock time crosses a link. A relayed message
   carries its age at the sending daemon, a relayed peer or host its
   "seen N ms ago", an event how long the message waited; the receiving
@@ -3481,7 +3507,9 @@ exactly as on a hub-dialed link.
   name; the hub accepts it only from a `[domain.<that host>] peers =
   true` with `peer_link = inbound` (anything else is refused with an
   error naming why) and answers `peer_hub_hello` on the same connection.
-  A newer call-in replaces an older live one. Trust is that of every
+  A call-in from the daemon that holds the link replaces it; another
+  daemon of that host is refused while that link lives ("One daemon per
+  link" above). Trust is that of every
   connection to the hub's private socket: the member reached it over SSH
   as the same user. A hub without the welcome flag `peer_callin` leaves
   the member listing it `unsupported`, retried every 60 s. A daemon with

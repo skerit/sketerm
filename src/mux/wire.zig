@@ -314,6 +314,10 @@ pub const FrameType = enum(u8) {
     /// (`peermail.HookPresence`), only to daemons advertising
     /// `peer_hook_presence`. No reply.
     peer_hook_presence = 46,
+    /// Federation: a link is alive (`peerhold`), no body, no reply. Sent
+    /// on a link either way, only to a far broker that said it takes them
+    /// (welcome `peer_link_beat`, or `beat` in its hello).
+    peer_link_beat = 47,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -1203,6 +1207,7 @@ test "wire: append-only frame and event values include panel RPC" {
     try std.testing.expectEqual(@as(u8, 106), @intFromEnum(FrameType.peer_subject_reply));
     try std.testing.expectEqual(@as(u8, 45), @intFromEnum(FrameType.peer_member_hello));
     try std.testing.expectEqual(@as(u8, 46), @intFromEnum(FrameType.peer_hook_presence));
+    try std.testing.expectEqual(@as(u8, 47), @intFromEnum(FrameType.peer_link_beat));
     try std.testing.expectEqual(@as(u8, 7), @intFromEnum(ChannelKind.web_helper));
     try std.testing.expectEqual(@as(u8, 64), @intFromEnum(FrameType.welcome));
     try std.testing.expectEqual(@as(u8, 94), @intFromEnum(FrameType.play_state));

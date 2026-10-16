@@ -374,6 +374,8 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
         // A call-in member's link (on a hub).
         .peer_member_hello => daemon_peers.handleMemberHello(self, cl, frame.payload),
         .peer_hub_relay, .peer_member_relay => daemon_peers.handleRelay(self, cl, frame.ftype, frame.payload),
+        // A federation link's beat: liveness only, never answered.
+        .peer_link_beat => daemon_peers.handleBeat(self, cl),
         // The broker keeps subjects; on an attached session the worker
         // hands it to the broker for that session's peer.
         .peer_subject => daemon_peers.handleSubject(self, cl, frame.payload),

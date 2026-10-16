@@ -38,6 +38,7 @@ const sessname = @import("sessname.zig");
 const env = @import("../util/env.zig");
 const xdg = @import("../util/xdg.zig");
 const clock = @import("../util/clock.zig");
+const ids = @import("../util/ids.zig");
 const Config = @import("../config.zig").Config;
 const wire = @import("wire.zig");
 const peerwork = @import("peerwork.zig");
@@ -121,6 +122,7 @@ pub fn sweep(d: *Daemon) void {
     const wall = clock.wallMs();
     if (d.peers.links) |*l| l.tick(d, s, now, wall);
     s.tick(wall);
+    s.beat(wall, now);
     const sig = workersSignature(d);
     if (s.roster_gen != d.peers.mapped_gen or sig != d.peers.mapped_sig) {
         offerTitles(d, s, wall);
@@ -233,8 +235,9 @@ pub fn handleHookPresence(d: *Daemon, cl: *Client, payload: []const u8) void {
 }
 
 /// `peer_hub_hello`: a hub's link announces itself. Accepted only on a
-/// broker that is no hub; from then on this connection carries
-/// `peer_hub_relay`.
+/// broker that is no hub, and only while no other hub holds this host's
+/// live uplink (`peermail.Store.admit`); from then on this connection
+/// carries `peer_hub_relay`.
 pub fn handleHubHello(d: *Daemon, cl: *Client, payload: []const u8) void {
     const frame = "peer_hub_hello";
     const s = storeFor(d, cl, frame) orelse return;
@@ -242,7 +245,11 @@ pub fn handleHubHello(d: *Daemon, cl: *Client, payload: []const u8) void {
     var parsed = std.json.parseFromSlice(peermail.HubHello, d.allocator, payload, .{ .ignore_unknown_fields = true }) catch
         return cl.queueErrFor("bad peer_hub_hello request", frame);
     defer parsed.deinit();
-    s.uplinkUp(cl.id, parsed.value, .inbound, clock.wallMs()) catch |e| return cl.queueErrFor(switch (e) {
+    switch (s.admit("", parsed.value.instance)) {
+        .take, .replace => {},
+        .refuse => |r| return refuseHeld(cl, frame, "another hub holds this host's uplink", parsed.value.host, r, parsed.value.instance),
+    }
+    s.uplinkUp(cl.id, parsed.value, .inbound, clock.wallMs(), clock.nowMs()) catch |e| return cl.queueErrFor(switch (e) {
         error.BadAddress => "peer_hub_hello: the hub's host or this host's name is not an address host",
         error.NotLinked, error.NotRegistered, error.OutOfMemory, error.NoEntropy, error.TooManyRecipients => "peer_hub_hello failed on the broker",
     }, frame);
@@ -251,8 +258,9 @@ pub fn handleHubHello(d: *Daemon, cl: *Client, payload: []const u8) void {
 
 /// `peer_member_hello`: a call-in member's link announces itself. Accepted
 /// only on a hub, for a `[domain.<host>] peers = true` with `peer_link =
-/// inbound`; answered by `peer_hub_hello`, and from then on this
-/// connection is that domain's link. A newer call-in replaces an older one.
+/// inbound`, and only while no other daemon of that host holds its live
+/// link (`peermail.Store.admit`); answered by `peer_hub_hello`, and from
+/// then on this connection is that domain's link.
 pub fn handleMemberHello(d: *Daemon, cl: *Client, payload: []const u8) void {
     const frame = "peer_member_hello";
     const s = storeFor(d, cl, frame) orelse return;
@@ -265,12 +273,33 @@ pub fn handleMemberHello(d: *Daemon, cl: *Client, payload: []const u8) void {
         error.UnknownDomain => "peer_member_hello: this hub has no [domain.<host>] peers = true for that host",
         error.NotInbound => "peer_member_hello: that host's [domain] is peer_link = outbound here; the hub dials it, it never calls in",
     }, frame);
+    const far = parsed.value.far();
+    switch (s.admit(l.domain, far.instance)) {
+        .take, .replace => {},
+        .refuse => |r| return refuseHeld(cl, frame, "another daemon of this host holds its link to the hub", l.domain, r, far.instance),
+    }
     // The hello goes out before `up` relays the domain's queued mail.
-    cl.queueJson(.peer_hub_hello, peermail.HubHello{ .host = s.host, .as = l.domain, .slow_mail = true });
-    const old = links.acceptCallin(l, cl.id, parsed.value.slow_mail, s, clock.wallMs());
-    if (old != 0) if (liveClient(d, old)) |gone| {
-        gone.dead = true;
-    };
+    cl.queueJson(.peer_hub_hello, peermail.HubHello{ .host = s.host, .as = l.domain, .slow_mail = true, .instance = s.selfInstance(), .beat = true });
+    links.acceptCallin(l, cl.id, far, s, clock.wallMs(), clock.nowMs());
+}
+
+/// Refuse a hello because another daemon holds the link (`link_held`): the
+/// refused daemon reads who, and dials again only after
+/// `peerhold.HELD_RETRY_MS`. Logged once per refused daemon.
+fn refuseHeld(cl: *Client, comptime frame: []const u8, comptime what: []const u8, host: []const u8, r: peermail.Store.Refusal, incoming: peermail.Instance) void {
+    var hb: [256]u8 = undefined;
+    var ib: [256]u8 = undefined;
+    var buf: [768]u8 = undefined;
+    const holder = r.holder.describe(&hb);
+    const text = std.fmt.bufPrint(&buf, frame ++ ": " ++ what ++ " ({s}); this daemon is refused while that link lives", .{holder}) catch frame ++ ": " ++ what;
+    if (r.first) log.warn("peer federation: refused {s} ({s}): {s} ({s})", .{ host, incoming.describe(&ib), what, holder });
+    cl.queueJson(.err, peermail.LinkRefused{ .@"error" = text, .@"for" = frame, .link_held = true });
+}
+
+/// `peer_link_beat`: a link is alive. No reply, whatever the connection.
+pub fn handleBeat(d: *Daemon, cl: *Client) void {
+    const s = if (d.peers.store) |*st| st else return;
+    s.linkHeard(cl.id, clock.nowMs());
 }
 
 /// `peer_hub_relay` (on a member) or `peer_member_relay` (on a hub): one
@@ -285,6 +314,7 @@ pub fn handleRelay(d: *Daemon, cl: *Client, ftype: wire.FrameType, payload: []co
     var parsed = std.json.parseFromSlice(peermail.Relay, d.allocator, payload, .{ .ignore_unknown_fields = true }) catch
         return cl.queueErrFor("bad relay request", frame);
     defer parsed.deinit();
+    s.linkHeard(cl.id, clock.nowMs());
     s.relayIn(cl.id, parsed.value, clock.wallMs()) catch |e| return cl.queueErrFor(switch (e) {
         error.NotLinked => if (s.hub) "peer_member_relay before peer_member_hello on this connection" else "peer_hub_relay before peer_hub_hello on this connection",
         error.BadAddress, error.NotRegistered, error.OutOfMemory, error.NoEntropy, error.TooManyRecipients => "a relay failed on the broker",
@@ -611,6 +641,12 @@ fn ensure(d: *Daemon) ?*peermail.Store {
     const links: ?*peerlink.Links = if (hub) (if (d.peers.links) |*l| l else null) else null;
     const domains: []const []const u8 = if (links) |l| (l.domains(arena.allocator()) catch &.{}) else &.{};
     const inbound: []const []const u8 = if (links) |l| (l.inbound(arena.allocator()) catch &.{}) else &.{};
+    // This broker's daemon, as its link hellos name it (`peerhold`).
+    var id_buf: [12]u8 = undefined;
+    const id: []const u8 = if (ids.fill(&id_buf)) |_| &id_buf else |_| blk: {
+        log.warn("peer federation: no entropy for this daemon's instance id; its links name none", .{});
+        break :blk "";
+    };
     d.peers.store = peermail.Store.init(d.allocator, .{
         .dir = dir,
         .host = host,
@@ -619,6 +655,7 @@ fn ensure(d: *Daemon) ?*peermail.Store {
         .domains = domains,
         .inbound = inbound,
         .wake = wakePolicy(),
+        .instance = .{ .id = id, .pid = c.getpid(), .socket = d.sock_path },
         .emit = .{ .ctx = d, .func = emit },
     }) catch {
         log.warn("peermail: out of memory starting the store", .{});
@@ -732,6 +769,23 @@ fn emit(ctx: *anyopaque, conn: u32, out: peermail.Out) bool {
             // call-in member's (on a hub).
             const cl = liveClient(d, conn) orelse return false;
             cl.queueJson(peerlink.relayFrame(if (d.peers.store) |*s| s.hub else false), v);
+            return true;
+        },
+        .beat => {
+            if (conn >= peerlink.LINK_ID_BASE) return if (d.peers.links) |*l| l.queueBeat(conn) else false;
+            const cl = liveClient(d, conn) orelse return false;
+            cl.queueFrame(.peer_link_beat, "");
+            return true;
+        },
+        // The store closed the link: a dialed one drops on the next tick,
+        // a client carrying one is closed.
+        .hangup => |why| {
+            if (conn >= peerlink.LINK_ID_BASE) {
+                if (d.peers.links) |*l| l.hangup(conn, why);
+                return true;
+            }
+            const cl = liveClient(d, conn) orelse return false;
+            cl.dead = true;
             return true;
         },
     }

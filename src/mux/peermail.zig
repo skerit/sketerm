@@ -43,6 +43,8 @@ const atomicwrite = @import("../util/atomicwrite.zig");
 const readfile = @import("../util/readfile.zig");
 
 const peerwake = @import("peerwake.zig");
+const peerhold = @import("peerhold.zig");
+pub const Instance = peerhold.Instance;
 pub const PeerState = vocab.PeerState;
 pub const PeerOutcome = vocab.PeerOutcome;
 pub const RefuseReason = vocab.RefuseReason;
@@ -439,6 +441,14 @@ pub const HubHello = struct {
     as: []const u8 = "",
     /// The hub reads slow mail and keys relays by (id, to) (welcome `peer_slow_mail`).
     slow_mail: bool = false,
+    /// The hub's daemon (`peerhold.Instance`); empty from an older hub.
+    instance: Instance = .{},
+    /// The hub beats on this link and takes beats (`peer_link_beat`).
+    beat: bool = false,
+
+    pub fn far(self: HubHello) Far {
+        return .{ .instance = self.instance, .beats = self.beat, .slow = self.slow_mail };
+    }
 };
 
 /// `peer_member_hello` body.
@@ -447,6 +457,34 @@ pub const MemberHello = struct {
     host: []const u8 = "",
     /// As `HubHello.slow_mail`, for the member.
     slow_mail: bool = false,
+    /// As `HubHello.instance`, the member's daemon.
+    instance: Instance = .{},
+    /// As `HubHello.beat`, for the member.
+    beat: bool = false,
+
+    pub fn far(self: MemberHello) Far {
+        return .{ .instance = self.instance, .beats = self.beat, .slow = self.slow_mail };
+    }
+};
+
+/// What one end of a link knows of the far broker: from its hello, or
+/// (a hub's dial) from its welcome.
+pub const Far = struct {
+    instance: Instance = .{},
+    /// It beats and takes beats (`peerhold`).
+    beats: bool = false,
+    /// It reads slow mail and keys relays by (id, to).
+    slow: bool = false,
+};
+
+/// The `.err` body a link end refuses a hello with. `link_held`: another
+/// daemon of that host holds a live link (`peerhold.admit`), and the
+/// refused one dials again only after `peerhold.HELD_RETRY_MS`. A daemon
+/// that predates it reads `error` alone.
+pub const LinkRefused = struct {
+    @"error": []const u8 = "",
+    @"for": []const u8 = "",
+    link_held: bool = false,
 };
 
 /// `peer_subject` body. On a broker connection `address` names the peer
@@ -608,6 +646,11 @@ pub const Out = union(enum) {
     /// The live peer on `conn` was given another alias: it is owed its
     /// own view again (an unsolicited `peer_list` req 0 carrying `self`).
     self_changed,
+    /// Federation: one `peer_link_beat` for the link `conn`.
+    beat,
+    /// Federation: the link `conn` is closed (replaced or silent); its
+    /// connection carries no route any more. Static text: why.
+    hangup: []const u8,
 };
 
 /// The owner's sink. @return whether the item reached a live connection.
@@ -881,17 +924,22 @@ const Route = struct {
     /// Wall ms the next dial is due; 0 = none.
     retry_at_ms: i64 = 0,
     redialing: bool = false,
+    /// The far daemon holding the live link, whether it is heard, and how
+    /// often it was replaced (`peerhold`).
+    holder: peerhold.Holder = .{},
 
     /// This route's own link as a host list shows it at `now`.
     fn info(self: *const Route, now: i64) HostInfo {
         const down = self.link != .up;
+        // An up link says why only while it flaps.
+        const flapping = !down and self.holder.flap.flapping;
         return .{
             .host = self.host,
             .link = self.link,
             .last_seen_ms = self.last_seen_ms,
             .direction = self.direction,
-            .why = if (down) self.why else null,
-            .detail = if (down) self.why_detail else "",
+            .why = if (down) self.why else if (flapping) .flapping else null,
+            .detail = if (down) self.why_detail else if (flapping) self.holder.flap.detail() else "",
             .retry_in_ms = if (down and self.retry_at_ms > now) self.retry_at_ms - now else 0,
             .redialing = down and self.redialing,
         };
@@ -987,6 +1035,8 @@ pub const Options = struct {
     inbound: []const []const u8 = &.{},
     /// The dormancy thresholds (rigs shorten the silence).
     wake: peerwake.Policy = .{},
+    /// This broker's daemon, named in its hellos (`peerhold`).
+    instance: Instance = .{},
     emit: Emit,
 };
 
@@ -1050,6 +1100,8 @@ pub const Store = struct {
     moved: [MOVED_RING]Moved = undefined,
     moved_len: usize = 0,
     moved_head: usize = 0,
+    /// This broker's daemon (`Options.instance`).
+    instance: peerhold.Held = .{},
 
     pub fn init(allocator: std.mem.Allocator, opts: Options) error{OutOfMemory}!Store {
         const dir = if (opts.dir) |d| try allocator.dupe(u8, d) else null;
@@ -1077,8 +1129,30 @@ pub const Store = struct {
                 }
             }
         };
+        s.instance.set(opts.instance);
         return s;
     }
+
+    /// This broker's daemon, for its hellos.
+    pub fn selfInstance(self: *const Store) Instance {
+        return self.instance.view();
+    }
+
+    /// What `peerhold.admit` makes of a hello from `far` on the link to
+    /// `domain` (on a member: the uplink). A refusal names the holder, and
+    /// whether this daemon was refused before (log the first only: a
+    /// stray retries for as long as it runs).
+    pub fn admit(self: *Store, domain: []const u8, far: Instance) Admit {
+        const r = self.linkRoute(domain) orelse return .take;
+        return switch (peerhold.admit(r.conn != 0, r.holder.who.view(), r.holder.beats, far)) {
+            .take => .take,
+            .replace => .replace,
+            .refuse => .{ .refuse = .{ .holder = r.holder.who.view(), .first = r.holder.refusing(far) } },
+        };
+    }
+
+    pub const Admit = union(peerhold.Admission) { take, replace, refuse: Refusal };
+    pub const Refusal = struct { holder: Instance, first: bool };
 
     pub fn deinit(self: *Store) void {
         for (self.peers.items) |p| self.freePeer(p);
@@ -2052,6 +2126,8 @@ pub const Store = struct {
     /// `retry_in_ms` > 0: when it is dialed again. Up clears it.
     pub fn linkWhy(self: *Store, domain: []const u8, why: PeerLinkWhy, detail: []const u8, retry_in_ms: i64, now: i64) void {
         const r = self.linkRoute(domain) orelse return;
+        // Another connection holds it now: what failed is not its state.
+        if (r.link == .up) return;
         const owned = self.allocator.dupe(u8, utf8Prefix(detail, LINK_DETAIL_MAX)) catch return self.warnf("peermail: out of memory noting why the link to {s} is down", .{domain});
         self.allocator.free(r.why_detail);
         r.why_detail = owned;
@@ -2070,13 +2146,12 @@ pub const Store = struct {
         self.presence_dirty = true;
     }
 
-    /// Hub: the link to `domain` came up as connection `conn`, its far
-    /// broker reading slow mail when `far_slow`; its outbound mail is
-    /// relayed at once.
-    pub fn linkUp(self: *Store, domain: []const u8, conn: u32, far_slow: bool, now: i64) void {
+    /// Hub: the link to `domain` came up as connection `conn` to `far`;
+    /// its outbound mail is relayed at once. Monotonic `mono`.
+    pub fn linkUp(self: *Store, domain: []const u8, conn: u32, far: Far, now: i64, mono: i64) void {
         const r = self.routeNamed(domain) orelse return;
-        r.far_slow = far_slow;
-        self.attach(r, conn, now);
+        r.far_slow = far.slow;
+        self.hold(r, conn, far, now, mono);
     }
 
     /// `domain`'s daemon predates federation (on a member: the hub it
@@ -2090,8 +2165,9 @@ pub const Store = struct {
     }
 
     /// Member: a hub said hello on connection `conn`, which `direction`
-    /// says who dialed. A newer hello replaces an older link.
-    pub fn uplinkUp(self: *Store, conn: u32, hello: HubHello, direction: PeerLinkDirection, now: i64) LinkError!void {
+    /// says who dialed. Ask `admit` first: a hello it allows replaces an
+    /// older link.
+    pub fn uplinkUp(self: *Store, conn: u32, hello: HubHello, direction: PeerLinkDirection, now: i64, mono: i64) LinkError!void {
         if (self.hub) return error.NotLinked;
         peeraddr.validHost(hello.host) catch return error.BadAddress;
         peeraddr.validHost(hello.as) catch return error.BadAddress;
@@ -2103,11 +2179,71 @@ pub const Store = struct {
         r.host = host;
         self.allocator.free(self.as_name);
         self.as_name = as;
-        if (r.conn != 0 and r.conn != conn) self.detach(r, now);
         self.touchFile(r.box);
         r.direction = direction;
         r.far_slow = hello.slow_mail;
+        self.hold(r, conn, hello.far(), now, mono);
+    }
+
+    /// `r`'s link is `conn` to `far` from now on. A live link on another
+    /// connection is replaced: hung up, and counted (`peerhold.Flap`).
+    fn hold(self: *Store, r: *Route, conn: u32, far: Far, now: i64, mono: i64) void {
+        if (r.conn != 0 and r.conn != conn) {
+            const old = r.conn;
+            const was = r.holder.who.view();
+            const name = if (r.host.len > 0) r.host else "the hub";
+            if (r.holder.flap.replaced(mono, was, far.instance)) {
+                self.warnf("peer federation: the link to {s} is FLAPPING: {s}. Two daemons link as that host; stop the one that should not (only a host's per-user daemon federates). Each replacement is no longer logged.", .{ name, r.holder.flap.detail() });
+            } else if (!r.holder.flap.flapping) {
+                var ob: [256]u8 = undefined;
+                var nb: [256]u8 = undefined;
+                self.warnf("peer federation: {s} linked again ({s}); its older link ({s}) is closed", .{ name, far.instance.describe(&nb), was.describe(&ob) });
+            }
+            self.detach(r, now);
+            _ = self.emit.call(old, .{ .hangup = "a newer link of the same host replaced it" });
+        }
+        r.holder.hold(far.instance, far.beats, mono);
         self.attach(r, conn, now);
+    }
+
+    /// Something arrived over link `conn` at monotonic `mono`.
+    pub fn linkHeard(self: *Store, conn: u32, mono: i64) void {
+        const r = self.routeByConn(conn) orelse return;
+        r.holder.heard(mono);
+    }
+
+    /// Whether the link to `domain` (on a member: the uplink) flaps now.
+    pub fn linkFlapping(self: *Store, domain: []const u8) bool {
+        const r = (if (self.hub) self.routeNamed(domain) else self.uplink()) orelse return false;
+        return r.holder.flap.flapping;
+    }
+
+    /// Beat on every live link whose far side takes beats, close those
+    /// whose far side fell silent (`peerhold.SILENCE_MS`), and say once
+    /// when a flapping link settled. Wall `now`, monotonic `mono`.
+    pub fn beat(self: *Store, now: i64, mono: i64) void {
+        for (self.routes.items) |r| {
+            const name = if (r.host.len > 0) r.host else "the hub";
+            if (r.holder.flap.settle(mono)) {
+                self.warnf("peer federation: the link to {s} stopped flapping", .{name});
+                self.presence_dirty = true;
+            }
+            if (r.conn == 0) continue;
+            switch (r.holder.due(mono)) {
+                .none => {},
+                .beat => {
+                    _ = self.emit.call(r.conn, .beat);
+                    r.holder.sent(mono);
+                },
+                .silent => {
+                    const old = r.conn;
+                    var ib: [256]u8 = undefined;
+                    self.warnf("peer federation: nothing heard over the link to {s} ({s}) for {d} s; it is closed", .{ name, r.holder.who.view().describe(&ib), @divTrunc(mono - r.holder.heard_ms, 1000) });
+                    self.detach(r, now);
+                    _ = self.emit.call(old, .{ .hangup = std.fmt.comptimePrint("nothing heard over it for {d} s", .{@divTrunc(peerhold.SILENCE_MS, 1000)}) });
+                },
+            }
+        }
     }
 
     /// Connection `conn` closed: a link it carried is down. Its peers stay
@@ -3164,6 +3300,8 @@ const Rec = struct {
             .relay => |r| .{ .conn = conn, .kind = .relay, .id = a.dupe(u8, r.id) catch "", .relay = r.kind, .outcome = r.outcome, .reason = r.reason },
             .warn => |w| .{ .conn = conn, .kind = .warn, .text = a.dupe(u8, w) catch "" },
             .self_changed => .{ .conn = conn, .kind = .self_changed },
+            .beat => .{ .conn = conn, .kind = .beat },
+            .hangup => |why| .{ .conn = conn, .kind = .hangup, .text = a.dupe(u8, why) catch "" },
         };
         self.got.append(a, g) catch return false;
         return out != .warn;
@@ -4288,6 +4426,11 @@ const Net = struct {
     skew: i64 = 0,
     /// Each side announces slow mail (both current); false = both predate it.
     slow: bool = true,
+    /// The daemons behind each end and whether they beat; empty and false
+    /// = both predate instances.
+    hub_daemon: Instance = .{},
+    mem_daemon: Instance = .{},
+    beats: bool = false,
 
     fn init(net: *Net, dir: ?[]const u8) !void {
         return net.initLink(dir, .outbound);
@@ -4323,8 +4466,8 @@ const Net = struct {
 
     fn connect(net: *Net, now: i64) !void {
         net.up = true;
-        try net.mem.uplinkUp(net.mem_link, .{ .host = "hub", .as = "box", .slow_mail = net.slow }, net.mem_direction, now + net.skew);
-        net.hub.linkUp("box", net.hub_link, net.slow, now);
+        try net.mem.uplinkUp(net.mem_link, .{ .host = "hub", .as = "box", .slow_mail = net.slow, .instance = net.hub_daemon, .beat = net.beats }, net.mem_direction, now + net.skew, now);
+        net.hub.linkUp("box", net.hub_link, .{ .slow = net.slow, .instance = net.mem_daemon, .beats = net.beats }, now, now);
     }
 
     /// Both ends see the link drop; the next one gets new connection ids.
@@ -4654,7 +4797,7 @@ test "federation: trust gate, unknown and unsupported hosts" {
     const mail = Relay{ .kind = .mail, .id = "m-abcdefgh", .from = .{ .address = "x" }, .to = "Zenit", .text = "forged" };
     try t.expectError(error.NotLinked, net.mem.relayIn(77, mail, 0));
     try t.expectError(error.NotLinked, net.hub.relayIn(77, mail, 0));
-    try t.expectError(error.NotLinked, net.hub.uplinkUp(77, .{ .host = "h", .as = "a" }, .inbound, 0));
+    try t.expectError(error.NotLinked, net.hub.uplinkUp(77, .{ .host = "h", .as = "a" }, .inbound, 0, 0));
     try t.expectEqual(@as(usize, 0), net.hub_rec.count(1, .deliver));
     // 2. A member speaks only for its own peers: a qualified `from` is refused.
     try net.connect(0);
@@ -4895,4 +5038,105 @@ test "what became of a message, and mail that expired while away, name the alias
     const gone = lastOf(&rec, 3, .event) orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(?RefuseReason, .not_durable_gone), gone.reason);
     try t.expectEqualStrings("temp", gone.to_alias);
+}
+
+fn warnsWith(rec: *const Rec, needle: []const u8) usize {
+    var n: usize = 0;
+    for (rec.got.items) |g| n += @intFromBool(g.kind == .warn and std.mem.indexOf(u8, g.text, needle) != null);
+    return n;
+}
+
+fn callinHub(rec: *Rec) !Store {
+    return Store.init(t.allocator, .{ .host = "hub", .hub = true, .domains = &.{"box"}, .inbound = &.{"box"}, .emit = rec.emit() });
+}
+
+test "federation: a member's own daemon replaces its call-in; another is refused while it is live, and gets in once it falls silent" {
+    var rec = Rec.init();
+    defer rec.deinit();
+    var s = try callinHub(&rec);
+    defer s.deinit();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const real = Instance{ .id = "k3f9", .pid = 10, .socket = "/r/box.sock" };
+    const stray = Instance{ .id = "zz21", .pid = 11, .socket = "/r/mcp.sock" };
+    // 1. Nobody holds it: the real daemon takes it.
+    try t.expect(s.admit("box", real) == .take);
+    s.linkUp("box", 7, .{ .instance = real, .beats = true }, 100, 0);
+    // 2. The same daemon calls in again (its old link half dead): replaced,
+    //    the old connection hung up.
+    try t.expect(s.admit("box", real) == .replace);
+    s.linkUp("box", 9, .{ .instance = real, .beats = true }, 200, 1_000);
+    try t.expectEqual(@as(usize, 1), rec.count(7, .hangup));
+    try t.expectEqual(@as(usize, 1), warnsWith(&rec, "linked again"));
+    // 3. Another daemon of that host, and one that names none, are refused
+    //    naming the holder; the link stays up on 9.
+    const held = s.admit("box", stray);
+    try t.expect(held == .refuse);
+    try t.expectEqualStrings("k3f9", held.refuse.holder.id);
+    try t.expect(s.admit("box", .{}) == .refuse);
+    try t.expectEqual(PeerLink.up, (try s.hostList(a, 300))[0].link);
+    // 4. It beats every BEAT_MS while heard, and the beat goes to 9.
+    s.beat(300, 1_000 + peerhold.BEAT_MS);
+    try t.expectEqual(@as(usize, 1), rec.count(9, .beat));
+    s.linkHeard(9, 1_000 + peerhold.BEAT_MS);
+    s.beat(300, 1_000 + peerhold.BEAT_MS + peerhold.SILENCE_MS);
+    try t.expectEqual(@as(usize, 0), rec.count(9, .hangup));
+    // 5. Silent past the bound: closed, listed waiting for the call-in, and
+    //    the other daemon gets in.
+    s.beat(400, 1_000 + peerhold.BEAT_MS + peerhold.SILENCE_MS + 1);
+    try t.expectEqual(@as(usize, 1), rec.count(9, .hangup));
+    try t.expectEqual(@as(usize, 1), warnsWith(&rec, "nothing heard over the link to box"));
+    const down = (try s.hostList(a, 400))[0];
+    try t.expectEqual(PeerLink.down, down.link);
+    try t.expectEqual(@as(?PeerLinkWhy, .awaiting_dial), down.why);
+    try t.expect(s.admit("box", stray) == .take);
+}
+
+test "federation: members that name no daemon replace each other as before, and a flapping link warns once and says so" {
+    var rec = Rec.init();
+    defer rec.deinit();
+    var s = try callinHub(&rec);
+    defer s.deinit();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Two old member daemons take turns every 2.2 s, as aeor's did.
+    var mono: i64 = 0;
+    var conn: u32 = 1;
+    s.linkUp("box", conn, .{}, 0, mono);
+    for (0..8) |_| {
+        try t.expect(s.admit("box", .{}) == .replace);
+        conn += 1;
+        mono += 2_200;
+        s.linkUp("box", conn, .{}, mono, mono);
+    }
+    try t.expectEqual(@as(usize, peerhold.FLAP_MAX), warnsWith(&rec, "linked again"));
+    try t.expectEqual(@as(usize, 1), warnsWith(&rec, "is FLAPPING"));
+    const up = (try s.hostList(a, mono))[0];
+    try t.expectEqual(PeerLink.up, up.link);
+    try t.expectEqual(@as(?PeerLinkWhy, .flapping), up.why);
+    try t.expect(std.mem.indexOf(u8, up.detail, "older build") != null);
+    // Left alone a whole window, it settles: said once, and no reason left.
+    s.beat(mono, mono + peerhold.FLAP_WINDOW_MS);
+    try t.expectEqual(@as(usize, 1), warnsWith(&rec, "stopped flapping"));
+    try t.expectEqual(@as(?PeerLinkWhy, null), (try s.hostList(a, mono))[0].why);
+    // An old member never beats: its link is never timed out.
+    s.beat(mono, mono + 100 * peerhold.SILENCE_MS);
+    try t.expectEqual(PeerLink.up, (try s.hostList(a, mono))[0].link);
+    try t.expectEqual(@as(usize, 0), rec.count(conn, .beat));
+}
+
+test "federation: a member keeps the hub that holds its uplink; a second hub is refused, the same one replaces it" {
+    var net: Net = undefined;
+    try net.init(null);
+    defer net.deinit();
+    net.hub_daemon = .{ .id = "hub1", .pid = 20, .socket = "/r/hub.sock" };
+    net.beats = true;
+    try net.connect(0);
+    try t.expect(net.mem.admit("", .{ .id = "hub2", .pid = 21 }) == .refuse);
+    try t.expect(net.mem.admit("", net.hub_daemon) == .replace);
+    // The hub holding it hangs up: the second hub may link.
+    net.mem.connGone(net.mem_link, 10);
+    try t.expect(net.mem.admit("", .{ .id = "hub2", .pid = 21 }) == .take);
 }
