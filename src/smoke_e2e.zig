@@ -3663,7 +3663,7 @@ fn spawnIsolatedMcp(allocator: std.mem.Allocator, fake_log: ?[*:0]const u8) ?Mcp
             _ = c.setenv(FAKE_AGENT_ENV, "1", 1);
             _ = c.setenv(FAKE_AGENT_LOG_ENV, path, 1);
         }
-        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "mcp", "--no-record", null };
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "mcp", "--no-record", "--structured", null };
         _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
@@ -13036,7 +13036,7 @@ const McpChild = struct {
                 // No --shared and no --socket: panel delivery must use only
                 // the inherited origin, while app/term/fs state stays on the
                 // MCP server's lazily started private daemon.
-                const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "mcp", null };
+                const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "mcp", "--structured", null };
                 _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
             } else {
                 // The harness may itself have been launched from inside a
@@ -13048,7 +13048,7 @@ const McpChild = struct {
                 // --shared skips the private daemon entirely (no second
                 // mux to clean up); --socket points it at THIS GUI.
                 const argv = [_:null]?[*:0]const u8{
-                    bindir.path(.sketerm), "mcp", "--shared", "--socket", socket.ptr, null,
+                    bindir.path(.sketerm), "mcp", "--shared", "--structured", "--socket", socket.ptr, null,
                 };
                 _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
             }
@@ -18509,7 +18509,7 @@ fn spawnHostMcp(allocator: std.mem.Allocator, host_rt: [:0]const u8, path_env: [
         _ = c.setenv("PATH", path_env.ptr, 1);
         _ = c.setenv(FAKE_AGENT_ENV, "1", 1);
         _ = c.setenv(FAKE_AGENT_LOG_ENV, log_path.ptr, 1);
-        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "mcp", "--no-record", null };
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "mcp", "--no-record", "--structured", null };
         _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }

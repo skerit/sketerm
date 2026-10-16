@@ -12,6 +12,8 @@ const nowMs = @import("../util/clock.zig").nowMs;
 
 /// Room for the binary, `mcp` and the extra arguments.
 const ARGV_MAX = 16;
+/// The server flag the rigs run with unless `Options.structured` is false.
+const STRUCTURED = "--structured";
 
 pub const Options = struct {
     /// Arguments after `mcp`.
@@ -29,6 +31,10 @@ pub const Options = struct {
     /// Removed from the child's environment, before `set_env` applies.
     unset_env: []const [*:0]const u8 = &.{},
     set_env: []const [2][*:0]const u8 = &.{},
+    /// `--structured`: the rigs assert facts. False runs the text default. Only
+    /// a server takes it: `extra` naming a subcommand (`agent-wait`, `peer`)
+    /// runs that instead and gets no server flag.
+    structured: bool = true,
 };
 
 pub fn Mcp(comptime fail: anytype) type {
@@ -66,20 +72,24 @@ pub fn Mcp(comptime fail: anytype) type {
                 path = "/bin/sh";
                 argv_buf[0] = "/bin/sh";
                 argv_buf[1] = "-c";
-                // Not the last command, so sh does not exec it away.
+                // Not the last command, so sh does not exec it away. The
+                // parent arguments are the shell's own, never the server's:
+                // its flags ride $MCPPROC_FLAGS (set in `spawnArgv`).
                 argv_buf[2] = if (opts.runs_dir != null)
                     // In the background with its stdin kept (an async list
                     // otherwise reads /dev/null), polling the drop directory.
-                    "\"$0\" mcp <&0 & s=$!; while kill -0 $s 2>/dev/null; do for f in \"$MCPPROC_RUNS\"/*.sh; do [ -f \"$f\" ] && mv \"$f\" \"$f.run\" && sh \"$f.run\"; done; sleep 0.05; done; wait $s"
+                    "\"$0\" mcp $MCPPROC_FLAGS <&0 & s=$!; while kill -0 $s 2>/dev/null; do for f in \"$MCPPROC_RUNS\"/*.sh; do [ -f \"$f\" ] && mv \"$f\" \"$f.run\" && sh \"$f.run\"; done; sleep 0.05; done; wait $s"
                 else
-                    "\"$0\" mcp; :";
+                    "\"$0\" mcp $MCPPROC_FLAGS; :";
                 argv_buf[3] = exe;
                 for (parent_args, 0..) |e, i| argv_buf[4 + i] = e;
             } else {
-                if (opts.extra.len + 2 > ARGV_MAX) fail("mcpproc: too many arguments");
+                if (opts.extra.len + 3 > ARGV_MAX) fail("mcpproc: too many arguments");
                 argv_buf[0] = exe;
                 argv_buf[1] = "mcp";
                 for (opts.extra, 0..) |e, i| argv_buf[2 + i] = e;
+                const server = opts.extra.len == 0 or std.mem.startsWith(u8, std.mem.span(opts.extra[0]), "--");
+                if (opts.structured and server) argv_buf[2 + opts.extra.len] = STRUCTURED;
             }
             return spawnArgv(allocator, path, &argv_buf, opts);
         }
@@ -100,6 +110,7 @@ pub fn Mcp(comptime fail: anytype) type {
                 for (opts.unset_env) |k| _ = unsetEnv(k);
                 for (opts.set_env) |kv| _ = c.setenv(kv[0], kv[1], 1);
                 if (opts.runs_dir) |d| _ = c.setenv("MCPPROC_RUNS", d, 1);
+                if (opts.under != null) _ = c.setenv("MCPPROC_FLAGS", if (opts.structured) STRUCTURED else "", 1);
                 _ = c.execv(path, @ptrCast(@constCast(argv_buf)));
                 c._exit(127);
             }

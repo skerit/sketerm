@@ -48,6 +48,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     // two are independent, which the text lane says in one line.
     const headless_terms = mcp_term.term_state.mux_sock != null;
     try res.fact("mode", mcp.srv_mode);
+    try res.fact("result_mode", @tagName(mcp.result_mode));
     try res.fact("headless_gui", mcp_app.app_state.ready);
     try res.fact("gui_socket", mcp.srv_gui_socket);
     try res.fact("gui_socket_source", @tagName(mcp.srv_gui_socket_source));
@@ -62,6 +63,10 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     try res.textf("direct GUI control socket: {s} ({s}) — independent of headless GUI apps and of relayed panels", .{
         yesNo(mcp.srv_gui_socket),
         @tagName(mcp.srv_gui_socket_source),
+    });
+    try res.text(switch (mcp.result_mode) {
+        .text => "results: text only (start the server with --structured for structuredContent and outputSchema)",
+        .structured => "results: structured (structuredContent beside the text, outputSchema in tools/list)",
     });
     if (!std.mem.eql(u8, mcp.srv_mode, "shared"))
         try res.text("this server talks to its own PRIVATE mux daemon: sessions here are invisible to the user's `sketerm mux list` / `sketerm app`, and apps started there are invisible here (run with --shared to join the user's daemon)");

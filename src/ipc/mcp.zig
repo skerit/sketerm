@@ -59,7 +59,7 @@ const MCP_HELP =
     \\Usage: sketerm mcp [--shared | --durable | --name NAME] [--socket PATH]
     \\                   [--log DIR] [--tools SPEC | --profile NAME] [--web-gui]
     \\                   [--web-motion-default direct|replay] [--web-motion-pack NAME]
-    \\                   [--channel-name NAME]
+    \\                   [--channel-name NAME] [--structured]
     \\       sketerm mcp agent-wait --socket PATH [--match TEXT] [--messages]
     \\                   [--follow] [--timeout SECONDS] [--since SEQ] AGENT
     \\       sketerm mcp agents [--format line|compact|json] [--parent PID]
@@ -72,6 +72,13 @@ const MCP_HELP =
     \\Runs a Model Context Protocol server on stdio. Register it in an
     \\MCP client (Claude Code, etc.) as command "sketerm" with args
     \\["mcp"].
+    \\
+    \\Results are short TEXT by default: one prose block (plus images),
+    \\written for a model to read. Errors start "error <code>: ".
+    \\  --structured   for programmatic consumers: every result also
+    \\                 carries structuredContent (JSON facts) and
+    \\                 tools/list declares each tool's outputSchema.
+    \\                 capabilities reports the mode as result_mode
     \\
     \\Isolation (default): app tools run against a PRIVATE mux daemon
     \\under $XDG_RUNTIME_DIR/sketerm/mcp-*/ — the assistant cannot see
@@ -264,6 +271,9 @@ pub const Opts = struct {
     web_motion_default: ?@import("../motion/replay.zig").Mode = null,
     /// `--web-motion-pack`: highest-precedence motion pack name.
     web_motion_pack: ?[]const u8 = null,
+    /// `--structured`: results carry `structuredContent` and tools/list
+    /// declares `outputSchema` (`result_mode`). Off: text only.
+    structured: bool = false,
 
     pub const ParseError = error{ UnknownFlag, MissingValue, BadName, SharedConflict };
 
@@ -317,6 +327,8 @@ pub const Opts = struct {
                 o.no_record = true;
             } else if (std.mem.eql(u8, a, mcp_webgui.FLAG)) {
                 o.web_gui = true;
+            } else if (std.mem.eql(u8, a, "--structured")) {
+                o.structured = true;
             } else if (std.mem.eql(u8, a, "--help")) {
                 o.help = true;
             } else {
@@ -836,6 +848,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         _ = c.fputs(MCP_HELP, platform.stdout());
         return 0;
     }
+    result_mode = if (opts.structured) .structured else .text;
 
     // Tool exposure policy and the web_gui grant, resolved BEFORE any
     // daemon or socket work: a typo must cost one clear line on
@@ -1550,6 +1563,14 @@ pub fn errResDetails(arena: std.mem.Allocator, code: ErrCode, msg: []const u8, d
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     try w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
+    if (result_mode == .text) {
+        // The text is all a text-mode reader gets: it must still be able
+        // to branch on the code. Details repeat what the message says.
+        const line = try std.fmt.allocPrint(arena, "error {s}{s}: {s}", .{ @tagName(code), if (code.retryable()) " (retryable)" else "", msg });
+        try std.json.Stringify.value(line, .{}, w);
+        try w.writeAll("}],\"isError\":true}");
+        return aw.written();
+    }
     try std.json.Stringify.value(msg, .{}, w);
     try w.writeAll("}],\"structuredContent\":{\"error\":{\"code\":\"");
     try w.writeAll(@tagName(code));
@@ -1692,7 +1713,7 @@ pub const Res = struct {
             try w.writeAll("\"}");
         }
         try w.writeAll("]");
-        if (self.has_structured) {
+        if (self.has_structured and result_mode == .structured) {
             try w.writeAll(",\"structuredContent\":{");
             try w.writeAll(self.sc.written());
             try w.writeAll("}");
@@ -1804,6 +1825,11 @@ pub var policy: mcpfilter.Policy = .unrestricted;
 /// Where `policy.spec` came from, for the capabilities report.
 pub var policy_source: []const u8 = "none";
 
+/// THE result mode of this server: `Res`/`errRes` and tools/list read it.
+/// `run` sets it from `--structured` (default text); the in-process
+/// default is the complete result, which the unit suites assert.
+pub var result_mode: mcp_tools.ResultMode = .structured;
+
 fn replaceAll(arena: std.mem.Allocator, haystack: []const u8, needle: []const u8, repl: []const u8) ![]const u8 {
     if (std.mem.indexOf(u8, haystack, needle) == null) return haystack;
     var aw: std.Io.Writer.Allocating = .init(arena);
@@ -1825,7 +1851,7 @@ fn renderedToolsJson(arena: std.mem.Allocator) ![]const u8 {
     var buf: [128]u8 = undefined;
     // Filter FIRST: the policy decides which entries exist, substitution
     // then rewrites only the survivors.
-    var out = try mcpfilter.filterToolsJson(arena, policy);
+    var out = try mcpfilter.filterToolsJson(arena, policy, result_mode);
     out = try replaceAll(arena, out, "%HOLD_DEF%", Tuning.defText(&buf, &Tuning.hold_ms));
     out = try replaceAll(arena, out, "%SETTLE_DEF%", Tuning.defText(&buf, &Tuning.settle_ms));
     out = try replaceAll(arena, out, "%TIMEOUT_DEF%", Tuning.defText(&buf, &Tuning.timeout_ms));
@@ -2228,6 +2254,8 @@ test "mcp Opts parses --tools and --profile" {
     const o = try Opts.parse(&.{ "--tools", "app, files:ro", "--profile", "readonly" });
     try std.testing.expectEqualStrings("app, files:ro", o.tools.?);
     try std.testing.expectEqualStrings("readonly", o.profile.?);
+    try std.testing.expect(!o.structured);
+    try std.testing.expect((try Opts.parse(&.{"--structured"})).structured);
     try std.testing.expectError(error.MissingValue, Opts.parse(&.{"--tools"}));
     try std.testing.expectError(error.BadName, Opts.parse(&.{ "--profile", "no spaces" }));
 }
@@ -2617,6 +2645,45 @@ test "errRes: uniform shape, code tag, retryable fact" {
     const ae = try appErr(arena, "boom");
     try t.expect(std.mem.indexOf(u8, ae, "\"code\":\"failed\"") != null);
     try t.expect(std.mem.indexOf(u8, ae, "\"isError\":true") != null);
+}
+
+test "text mode: no structuredContent, no outputSchema, the error code in the text" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const saved = result_mode;
+    defer result_mode = saved;
+    result_mode = .text;
+
+    var r = Res.init(arena);
+    try r.fact("count", @as(u32, 3));
+    try r.text("3 things");
+    const out = try r.finishWithImages(&.{"\x89PNG"}, null);
+    const obj = (try std.json.parseFromSliceLeaky(std.json.Value, arena, out, .{})).object;
+    try t.expect(obj.get("structuredContent") == null);
+    const content = obj.get("content").?.array.items;
+    try t.expectEqual(@as(usize, 2), content.len);
+    try t.expectEqualStrings("3 things", content[0].object.get("text").?.string);
+    try t.expectEqualStrings("image", content[1].object.get("type").?.string);
+
+    const nf = (try std.json.parseFromSliceLeaky(std.json.Value, arena, try errRes(arena, .not_found, "no web view with id 4"), .{})).object;
+    try t.expect(nf.get("isError").?.bool);
+    try t.expect(nf.get("structuredContent") == null);
+    try t.expectEqualStrings("error not_found: no web view with id 4", nf.get("content").?.array.items[0].object.get("text").?.string);
+    const to = try errResDetails(arena, .timeout, "did not settle", @as(?struct { waited_ms: i64 }, .{ .waited_ms = 5 }));
+    try t.expect(std.mem.indexOf(u8, to, "\"error timeout (retryable): did not settle\"") != null);
+    try t.expect(std.mem.indexOf(u8, to, "structuredContent") == null);
+
+    var fake = FakeBackend{ .responses = &.{}, .allocator = std.testing.allocator };
+    defer fake.deinit();
+    const listed = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":"t","method":"tools/list"}
+    ).?;
+    try t.expect(std.mem.indexOf(u8, listed, "\"inputSchema\"") != null);
+    try t.expect(std.mem.indexOf(u8, listed, "\"outputSchema\"") == null);
+    const tools = (try std.json.parseFromSliceLeaky(std.json.Value, arena, listed, .{})).object.get("result").?.object.get("tools").?.array;
+    try t.expectEqual(mcp_tools.TOOLS.len, tools.items.len);
 }
 
 /// Test helper: assert a migrated tool result speaks BOTH lanes and

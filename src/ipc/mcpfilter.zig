@@ -191,19 +191,24 @@ fn trim(s: []const u8) []const u8 {
 
 /// The tools/list array narrowed to what `policy` allows, rebuilt from
 /// the table so no JSON has to be re-parsed to find out what a member
-/// is called.
-pub fn filterToolsJson(arena: std.mem.Allocator, policy: Policy) ![]const u8 {
-    if (policy.isUnrestricted()) return tools.TOOLS_JSON;
+/// is called. A `mode` that declares no output schemas serves each
+/// tool's head only.
+pub fn filterToolsJson(arena: std.mem.Allocator, policy: Policy, mode: tools.ResultMode) ![]const u8 {
+    const full = mode.declaresOutputSchema();
+    if (policy.isUnrestricted() and full) return tools.TOOLS_JSON;
 
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     try w.writeAll("[");
 
     var wrote: usize = 0;
-    for (TOOL_META, tools.TOOL_JSON) |m, json| {
+    for (TOOL_META, tools.TOOL_JSON, tools.TOOL_JSON_HEAD) |m, json, head| {
         if (!policy.allowsMeta(m)) continue;
         if (wrote > 0) try w.writeAll(",");
-        try w.writeAll(json);
+        if (full) try w.writeAll(json) else {
+            try w.writeAll(head);
+            try w.writeAll("}");
+        }
         wrote += 1;
     }
 
@@ -301,7 +306,7 @@ test "all:ro grants every non-mutating tool and nothing else" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const out = try filterToolsJson(arena, p);
+    const out = try filterToolsJson(arena, p, .structured);
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, out, .{});
     try testing.expect(parsed.value.array.items.len < tools.TOOLS.len);
     for (parsed.value.array.items) |item| {
@@ -366,7 +371,7 @@ test "filterToolsJson emits only the allowed tools, schemas intact" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const out = try filterToolsJson(arena, .{ .spec = "app:ro" });
+    const out = try filterToolsJson(arena, .{ .spec = "app:ro" }, .structured);
     // Still one JSON line: the framing survives the rebuild.
     try testing.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, out, .{});
@@ -395,15 +400,38 @@ test "filterToolsJson emits only the allowed tools, schemas intact" {
 test "an unrestricted policy hands back the generated list unchanged" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    const out = try filterToolsJson(arena_state.allocator(), .unrestricted);
+    const out = try filterToolsJson(arena_state.allocator(), .unrestricted, .structured);
     try testing.expectEqualStrings(tools.TOOLS_JSON, out);
+}
+
+test "text mode lists every tool without an outputSchema, the rest unchanged" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const out = try filterToolsJson(arena, .unrestricted, .text);
+    try testing.expect(std.mem.indexOf(u8, out, "\"outputSchema\"") == null);
+    try testing.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
+    const text = try std.json.parseFromSliceLeaky(std.json.Value, arena, out, .{});
+    const full = try std.json.parseFromSliceLeaky(std.json.Value, arena, tools.TOOLS_JSON, .{});
+    try testing.expectEqual(full.array.items.len, text.array.items.len);
+    for (full.array.items, text.array.items) |f, t| {
+        try testing.expectEqual(f.object.count() - 1, t.object.count());
+        inline for (.{ "name", "description", "inputSchema" }) |key| try testing.expectEqualStrings(
+            try std.json.Stringify.valueAlloc(arena, f.object.get(key).?, .{}),
+            try std.json.Stringify.valueAlloc(arena, t.object.get(key).?, .{}),
+        );
+    }
+    // A policy narrows text mode exactly as it narrows structured mode.
+    const narrowed = try std.json.parseFromSliceLeaky(std.json.Value, arena, try filterToolsJson(arena, .{ .spec = "-all" }, .text), .{});
+    try testing.expectEqual(@as(usize, 1), narrowed.array.items.len);
+    try testing.expect(narrowed.array.items[0].object.get("outputSchema") == null);
 }
 
 test "a policy denying everything still lists core" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const out = try filterToolsJson(arena, .{ .spec = "-all" });
+    const out = try filterToolsJson(arena, .{ .spec = "-all" }, .structured);
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, out, .{});
     try testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
     try testing.expectEqualStrings("capabilities", parsed.value.array.items[0].object.get("name").?.string);

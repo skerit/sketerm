@@ -771,6 +771,32 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return 0;
     }
 
+    // ── Stage 0: text results by default, facts with --structured ─
+    {
+        var m = Mcp.spawnWith(allocator, exe, .{ .structured = false });
+        m.initialize();
+        const listed = m.listTools();
+        if (std.mem.indexOf(u8, listed, "\"inputSchema\"") == null) fail("text mode: tools/list carried no tools");
+        if (std.mem.indexOf(u8, listed, "\"outputSchema\"") != null) fail("text mode: tools/list declared an outputSchema");
+        const caps = m.callTool("capabilities", "{}");
+        if (std.mem.indexOf(u8, caps, "\"structuredContent\":") != null) fail("text mode: capabilities carried structuredContent");
+        if (std.mem.indexOf(u8, caps, "results: text only") == null) fail("text mode: capabilities did not state the result mode");
+        const peers = m.callTool("peer_list", "{}");
+        if (std.mem.indexOf(u8, peers, "\"structuredContent\":") != null) fail("text mode: peer_list carried structuredContent");
+        const bad = m.callTool("no_such_tool", "{}");
+        if (std.mem.indexOf(u8, bad, "\"isError\":true") == null or std.mem.indexOf(u8, bad, "\"text\":\"error unknown_tool: ") == null)
+            fail("text mode: an error did not name its code in the text");
+        m.closeStdinWait();
+
+        var s = Mcp.spawn(allocator, exe, &.{});
+        s.initialize();
+        if (std.mem.indexOf(u8, s.listTools(), "\"outputSchema\"") == null) fail("--structured: tools/list declared no outputSchema");
+        if (std.mem.indexOf(u8, s.callTool("capabilities", "{}"), "\"result_mode\":\"structured\"") == null)
+            fail("--structured: capabilities did not report result_mode structured");
+        s.closeStdinWait();
+        say("smoke-mcp: text results by default, structured on --structured ok");
+    }
+
     // ── Stage 1: ephemeral isolation + headless terminal ──────────
     {
         var m = Mcp.spawn(allocator, exe, &.{});
