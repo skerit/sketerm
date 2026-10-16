@@ -11,6 +11,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const env = @import("../util/env.zig");
+const wire = @import("../mux/wire.zig");
 
 /// The longest name.
 pub const NAME_MAX = 64;
@@ -21,6 +22,14 @@ pub const HOST_MAX = 253;
 pub const ANON_PREFIX = "anon-";
 /// Random characters after `anon-`.
 pub const ANON_CHARS = 4;
+/// Names under this prefix are derived from the session origin id of the
+/// sketerm pane a server runs in (`paneName`), so they are durable per
+/// pane and never follow its name; nothing else may claim one.
+pub const PANE_PREFIX = "p-";
+/// Origin-id hex characters after `p-`.
+pub const PANE_CHARS = 8;
+/// A pane-derived name's length.
+pub const PANE_NAME_LEN = PANE_PREFIX.len + PANE_CHARS;
 /// The longest formatted address.
 pub const ADDRESS_MAX = HOST_MAX + 1 + NAME_MAX;
 /// Rigs override this host's name in peer addresses (default: gethostname).
@@ -97,6 +106,26 @@ pub fn isAnonName(name: []const u8) bool {
     return std.mem.startsWith(u8, name, ANON_PREFIX);
 }
 
+/// Whether `name` carries the reserved `p-` prefix.
+pub fn isPaneName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, PANE_PREFIX);
+}
+
+/// Whether `name` lies in a space only sketerm mints (`anon-`, `p-`),
+/// which an explicit name must not claim.
+pub fn isReservedName(name: []const u8) bool {
+    return isAnonName(name) or isPaneName(name);
+}
+
+/// The name of a server in the pane whose session origin id is
+/// `origin_id`, written into `buf`; null when that is no valid origin id.
+pub fn paneName(buf: *[PANE_NAME_LEN]u8, origin_id: []const u8) ?[]const u8 {
+    if (!wire.validSessionOriginId(origin_id)) return null;
+    @memcpy(buf[0..PANE_PREFIX.len], PANE_PREFIX);
+    @memcpy(buf[PANE_PREFIX.len..], origin_id[0..PANE_CHARS]);
+    return buf;
+}
+
 fn validPart(part: []const u8, max: usize) Error!void {
     if (part.len == 0) return error.Empty;
     if (part.len > max) return error.TooLong;
@@ -156,4 +185,19 @@ test "the hub qualifies what arrives and localizes what leaves" {
     try validHost("hohenheim.local");
     try t.expectError(error.Empty, validHost(""));
     try t.expectError(error.BadChar, validHost("a/b"));
+}
+
+test "a pane name is p- and the origin id's first 8 hex; both reserved spaces are recognised" {
+    var buf: [PANE_NAME_LEN]u8 = undefined;
+    const name = paneName(&buf, "3fa9c2e17b0d4e5f8a6b1c2d3e4f5a6b").?;
+    try t.expectEqualStrings("p-3fa9c2e1", name);
+    try validName(name);
+    try t.expect(isPaneName(name) and isReservedName(name));
+    try t.expect(isReservedName("anon-k3f9"));
+    try t.expect(!isReservedName("Zenit") and !isReservedName("pane-1"));
+    // Not an origin id: wrong length, uppercase, not hex.
+    try t.expect(paneName(&buf, "3fa9c2e1") == null);
+    try t.expect(paneName(&buf, "3FA9C2E17B0D4E5F8A6B1C2D3E4F5A6B") == null);
+    try t.expect(paneName(&buf, "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz") == null);
+    try t.expect(paneName(&buf, "") == null);
 }

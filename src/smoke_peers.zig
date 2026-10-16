@@ -79,6 +79,11 @@ const UNSET = [_][*:0]const u8{
     "SKETERM_PEER_NAME",
 };
 
+/// The pane session origin id of section d2's servers, and the address
+/// it yields.
+const PANE_ORIGIN = "3fa9c2e17b0d4e5f8a6b1c2d3e4f5a6b";
+const PANE_ADDR = peeraddr.PANE_PREFIX ++ PANE_ORIGIN[0..peeraddr.PANE_CHARS];
+
 const Stage = struct {
     allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -97,6 +102,22 @@ const Stage = struct {
             return out;
         }
         return out[0..base.len];
+    }
+
+    /// `env(null)` inside a sketerm pane named "Zenit" whose session
+    /// origin id is `PANE_ORIGIN`.
+    fn paneEnv(self: *Stage) []const [2][*:0]const u8 {
+        const base = self.env(null);
+        const out = self.arena.alloc([2][*:0]const u8, base.len + 2) catch fail("oom");
+        @memcpy(out[0..base.len], base);
+        out[base.len] = .{ "SKETERM_SESSION", "Zenit" };
+        out[base.len + 1] = .{ "SKETERM_SESSION_ORIGIN_ID", PANE_ORIGIN };
+        return out;
+    }
+
+    /// A server started in that pane.
+    fn paneServer(self: *Stage) Mcp {
+        return Mcp.spawnWith(self.allocator, self.exe, .{ .extra = &.{"--no-record"}, .unset_env = &UNSET, .set_env = self.paneEnv() });
     }
 
     /// A server registered under `name` (null: none, anon), started
@@ -476,6 +497,28 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
     awaitOffline(&alice, arena, anon_addr, true, "15. anon gone");
     expectRefused(&alice, arena, anon_addr, "too late", "not_durable_gone", "15. gone anon");
     std.debug.print("smoke: peers: anon address delivered while live, not_durable_gone after ok\n", .{});
+
+    // -- d2. a server in a sketerm pane --
+    // 15a. the pane session is named "Zenit": the address is p- plus its
+    //      origin id's start, never the name, and it is durable.
+    {
+        var pane = stage.paneServer();
+        pane.initialize();
+        const caps = registered(&pane, arena, "15a. pane server");
+        expectStr(caps, "address", PANE_ADDR, "15a. the pane address");
+        if (!boolOf(caps, "durable", "15a.")) fail("15a. a pane address is not durable");
+        // 15b. it stops; mail for the pane waits.
+        pane.closeStdinWait();
+        awaitOffline(&alice, arena, PANE_ADDR, false, "15b. pane server offline");
+        expectStr(send(&alice, arena, PANE_ADDR, "for whoever runs in that pane", "15b. send"), "outcome", "queued", "15b. outcome to an away pane address");
+        // 15c. a restart in the same pane is the same address and gets it.
+        var again = stage.paneServer();
+        again.initialize();
+        expectStr(registered(&again, arena, "15c. pane server again"), "address", PANE_ADDR, "15c. the restarted pane address");
+        expectStr(readOne(&again, arena, 5_000, "15c. peer_read"), "text", "for whoever runs in that pane", "15c. the waiting mail");
+        again.closeStdinWait();
+    }
+    std.debug.print("smoke: peers: a pane server is p-<origin id>, durable across a restart ok\n", .{});
 
     // -- e. expiry --
     // 16. alice -> carol (away since step 1): queued; past the TTL the

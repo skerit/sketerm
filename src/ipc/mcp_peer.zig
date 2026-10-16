@@ -56,15 +56,21 @@ pub const Name = struct {
 };
 
 /// The address this server registers, decided once: an explicit name
-/// (`--name`, then `SKETERM_PEER_NAME`), else the pane session it was
-/// started in, else none (anon, not durable). A candidate that is not a
-/// valid peer name, or names the anon space, is skipped.
-pub fn chooseName(explicit: ?[]const u8, env_name: ?[]const u8, session: ?[]const u8) Name {
-    for ([_]?[]const u8{ explicit, env_name, session }) |cand| {
+/// (`--name`, then `SKETERM_PEER_NAME`), else `p-` plus the first hex of
+/// the origin id of the sketerm pane session it was started in (opaque,
+/// so renaming the pane never moves it, and durable, so a restart in the
+/// same pane gets its mail and subject back), else none (anon, not
+/// durable). An explicit candidate that is not a valid peer name, or
+/// claims a reserved space (`anon-`, `p-`), is skipped; the session NAME
+/// is never a candidate.
+/// @param pane_buf receives a pane-derived address; the result may borrow it.
+pub fn chooseName(explicit: ?[]const u8, env_name: ?[]const u8, origin_id: ?[]const u8, pane_buf: *[peeraddr.PANE_NAME_LEN]u8) Name {
+    for ([_]?[]const u8{ explicit, env_name }) |cand| {
         const n = cand orelse continue;
         const valid = if (peeraddr.validName(n)) true else |_| false;
-        if (valid and !peeraddr.isAnonName(n)) return .{ .address = n, .durable = true };
+        if (valid and !peeraddr.isReservedName(n)) return .{ .address = n, .durable = true };
     }
+    if (origin_id) |id| if (peeraddr.paneName(pane_buf, id)) |n| return .{ .address = n, .durable = true };
     return .{ .address = "", .durable = false };
 }
 
@@ -273,8 +279,9 @@ pub fn configure(allocator: std.mem.Allocator, cfg: Config) void {
     link.mailbox = Mailbox.init(allocator);
     link.lease = cfg.lease;
     const env_name: ?[]const u8 = if (c.getenv(ENV_NAME)) |v| std.mem.span(v) else null;
-    const session: ?[]const u8 = if (c.getenv("SKETERM_SESSION")) |v| std.mem.span(v) else null;
-    const n = chooseName(cfg.explicit, env_name, session);
+    const origin_id: ?[]const u8 = if (c.getenv("SKETERM_SESSION_ORIGIN_ID")) |v| std.mem.span(v) else null;
+    var pane_buf: [peeraddr.PANE_NAME_LEN]u8 = undefined;
+    const n = chooseName(cfg.explicit, env_name, origin_id, &pane_buf);
     link.name = .{ .address = allocator.dupe(u8, n.address) catch "", .durable = n.durable };
     link.cwd = allocator.dupe(u8, cfg.cwd) catch &.{};
     connect();
@@ -741,18 +748,29 @@ pub fn capabilityJson(arena: std.mem.Allocator) ![]const u8 {
 
 const t = std.testing;
 
-test "the address: --name, then SKETERM_PEER_NAME, then the pane session, else anon" {
-    const both = chooseName("Builder", "Env", "Zenit");
+test "the address: --name, then SKETERM_PEER_NAME, then the pane's origin id, else anon" {
+    var pb: [peeraddr.PANE_NAME_LEN]u8 = undefined;
+    const origin = "3fa9c2e17b0d4e5f8a6b1c2d3e4f5a6b";
+    const both = chooseName("Builder", "Env", origin, &pb);
     try t.expectEqualStrings("Builder", both.address);
     try t.expect(both.durable);
-    try t.expectEqualStrings("Env", chooseName(null, "Env", "Zenit").address);
-    const sess = chooseName(null, null, "Zenit");
-    try t.expectEqualStrings("Zenit", sess.address);
-    try t.expect(sess.durable);
-    // A candidate that is no peer name, or claims the anon space, is skipped.
-    try t.expectEqualStrings("Zenit", chooseName("a/b", "", "Zenit").address);
-    try t.expectEqualStrings("Qq", chooseName("anon-ab12", null, "Qq").address);
-    const none = chooseName(null, null, null);
+    try t.expectEqualStrings("Env", chooseName(null, "Env", origin, &pb).address);
+    // The pane: opaque and durable, from the origin id, never a name.
+    const pane = chooseName(null, null, origin, &pb);
+    try t.expectEqualStrings("p-3fa9c2e1", pane.address);
+    try t.expect(pane.durable);
+    // A candidate that is no peer name, or claims a reserved space, is skipped.
+    try t.expectEqualStrings("p-3fa9c2e1", chooseName("a/b", "", origin, &pb).address);
+    try t.expectEqualStrings("Qq", chooseName("anon-ab12", "Qq", null, &pb).address);
+    try t.expectEqualStrings("Qq", chooseName("p-deadbeef", "Qq", null, &pb).address);
+    try t.expectEqualStrings("p-3fa9c2e1", chooseName("p-deadbeef", "p-00000000", origin, &pb).address);
+    // A malformed origin id is no address: anon.
+    for ([_][]const u8{ "Zenit", "3FA9C2E17B0D4E5F8A6B1C2D3E4F5A6B", "3fa9c2e1", "" }) |bad| {
+        const anon = chooseName(null, null, bad, &pb);
+        try t.expectEqualStrings("", anon.address);
+        try t.expect(!anon.durable);
+    }
+    const none = chooseName(null, null, null, &pb);
     try t.expectEqualStrings("", none.address);
     try t.expect(!none.durable);
 }
