@@ -11,7 +11,7 @@
 //!
 //! Split of concerns: `eval` is portable logic (timestamps + arithmetic,
 //! the only GTK touch is reading qdata off the page); `draw` is the
-//! GTK/cairo-bound half. Keep new conditions in `eval` and new looks in
+//! GTK-bound half. Keep new conditions in `eval` and new looks in
 //! `draw` so a future non-GTK frontend can reuse the conditions.
 
 const std = @import("std");
@@ -44,7 +44,7 @@ pub const Effect = struct {
     name: []const u8,
     enabled: *const fn (s: TabSettings) bool,
     eval: *const fn (page: *c.AdwTabPage, cfg: *const Config, s: TabSettings) Activation,
-    draw: *const fn (page: *c.AdwTabPage, widget: *c.GtkWidget, snapshot: ?*c.GtkSnapshot, act: Activation) void,
+    draw: *const fn (renderer: *Renderer, page: *c.AdwTabPage, widget: *c.GtkWidget, snapshot: ?*c.GtkSnapshot, act: Activation) void,
 };
 
 /// Drawn back-to-front: aurora wash first, warning on top.
@@ -208,42 +208,86 @@ fn auroraIntensity(elapsed_us: i64, ema_us: i64) f64 {
     return 1.0 - fade / GLOW_DECAY_US;
 }
 
-/// The aurora glow (full-width soft wash + opaque bottom border), drawn
-/// before the children so it sits underneath them.
-fn auroraDraw(_: *c.AdwTabPage, widget: *c.GtkWidget, snapshot: ?*c.GtkSnapshot, act: Activation) void {
-    const w: f64 = @floatFromInt(c.gtk_widget_get_width(@ptrCast(widget)));
-    const h: f64 = @floatFromInt(c.gtk_widget_get_height(@ptrCast(widget)));
-    var rect: c.graphene_rect_t = undefined;
-    _ = c.graphene_rect_init(&rect, 0, 0, @floatCast(w), @floatCast(h));
-    const cr = c.gtk_snapshot_append_cairo(snapshot, &rect) orelse return;
-    // gtk_snapshot_append_cairo is transfer-full: the returned cairo_t owns
-    // a fresh image surface (sized to `rect`) and MUST be destroyed, or both
-    // leak. This runs every frame while the glow animates — a missing
-    // destroy here leaked ~MB/s of C-heap surfaces.
-    defer c.cairo_destroy(cr);
-    const t_us: f64 = @floatFromInt(c.g_get_monotonic_time());
+/// Shared by every tab in one strip. The old Cairo path rasterized and
+/// uploaded two gradients into a full-size image for EACH tab EVERY frame.
+/// The colour field is identical across tabs: only geometry and opacity
+/// differ. Upload 65x5 + 65x1 texels once per frame and let GSK interpolate
+/// the same 64 horizontal colour stops and piecewise-linear vertical mask.
+pub const Renderer = struct {
+    frame_time: i64 = -1,
+    wash: ?*c.GdkTexture = null,
+    border: ?*c.GdkTexture = null,
 
-    // Soft aurora wash over the WHOLE tab, faint at the top and growing
-    // toward the bottom (a vertical alpha mask gives the glow gradient).
-    if (makeAurora(w, act.intensity, t_us)) |wash| {
-        defer c.cairo_pattern_destroy(wash);
-        c.cairo_set_source(cr, wash);
-        if (c.cairo_pattern_create_linear(0, 0, 0, h)) |mask| {
-            defer c.cairo_pattern_destroy(mask);
-            c.cairo_pattern_add_color_stop_rgba(mask, 0.0, 1, 1, 1, 0.04);
-            c.cairo_pattern_add_color_stop_rgba(mask, 0.75, 1, 1, 1, 0.16);
-            c.cairo_pattern_add_color_stop_rgba(mask, 1.0, 1, 1, 1, 0.38);
-            c.cairo_mask(cr, mask);
+    pub fn deinit(self: *Renderer) void {
+        if (self.wash) |texture| c.g_object_unref(texture);
+        if (self.border) |texture| c.g_object_unref(texture);
+        self.* = .{};
+    }
+
+    fn prepare(self: *Renderer, frame_time: i64) bool {
+        if (self.frame_time == frame_time and self.wash != null and self.border != null) return true;
+        const colors = auroraColors(@floatFromInt(frame_time));
+        // Rows at y=0, .25, .5, .75, 1 reproduce the original mask's
+        // stops (alpha .04 at 0, .16 at .75, .38 at 1) exactly.
+        const alphas = [_]f64{ 0.04, 0.08, 0.12, 0.16, 0.38 };
+        var wash: [AURORA_SAMPLES * 5 * 4]u8 = undefined;
+        var border: [AURORA_SAMPLES * 4]u8 = undefined;
+        for (colors, 0..) |rgb, x| {
+            writePixel(border[x * 4 ..][0..4], rgb, 1);
+            for (alphas, 0..) |alpha, y|
+                writePixel(wash[(y * AURORA_SAMPLES + x) * 4 ..][0..4], rgb, alpha);
         }
+        const next_wash = textureFromPixels(&wash, 5) orelse return false;
+        const next_border = textureFromPixels(&border, 1) orelse {
+            c.g_object_unref(next_wash);
+            return false;
+        };
+        self.deinit();
+        self.* = .{ .frame_time = frame_time, .wash = next_wash, .border = next_border };
+        return true;
     }
+};
 
-    // Opaque aurora bottom border.
-    if (makeAurora(w, act.intensity, t_us)) |bar| {
-        defer c.cairo_pattern_destroy(bar);
-        c.cairo_set_source(cr, bar);
-        c.cairo_rectangle(cr, 0, h - 3, w, 3);
-        c.cairo_fill(cr);
-    }
+fn writePixel(pixel: *[4]u8, rgb: [3]f64, alpha: f64) void {
+    for (rgb, 0..) |channel, i| pixel[i] = @intFromFloat(@round(channel * alpha * 255));
+    pixel[3] = @intFromFloat(@round(alpha * 255));
+}
+
+fn textureFromPixels(pixels: []const u8, height: c_int) ?*c.GdkTexture {
+    const bytes = c.g_bytes_new(pixels.ptr, pixels.len) orelse return null;
+    defer c.g_bytes_unref(bytes);
+    return c.gdk_memory_texture_new(AURORA_SAMPLES, height, c.GDK_MEMORY_R8G8B8A8_PREMULTIPLIED, bytes, AURORA_SAMPLES * 4);
+}
+
+/// Align the first/last texel centres with the gradient endpoints. Clipping
+/// the half-texel overhang preserves the old geometry at every scale/size.
+fn appendAurora(snapshot: ?*c.GtkSnapshot, texture: *c.GdkTexture, w: f32, y: f32, h: f32, rows: usize, opacity: f64) void {
+    var clip: c.graphene_rect_t = undefined;
+    _ = c.graphene_rect_init(&clip, 0, y, w, h);
+    const dx = w / (2 * (AURORA_SAMPLES - 1));
+    const dy = if (rows > 1) h / (2 * @as(f32, @floatFromInt(rows - 1))) else 0;
+    var bounds: c.graphene_rect_t = undefined;
+    _ = c.graphene_rect_init(&bounds, -dx, y - dy, w + 2 * dx, h + 2 * dy);
+    c.gtk_snapshot_push_clip(snapshot, &clip);
+    // A plain texture node scales directly in the destination pass. An
+    // explicit TextureScale node first resamples into an offscreen image
+    // at logical resolution whenever the monitor scale is not 1, adding
+    // TWO render passes per tab on fractional/HiDPI displays.
+    c.gtk_snapshot_push_opacity(snapshot, opacity);
+    c.gtk_snapshot_append_texture(snapshot, texture, &bounds);
+    c.gtk_snapshot_pop(snapshot);
+    c.gtk_snapshot_pop(snapshot);
+}
+
+/// The same flowing wash and bottom border, without per-tab raster uploads.
+fn auroraDraw(renderer: *Renderer, _: *c.AdwTabPage, widget: *c.GtkWidget, snapshot: ?*c.GtkSnapshot, act: Activation) void {
+    const w: f32 = @floatFromInt(c.gtk_widget_get_width(widget));
+    const h: f32 = @floatFromInt(c.gtk_widget_get_height(widget));
+    if (w <= 0 or h <= 0) return;
+    const clock = c.gtk_widget_get_frame_clock(widget) orelse return;
+    if (!renderer.prepare(c.gdk_frame_clock_get_frame_time(clock))) return;
+    appendAurora(snapshot, renderer.wash.?, w, 0, h, 5, act.intensity);
+    appendAurora(snapshot, renderer.border.?, w, h - 3, 3, 1, act.intensity);
 }
 
 const aurora_effect = Effect{
@@ -253,14 +297,11 @@ const aurora_effect = Effect{
     .draw = auroraDraw,
 };
 
-/// An aurora ramp across `width`: full-spectrum colour blobs, evenly spaced
-/// in hue, that all drift right-to-left while each wobbles in place on its
-/// own cycle. The colour at every point is the soft (gaussian) blend of the
-/// blobs, computed toroidally so the drift is seamless. The wobble keeps the
-/// flow organic instead of a rigid translation.
-fn makeAurora(width: f64, alpha: f64, t_us: f64) ?*c.cairo_pattern_t {
-    const span = if (width > 1) width else 1;
-    const pat = c.cairo_pattern_create_linear(0, 0, span, 0) orelse return null;
+/// Same 64-stop rainbow as the Cairo renderer. Independent of tab width
+/// and intensity, so every glowing tab shares this frame's colour field.
+const AURORA_SAMPLES = 65;
+fn auroraColors(t_us: f64) [AURORA_SAMPLES][3]f64 {
+    var colors: [AURORA_SAMPLES][3]f64 = undefined;
     const tau = 2.0 * std.math.pi;
     const nb: f64 = @floatFromInt(AURORA_BLOBS);
     const drift = t_us / AURORA_DRIFT_US;
@@ -276,10 +317,8 @@ fn makeAurora(width: f64, alpha: f64, t_us: f64) ?*c.cairo_pattern_t {
     }
 
     const inv2s2 = 1.0 / (2.0 * AURORA_SIGMA * AURORA_SIGMA);
-    const N: usize = 64;
-    var k: usize = 0;
-    while (k <= N) : (k += 1) {
-        const pos = @as(f64, @floatFromInt(k)) / @as(f64, @floatFromInt(N));
+    for (&colors, 0..) |*color, k| {
+        const pos = @as(f64, @floatFromInt(k)) / (AURORA_SAMPLES - 1);
         var r: f64 = 0;
         var g: f64 = 0;
         var b: f64 = 0;
@@ -303,9 +342,9 @@ fn makeAurora(width: f64, alpha: f64, t_us: f64) ?*c.cairo_pattern_t {
         r = std.math.clamp(grey + (r - grey) * AURORA_SAT, 0.0, 1.0);
         g = std.math.clamp(grey + (g - grey) * AURORA_SAT, 0.0, 1.0);
         b = std.math.clamp(grey + (b - grey) * AURORA_SAT, 0.0, 1.0);
-        c.cairo_pattern_add_color_stop_rgba(pat, pos, r, g, b, alpha);
+        color.* = .{ r, g, b };
     }
-    return pat;
+    return colors;
 }
 
 fn hsv2rgb(hv: f64, s: f64, v: f64) [3]f64 {
@@ -378,7 +417,7 @@ pub fn warnDeadline(page: *c.AdwTabPage, threshold_us: i64) ?i64 {
     return activity_ts + threshold_us;
 }
 
-fn warnDraw(_: *c.AdwTabPage, widget: *c.GtkWidget, snapshot: ?*c.GtkSnapshot, act: Activation) void {
+fn warnDraw(_: *Renderer, _: *c.AdwTabPage, widget: *c.GtkWidget, snapshot: ?*c.GtkSnapshot, act: Activation) void {
     const w: f64 = @floatFromInt(c.gtk_widget_get_width(@ptrCast(widget)));
     const h: f64 = @floatFromInt(c.gtk_widget_get_height(@ptrCast(widget)));
 
@@ -391,24 +430,19 @@ fn warnDraw(_: *c.AdwTabPage, widget: *c.GtkWidget, snapshot: ?*c.GtkSnapshot, a
     // Red wash: faint at the top, denser toward the bottom border.
     var rect: c.graphene_rect_t = undefined;
     _ = c.graphene_rect_init(&rect, 0, 0, @floatCast(w), @floatCast(h));
-    if (c.gtk_snapshot_append_cairo(snapshot, &rect)) |cr| {
-        // Transfer-full: must destroy the cairo_t (and its surface) or it
-        // leaks every animated frame. See auroraDraw.
-        defer c.cairo_destroy(cr);
-        if (c.cairo_pattern_create_linear(0, 0, 0, h)) |grad| {
-            defer c.cairo_pattern_destroy(grad);
-            c.cairo_pattern_add_color_stop_rgba(grad, 0.0, 0.85, 0.12, 0.12, 0.05 * strength);
-            c.cairo_pattern_add_color_stop_rgba(grad, 0.75, 0.85, 0.12, 0.12, 0.22 * strength);
-            c.cairo_pattern_add_color_stop_rgba(grad, 1.0, 0.90, 0.10, 0.10, 0.55 * strength);
-            c.cairo_set_source(cr, grad);
-            c.cairo_rectangle(cr, 0, 0, w, h);
-            c.cairo_fill(cr);
-        }
-        // Opaque red bottom border to match the aurora's footer line.
-        c.cairo_set_source_rgba(cr, 0.92, 0.10, 0.10, @min(1.0, 0.85 * strength));
-        c.cairo_rectangle(cr, 0, h - 3, w, 3);
-        c.cairo_fill(cr);
-    }
+    const stops = [_]c.GskColorStop{
+        .{ .offset = 0, .color = .{ .red = 0.85, .green = 0.12, .blue = 0.12, .alpha = @floatCast(0.05 * strength) } },
+        .{ .offset = 0.75, .color = .{ .red = 0.85, .green = 0.12, .blue = 0.12, .alpha = @floatCast(0.22 * strength) } },
+        .{ .offset = 1, .color = .{ .red = 0.90, .green = 0.10, .blue = 0.10, .alpha = @floatCast(0.55 * strength) } },
+    };
+    var start: c.graphene_point_t = undefined;
+    var end: c.graphene_point_t = undefined;
+    _ = c.graphene_point_init(&start, 0, 0);
+    _ = c.graphene_point_init(&end, 0, @floatCast(h));
+    c.gtk_snapshot_append_linear_gradient(snapshot, &rect, &start, &end, &stops, stops.len);
+    _ = c.graphene_rect_init(&rect, 0, @floatCast(h - 3), @floatCast(w), 3);
+    const border: c.GdkRGBA = .{ .red = 0.92, .green = 0.10, .blue = 0.10, .alpha = @floatCast(@min(1.0, 0.85 * strength)) };
+    c.gtk_snapshot_append_color(snapshot, &border, &rect);
 
     drawWarnIcon(widget, snapshot, h, strength);
 }
@@ -518,4 +552,33 @@ test "inactive warning: edge-triggered on activity, cleared by acknowledgement" 
     // Never produced output → nothing to warn about, even if "seen" long ago.
     try std.testing.expectEqual(Activation{}, warnActivation(0, now - threshold * 9, now, threshold));
     try std.testing.expectEqual(Activation{}, warnActivation(0, 0, now, threshold));
+}
+
+test "aurora shares tiny textures per frame and preserves its gradient" {
+    const t = std.testing;
+    var renderer: Renderer = .{};
+    defer renderer.deinit();
+    try t.expect(renderer.prepare(1_000_000));
+    const wash = renderer.wash.?;
+    try t.expectEqual(@as(c_int, 65), c.gdk_texture_get_width(wash));
+    try t.expectEqual(@as(c_int, 5), c.gdk_texture_get_height(wash));
+    try t.expectEqual(@as(c_int, 1), c.gdk_texture_get_height(renderer.border.?));
+    try t.expect(renderer.prepare(1_000_000));
+    try t.expectEqual(wash, renderer.wash.?); // all tabs share one upload
+
+    // gdk_texture_download returns native premultiplied ARGB32. Verify
+    // the old wash's three alpha stops and its fully opaque footer.
+    var pixels: [65 * 5]u32 = undefined;
+    c.gdk_texture_download(wash, @ptrCast(&pixels), 65 * 4);
+    try t.expectEqual(@as(u32, 10), pixels[0] >> 24);
+    try t.expectEqual(@as(u32, 41), pixels[65 * 3] >> 24);
+    try t.expectEqual(@as(u32, 97), pixels[65 * 4] >> 24);
+    var border: [65]u32 = undefined;
+    c.gdk_texture_download(renderer.border.?, @ptrCast(&border), 65 * 4);
+    for (border) |pixel| try t.expectEqual(@as(u32, 255), pixel >> 24);
+
+    try t.expect(renderer.prepare(2_000_000));
+    var next: [65 * 5]u32 = undefined;
+    c.gdk_texture_download(renderer.wash.?, @ptrCast(&next), 65 * 4);
+    try t.expect(!std.mem.eql(u32, &pixels, &next)); // genuinely animated
 }

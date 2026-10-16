@@ -1316,40 +1316,6 @@ pub fn refreshTitlebarCss(self: *Window) void {
         \\    border-radius: 0;
         \\}}
         \\
-        \\/* Active-tab indicator — accent line under the selected
-        \\   tab plus a stronger background tint, à la Terminator.
-        \\   Inactive tabs dim to ~55% so the active one stands
-        \\   out. libadwaita uses `tab:selected` (pseudo-class),
-        \\   not `.selected` / `:checked`. We give the selected
-        \\   rule higher specificity (`tabbar tabbox tab`) so it
-        \\   wins over libadwaita's own `tabbar tab:selected`
-        \\   block at the same priority level.
-        \\
-        \\   Unselected tabs also need a background of their own:
-        \\   with none, they show the AdwToolbarView top-bar colour
-        \\   and are indistinguishable from the files-mode menubar
-        \\   sitting right above the tab strip. A semi-transparent
-        \\   black overlay darkens whatever the theme's chrome is
-        \\   without naming a colour. `color-mix()`/`shade()` over
-        \\   `@headerbar_bg_color` parse fine on GTK 4.22 too, but
-        \\   the overlay needs no colour function at all, so it is
-        \\   the version- and theme-independent form. It sits
-        \\   UNDER the tab's own snapshot (GTK paints the CSS box
-        \\   before the snapshot vfunc), so the washes drawn in
-        \\   tab_effects.zig still composite on top. The alpha is
-        \\   multiplied by the 0.55 tab opacity, hence 0.22 for a
-        \\   ~0.12 effective wash. The hover rule is ours too:
-        \\   our APPLICATION-priority rule would otherwise outrank
-        \\   the theme's hover background and hover feedback would
-        \\   vanish. */
-        \\tabbar tab {{ opacity: 0.55; background-color: rgba(0, 0, 0, 0.22); }}
-        \\tabbar tab:hover {{ background-color: rgba(0, 0, 0, 0.08); }}
-        \\tabbar tabbox tab:selected {{
-        \\    opacity: 1.0;
-        \\    box-shadow: inset 0 -3px 0 0 @theme_selected_bg_color;
-        \\    background-color: alpha(@theme_selected_bg_color, 0.18);
-        \\}}
-        \\
         \\/* Split-pane separator — solid 4-px #353535 line.
         \\   `gtk_paned_set_wide_handle(paned, TRUE)` adds the
         \\   `.wide` style class to the separator. libadwaita's

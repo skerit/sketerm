@@ -7,7 +7,7 @@
 //! Each tab is a REAL widget tree (GtkLabel + flat GtkButton) styled by
 //! CSS with libadwaita's named colours, so it inherits the theme's font,
 //! centring, hover and selected states natively. The rainbow activity
-//! glow rides on top as a non-interactive GtkDrawingArea overlay.
+//! glow is rendered from tiny shared textures behind the tab's children.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -19,6 +19,11 @@ const cssutil = @import("cssutil.zig");
 const agentbadge = @import("agentbadge.zig");
 
 const TAB_W: c_int = 170;
+
+/// Dim tab contents individually. Applying this to the entire tab makes
+/// GSK re-composite its background, moving glow and text into a separate
+/// offscreen framebuffer every frame (one render pass per inactive tab).
+const UNSELECTED_OPACITY = 0.55;
 
 /// Whether a tab shows its close button: never on a pinned tab (the
 /// pinned section is for tabs that should not close by accident), else
@@ -279,9 +284,15 @@ fn centerGroup(width: c_int, content: c_int) Span {
 /// (icon, title, close) on top so the text/button stay legible.
 fn tabSnapshot(widget: [*c]c.GtkWidget, snapshot: ?*c.GtkSnapshot) callconv(.c) void {
     drawEffects(widget, snapshot);
+    const tab = tabOf(widget) orelse return;
+    const selected = c.adw_tab_view_get_selected_page(tab.bar.view) == @as(?*c.AdwTabPage, tab.page);
     var child = c.gtk_widget_get_first_child(widget);
     while (child != null) : (child = c.gtk_widget_get_next_sibling(child)) {
+        // Keep the text/icons subdued without enclosing the animated
+        // background in a group-opacity offscreen pass.
+        if (!selected) c.gtk_snapshot_push_opacity(snapshot, UNSELECTED_OPACITY);
         c.gtk_widget_snapshot_child(widget, child, snapshot);
+        if (!selected) c.gtk_snapshot_pop(snapshot);
     }
 }
 
@@ -295,22 +306,13 @@ fn drawEffects(widget: [*c]c.GtkWidget, snapshot: ?*c.GtkSnapshot) void {
     const s = tab_effects.tabSettings(tab.page);
     for (tab_effects.registry) |effect| {
         if (!effect.enabled(s)) continue;
-        const act = effect.eval(tab.page, cfg, s);
+        var act = effect.eval(tab.page, cfg, s);
         if (act.intensity <= 0.01) continue;
-        effect.draw(tab.page, @ptrCast(widget), snapshot, act);
+        act.intensity *= UNSELECTED_OPACITY;
+        effect.draw(&tab.bar.effect_renderer, tab.page, @ptrCast(widget), snapshot, act);
     }
 }
 
-/// True if any enabled effect on this page is still animating, so the tick
-/// loop should keep running.
-fn tabAnimating(cfg: *const Config, page: *c.AdwTabPage) bool {
-    const s = tab_effects.tabSettings(page);
-    for (tab_effects.registry) |effect| {
-        if (!effect.enabled(s)) continue;
-        if (effect.eval(page, cfg, s).animating) return true;
-    }
-    return false;
-}
 fn tabbarClassInit(klass: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
     c.gtk_widget_class_set_css_name(@ptrCast(@alignCast(klass)), "tabbar");
 }
@@ -399,6 +401,7 @@ pub const TabBar = struct {
     box: *c.GtkWidget,
     tabs: std.ArrayList(*Tab) = .empty,
     tick_id: c.guint = 0,
+    effect_renderer: tab_effects.Renderer = .{},
     reorder_gesture: ?*c.GtkGesture = null,
     drop_target: ?*c.GtkDropTarget = null,
     /// Set by `sever` before any source or widget callback can outlive the
@@ -478,6 +481,8 @@ pub const TabBar = struct {
         /// True while this is the tab under the cursor, so the tabbox
         /// snapshots it last (on top of its neighbours).
         dragging: bool = false,
+        /// Effects visible at the last tick, so expiry repaints once too.
+        effect_mask: u64 = 0,
     };
 
     /// Live in-bar reorder state, mirroring AdwTabBox: one pressed tab
@@ -553,6 +558,8 @@ pub const TabBar = struct {
         self.connectSelf(view, "page-detached", @ptrCast(&onStructure));
         self.connectSelf(view, "page-reordered", @ptrCast(&onStructure));
         self.connectSelf(view, "notify::selected-page", @ptrCast(&onSelection));
+        self.connectSelf(tabbar, "map", @ptrCast(&onBarMap));
+        self.connectSelf(tabbar, "unmap", @ptrCast(&onBarUnmap));
 
         self.rebuild();
         return self;
@@ -560,7 +567,15 @@ pub const TabBar = struct {
 
     pub fn ensureTick(self: *TabBar) void {
         if (self.callbacks_severed or self.tick_id != 0) return;
+        if (!self.verify_teardown and c.gtk_widget_get_mapped(self.root) == 0) return;
         self.tick_id = c.g_timeout_add(33, @ptrCast(&onTick), self);
+    }
+
+    fn stopTick(self: *TabBar) void {
+        if (self.tick_id != 0) {
+            _ = c.g_source_remove(self.tick_id);
+            self.tick_id = 0;
+        }
     }
 
     /// The inactive-warning fires on *silence*, with no event to wake the
@@ -628,6 +643,9 @@ pub const TabBar = struct {
             }
             c.gtk_widget_queue_draw(t.tab_box);
         }
+        // A newly unselected page may still be glowing even if output has
+        // just stopped and no further activity event will wake the timer.
+        self.ensureTick();
     }
 
     fn clearTabs(self: *TabBar) void {
@@ -770,6 +788,7 @@ pub const TabBar = struct {
             c.gtk_widget_set_visible(t.child, @intFromBool(!hid));
             if (t.sep_before) |s| c.gtk_widget_set_visible(s, @intFromBool(!hid));
         }
+        self.ensureTick();
     }
 
     fn buildTab(self: *TabBar, t: *Tab, page: *c.AdwTabPage) void {
@@ -892,10 +911,7 @@ pub const TabBar = struct {
         self.callbacks_severed = true;
 
         const sources_live = self.tick_id != 0 and self.warn_arm_id != 0;
-        if (self.tick_id != 0) {
-            _ = c.g_source_remove(self.tick_id);
-            self.tick_id = 0;
-        }
+        self.stopTick();
         if (self.warn_arm_id != 0) {
             _ = c.g_source_remove(self.warn_arm_id);
             self.warn_arm_id = 0;
@@ -912,6 +928,15 @@ pub const TabBar = struct {
             null,
             null,
             @as(c.gpointer, @ptrCast(self)),
+        );
+        disconnected += c.g_signal_handlers_disconnect_matched(
+            @ptrCast(self.root),
+            c.G_SIGNAL_MATCH_DATA,
+            0,
+            0,
+            null,
+            null,
+            @ptrCast(self),
         );
         if (self.reorder_gesture) |gesture| {
             disconnected += c.g_signal_handlers_disconnect_matched(
@@ -967,16 +992,23 @@ pub const TabBar = struct {
             c.abort();
         }
         self.sever();
+        self.effect_renderer.deinit();
         self.allocator.destroy(self);
     }
 };
 
-/// The tabs are now real `tabbar`/`tab` CSS nodes, so Adwaita's base
-/// stylesheet AND the user's theme style them natively — we add nothing
-/// of our own except the native-style close-button reveal-on-hover
-/// (which AdwTab does in C, not CSS).
+/// Native tab styling plus our selected/unselected contrast. Keep the
+/// tab itself fully opaque: dimming the whole widget turns every activity
+/// frame into N extra GPU render passes. Contents/effects dim individually
+/// in tabSnapshot/drawEffects; the background's alpha is already scaled.
 fn installCss(any_widget: *c.GtkWidget) void {
     const css =
+        \\tabbar tab { background-color: rgba(0, 0, 0, 0.121); }
+        \\tabbar tab:hover { background-color: rgba(0, 0, 0, 0.044); }
+        \\tabbar tabbox tab:selected {
+        \\  box-shadow: inset 0 -3px 0 0 @theme_selected_bg_color;
+        \\  background-color: alpha(@theme_selected_bg_color, 0.18);
+        \\}
         \\tab .tab-close-button {
         \\  opacity: 0;
         \\  transition: opacity 150ms ease-in-out;
@@ -1081,29 +1113,52 @@ fn onClose(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
     _ = c.adw_tab_view_close_page(t.bar.view, t.page);
 }
 
-/// Effect + reorder tick: repaint effects, ease neighbour slides toward
-/// their targets; stop once nothing is animating and nothing is mid-slide.
+/// Animate visible indicators in both focused and unfocused windows.
+/// Only changing tabs are invalidated; the entire tabbox is invalidated
+/// only when reordering actually moves its children.
 fn onTick(user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(TabBar, user);
+    self.tick_id = 0;
+    if (self.callbacks_severed) return 0;
+    if (!self.verify_teardown and c.gtk_widget_get_mapped(self.root) == 0) return 0;
     var any_active = false;
+    var slides_changed = false;
     const dragging = if (self.reorder) |r| r.active else false;
+    const selected = c.adw_tab_view_get_selected_page(self.view);
     for (self.tabs.items) |t| {
         const eased = easeSlide(t.slide, t.slide_target);
+        slides_changed = slides_changed or eased.value != t.slide;
         t.slide = eased.value;
         if (eased.moving) any_active = true;
-        const sel = c.adw_tab_view_get_selected_page(self.view) == @as(?*c.AdwTabPage, t.page);
-        if (!sel and tabAnimating(self.config, t.page)) any_active = true;
-        c.gtk_widget_queue_draw(t.tab_box);
+        var mask: u64 = 0;
+        var animating = false;
+        if (selected != @as(?*c.AdwTabPage, t.page) and c.gtk_widget_get_mapped(t.tab_box) != 0) {
+            const settings = tab_effects.tabSettings(t.page);
+            for (tab_effects.registry, 0..) |effect, i| {
+                if (!effect.enabled(settings)) continue;
+                const act = effect.eval(t.page, self.config, settings);
+                if (act.intensity > 0.01) mask |= @as(u64, 1) << @intCast(i);
+                animating = animating or act.animating;
+            }
+        }
+        any_active = any_active or animating;
+        if (mask != t.effect_mask or animating)
+            c.gtk_widget_queue_draw(t.tab_box);
+        t.effect_mask = mask;
     }
-    // Reorder offsets live on the tabbox snapshot; keep it repainting
-    // while any tab is mid-slide or being dragged.
-    if (dragging or any_active) c.gtk_widget_queue_draw(self.box);
-    if (!any_active and !dragging) {
-        if (self.verify_teardown) return 1;
-        self.tick_id = 0;
-        return 0;
-    }
-    return 1;
+    if (dragging or slides_changed) c.gtk_widget_queue_draw(self.box);
+    if (any_active or dragging or self.verify_teardown) self.ensureTick();
+    // One-shot: ensureTick also handles map/unmap and teardown.
+    return 0;
+}
+
+fn onBarMap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+    cast.userData(TabBar, user).ensureTick();
+}
+
+fn onBarUnmap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(TabBar, user);
+    if (!self.verify_teardown) self.stopTick();
 }
 
 /// One-shot: a tab has now been silent past the warning threshold. Wake the
@@ -1463,4 +1518,156 @@ test "the theme is the configured one, else GTK_THEME without its variant" {
     try testing.expectEqualStrings("", themeName("", null));
     const long = "x" ** 256;
     try testing.expectEqualStrings("", themeName("", long));
+}
+
+test "tab indicators keep moving, expire, and pause only when hidden" {
+    const opt_in = c.getenv("SKETERM_TEST_TAB_ACTIVITY") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, std.mem.span(opt_in), "1")) return error.SkipZigTest;
+    const t = std.testing;
+    try t.expect(c.gtk_init_check() != 0);
+    c.adw_init();
+    const window = c.gtk_window_new().?;
+    defer c.gtk_window_destroy(@ptrCast(window));
+    c.gtk_window_set_title(@ptrCast(window), "Isolated tab-animation regression");
+    c.gtk_window_set_default_size(@ptrCast(window), 640, 240);
+    const view_widget = c.adw_tab_view_new().?;
+    const view: *c.AdwTabView = @ptrCast(view_widget);
+    const selected = c.adw_tab_view_append(view, c.gtk_label_new("selected")).?;
+    const active = c.adw_tab_view_append(view, c.gtk_label_new("background output")).?;
+    c.adw_tab_page_set_title(selected, "Selected");
+    c.adw_tab_page_set_title(active, "Background output");
+    c.adw_tab_view_set_selected_page(view, selected);
+    const bar = try TabBar.create(t.allocator, view);
+    defer bar.deinit();
+    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+    c.gtk_box_append(@ptrCast(box), bar.root);
+    c.gtk_box_append(@ptrCast(box), @ptrCast(@alignCast(view_widget)));
+    c.gtk_window_set_child(@ptrCast(window), box);
+    c.gtk_window_present(@ptrCast(window));
+    const Probe = struct {
+        fn stream(b: *TabBar, page: ?*c.AdwTabPage, ms: i64) void {
+            const clock = @import("../util/clock.zig");
+            const deadline = clock.nowMs() + ms;
+            while (clock.nowMs() < deadline) {
+                if (page) |p| {
+                    tab_effects.recordActivity(p);
+                    b.ensureTick();
+                }
+                _ = c.g_main_context_iteration(null, 0);
+                _ = c.usleep(1000);
+            }
+        }
+
+        /// Bits: animated texture / text. Reject the two render-tree
+        /// shapes that made every tab allocate offscreen GPU targets.
+        fn directFlags(node: *c.GskRenderNode, renderer: *const tab_effects.Renderer) error{ GroupOpacityOffscreen, TextureScaleOffscreen }!u2 {
+            return switch (c.gsk_render_node_get_node_type(node)) {
+                c.GSK_TEXTURE_NODE => @intFromBool(isAnimated(c.gsk_texture_node_get_texture(node), renderer)),
+                c.GSK_TEXTURE_SCALE_NODE => blk: {
+                    // GTK may use scaled textures for static icons. It
+                    // is the per-frame aurora path that must stay direct.
+                    if (isAnimated(c.gsk_texture_scale_node_get_texture(node), renderer)) return error.TextureScaleOffscreen;
+                    break :blk 0;
+                },
+                c.GSK_TEXT_NODE => 2,
+                c.GSK_CONTAINER_NODE => blk: {
+                    var flags: u2 = 0;
+                    for (0..c.gsk_container_node_get_n_children(node)) |i|
+                        flags |= try directFlags(c.gsk_container_node_get_child(node, @intCast(i)).?, renderer);
+                    break :blk flags;
+                },
+                c.GSK_OPACITY_NODE => blk: {
+                    const flags = try directFlags(c.gsk_opacity_node_get_child(node).?, renderer);
+                    // Individual text/texture opacity is cheap; a group
+                    // containing both repaints the entire tab offscreen.
+                    if (flags == 3) return error.GroupOpacityOffscreen;
+                    break :blk flags;
+                },
+                c.GSK_TRANSFORM_NODE => try directFlags(c.gsk_transform_node_get_child(node).?, renderer),
+                c.GSK_CLIP_NODE => try directFlags(c.gsk_clip_node_get_child(node).?, renderer),
+                c.GSK_ROUNDED_CLIP_NODE => try directFlags(c.gsk_rounded_clip_node_get_child(node).?, renderer),
+                c.GSK_COLOR_MATRIX_NODE => try directFlags(c.gsk_color_matrix_node_get_child(node).?, renderer),
+                else => 0,
+            };
+        }
+
+        fn isAnimated(texture: ?*c.GdkTexture, renderer: *const tab_effects.Renderer) bool {
+            return texture != null and (texture == renderer.wash or texture == renderer.border);
+        }
+
+        fn expectDirect(widget: *c.GtkWidget, renderer: *const tab_effects.Renderer) !void {
+            const paintable = c.gtk_widget_paintable_new(widget).?;
+            defer c.g_object_unref(paintable);
+            const snapshot = c.gtk_snapshot_new();
+            c.gdk_paintable_snapshot(@ptrCast(paintable), @ptrCast(snapshot), @floatFromInt(c.gtk_widget_get_width(widget)), @floatFromInt(c.gtk_widget_get_height(widget)));
+            const node = c.gtk_snapshot_free_to_node(snapshot) orelse return error.TestUnexpectedResult;
+            defer c.gsk_render_node_unref(node);
+            try std.testing.expectEqual(@as(u2, 3), try directFlags(node, renderer));
+        }
+    };
+    Probe.stream(bar, active, 500);
+    const clock = c.gtk_widget_get_frame_clock(window).?;
+    var before = c.gdk_frame_clock_get_frame_counter(clock);
+    Probe.stream(bar, active, 400);
+    std.debug.print("tab animation: initial frames={d}\n", .{c.gdk_frame_clock_get_frame_counter(clock) - before});
+    try t.expect(c.gdk_frame_clock_get_frame_counter(clock) - before >= 5);
+    try Probe.expectDirect(bar.tabs.items[1].tab_box, &bar.effect_renderer);
+    // Negative control: the old whole-tab 55% opacity must be rejected
+    // by the same check, even though its pixels still look correct.
+    c.gtk_widget_set_opacity(bar.tabs.items[1].tab_box, UNSELECTED_OPACITY);
+    Probe.stream(bar, active, 100);
+    try t.expectError(error.GroupOpacityOffscreen, Probe.expectDirect(bar.tabs.items[1].tab_box, &bar.effect_renderer));
+    c.gtk_widget_set_opacity(bar.tabs.items[1].tab_box, 1);
+    Probe.stream(bar, active, 100);
+
+    // Do not equate an unfocused WINDOW with an inactive TAB: this must
+    // keep flowing while the user works in a different application.
+    const widgetshot = @import("widgetshot.zig");
+    const image_before = widgetshot.widgetToPng(bar.tabs.items[1].tab_box) orelse return error.TestUnexpectedResult;
+    defer c.g_bytes_unref(image_before);
+    const idle_before = widgetshot.widgetToPng(bar.tabs.items[0].tab_box) orelse return error.TestUnexpectedResult;
+    defer c.g_bytes_unref(idle_before);
+    before = c.gdk_frame_clock_get_frame_counter(clock);
+    Probe.stream(bar, active, 1200);
+    const image_after = widgetshot.widgetToPng(bar.tabs.items[1].tab_box) orelse return error.TestUnexpectedResult;
+    defer c.g_bytes_unref(image_after);
+    const idle_after = widgetshot.widgetToPng(bar.tabs.items[0].tab_box) orelse return error.TestUnexpectedResult;
+    defer c.g_bytes_unref(idle_after);
+    std.debug.print("tab animation: sustained frames={d}, moving={any}, idle-stable={any}\n", .{ c.gdk_frame_clock_get_frame_counter(clock) - before, c.g_bytes_equal(image_before, image_after) == 0, c.g_bytes_equal(idle_before, idle_after) != 0 });
+    try t.expect(c.gdk_frame_clock_get_frame_counter(clock) - before >= 25);
+    try t.expect(c.g_bytes_equal(image_before, image_after) == 0);
+    try t.expect(c.g_bytes_equal(idle_before, idle_after) != 0);
+    try t.expect(bar.tabs.items[1].effect_mask != 0);
+    Probe.stream(bar, null, 3600); // stopped output fades away, then sleeps
+    std.debug.print("tab animation: expired mask={d}, timer={d}\n", .{ bar.tabs.items[1].effect_mask, bar.tick_id });
+    try t.expectEqual(@as(u64, 0), bar.tabs.items[1].effect_mask);
+    try t.expectEqual(@as(c.guint, 0), bar.tick_id);
+    before = c.gdk_frame_clock_get_frame_counter(clock);
+    Probe.stream(bar, null, 200);
+    std.debug.print("tab animation: idle frames={d}\n", .{c.gdk_frame_clock_get_frame_counter(clock) - before});
+    try t.expectEqual(before, c.gdk_frame_clock_get_frame_counter(clock));
+
+    // Output on the selected page needs no glow. Switching away must
+    // restart its animation even if there is no subsequent output.
+    c.adw_tab_view_set_selected_page(view, active);
+    Probe.stream(bar, active, 100);
+    Probe.stream(bar, null, 100);
+    std.debug.print("tab animation: selected timer={d}\n", .{bar.tick_id});
+    try t.expectEqual(@as(c.guint, 0), bar.tick_id);
+    c.adw_tab_view_set_selected_page(view, selected);
+    before = c.gdk_frame_clock_get_frame_counter(clock);
+    Probe.stream(bar, null, 400);
+    std.debug.print("tab animation: deselected frames={d}\n", .{c.gdk_frame_clock_get_frame_counter(clock) - before});
+    try t.expect(c.gdk_frame_clock_get_frame_counter(clock) - before >= 3);
+
+    before = c.gdk_frame_clock_get_frame_counter(clock);
+    Probe.stream(bar, active, 400);
+    try t.expect(c.gdk_frame_clock_get_frame_counter(clock) - before >= 5);
+
+    c.gtk_widget_set_visible(bar.root, 0);
+    Probe.stream(bar, active, 100);
+    try t.expectEqual(@as(c.guint, 0), bar.tick_id);
+    c.gtk_widget_set_visible(bar.root, 1);
+    Probe.stream(bar, active, 100);
+    try t.expect(bar.tick_id != 0);
 }
