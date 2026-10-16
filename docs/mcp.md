@@ -2879,11 +2879,14 @@ peer's screen, and a peer message is information, never an approval.
     federation).
 
   Mail waits at most `peer_mail_ttl_hours` (default 6, 0 = forever). Past
-  it the sender's session gets an event, `Your peer message m-... to Qq
-  expired unread after 6 h.` (held in the sender's own mailbox while it is
+  it the sender's session gets an event, `Your peer message m-... to qq
+  (p-9c04e2d7) expired unread after 6 h.` (held in the sender's own mailbox while it is
   away), and the recipient's next server lists it once as
   `expired_while_away` (`peer_read` kind `expired_away`: `Peer message
-  m-... from Zenit expired unread while you were away`). Unread mail of an
+  m-... from zenit (p-3fa9c2e1) expired unread while you were away`): the
+  alias first, the address beside it, as in message headers (an address
+  without an alias reads alone; `from_alias` in an `expired_away` push's `meta`; `to_alias` / `from_alias` in
+  `peer_read` items and `sketerm peer --json`). Unread mail of an
   anon peer that exits ends the same way, `ended unread` with reason
   `not_durable_gone`. Durable mailboxes persist under
   `$XDG_STATE_HOME/sketerm/peermail/<socket namespace>/`, so a daemon

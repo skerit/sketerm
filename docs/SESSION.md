@@ -23188,3 +23188,18 @@ dalaran down (unreachable: ssh: ...; retry in 40s; seen 15m ago)` and
 Unit tests in peerlink, peermail, peer_cli, vocab; the smoke federation
 stage asserts `unreachable` (the fake ssh now prints ssh's refusal) and
 `awaiting_dial` on its two cuts.
+
+## 2026-10-16: expiry events and expired-away mail name the alias
+
+Expiry and end-unread events still named the recipient by its opaque
+address (`p-...`), and `expired_away` items the sender's. They now read
+like message headers, the alias first and the address beside it: `Your
+peer message m-... to qq (p-9c04e2d7) expired unread after 6 h.`, `Peer
+message m-... from zenit (p-3fa9c2e1) expired unread while you were
+away`. `Event.to_alias` (also on the stored item and relays, looked up
+where the event is raised: the mailbox here, else a federated peer's last
+report) and `Expired.from_alias` (the sender's alias as stamped on the
+message); in `peer_read` items, the CLI's JSON lines and an `expired_away`
+push's `meta`. Older
+parties ignore the fields and keep the address-only wording. Unit tests
+in peermail and agentpush.

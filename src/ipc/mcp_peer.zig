@@ -933,6 +933,8 @@ const ReadItem = struct {
     content: []const u8,
     from: ?[]const u8 = null,
     from_alias: ?[]const u8 = null,
+    /// An event: the recipient's alias.
+    to_alias: ?[]const u8 = null,
     to: ?[]const u8 = null,
     text: ?[]const u8 = null,
     reply_to: ?[]const u8 = null,
@@ -983,10 +985,14 @@ fn peerRead(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             },
             .event => |e| {
                 o.to = try arena.dupe(u8, e.to);
+                o.to_alias = if (e.to_alias.len > 0) try arena.dupe(u8, e.to_alias) else null;
                 o.outcome = @tagName(e.outcome);
                 o.reason = if (e.reason) |r| @tagName(r) else null;
             },
-            .expired_away => |x| o.from = try arena.dupe(u8, x.from),
+            .expired_away => |x| {
+                o.from = try arena.dupe(u8, x.from);
+                o.from_alias = if (x.from_alias.len > 0) try arena.dupe(u8, x.from_alias) else null;
+            },
         }
         if (!g.earlier and h.needsAck()) try ids.append(arena, o.id);
         try res.textf("\n[{d}{s}{s}] {s}", .{ h.seq, if (g.earlier) ", re-read" else "", if (h.quiet()) ", slow mail" else "", pushed.content });

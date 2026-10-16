@@ -358,6 +358,8 @@ const EventLine = struct {
     outcome: []const u8,
     reason: ?[]const u8 = null,
     to: []const u8,
+    /// The recipient's alias; absent when it has none.
+    to_alias: ?[]const u8 = null,
     queued_ms: i64,
 };
 
@@ -365,6 +367,8 @@ const ExpiredLine = struct {
     kind: []const u8 = "expired_away",
     id: []const u8,
     from: []const u8,
+    /// The sender's alias when it sent; absent when it had none.
+    from_alias: ?[]const u8 = null,
     sent_ms: i64,
     expired_ms: i64,
 };
@@ -404,8 +408,8 @@ pub fn itemText(arena: std.mem.Allocator, item: agentpush.PeerItem, json: bool) 
             .reply_to = m.reply_to,
             .slow = if (m.quiet) true else null,
         }),
-        .event => |e| jsonLine(arena, EventLine{ .id = e.id, .outcome = @tagName(e.outcome), .reason = if (e.reason) |r| @tagName(r) else null, .to = e.to, .queued_ms = e.queued_ms }),
-        .expired_away => |x| jsonLine(arena, ExpiredLine{ .id = x.id, .from = x.from, .sent_ms = x.sent_ms, .expired_ms = x.expired_ms }),
+        .event => |e| jsonLine(arena, EventLine{ .id = e.id, .outcome = @tagName(e.outcome), .reason = if (e.reason) |r| @tagName(r) else null, .to = e.to, .to_alias = nonEmpty(e.to_alias), .queued_ms = e.queued_ms }),
+        .expired_away => |x| jsonLine(arena, ExpiredLine{ .id = x.id, .from = x.from, .from_alias = nonEmpty(x.from_alias), .sent_ms = x.sent_ms, .expired_ms = x.expired_ms }),
     };
 }
 

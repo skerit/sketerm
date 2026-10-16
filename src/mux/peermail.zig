@@ -197,6 +197,8 @@ pub const ListReq = struct {
 pub const Expired = struct {
     id: []const u8,
     from: []const u8,
+    /// The sender's alias when it sent, "" = none (it reads as `from`).
+    from_alias: []const u8 = "",
     sent_ms: i64,
     expired_ms: i64,
 };
@@ -363,6 +365,8 @@ pub const Event = struct {
     outcome: PeerOutcome = .expired,
     reason: ?RefuseReason = null,
     to: []const u8 = "",
+    /// The recipient's alias, "" = none (it reads as `to`).
+    to_alias: []const u8 = "",
     /// How long it waited.
     queued_ms: i64 = 0,
     /// Slow mail, as `Deliver.quiet`: the owner is dormant.
@@ -455,6 +459,8 @@ pub const Relay = struct {
     to: []const u8 = "",
     /// `event`: the address the event is for.
     owner: []const u8 = "",
+    /// `event`: the recipient's alias (`Event.to_alias`).
+    to_alias: []const u8 = "",
     /// `mail`: ms since it was sent, at the sending broker.
     age_ms: i64 = 0,
     text: []const u8 = "",
@@ -551,6 +557,8 @@ pub const Item = struct {
     queued_ms: i64 = 0,
     /// An event in an outbound mailbox: the far-side address it is for.
     owner: []const u8 = "",
+    /// An event: its recipient's alias (`Event.to_alias`).
+    to_alias: []const u8 = "",
     /// A message: slow mail (`Deliver.quiet`), decided when it was routed.
     quiet: bool = false,
 
@@ -569,6 +577,8 @@ const ExpiredEntry = struct {
     id_len: u8 = 0,
     from_buf: [peeraddr.ADDRESS_MAX]u8 = undefined,
     from_len: u16 = 0,
+    from_alias_buf: [peeraddr.ALIAS_MAX]u8 = undefined,
+    from_alias_len: u8 = 0,
     sent_ms: i64 = 0,
     expired_ms: i64 = 0,
 };
@@ -648,6 +658,9 @@ const Box = struct {
         const f = @min(item.from.address.len, e.from_buf.len);
         @memcpy(e.from_buf[0..f], item.from.address[0..f]);
         e.from_len = @intCast(f);
+        const fa = @min(item.from.alias.len, e.from_alias_buf.len);
+        @memcpy(e.from_alias_buf[0..fa], item.from.alias[0..fa]);
+        e.from_alias_len = @intCast(fa);
         if (self.expired_len < EXPIRED_RING) {
             self.expired[self.expired_len] = e;
             self.expired_len += 1;
@@ -1114,6 +1127,7 @@ pub const Store = struct {
                 .outcome = .expired,
                 .reason = .not_durable_gone,
                 .to = p.address,
+                .to_alias = box.alias,
                 .queued_ms = now - s.item.sent_ms,
             }, now),
             .event => self.warnf("peer event {s} for gone {s} dropped", .{ s.item.id, p.address }),
@@ -1436,6 +1450,7 @@ pub const Store = struct {
                 try expired.append(arena, .{
                     .id = try arena.dupe(u8, e.id_buf[0..e.id_len]),
                     .from = try arena.dupe(u8, e.from_buf[0..e.from_len]),
+                    .from_alias = try arena.dupe(u8, e.from_alias_buf[0..e.from_alias_len]),
                     .sent_ms = e.sent_ms,
                     .expired_ms = e.expired_ms,
                 });
@@ -1699,9 +1714,9 @@ pub const Store = struct {
                         self.warnf("peermail: {s} lost forwarding from {s}: {s}", .{ s.item.id, old.address, @errorName(e) });
                         continue;
                     };
-                    if (res.outcome == .refused) self.notifySender(&s.item, .{ .id = s.item.id, .outcome = .refused, .reason = res.reason, .to = to, .queued_ms = now - s.item.sent_ms }, now);
+                    if (res.outcome == .refused) self.notifySender(&s.item, .{ .id = s.item.id, .outcome = .refused, .reason = res.reason, .to = to, .to_alias = old.alias, .queued_ms = now - s.item.sent_ms }, now);
                 },
-                .event => self.deliverEvent(to, .{ .id = s.item.id, .outcome = s.item.outcome, .reason = s.item.reason, .to = s.item.to, .queued_ms = s.item.queued_ms }, now),
+                .event => self.deliverEvent(to, .{ .id = s.item.id, .outcome = s.item.outcome, .reason = s.item.reason, .to = s.item.to, .to_alias = s.item.to_alias, .queued_ms = s.item.queued_ms }, now),
             }
         }
         self.dropBox(old);
@@ -2104,7 +2119,7 @@ pub const Store = struct {
         const owner = self.inAddr(&ob, r, rl.owner);
         const local = if (peeraddr.Address.parse(owner)) |o| (if (o.host) |h| self.isSelfHost(h) else true) else |_| false;
         if (self.hub or local) {
-            self.deliverEvent(owner, .{ .id = rl.id, .outcome = rl.outcome, .reason = rl.reason, .to = to, .queued_ms = rl.queued_ms }, now);
+            self.deliverEvent(owner, .{ .id = rl.id, .outcome = rl.outcome, .reason = rl.reason, .to = to, .to_alias = rl.to_alias, .queued_ms = rl.queued_ms }, now);
         } else self.warnf("peer event {s} for {s}, not a peer here, dropped", .{ rl.id, owner });
         self.answerStored(r, rl.id, .event, to, .{ .outcome = .delivered });
     }
@@ -2193,6 +2208,7 @@ pub const Store = struct {
                 .outcome = it.outcome,
                 .reason = it.reason,
                 .queued_ms = it.queued_ms,
+                .to_alias = it.to_alias,
             },
         };
         if (!self.emit.call(r.conn, .{ .relay = rl })) return false;
@@ -2592,6 +2608,7 @@ pub const Store = struct {
                 .outcome = it.outcome,
                 .reason = it.reason,
                 .to = it.to,
+                .to_alias = it.to_alias,
                 .queued_ms = it.queued_ms,
                 // Events never count against the loop cap, but a dormant
                 // owner is not woken by one either.
@@ -2620,6 +2637,16 @@ pub const Store = struct {
         self.deliverEvent(msg.from.address, ev, now);
     }
 
+    /// The alias of `address` as this side names it: its mailbox's here,
+    /// else a federated peer's as last reported; "" when none.
+    fn aliasAnywhere(self: *const Store, address: []const u8) []const u8 {
+        if (self.boxOf(address)) |b| if (!b.isRoute()) return b.alias;
+        for (self.routes.items) |r| for (r.peers) |p| {
+            if (std.mem.eql(u8, p.address, address)) return p.alias;
+        };
+        return "";
+    }
+
     /// Queue `ev` in `owner`'s own mailbox and push it when `owner` is live;
     /// an owner on another host gets it through that host's route; dropped
     /// with a warning when `owner` has no mailbox here.
@@ -2636,6 +2663,7 @@ pub const Store = struct {
             .kind = .event,
             .id = ev.id,
             .to = ev.to,
+            .to_alias = if (ev.to_alias.len > 0) ev.to_alias else self.aliasAnywhere(ev.to),
             .owner = if (remote != null) owner else "",
             .sent_ms = now,
             .outcome = ev.outcome,
@@ -2672,6 +2700,7 @@ pub const Store = struct {
         it.text = try a.dupe(u8, item.text);
         it.reply_to = if (item.reply_to) |r| try a.dupe(u8, r) else null;
         it.owner = try a.dupe(u8, item.owner);
+        it.to_alias = try a.dupe(u8, item.to_alias);
         s.item = it;
         return s;
     }
@@ -2934,6 +2963,7 @@ const Rec = struct {
         quiet: bool = false,
         results: []const RecipientResult = &.{},
         to_polls: bool = false,
+        to_alias: []const u8 = "",
     };
 
     fn init() Rec {
@@ -2954,7 +2984,7 @@ const Rec = struct {
         for (self.dead.items) |d| if (d == conn) return false;
         const g: Got = switch (out) {
             .deliver => |d| .{ .conn = conn, .kind = .deliver, .id = a.dupe(u8, d.id) catch "", .to = a.dupe(u8, d.to) catch "", .queued = d.queued, .age_ms = d.age_ms, .text = a.dupe(u8, d.text) catch "", .from = a.dupe(u8, d.from.address) catch "", .sender_state = d.sender_state, .sender_subject = a.dupe(u8, d.sender_subject) catch "", .quiet = d.quiet, .from_alias = a.dupe(u8, d.from.alias) catch "" },
-            .event => |e| .{ .conn = conn, .kind = .event, .id = a.dupe(u8, e.id) catch "", .outcome = e.outcome, .reason = e.reason, .to = a.dupe(u8, e.to) catch "", .queued_ms = e.queued_ms, .quiet = e.quiet },
+            .event => |e| .{ .conn = conn, .kind = .event, .id = a.dupe(u8, e.id) catch "", .outcome = e.outcome, .reason = e.reason, .to = a.dupe(u8, e.to) catch "", .queued_ms = e.queued_ms, .quiet = e.quiet, .to_alias = a.dupe(u8, e.to_alias) catch "" },
             .reply => |r| .{ .conn = conn, .kind = .reply, .id = a.dupe(u8, r.id) catch "", .outcome = r.outcome, .reason = r.reason, .to_state = r.to_state, .to_polls = r.to_polls, .req = r.req, .results = dupeResults(a, r.results) },
             .relay => |r| .{ .conn = conn, .kind = .relay, .id = a.dupe(u8, r.id) catch "", .relay = r.kind, .outcome = r.outcome, .reason = r.reason },
             .warn => |w| .{ .conn = conn, .kind = .warn, .text = a.dupe(u8, w) catch "" },
@@ -4463,4 +4493,43 @@ test "an inbound domain whose member has not called in waits for it, again after
     try t.expectEqual(@as(?PeerLinkWhy, null), (try net.hub.hostList(a, 0))[0].why);
     net.cut(10);
     try t.expectEqual(@as(?PeerLinkWhy, .awaiting_dial), (try net.hub.hostList(a, 10))[0].why);
+}
+
+test "what became of a message, and mail that expired while away, name the alias beside the address" {
+    var rec = Rec.init();
+    defer rec.deinit();
+    var s = try Store.init(t.allocator, .{ .ttl_ms = 1000, .emit = rec.emit() });
+    defer s.deinit();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    var zenit = regPane("3fa9c2e1");
+    zenit.alias = "zenit";
+    var qq = regPane("9c04e2d7");
+    qq.alias = "qq";
+    try s.register(1, zenit, 0);
+    try s.register(2, qq, 0);
+    s.deregister(2, 0);
+    var idb: [ID_LEN]u8 = undefined;
+    try t.expectEqual(PeerOutcome.queued, (try s.send(1, .{ .to = "qq", .text = "late" }, 100, &idb)).outcome);
+    s.deregister(1, 200);
+    s.sweep(1100);
+    // 1. The sender's expiry event names qq, its address beside it.
+    try s.register(3, zenit, 1200);
+    s.flush(3, 1200);
+    const ev = lastOf(&rec, 3, .event) orelse return error.TestUnexpectedResult;
+    try t.expectEqualStrings("p-9c04e2d7", ev.to);
+    try t.expectEqualStrings("qq", ev.to_alias);
+    // 2. qq's next server learns it expired, from zenit.
+    try s.register(4, qq, 1300);
+    const me = (try s.selfInfo(arena.allocator(), 4)).?;
+    try t.expectEqualStrings("p-3fa9c2e1", me.expired_while_away[0].from);
+    try t.expectEqualStrings("zenit", me.expired_while_away[0].from_alias);
+    // 3. Unread mail of an anon peer that leaves ends with its alias too.
+    try s.register(5, .{ .app = "cli", .alias = "temp", .slow_mail = true }, 1400);
+    try t.expectEqualStrings("temp", s.aliasOf(s.addressOf(5).?));
+    _ = try s.send(3, .{ .to = "temp", .text = "never read" }, 1500, &idb);
+    s.deregister(5, 1600);
+    const gone = lastOf(&rec, 3, .event) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(?RefuseReason, .not_durable_gone), gone.reason);
+    try t.expectEqualStrings("temp", gone.to_alias);
 }

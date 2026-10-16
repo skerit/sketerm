@@ -239,7 +239,10 @@ pub fn composePeer(arena: std.mem.Allocator, item: PeerItem) !Push {
             try w.print("\n\n{s}", .{m.text});
         },
         .event => |e| {
-            try w.print("Your peer message {s} to {s} ", .{ e.id, e.to });
+            // The recipient reads as its alias, its address beside it.
+            try w.print("Your peer message {s} to ", .{e.id});
+            try writeNamed(w, e.to_alias, e.to);
+            try w.writeAll(" ");
             if (e.outcome == .refused) {
                 try w.print("was refused there: {s}.", .{if (e.reason) |r| r.describe() else "no reason given"});
             } else if (e.reason) |r| {
@@ -251,7 +254,9 @@ pub fn composePeer(arena: std.mem.Allocator, item: PeerItem) !Push {
             } else try w.print("is {s}.", .{@tagName(e.outcome)});
         },
         .expired_away => |x| {
-            try w.print("Peer message {s} from {s} expired unread while you were away (", .{ x.id, x.from });
+            try w.print("Peer message {s} from ", .{x.id});
+            try writeNamed(w, x.from_alias, x.from);
+            try w.writeAll(" expired unread while you were away (");
             try writeAge(w, x.expired_ms - x.sent_ms);
             try w.writeAll(" after it was sent).");
         },
@@ -283,6 +288,7 @@ fn peerMeta(arena: std.mem.Allocator, item: PeerItem) !agentwait.Meta {
         .expired_away => |x| .{
             .kind = "peer_expired_away",
             .from = x.from,
+            .from_alias = nonEmpty(x.from_alias),
             .message = x.id,
             .at = try wallAt(arena, x.sent_ms),
         },
@@ -295,6 +301,12 @@ fn senderState(m: peermail.Deliver) vocab.PeerState {
 
 fn nonEmpty(s: []const u8) ?[]const u8 {
     return if (s.len > 0) s else null;
+}
+
+/// A peer as a sentence names it: its alias, its address beside it; just
+/// the address when it has no alias.
+fn writeNamed(w: *std.Io.Writer, alias: []const u8, address: []const u8) !void {
+    if (alias.len > 0) try w.print("{s} ({s})", .{ alias, address }) else try w.writeAll(address);
 }
 
 fn wallAt(arena: std.mem.Allocator, wall_ms: i64) !?[]const u8 {
@@ -495,4 +507,11 @@ test "what became of a sent message, and mail that expired while away, read as o
     const far = try composePeer(a, .{ .event = .{ .id = "m-8", .outcome = .refused, .to = "box/Nobody", .reason = .unknown_address } });
     try t.expectEqualStrings("Your peer message m-8 to box/Nobody was refused there: no peer of that address is known on that host.", far.content);
     try t.expectEqualStrings("peer_refused", far.meta.kind);
+    // Aliases lead, as in message headers: the recipient of an event, the
+    // sender of mail that expired while away; the address beside it.
+    const aliased = try composePeer(a, .{ .event = .{ .id = "m-9", .to = "p-3fa9c2e1", .to_alias = "zenit", .queued_ms = 6 * 3600_000 } });
+    try t.expectEqualStrings("Your peer message m-9 to zenit (p-3fa9c2e1) expired unread after 6 h.", aliased.content);
+    const away_aliased = try composePeer(a, .{ .expired_away = .{ .id = "m-10", .from = "p-9c04e2d7", .from_alias = "qq", .sent_ms = 1_000, .expired_ms = 1_000 + 7 * 3600_000 } });
+    try t.expectEqualStrings("Peer message m-10 from qq (p-9c04e2d7) expired unread while you were away (7 h after it was sent).", away_aliased.content);
+    try t.expectEqualStrings("qq", away_aliased.meta.from_alias.?);
 }
