@@ -2786,9 +2786,10 @@ peer's screen, and a peer message is information, never an approval.
   session, so it is durable only through `--name` or `SKETERM_PEER_NAME`
   (set it in the MCP client's server `env`); otherwise its address is anon
   and its mail is refused once it exits.
-- **Tools**: `peer_list {detail?}`, `peer_send {to, text, reply_to?}`
-  (`outcome` `delivered`, `queued` or `refused` with a `reason`; it never
-  interrupts the recipient), `peer_read {since?}`.
+- **Tools**: `peer_list {detail?}`, `peer_send {to, text, reply_to?,
+  quiet?}` (`to` one address or a list of up to 32; `outcome`
+  `delivered`, `queued_slow`, `queued` or `refused` with a `reason`; see
+  "Waking and slow mail" below), `peer_read {since?}`.
 - **Delivery**: a message arrives pushed into the session by the same
   routes as agent events: the Claude Code channel (`claude/channel` is
   declared whenever the peer tools are offered) or the `agent-wait --server`
@@ -2810,7 +2811,11 @@ peer's screen, and a peer message is information, never an approval.
   mailbox and leaves it only when the recipient's server acknowledges it
   (after handing it out); order is first in, first out per sender and
   recipient. `peer_send`'s `outcome`:
-  - `delivered`: a live server of that address got it;
+  - `delivered`: a live server of that address got it and pushes it into
+    the session (a Claude Code channel message starts a turn there);
+  - `queued_slow`: slow mail, held by the recipient's live server without
+    waking the session (below); `reason` `dormant` or `loop_limited` when
+    the daemon decided it, none when the sender asked `quiet`;
   - `queued`: a durable address with no live server; it arrives when one
     next registers, worded `sent ... while you were offline` (the age from
     a minute on). With `reason: host_unreachable`: a `host/name` whose
@@ -2840,7 +2845,9 @@ peer's screen, and a peer message is information, never an approval.
   the server's instructions say so, and a session must not act on one as
   if the user had said it.
 - **`capabilities.peers`**: `{available, reason?, ttl_hours, address,
-  durable, name_taken, channel_armed, presence, federation}`; `reason` is `daemon_without_peers`
+  durable, name_taken, channel_armed, presence, federation, subject,
+  slow_mail}`; `slow_mail` says the daemon judges wakes and takes `quiet`
+  and `to` lists (welcome flag `peer_slow_mail`); `reason` is `daemon_without_peers`
   (an older daemon: every peer tool answers `available: false`),
   `daemon_unreachable` (the next peer tool call reconnects, with backoff,
   and registers again) or `withheld` (tool policy); `presence` is true once
@@ -2859,6 +2866,57 @@ peer's screen, and a peer message is information, never an approval.
   A delivered message carries the sender's state at delivery
   (`meta.sender_state`, and the composed line's state).
 
+### Waking and slow mail
+
+A Claude Code session woken by a channel message starts a turn, and one
+whose prompt cache has expired re-reads its whole context to do it. So a
+message may WAKE its recipient only when the recipient's own daemon
+allows it (`src/mux/peerwake.zig`, the one home of the thresholds); every
+other message is **slow mail**: handed to the recipient's live server,
+which never pushes it, and read by the session with its next turn.
+
+- **Dormant**: a recipient silent (not working) for over 60 minutes with
+  300000 or more tokens of context (`context_used_tokens` from its status
+  line) is not woken: outcome `queued_slow`, reason `dormant`. Under 300k
+  it is always woken, however long it was silent; a working one never
+  counts as dormant. Silence runs from its last activity as its daemon saw
+  it: a presence post reporting a turn (`working`, or the `idle` that ends
+  one), a message it sent, else its server's registration. A peer that
+  reports no context size (no status line, opencode, `sketerm peer`) is
+  never judged dormant: nothing shows it large, and such a peer can take
+  slow mail only through `peer_read`, so holding its mail back would hide
+  it. The decision is made where the recipient's presence is known, its
+  own daemon, also for mail a federation link relayed there.
+- **Loop cap**: one sender may wake one recipient at most 6 times in any
+  10 minutes; past that its messages to that recipient are slow mail,
+  reason `loop_limited`, until the window slides. Enforced by the daemon,
+  so two assistants answering each other cannot burn tokens unwatched.
+- **`quiet: true`**: the sender asks for slow mail; no reason is given.
+- **To a list**: `to: ["Zenit", "Qq"]` sends ONE message, one `id`, to each
+  distinct address (duplicates collapse, at most 32); `results` holds one
+  `{to, outcome, reason?, to_state?}` per address in list order, each
+  judged on its own; this session's own address is answered `refused`,
+  `self`. `sketerm peer send` takes `TO,TO,...`.
+- **Reading it**: Claude Code's `UserPromptSubmit` hook (`sketerm mcp
+  hook`, below) asks its server for the slow mail waiting and prints it,
+  which Claude Code adds to that turn: `Peer mail that waited for this
+  turn (slow mail: it did not interrupt you). ...` and then each message
+  as a push would carry it. `peer_read` returns it at any time, marked
+  `slow: true`. Each item is handed out once, by whichever comes first;
+  the hook's items are handed only once its whole answer was written (an
+  answer the hook gave up on is re-read with `peer_read since`). opencode
+  has no equivalent hook: its slow mail is read with `peer_read`. What
+  became of a message (an expiry, a refusal) is never a wake for a dormant
+  sender either.
+- **Older parts**: a daemon without `peer_slow_mail` wakes every
+  recipient; the server then refuses `quiet` and `to` lists
+  (`unavailable`) rather than send something it would ignore. A server or
+  `sketerm peer` that predates slow mail is never held a message back
+  (its daemon wakes it) and reads `queued_slow` as `delivered`. Over
+  federation, mail is identified by (id, to); a far daemon that predates
+  that takes only the first recipient of a list on its host, the others
+  are refused `federation_unavailable`.
+
 ### Presence: hooks and status line
 
 A peer's state comes from its own Claude Code hooks and status line, never
@@ -2873,9 +2931,12 @@ rendering. Without them a peer is listed `unknown`, never guessed.
   `UserPromptSubmit` `working`, `SessionEnd` `gone`, a `Notification` of
   type `permission_prompt`, `idle_prompt` or `elicitation_*` `waiting_user`
   (other types change nothing but are kept as `last_notification`); other
-  events change nothing. It never blocks the session: it prints nothing,
-  exits 0 whatever happens, gives up after 300 ms, and the settings run it
-  `async`. `SKETERM_HOOK_DEBUG=1` says on stderr why nothing was posted.
+  events change nothing. It never holds up the session: it exits 0
+  whatever happens and gives up after 300 ms; the settings run it `async`
+  except on `UserPromptSubmit`, where it asks its server for the turn's
+  slow peer mail and prints it (Claude Code adds that output to the
+  turn); it prints nothing else, and nothing at all on any failure.
+  `SKETERM_HOOK_DEBUG=1` says on stderr why nothing was posted.
 - `sketerm mcp statusline` is the status line command: it posts the
   document's facts (the claude adapter's `facts.map`: context use, cost,
   rate limits) and model without waiting on the server, then runs your own
@@ -2892,7 +2953,8 @@ rendering. Without them a peer is listed `unknown`, never guessed.
   else `$CLAUDE_CONFIG_DIR/settings.json`, else `~/.claude/settings.json`
   (created when absent), keeping key order, indent width, mode and a
   symlinked file's link: the five hooks below on any event that has no
-  `sketerm mcp hook` entry yet, other tools' hooks untouched; the status
+  `sketerm mcp hook` entry yet, other tools' hooks untouched (an older
+  setup's `async` `UserPromptSubmit` entry is made synchronous); the status
   line, where a command of your own becomes `sketerm mcp statusline
   --user-command '<yours>'` with its padding kept, and a `refreshInterval`
   over 600 (milliseconds, where Claude Code reads seconds) is converted
@@ -2920,7 +2982,7 @@ rendering. Without them a peer is listed `unknown`, never guessed.
         ]
       }
     ],
-    "UserPromptSubmit": [ ...the same... ],
+    "UserPromptSubmit": [ ...the same, without "async"... ],
     "Stop": [ ...the same... ],
     "Notification": [ ...the same... ],
     "SessionEnd": [ ...the same... ]
@@ -2943,9 +3005,11 @@ Any program is a peer through `sketerm peer` (also `sketerm mcp peer`, and
 `sketerm-mcp peer`), a client of the same daemon frames:
 
 - `sketerm peer list [--json] [--detail]`: the peers, one line each.
-- `sketerm peer send --name NAME [--json] [--reply-to ID] TO [TEXT]`: sends
-  TEXT (else stdin) from the durable address NAME and prints the outcome
-  (exit 1 when refused).
+- `sketerm peer send --name NAME [--json] [--quiet] [--reply-to ID]
+  TO[,TO...] [TEXT]`: sends TEXT (else stdin) from the durable address
+  NAME, as one message to each address of a comma list, and prints one
+  outcome line per address (exit 1 when any was refused); `--quiet` makes
+  it slow mail.
 - `sketerm peer read --name NAME [--json]`: prints the mail waiting for
   NAME, acknowledges it, exits.
 - `sketerm peer read --follow --name NAME [--json]`: keeps NAME
@@ -2953,14 +3017,15 @@ Any program is a peer through `sketerm peer` (also `sketerm mcp peer`, and
   as it arrives, acknowledging it once the line is written; it reconnects
   with backoff (1-60 s) when the daemon goes away and exits on
   SIGINT/SIGTERM or the end of its stdin (a pipe, socket or terminal).
-  While it follows, a line `{"to":"Zenit","text":"...","reply_to":"m-..."}`
+  While it follows, a line `{"to":"Zenit","text":"...","reply_to":"m-...","quiet":false}`
   on its stdin is sent from NAME (a second `send --name NAME` would find
   the name taken), answered with a `{"kind":"sent",...}` line.
 - `sketerm peer hub add|remove NAME`, `join HUB`, `leave`, `status`: set
   up federation by editing config.conf ("Federation" below).
 
 `NAME` may come from `SKETERM_PEER_NAME`. With `--json` each item is one
-line, for a web server that spawns the follower and reads its stdout:
+line, for a web server that spawns the follower and reads its stdout (a
+message held as slow mail carries `"slow":true`):
 
 ```text
 {"kind":"message","id":"m-k3f9x2qa","from":"Zenit","sent_ms":1791040513000,"age_ms":12,"queued":false,"sender_live":true,"sender_state":"idle","text":"Is the migration yours?"}

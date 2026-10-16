@@ -23061,3 +23061,26 @@ dialed link takes; relays then flow as on any link (`relayFrame` picks
 hub's accept/refuse/replace, and the peermail exchange over an inbound
 link; the smoke federation stage gained section 8 (a third daemon calls
 in, mail both ways, cut by its proxy's pid, redial, delivered once).
+
+## 2026-10-16: peer wake rules, slow mail, to lists, the loop cap
+
+A peer message pushed into a Claude Code session starts a turn, and one
+whose prompt cache expired re-reads its whole context. The recipient's
+own broker now judges every message to a live peer of its host
+(`src/mux/peerwake.zig`, the one home of the thresholds; relayed mail
+included): a dormant recipient (silent over 60 min with 300k+ tokens of
+`context_used_tokens`) is not woken, and one sender wakes one recipient
+at most 6 times in 10 min. Those messages, and `peer_send quiet:true`,
+are slow mail: outcome `queued_slow` (reasons `dormant`, `loop_limited`),
+`peer_deliver`/`peer_event` `quiet`, held by the server and handed with
+the next turn by the now synchronous `UserPromptSubmit` hook (the
+waiter's end line carries it, handed only once fully written) or by
+`peer_read` (`slow: true`), once either way. `peer_send.to` takes a list
+(one id, `results` per recipient, at most 32); relays are keyed by (id,
+to). Welcome flag `peer_slow_mail` (`capabilities.peers.slow_mail`);
+`RegisterReq.slow_mail` marks clients that parse the new words, older
+ones read `delivered`. A peer without a context fact is never judged
+dormant; opencode reads slow mail with `peer_read` only. Unit tests in
+peerwake, peermail, mcp_peer, mcp_hook, mcp_setup and peer_cli; the smoke
+peer stage gained section k (a list, quiet via peer_read and via the
+hook, a dormant peer by faked facts and a 1.5 s rig silence, the cap).
