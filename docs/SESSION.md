@@ -1,5 +1,20 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-16: pane peers get an opaque address and default to the pane title
+
+A peer's address no longer comes from its pane's session name: `chooseName`
+(`src/ipc/mcp_peer.zig`) is now `--name`, `SKETERM_PEER_NAME`, then `p-` plus
+the first 8 hex digits of `$SKETERM_SESSION_ORIGIN_ID` (validated by
+`wire.validSessionOriginId`), else anon. It is durable, so a Claude restarted
+in the same pane gets its mail and subject back, and renaming the pane moves
+nothing. `peeraddr.zig` owns the `p-` prefix (`paneName`, `isPaneName`,
+`isReservedName`); explicit names in `anon-` or `p-` are skipped. Old daemons
+accept `p-` as an ordinary durable name. The GUI (`Pane.offerDefaultSubject`)
+sets a new peer's empty subject to the user-locked pane title, once per
+address. Unit tests cover the precedence; smoke-broker/smoke-mux's peer stage
+checks the pane address across a restart; smoke-agents-gui stage 5 checks it on
+the real GUI with the default subject surviving a retitle and a clear sticking.
+
 ## 2026-10-16: `sketerm mcp setup` installs the Claude Code and opencode integration
 
 `sketerm mcp setup [--user] [--config-dir DIR] [--dry-run]` (`src/ipc/mcp_setup.zig`)

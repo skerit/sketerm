@@ -2770,16 +2770,22 @@ assistants' sessions on one host can message each other. Nothing reads a
 peer's screen, and a peer message is information, never an approval.
 
 - **Address**, decided once at startup: the server's `--name` (not the
-  implied `default` of a bare `--durable`), else `$SKETERM_PEER_NAME`, else
-  the pane session it was started in (`$SKETERM_SESSION`), else none: the
-  daemon mints `anon-xxxx`. A named address is durable: mail for it waits
-  (the daemon's `peer_mail_ttl_hours`, default 6) for whichever server
-  next registers it. A name another live server holds is not merged:
-  this one gets an anon address and `name_taken`. A session in Konsole,
-  GNOME Terminal or any terminal other than sketerm has no pane session,
-  so it is durable only through `--name` or `SKETERM_PEER_NAME` (set it in
-  the MCP client's server `env`); otherwise its address is anon and its
-  mail is refused once it exits.
+  implied `default` of a bare `--durable`), else `$SKETERM_PEER_NAME`, else,
+  inside a sketerm pane, `p-` plus the first 8 hex digits of that pane
+  session's origin id (`$SKETERM_SESSION_ORIGIN_ID`, e.g. `p-3fa9c2e1`),
+  else none: the daemon mints `anon-xxxx`. The pane address is opaque on
+  purpose: it never comes from the pane's or session's name, so renaming
+  either moves nothing, and what the session works on is its subject
+  (below). `anon-` and `p-` are reserved: an explicit name in either space
+  is skipped. A named or pane address is durable: mail for it waits (the
+  daemon's `peer_mail_ttl_hours`, default 6) for whichever server next
+  registers it, so a Claude restarted in the same pane gets its waiting
+  mail and its subject back. A name another live server holds is not
+  merged: this one gets an anon address and `name_taken`. A session in
+  Konsole, GNOME Terminal or any terminal other than sketerm has no pane
+  session, so it is durable only through `--name` or `SKETERM_PEER_NAME`
+  (set it in the MCP client's server `env`); otherwise its address is anon
+  and its mail is refused once it exits.
 - **Tools**: `peer_list {detail?}`, `peer_send {to, text, reply_to?}`
   (`outcome` `delivered`, `queued` or `refused` with a `reason`; it never
   interrupts the recipient), `peer_read {since?}`.
@@ -2981,6 +2987,15 @@ characters (no newlines or tabs); anything else is refused.
 - From the sketerm GUI: the pane menu's Pane > Set Subject… names the peer
   whose process runs in that pane's process tree (insensitive when none
   does). Empty clears it.
+- By default, from the pane title: when a peer first appears in a pane's
+  session without a subject, the GUI sets the subject to the title the
+  user gave that pane (Set Pane Title…, or a titlebar double-click). Only
+  that user-set title counts, never the OSC title a program sets, and it
+  happens once per peer address: re-titling the pane later does not move
+  the subject, and a subject the user cleared is not set again. A pane
+  without a user-set title gives no default. A Claude restarted in the
+  same pane keeps its `p-` address, so it gets its stored subject back
+  and is not touched.
 
 The broker keeps the subject with the address, not the connection: a
 durable address keeps it across server restarts and daemon restarts
