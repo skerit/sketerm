@@ -17,6 +17,7 @@
 const std = @import("std");
 const c = @import("c.zig").c;
 const mcpproc = @import("smoke/mcpproc.zig");
+const muxrig = @import("smoke/muxrig.zig");
 const daemon_peers = @import("mux/daemon_peers.zig");
 const peeraddr = @import("ipc/peeraddr.zig");
 const peermail = @import("mux/peermail.zig");
@@ -300,13 +301,50 @@ fn expectNothing(m: *Mcp, arena: std.mem.Allocator, comptime what: []const u8) v
     if (items(m, arena, what).len != 0) fail(what ++ ": an item was handed out twice");
 }
 
-/// The peer_list line for `address`, or null.
+/// The peer_list line for `address`: an address, an alias, or
+/// `<via host>/<alias>` for a peer of a federated host; null when none.
 fn listed(m: *Mcp, arena: std.mem.Allocator, address: []const u8, comptime what: []const u8) ?std.json.ObjectMap {
     const r = call(m, arena, "peer_list", "{\"detail\":true}", what);
     for ((r.get("peers") orelse fail(what ++ ": no peers")).array.items) |p| {
         if (std.mem.eql(u8, str(p.object, "address", what), address)) return p.object;
+        const alias = if (p.object.get("alias")) |v| v.string else continue;
+        if (std.mem.eql(u8, alias, address)) return p.object;
+        const via = if (p.object.get("via_host")) |v| v.string else continue;
+        if (address.len == via.len + 1 + alias.len and std.mem.startsWith(u8, address, via) and address[via.len] == '/' and std.mem.endsWith(u8, address, alias)) return p.object;
     }
     return null;
+}
+
+/// The durable address a program named `name` registers (`n-`...).
+fn namedAddr(arena: std.mem.Allocator, name: []const u8) []const u8 {
+    var b: [peeraddr.NAMED_NAME_LEN]u8 = undefined;
+    return arena.dupe(u8, peeraddr.namedAddress(&b, name) orelse fail("a name without a slug")) catch fail("oom");
+}
+
+/// `host/alias` without its host.
+fn aliasPart(addr: []const u8) []const u8 {
+    return if (std.mem.lastIndexOfScalar(u8, addr, '/')) |i| addr[i + 1 ..] else addr;
+}
+
+/// What `m`'s peer_list text says, into the log (`what` tags it).
+fn printList(m: *Mcp, arena: std.mem.Allocator, comptime what: []const u8) void {
+    m.sendToolAllocated("peer_list", "{}");
+    const deadline = nowMs() + 20_000;
+    while (nowMs() < deadline) {
+        const line = arena.dupe(u8, m.recvLine(20_000)) catch fail("oom");
+        const v = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch fail(what ++ ": reply is not JSON");
+        if (v != .object) continue;
+        const id = v.object.get("id") orelse continue;
+        if (id != .integer or id.integer != m.id) continue;
+        const content = ((v.object.get("result") orelse fail(what ++ ": no result")).object.get("content") orelse fail(what ++ ": no content")).array.items;
+        std.debug.print("smoke: peers: " ++ what ++ " peer_list text:\n", .{});
+        for (content) |part| if (part.object.get("text")) |tx| {
+            var it = std.mem.splitScalar(u8, tx.string, '\n');
+            while (it.next()) |l| std.debug.print("    {s}\n", .{l});
+        };
+        return;
+    }
+    fail(what ++ ": no peer_list reply");
 }
 
 /// Poll `m`'s peer_list until `address` is offline (`gone_entirely`:
@@ -369,13 +407,13 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
     {
         var carol = stage.server("carol", null);
         carol.initialize();
-        expectStr(registered(&carol, arena, "carol"), "address", "carol", "1. carol's address");
+        expectStr(registered(&carol, arena, "carol"), "alias", "carol", "1. carol's alias");
         carol.closeStdinWait();
     }
 
     // -- a. two named servers see each other --
     // 2. alice and bob register under SKETERM_PEER_NAME: capabilities
-    //    report peers available, durable, at that address.
+    //    report peers available, durable, with that name as their alias.
     // alice's parent shell stands in for her Claude Code: the hook and
     // status line runs of section h are processes of its tree.
     const runs = std.fmt.allocPrintSentinel(arena, "{s}/runs", .{std.mem.sliceTo(&root_buf, 0)}, 0) catch fail("oom");
@@ -386,7 +424,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
     bob.initialize();
     for ([_]struct { m: *Mcp, name: []const u8 }{ .{ .m = &alice, .name = "alice" }, .{ .m = &bob, .name = "bob" } }) |s| {
         const caps = registered(s.m, arena, "2. registration");
-        expectStr(caps, "address", s.name, "2. capabilities.peers.address");
+        expectStr(caps, "alias", s.name, "2. capabilities.peers.alias");
         if (!boolOf(caps, "durable", "2.")) fail("2. a named server is not durable");
         if (boolOf(caps, "name_taken", "2.")) fail("2. a free name reads as taken");
     }
@@ -407,7 +445,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
         const it = readOne(&bob, arena, 5_000, "5. bob peer_read");
         expectStr(it, "kind", "message", "5. kind");
         expectStr(it, "id", hello_id, "5. id");
-        expectStr(it, "from", "alice", "5. from");
+        expectStr(it, "from_alias", "alice", "5. from");
         expectStr(it, "text", "hello bob, this is the body", "5. text");
         const content = str(it, "content", "5.");
         contains(content, "Peer message from alice (", "5. the composed sender line");
@@ -433,7 +471,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
     bob2.initialize();
     {
         const caps = registered(&bob2, arena, "9. bob again");
-        expectStr(caps, "address", "bob", "9. the restarted server's address");
+        expectStr(caps, "alias", "bob", "9. the restarted server's alias");
         if (boolOf(caps, "name_taken", "9.")) fail("9. the restarted server found its own old name taken");
         const it = readOne(&bob2, arena, 5_000, "9. bob2 peer_read");
         expectStr(it, "id", away_id, "9. id");
@@ -540,7 +578,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
         expectStr(ev, "kind", "event", "16. kind");
         expectStr(ev, "id", late_id, "16. id");
         expectStr(ev, "outcome", "expired", "16. outcome");
-        expectStr(ev, "to", "carol", "16. to");
+        expectStr(ev, "to", namedAddr(arena, "carol"), "16. to");
         contains(str(ev, "content", "16."), "expired unread after", "16. wording");
     }
     // 17. the next carol learns it expired while she was away.
@@ -551,7 +589,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
         const it = readOne(&carol2, arena, 5_000, "17. carol2 peer_read");
         expectStr(it, "kind", "expired_away", "17. kind");
         expectStr(it, "id", late_id, "17. id");
-        expectStr(it, "from", "alice", "17. from");
+        expectStr(it, "from", namedAddr(arena, "alice"), "17. from");
         contains(str(it, "content", "17."), "expired unread while you were away", "17. wording");
         carol2.closeStdinWait();
     }
@@ -566,7 +604,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
     dave.send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
     {
         const caps = registered(&dave, arena, "18. dave");
-        expectStr(caps, "address", "dave", "18. address");
+        expectStr(caps, "alias", "dave", "18. alias");
         if (!boolOf(caps, "channel_armed", "18.")) fail("18. the channel is not armed");
     }
     // 19. alice -> dave: a notifications/claude/channel line on dave's stdout.
@@ -665,7 +703,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
         const line = follower.recvLineOrNull(10_000) orelse fail("28. the follower printed nothing");
         const v = std.json.parseFromSliceLeaky(std.json.Value, arena, arena.dupe(u8, line) catch fail("oom"), .{}) catch fail("28. the follower's line is not JSON");
         expectStr(v.object, "kind", "message", "28. kind");
-        expectStr(v.object, "from", "alice", "28. from");
+        expectStr(v.object, "from_alias", "alice", "28. from");
         expectStr(v.object, "text", "hello web app", "28. text");
         expectStr(v.object, "sender_state", "idle", "28. sender_state");
         if (boolOf(v.object, "queued", "28.")) fail("28. a live delivery reads as queued");
@@ -692,9 +730,10 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
         expectStr(v.object, "outcome", "delivered", "31. outcome");
         sender.closeStdinWait();
         const it = readOne(&alice, arena, 5_000, "31. alice peer_read");
-        expectStr(it, "from", "webapp", "31. from");
+        expectStr(it, "from_alias", "webapp", "31. from");
         expectStr(it, "text", "reply from the web app", "31. text");
-        contains(str(it, "content", "31."), "Peer message from webapp (cli", "31. app cli");
+        contains(str(it, "content", "31."), "Peer message from webapp (n-", "31. the alias, then the n- address");
+        contains(str(it, "content", "31."), ", cli on ", "31. app cli");
     }
     std.debug.print("smoke: peers: sketerm peer follow, read and send ok\n", .{});
 
@@ -724,7 +763,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
     awaitOffline(&bob2, arena, "alice", false, "36. alice offline");
     alice = stage.serverWithTree("alice", runs.ptr);
     alice.initialize();
-    expectStr(registered(&alice, arena, "36. alice again"), "address", "alice", "36. address");
+    expectStr(registered(&alice, arena, "36. alice again"), "alias", "alice", "36. alias");
     if (!boolOf(registered(&alice, arena, "36. caps"), "subject", "36.")) fail("36. capabilities.peers.subject is false on a daemon that keeps subjects");
     awaitSubject(&bob2, arena, "alice", "template links", "36.");
     // 37. --clear in the new server's tree: gone from bob2's list.
@@ -856,17 +895,60 @@ const FedHost = struct {
         return h;
     }
 
-    fn env(self: *const FedHost, arena: std.mem.Allocator, name: [*:0]const u8) []const [2][*:0]const u8 {
+    /// Its directories, and `extra` (a peer name, a session origin id).
+    fn env(self: *const FedHost, arena: std.mem.Allocator, extra: ?[2][*:0]const u8) []const [2][*:0]const u8 {
         const out = arena.alloc([2][*:0]const u8, 4) catch fail("oom");
         out[0] = .{ "XDG_RUNTIME_DIR", self.rt.ptr };
         out[1] = .{ "XDG_STATE_HOME", self.st.ptr };
         out[2] = .{ "XDG_CONFIG_HOME", self.cfg.ptr };
-        out[3] = .{ "SKETERM_PEER_NAME", name };
+        if (extra) |kv| out[3] = kv else return out[0..3];
         return out;
     }
 
     fn server(self: *const FedHost, allocator: std.mem.Allocator, arena: std.mem.Allocator, exe: [*:0]const u8, name: [*:0]const u8) Mcp {
-        return Mcp.spawnWith(allocator, exe, .{ .extra = &.{"--no-record"}, .unset_env = &UNSET, .set_env = self.env(arena, name) });
+        return Mcp.spawnWith(allocator, exe, .{ .extra = &.{"--no-record"}, .unset_env = &UNSET, .set_env = self.env(arena, .{ "SKETERM_PEER_NAME", name }) });
+    }
+
+    /// A server started inside the session whose origin id is `origin`
+    /// (as its child would be: it names no peer, the session titles it).
+    fn sessionServer(self: *const FedHost, allocator: std.mem.Allocator, arena: std.mem.Allocator, exe: [*:0]const u8, origin: [:0]const u8) Mcp {
+        return Mcp.spawnWith(allocator, exe, .{ .extra = &.{"--no-record"}, .unset_env = &UNSET, .set_env = self.env(arena, .{ "SKETERM_SESSION_ORIGIN_ID", origin.ptr }) });
+    }
+
+    fn sock(self: *const FedHost, arena: std.mem.Allocator) []const u8 {
+        return std.fmt.allocPrint(arena, "{s}/sketerm/mux.sock", .{self.rt}) catch fail("oom");
+    }
+
+    /// Spawn a `cat` session called `name` on this daemon (a headless
+    /// session someone named, no GUI anywhere); its origin id.
+    fn spawnTitled(self: *const FedHost, allocator: std.mem.Allocator, arena: std.mem.Allocator, name: []const u8) [:0]const u8 {
+        var conn = muxclient.Conn.connectProbed(allocator, self.sock(arena)) catch fail("f9. connect to spawn a session");
+        defer conn.deinit();
+        muxrig.spawnCat("smoke-peers", allocator, &conn, name);
+        conn.sendFrame(.list, "") catch fail("f9. list send");
+        const f = conn.recvExpectFor(&.{.welcome}, 10_000) catch fail("f9. list reply");
+        defer f.deinit(allocator);
+        const List = struct { sessions: []const struct { name: []const u8 = "", origin_id: []const u8 = "" } = &.{} };
+        const l = std.json.parseFromSliceLeaky(List, arena, arena.dupe(u8, f.payload) catch fail("oom"), .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch fail("f9. list parse");
+        for (l.sessions) |s| if (std.mem.eql(u8, s.name, name)) return arena.dupeZ(u8, s.origin_id) catch fail("oom");
+        fail("f9. the spawned session is not listed");
+    }
+
+    /// Kill the session called `name` and wait until it is no longer listed.
+    fn killSession(self: *const FedHost, allocator: std.mem.Allocator, arena: std.mem.Allocator, name: []const u8) void {
+        var conn = muxclient.Conn.connectProbed(allocator, self.sock(arena)) catch fail("f9. connect to kill a session");
+        defer conn.deinit();
+        conn.sendJson(.kill, .{ .name = name }) catch fail("f9. kill send");
+        (conn.recvExpectFor(&.{.ok}, 10_000) catch fail("f9. kill ok")).deinit(allocator);
+        const deadline = nowMs() + 10_000;
+        while (nowMs() < deadline) {
+            conn.sendFrame(.list, "") catch fail("f9. list send");
+            const f = conn.recvExpectFor(&.{.welcome}, 10_000) catch fail("f9. list reply");
+            defer f.deinit(allocator);
+            if (std.mem.indexOf(u8, f.payload, std.fmt.allocPrint(arena, "\"name\":\"{s}\"", .{name}) catch fail("oom")) == null) return;
+            _ = c.usleep(100_000);
+        }
+        fail("f9. the killed session is still listed");
     }
 };
 
@@ -946,13 +1028,13 @@ const FakeSsh = struct {
 fn mailBothWays(from: *Mcp, to: *Mcp, arena: std.mem.Allocator, to_addr: []const u8, from_addr: []const u8, comptime tag: []const u8) void {
     expectStr(send(from, arena, to_addr, "ping across", tag ++ " send"), "outcome", "delivered", tag ++ " outcome");
     const it = readOne(to, arena, 10_000, tag ++ " peer_read");
-    expectStr(it, "from", from_addr, tag ++ " from");
+    expectStr(it, "from_alias", aliasPart(from_addr), tag ++ " from");
     expectStr(it, "text", "ping across", tag ++ " text");
-    contains(str(it, "content", tag), std.fmt.allocPrint(arena, "Reply with peer_send to \"{s}\"", .{from_addr}) catch fail("oom"), tag ++ " reply hint");
+    contains(str(it, "content", tag), std.fmt.allocPrint(arena, "Reply with peer_send to \"{s}\"", .{aliasPart(from_addr)}) catch fail("oom"), tag ++ " reply hint");
     const args = std.fmt.allocPrint(arena, "{{\"to\":\"{s}\",\"text\":\"pong back\",\"reply_to\":\"{s}\"}}", .{ from_addr, str(it, "id", tag) }) catch fail("oom");
     expectStr(call(to, arena, "peer_send", args, tag ++ " reply"), "outcome", "delivered", tag ++ " reply outcome");
     const back = readOne(from, arena, 10_000, tag ++ " reply peer_read");
-    expectStr(back, "from", to_addr, tag ++ " reply from");
+    expectStr(back, "from_alias", aliasPart(to_addr), tag ++ " reply from");
     expectStr(back, "reply_to", str(it, "id", tag), tag ++ " reply_to");
 }
 
@@ -971,7 +1053,7 @@ fn cutAndRestore(hub: *Mcp, far: *Mcp, arena: std.mem.Allocator, ssh: *const Fak
     if (c.unlink(ssh.down.ptr) != 0) fail(tag ++ " could not restore the link");
     const it = readOne(far, arena, 90_000, tag ++ " peer_read after the link is back");
     expectStr(it, "text", "sent while the link was down", tag ++ " text");
-    expectStr(it, "from", hub_addr, tag ++ " from");
+    expectStr(it, "from_alias", aliasPart(hub_addr), tag ++ " from");
     if (it.get("age_s") == null) fail(tag ++ " the delivery has no age");
     expectNothing(far, arena, tag ++ " delivered once");
     _ = awaitListed(hub, arena, far_addr, "up", 20_000, tag ++ " the hub lists the far peer up again");
@@ -997,8 +1079,10 @@ fn awaitListed(m: *Mcp, arena: std.mem.Allocator, address: []const u8, link: ?[]
 /// member name that left) exercise presence, mail both ways with reply
 /// routing, a cut link with mail queued in between, far refusals and TTL
 /// expiry across the link, then the member's trust rule on its socket.
-/// Last a call-in member (`peer_hub_domain`) dials the hub's inbound
+/// Then a call-in member (`peer_hub_domain`) dials the hub's inbound
 /// `[domain.cin]` and gets the same presence, mail and cut-and-redial.
+/// Last aliases across the two linked daemons, with no GUI: sessions by
+/// name, a resumed alias with its mail, and a viewer's title.
 pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
     if (!prepared) fail("prepare() must run before the federation stage");
     const started = nowMs();
@@ -1032,7 +1116,7 @@ pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
     {
         var mike = mem.server(allocator, arena, exe, "mike");
         mike.initialize();
-        expectStr(registered(&mike, arena, "f1. mike"), "address", "mike", "f1. mike's address");
+        expectStr(registered(&mike, arena, "f1. mike"), "alias", "mike", "f1. mike's alias");
         mike.closeStdinWait();
     }
     var zed = hub.server(allocator, arena, exe, "zed");
@@ -1078,7 +1162,7 @@ pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
         const ev = readOne(&zed, arena, FED_TTL_MS + daemon_peers.SWEEP_EVERY_MS + 10_000, "f6. zed's expiry event");
         if (nowMs() - sent_at < FED_TTL_MS - 500) fail("f6. the expiry came before the TTL");
         expectStr(ev, "outcome", "expired", "f6. event outcome");
-        expectStr(ev, "to", FED_DOMAIN ++ "/mike", "f6. event to");
+        expectStr(ev, "to", std.fmt.allocPrint(arena, FED_DOMAIN ++ "/{s}", .{namedAddr(arena, "mike")}) catch fail("oom"), "f6. event to");
     }
     std.debug.print("smoke: peers: federation TTL expiry reaches the sender across the link ok\n", .{});
 
@@ -1128,6 +1212,58 @@ pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
         cid.closeStdinWait();
     }
     std.debug.print("smoke: peers: federation call-in member presence, mail, cut and redial ok\n", .{});
+
+    // 9. Aliases across the federation, no GUI anywhere: a session named
+    //    zenit on each host gives its server the alias zenit on the hub
+    //    and zenit-1 on the member (the hub's is live). The member's
+    //    session ends; mail to zenit-1 waits; a NEW member session named
+    //    zenit resumes zenit-1 (not zenit-2) and gets that mail.
+    {
+        const t0 = nowMs();
+        var zh = hub.sessionServer(allocator, arena, exe, hub.spawnTitled(allocator, arena, "zenit"));
+        zh.initialize();
+        expectStr(registered(&zh, arena, "f9. the hub's zenit"), "alias", "zenit", "f9. the hub's session is zenit");
+        _ = awaitListed(&mia, arena, "zenit", "up", 20_000, "f9. the member sees the hub's zenit");
+        var zm = mem.sessionServer(allocator, arena, exe, mem.spawnTitled(allocator, arena, "zenit"));
+        zm.initialize();
+        expectStr(registered(&zm, arena, "f9. the member's zenit"), "alias", "zenit-1", "f9. the member's session is zenit-1");
+        _ = awaitListed(&zed, arena, "zenit-1", "up", 20_000, "f9. the hub sees the member's zenit-1");
+        printList(&zed, arena, "f9. on the hub, zed's");
+        zm.closeStdinWait();
+        mem.killSession(allocator, arena, "zenit");
+        awaitOffline(&zed, arena, "zenit-1", false, "f9. zenit-1 offline on the hub");
+        expectStr(send(&zed, arena, "zenit-1", "for whoever is zenit-1 next", "f9. send"), "outcome", "queued", "f9. mail to the gone zenit-1 waits");
+        var zm2 = mem.sessionServer(allocator, arena, exe, mem.spawnTitled(allocator, arena, "zenit"));
+        zm2.initialize();
+        expectStr(registered(&zm2, arena, "f9. a new member zenit"), "alias", "zenit-1", "f9. the new session resumed zenit-1");
+        expectStr(readOne(&zm2, arena, 20_000, "f9. the resumed alias's mail"), "text", "for whoever is zenit-1 next", "f9. the waiting mail moved to it");
+        printList(&zm2, arena, "f9. on the member, the resumed zenit-1's");
+        zm2.closeStdinWait();
+        // 10. A session nobody named (a minted name) has no alias until a
+        //     viewer titles it (what the GUI sends for a pane or tab title):
+        //     the server inside is then told its alias, and the title is
+        //     its subject.
+        {
+            const origin = hub.spawnTitled(allocator, arena, "s4242-1");
+            var inner = hub.sessionServer(allocator, arena, exe, origin);
+            inner.initialize();
+            expectStr(registered(&inner, arena, "f10. an untitled session"), "alias", "", "f10. an untitled session has no alias");
+            var viewer = muxclient.Conn.connectProbed(allocator, hub.sock(arena)) catch fail("f10. connect a viewer");
+            defer viewer.deinit();
+            viewer.sendJson(.attach, .{ .name = "s4242-1" }) catch fail("f10. attach");
+            (viewer.recvExpectFor(&.{.snapshot}, 10_000) catch fail("f10. attach snapshot")).deinit(allocator);
+            viewer.sendJson(.peer_subject, peermail.SubjectReq{ .title = "Qq Work" }) catch fail("f10. send the title");
+            const deadline = nowMs() + 10_000;
+            while (!std.mem.eql(u8, str(registered(&inner, arena, "f10. titled"), "alias", "f10."), "qq-work")) {
+                if (nowMs() > deadline) fail("f10. the viewer's title never became the alias");
+                _ = c.usleep(100_000);
+            }
+            awaitSubject(&zed, arena, "qq-work", "Qq Work", "f10. the title is the default subject");
+            inner.closeStdinWait();
+        }
+        zh.closeStdinWait();
+        std.debug.print("smoke: peers: federated aliases zenit / zenit-1, a new session resumes zenit-1 with its mail, a viewer's title names an untitled session ok ({d} ms)\n", .{nowMs() - t0});
+    }
 
     mia.closeStdinWait();
     zed.closeStdinWait();
