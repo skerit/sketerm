@@ -20,6 +20,7 @@ const mcpproc = @import("smoke/mcpproc.zig");
 const daemon_peers = @import("mux/daemon_peers.zig");
 const peeraddr = @import("ipc/peeraddr.zig");
 const peermail = @import("mux/peermail.zig");
+const peerwake = @import("mux/peerwake.zig");
 const muxclient = @import("mux/client.zig");
 const nowMs = @import("util/clock.zig").nowMs;
 const atomicwrite = @import("util/atomicwrite.zig");
@@ -40,6 +41,11 @@ const TTL_MS: i64 = 5_000;
 const TTL_TEXT = "5000";
 /// One sweep period plus scheduling slack past the TTL.
 const EXPIRY_BUDGET_MS: i64 = TTL_MS + daemon_peers.SWEEP_EVERY_MS + 4_000;
+/// The rig broker's dormancy silence (`peerwake.SILENCE_ENV`): short
+/// enough to wait out, long enough that no earlier step reads as dormant
+/// (none of them reports a large context anyway).
+const SILENCE_MS: i64 = 1_500;
+const SILENCE_TEXT = "1500";
 
 var root_buf: [64:0]u8 = undefined;
 var rt_buf: [80:0]u8 = undefined;
@@ -66,6 +72,7 @@ pub fn prepare() void {
     _ = c.setenv("XDG_STATE_HOME", st.ptr, 1);
     _ = c.setenv("XDG_CONFIG_HOME", cfg.ptr, 1);
     _ = c.setenv(daemon_peers.TTL_ENV, TTL_TEXT, 1);
+    _ = c.setenv(peerwake.SILENCE_ENV, SILENCE_TEXT, 1);
     prepared = true;
 }
 
@@ -742,6 +749,74 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
         follower.terminate();
     }
     std.debug.print("smoke: peers: user-set subject ok\n", .{});
+
+    // -- k. wake rules: to lists, slow mail, dormancy, the loop cap --
+    // 39. One message to a list: one id, one outcome per address, in list
+    //     order (a duplicate collapses, bob himself is refused self).
+    {
+        const r = call(&bob2, arena, "peer_send", "{\"to\":[\"alice\",\"dave\",\"alice\",\"bob\"],\"text\":\"to all of you\"}", "39. to list");
+        const results = (r.get("results") orelse fail("39. no results")).array.items;
+        if (results.len != 3) fail("39. three distinct addresses, three results");
+        expectStr(results[0].object, "to", "alice", "39. order");
+        expectStr(results[0].object, "outcome", "delivered", "39. alice");
+        expectStr(results[1].object, "outcome", "delivered", "39. dave");
+        expectStr(results[2].object, "reason", "self", "39. bob himself");
+        expectStr(readOne(&alice, arena, 5_000, "39. alice peer_read"), "id", str(r, "id", "39."), "39. the one id");
+    }
+    // 40. quiet: slow mail, held by alice's server without waking her;
+    //     peer_read hands it, marked slow.
+    {
+        const r = call(&bob2, arena, "peer_send", "{\"to\":\"alice\",\"text\":\"no hurry\",\"quiet\":true}", "40. quiet");
+        expectStr(r, "outcome", "queued_slow", "40. outcome");
+        if (r.get("reason") != null) fail("40. a quiet send names a reason");
+        const it = readOne(&alice, arena, 5_000, "40. alice peer_read");
+        expectStr(it, "text", "no hurry", "40. text");
+        if (!boolOf(it, "slow", "40.")) fail("40. slow mail is not marked slow");
+    }
+    // 41. The next turn takes it: alice's UserPromptSubmit hook prints it
+    //     (Claude Code adds that to the turn), and peer_read has nothing.
+    {
+        expectStr(call(&bob2, arena, "peer_send", "{\"to\":\"alice\",\"text\":\"for your next turn\",\"quiet\":true}", "41. quiet"), "outcome", "queued_slow", "41. outcome");
+        const r = runInTree(arena, runs, exe, std.fmt.allocPrint(arena, "'{{exe}}' mcp hook < '{s}'", .{prompt_in}) catch fail("oom"), "41. hook");
+        if (!std.mem.eql(u8, r.rc, "0")) fail("41. the hook did not exit 0");
+        contains(r.out, "Peer mail that waited for this turn (slow mail", "41. the slow mail header");
+        contains(r.out, "\n\nfor your next turn", "41. the slow mail body");
+        expectNothing(&alice, arena, "41. alice peer_read after the hook");
+        // With nothing waiting, the next turn's hook prints nothing.
+        expectSilentOk(runInTree(arena, runs, exe, std.fmt.allocPrint(arena, "'{{exe}}' mcp hook < '{s}'", .{prompt_in}) catch fail("oom"), "41. empty hook"), "41. empty hook");
+    }
+    // 42. Dormant: alice reports 350k of context and ends her turn; past
+    //     the rig's silence (SILENCE_MS) a message to her is slow mail,
+    //     reason dormant, and her next turn's hook prints it.
+    {
+        const big_in = inputFile(arena, runs, "big.json", "{\"model\":{\"display_name\":\"Opus\"},\"context_window\":{\"context_window_size\":1000000,\"used_percentage\":35,\"current_usage\":{\"input_tokens\":350000,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}");
+        _ = runInTree(arena, runs, exe, std.fmt.allocPrint(arena, "'{{exe}}' mcp statusline --user-command true < '{s}'", .{big_in}) catch fail("oom"), "42. statusline");
+        const deadline = nowMs() + 10_000;
+        while (true) {
+            const p = listed(&bob2, arena, "alice", "42.") orelse fail("42. alice not listed");
+            if (p.get("facts")) |f| if (f.object.get(peerwake.CONTEXT_FACT)) |v| if (v == .integer and v.integer == 350_000) break;
+            if (nowMs() > deadline) fail("42. alice's context never reached peer_list");
+            _ = c.usleep(50_000);
+        }
+        expectSilentOk(runInTree(arena, runs, exe, std.fmt.allocPrint(arena, "'{{exe}}' mcp hook < '{s}'", .{stop_in}) catch fail("oom"), "42. stop"), "42. stop");
+        _ = awaitState(&bob2, arena, "alice", "idle", "42. alice idle");
+        _ = c.usleep(@intCast((SILENCE_MS + 500) * 1000));
+        const r = send(&bob2, arena, "alice", "are you there", "42. send to dormant alice");
+        expectStr(r, "outcome", "queued_slow", "42. outcome");
+        expectStr(r, "reason", "dormant", "42. reason");
+        const h = runInTree(arena, runs, exe, std.fmt.allocPrint(arena, "'{{exe}}' mcp hook < '{s}'", .{prompt_in}) catch fail("oom"), "42. hook");
+        contains(h.out, "\n\nare you there", "42. the next turn gets it");
+        expectSilentOk(runInTree(arena, runs, exe, std.fmt.allocPrint(arena, "'{{exe}}' mcp hook < '{s}'", .{stop_in}) catch fail("oom"), "42. stop again"), "42. stop again");
+    }
+    // 43. The loop cap: bob already woke dave once (39); the cap's worth
+    //     of wakes is delivered, the next one is slow mail, loop_limited.
+    {
+        for (1..peerwake.LOOP_WAKES_MAX) |_| expectStr(send(&bob2, arena, "dave", "ping", "43. wake"), "outcome", "delivered", "43. under the cap");
+        const r = send(&bob2, arena, "dave", "ping", "43. past the cap");
+        expectStr(r, "outcome", "queued_slow", "43. outcome");
+        expectStr(r, "reason", "loop_limited", "43. reason");
+    }
+    std.debug.print("smoke: peers: to lists, slow mail, dormancy and the loop cap ok\n", .{});
 
     dave.closeStdinWait();
     bob2.closeStdinWait();

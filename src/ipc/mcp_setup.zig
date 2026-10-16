@@ -94,8 +94,14 @@ fn mergeHooks(arena: std.mem.Allocator, root: *std.json.ObjectMap, changes: *std
     for (std.enums.values(mcp_hook.HookEvent)) |ev| {
         const groups = (try arrayAt(arena, hooks, @tagName(ev))) orelse
             return try std.fmt.allocPrint(arena, "hooks.{s} is not a list", .{@tagName(ev)});
-        if (hasHook(groups.items)) continue;
-        try groups.append(try mcp_hook.hookGroup(arena));
+        if (ownHook(groups.items)) |h| {
+            // An older setup ran it async, so its output (the turn's slow
+            // peer mail) never reached the turn.
+            if (ev.blocking() and h.orderedRemove("async"))
+                try changes.append(arena, try std.fmt.allocPrint(arena, "the {s} hook now runs synchronously (its output is the turn's slow peer mail)", .{@tagName(ev)}));
+            continue;
+        }
+        try groups.append(try mcp_hook.hookGroup(arena, ev));
         if (added.items.len > 0) try added.appendSlice(arena, ", ");
         try added.appendSlice(arena, @tagName(ev));
     }
@@ -103,19 +109,19 @@ fn mergeHooks(arena: std.mem.Allocator, root: *std.json.ObjectMap, changes: *std
     return null;
 }
 
-/// Whether one of the hook groups `groups` already runs `sketerm mcp hook`.
-fn hasHook(groups: []const std.json.Value) bool {
-    for (groups) |g| {
-        if (g != .object) continue;
-        const list = g.object.get("hooks") orelse continue;
-        if (list != .array) continue;
-        for (list.array.items) |h| {
-            if (h != .object) continue;
+/// The hook of the groups `groups` that runs `sketerm mcp hook`, if one does.
+fn ownHook(groups: []std.json.Value) ?*std.json.ObjectMap {
+    for (groups) |*g| {
+        if (g.* != .object) continue;
+        const list = g.object.getPtr("hooks") orelse continue;
+        if (list.* != .array) continue;
+        for (list.array.items) |*h| {
+            if (h.* != .object) continue;
             const cmd = h.object.get("command") orelse continue;
-            if (cmd == .string and mcp_hook.runsSubcommand(cmd.string, mcp_hook.HOOK_SUBCOMMAND)) return true;
+            if (cmd == .string and mcp_hook.runsSubcommand(cmd.string, mcp_hook.HOOK_SUBCOMMAND)) return &h.object;
         }
     }
-    return false;
+    return null;
 }
 
 fn mergeStatusLine(arena: std.mem.Allocator, root: *std.json.ObjectMap, changes: *std.ArrayList([]const u8)) !?[]const u8 {
@@ -596,6 +602,23 @@ test "other tools' hooks are kept in place; ours is appended once per event" {
     try t.expectEqualStrings("notify-send done", stop[0].object.get("hooks").?.array.items[0].object.get("command").?.string);
     try t.expectEqualStrings(mcp_hook.HOOK_COMMAND, stop[1].object.get("hooks").?.array.items[0].object.get("command").?.string);
     try t.expectEqual(@as(usize, 1), hooks.get("SessionStart").?.array.items.len);
+    try expectNoChange(a, text);
+}
+
+test "an older setup's async UserPromptSubmit hook is made synchronous, once" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const input =
+        \\{"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "sketerm mcp hook", "async": true}]}]}}
+    ;
+    const m = try mergeSettings(a, input);
+    const changes = try changesOf(m);
+    try t.expectEqualStrings("the UserPromptSubmit hook now runs synchronously (its output is the turn's slow peer mail)", changes[0]);
+    const text = try mergedText(m);
+    const h = (try parse(a, text)).get("hooks").?.object.get("UserPromptSubmit").?.array.items[0].object.get("hooks").?.array.items[0].object;
+    try t.expect(h.get("async") == null);
+    try t.expectEqualStrings("type", h.keys()[0]);
     try expectNoChange(a, text);
 }
 

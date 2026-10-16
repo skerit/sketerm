@@ -53,6 +53,7 @@ pub const DialResult = struct {
     peers: bool = false,
     peer_federation: bool = false,
     peer_callin: bool = false,
+    peer_slow_mail: bool = false,
 };
 
 pub const Verdict = enum { federate, unsupported, failed };
@@ -90,6 +91,8 @@ pub const Link = struct {
     conn_id: u32 = 0,
     /// A queue failed inside the store's sink; dropped on the next tick.
     broken: bool = false,
+    /// The far broker reads slow mail (its welcome or hello said so).
+    far_slow: bool = false,
 };
 
 pub const Links = struct {
@@ -216,14 +219,15 @@ pub const Links = struct {
     }
 
     /// Hub: broker client `client_id` is `l`'s call-in now (its
-    /// `peer_hub_hello` already queued). @return the client id of the link
-    /// it replaces, or 0.
-    pub fn acceptCallin(self: *Links, l: *Link, client_id: u32, store: *peermail.Store, wall: i64) u32 {
+    /// `peer_hub_hello` already queued), its hello saying whether it reads
+    /// slow mail. @return the client id of the link it replaces, or 0.
+    pub fn acceptCallin(self: *Links, l: *Link, client_id: u32, far_slow: bool, store: *peermail.Store, wall: i64) u32 {
         const old: u32 = if (l.phase == .up) l.conn_id else 0;
         if (old != 0) {
             store.connGone(old, wall);
             log.warn("peer federation: {s} called in again; its older link is closed", .{l.domain});
         }
+        l.far_slow = far_slow;
         self.up(l, client_id, store, wall);
         return old;
     }
@@ -248,7 +252,7 @@ pub const Links = struct {
         l.broken = false;
         l.backoff.reset();
         log.info("peer federation: link to {s} up ({s})", .{ l.domain, @tagName(l.direction) });
-        if (self.hub) store.linkUp(l.domain, conn_id, wall);
+        if (self.hub) store.linkUp(l.domain, conn_id, l.far_slow, wall);
     }
 
     /// One pollfd per link, in link order (fd -1 when it has none now).
@@ -363,10 +367,12 @@ pub const Links = struct {
                 l.conn.?.caps.peers = res.peers;
                 l.conn.?.caps.peer_federation = res.peer_federation;
                 l.conn.?.caps.peer_callin = res.peer_callin;
+                l.conn.?.caps.peer_slow_mail = res.peer_slow_mail;
+                l.far_slow = res.peer_slow_mail;
                 const hello = if (self.hub)
-                    l.conn.?.queueJson(.peer_hub_hello, peermail.HubHello{ .host = store.host, .as = l.domain })
+                    l.conn.?.queueJson(.peer_hub_hello, peermail.HubHello{ .host = store.host, .as = l.domain, .slow_mail = true })
                 else
-                    l.conn.?.queueJson(.peer_member_hello, peermail.MemberHello{ .host = store.host });
+                    l.conn.?.queueJson(.peer_member_hello, peermail.MemberHello{ .host = store.host, .slow_mail = true });
                 hello catch return self.drop(l, store, now, wall, "the hello could not be sent");
                 if (self.hub) return self.up(l, id, store, wall);
                 l.phase = .greeting;
@@ -466,6 +472,7 @@ fn dialChild(spec: []const u8, out_fd: c_int) noreturn {
             .peers = conn.caps.peers,
             .peer_federation = conn.caps.peer_federation,
             .peer_callin = conn.caps.peer_callin,
+            .peer_slow_mail = conn.caps.peer_slow_mail,
         };
         conn_fd = conn.fd;
     } else |e| res.@"error" = @errorName(e);
@@ -566,13 +573,13 @@ test "the hub takes a call-in only from a configured inbound domain, and a newer
     try t.expectError(error.NotInbound, links.callin("box"));
     // 2. The inbound member calls in: its link is up over that client.
     const l = try links.callin("aeor");
-    try t.expectEqual(@as(u32, 0), links.acceptCallin(l, 7, &store, 100));
+    try t.expectEqual(@as(u32, 0), links.acceptCallin(l, 7, true, &store, 100));
     const hosts = try store.hostList(arena.allocator());
     try t.expectEqual(PeerLink.up, hosts[1].link);
     try t.expectEqual(@as(?PeerLinkDirection, .inbound), hosts[1].direction);
     // 3. It calls in again before the old client is gone: the new one
     // replaces it, and the old one's late hang-up changes nothing.
-    try t.expectEqual(@as(u32, 7), links.acceptCallin(l, 9, &store, 200));
+    try t.expectEqual(@as(u32, 7), links.acceptCallin(l, 9, true, &store, 200));
     links.clientGone(7);
     store.connGone(7, 210);
     try t.expectEqual(PeerLink.up, (try store.hostList(arena.allocator()))[1].link);

@@ -8,11 +8,14 @@
 //! peer with it.
 //!
 //! Neither may ever hold up its client: the hook exits 0 whatever
-//! happens, prints nothing on stdout (SessionStart and UserPromptSubmit
-//! inject a hook's stdout into Claude's context), and bounds its whole
-//! run; the status line posts without waiting on the server and then
-//! runs the user's own status command with the same stdin, passing its
-//! stdout through untouched.
+//! happens and bounds its whole run; it prints nothing on stdout
+//! (SessionStart and UserPromptSubmit inject a hook's stdout into
+//! Claude's context) except, on UserPromptSubmit, the slow peer mail its
+//! server hands this turn (`HookEvent.blocking`: the one event the
+//! settings run synchronously, so that output reaches the turn). The
+//! status line posts without waiting on the server and then runs the
+//! user's own status command with the same stdin, passing its stdout
+//! through untouched.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -68,6 +71,16 @@ pub const HookEvent = enum {
             .UserPromptSubmit => .working,
             .SessionEnd => .gone,
             .Notification => if (notification) |k| (if (k.waitsOnUser()) .waiting_user else null) else null,
+        };
+    }
+
+    /// Claude Code waits for this event's hook and adds its stdout to the
+    /// turn's context: the slow peer mail of the turn rides it. Every
+    /// other event runs `async`, never waited for.
+    pub fn blocking(self: HookEvent) bool {
+        return switch (self) {
+            .UserPromptSubmit => true,
+            .SessionStart, .Stop, .Notification, .SessionEnd => false,
         };
     }
 };
@@ -166,6 +179,19 @@ pub fn postToServers(arena: std.mem.Allocator, parent: ?c.pid_t, line: []const u
     var n: usize = 0;
     for (serversOfThisClient(arena, parent)) |e| n += @intFromBool(agentwait.postPresence(e.agent_socket, line));
     return n;
+}
+
+/// Ask every server of this process's client (`take_slow` in `line`)
+/// until `deadline_ms`: the slow peer mail they hand this turn, joined.
+/// @return "" when none answered with any (or on any failure).
+pub fn askServers(arena: std.mem.Allocator, parent: ?c.pid_t, line: []const u8, deadline_ms: i64) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (serversOfThisClient(arena, parent)) |e| {
+        const got = agentwait.askPresence(arena, e.agent_socket, line, deadline_ms) orelse continue;
+        if (out.items.len > 0) out.appendSlice(arena, "\n\n") catch return "";
+        out.appendSlice(arena, got) catch return "";
+    }
+    return out.items;
 }
 
 /// The hook's post for its stdin document; null when it is not one.
@@ -279,8 +305,10 @@ pub const HOOK_HELP =
     \\the session's presence (working, idle, waiting on its user, gone) to the
     \\sketerm MCP server that session started, found through this process's
     \\ancestry (--parent PID: the server PID started). peer_list shows it.
-    \\Prints nothing, exits 0 whatever happens, and gives up after 300 ms;
-    \\SKETERM_HOOK_DEBUG=1 says on stderr why nothing was reported.
+    \\Prints nothing (but on UserPromptSubmit the slow peer mail its server
+    \\held for this turn, which Claude Code adds to the turn), exits 0
+    \\whatever happens, and gives up after 300 ms; SKETERM_HOOK_DEBUG=1 says
+    \\on stderr why nothing was reported.
     \\--print-settings prints the hooks and statusLine settings; `sketerm mcp
     \\setup` merges them into your Claude Code settings for you.
     \\
@@ -303,7 +331,7 @@ pub fn settingsJson(arena: std.mem.Allocator) ![]const u8 {
     var hooks: std.json.ObjectMap = .empty;
     for (std.enums.values(HookEvent)) |ev| {
         var groups = std.json.Array.init(arena);
-        try groups.append(try hookGroup(arena));
+        try groups.append(try hookGroup(arena, ev));
         try hooks.put(arena, @tagName(ev), .{ .array = groups });
     }
     var root: std.json.ObjectMap = .empty;
@@ -312,13 +340,14 @@ pub fn settingsJson(arena: std.mem.Allocator) ![]const u8 {
     return std.fmt.allocPrint(arena, "{f}\n", .{std.json.fmt(std.json.Value{ .object = root }, .{ .whitespace = .indent_2 })});
 }
 
-/// One hook group (an entry of a `hooks.<event>` list) running `HOOK_COMMAND`.
-pub fn hookGroup(arena: std.mem.Allocator) !std.json.Value {
+/// One hook group (an entry of a `hooks.<event>` list) running `HOOK_COMMAND` for `ev`.
+pub fn hookGroup(arena: std.mem.Allocator, ev: HookEvent) !std.json.Value {
     var hook: std.json.ObjectMap = .empty;
     try hook.put(arena, "type", .{ .string = "command" });
     try hook.put(arena, "command", .{ .string = HOOK_COMMAND });
-    // Never blocks the session: Claude Code does not wait for it at all.
-    try hook.put(arena, "async", .{ .bool = true });
+    // Never blocks the session: Claude Code does not wait for it at all,
+    // except where its output is the point (bounded by HOOK_BUDGET_MS).
+    if (!ev.blocking()) try hook.put(arena, "async", .{ .bool = true });
     var hook_list = std.json.Array.init(arena);
     try hook_list.append(.{ .object = hook });
     var group: std.json.ObjectMap = .empty;
@@ -372,12 +401,22 @@ pub fn hookCli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         debug("no complete hook JSON on stdin within {d} ms", .{HOOK_BUDGET_MS});
         return 0;
     }
-    const p = hookPresence(arena, in.bytes) orelse {
+    var p = hookPresence(arena, in.bytes) orelse {
         debug("stdin is not a hook document (no hook_event_name)", .{});
         return 0;
     };
+    const ev = std.meta.stringToEnum(HookEvent, p.event);
+    const asks = if (ev) |e| e.blocking() else false;
+    p.take_slow = asks;
     const line = agentwait.encodePresence(arena, p) catch return 0;
-    if (postToServers(arena, o.parent, line) == 0) debug("no sketerm MCP server of this session took the {s} post", .{p.event});
+    if (!asks) {
+        if (postToServers(arena, o.parent, line) == 0) debug("no sketerm MCP server of this session took the {s} post", .{p.event});
+        return 0;
+    }
+    // The turn's slow peer mail becomes its context; anything short of a
+    // whole answer within the budget prints nothing.
+    const slow = askServers(arena, o.parent, line, deadline);
+    if (slow.len > 0) _ = fdio.writeAll(1, slow) else debug("no slow peer mail for this turn", .{});
     return 0;
 }
 
@@ -569,7 +608,7 @@ test "servers: the nearest ancestor that started one, all of its servers" {
     try t.expectEqual(@as(usize, 0), (try serverSockets(a, &entries, &.{ 41, 1 })).len);
 }
 
-test "the printed settings: every subscribed event async, the status line with its interval" {
+test "the printed settings: every subscribed event async but UserPromptSubmit, the status line with its interval" {
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -580,11 +619,54 @@ test "the printed settings: every subscribed event async, the status line with i
     for (std.enums.values(HookEvent)) |ev| {
         const h = hooks.get(@tagName(ev)).?.array.items[0].object.get("hooks").?.array.items[0].object;
         try t.expectEqualStrings(HOOK_COMMAND, h.get("command").?.string);
-        try t.expect(h.get("async").?.bool);
+        // Only the event whose stdout carries the turn's slow mail is waited for.
+        if (ev.blocking()) try t.expect(h.get("async") == null) else try t.expect(h.get("async").?.bool);
     }
+    try t.expect(HookEvent.UserPromptSubmit.blocking());
     const sl = doc.object.get("statusLine").?.object;
     try t.expectEqualStrings(STATUSLINE_COMMAND, sl.get("command").?.string);
     try t.expectEqual(@as(i64, REFRESH_INTERVAL_S), sl.get("refreshInterval").?.integer);
+}
+
+test "the hook prints the turn's slow mail from its server's end line, and nothing on any failure" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const Case = struct { reply: []const u8, want: ?[]const u8 };
+    const end_with = try agentwait.encodeEndWith(a, "presence taken", "Peer mail that waited\n\nhi");
+    const wake = "{\"type\":\"wake\",\"agent\":\"x\"}\n";
+    const cases = [_]Case{
+        // The answer: its content, newlines intact.
+        .{ .reply = end_with, .want = "Peer mail that waited\n\nhi" },
+        // Another line first: still the end line's content.
+        .{ .reply = try std.mem.concat(a, u8, &.{ wake, end_with }), .want = "Peer mail that waited\n\nhi" },
+        // A server with none, or one that predates slow mail: nothing.
+        .{ .reply = try agentwait.encodeEnd(a, "presence taken"), .want = null },
+        // Garbage, or a hangup without a whole line: nothing.
+        .{ .reply = "not json\n", .want = null },
+        .{ .reply = "{\"type\":\"end\",\"content\":\"cut sh", .want = null },
+    };
+    for (cases) |cs| {
+        var pair: [2]c_int = undefined;
+        try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair));
+        defer _ = c.close(pair[0]);
+        try t.expect(fdio.writeAll(pair[1], cs.reply));
+        _ = c.close(pair[1]);
+        const got = agentwait.readEndContent(a, pair[0], clock.nowMs() + HOOK_BUDGET_MS);
+        if (cs.want) |w| try t.expectEqualStrings(w, got.?) else try t.expect(got == null);
+    }
+    // A server that never answers: nothing, once the deadline passed.
+    {
+        var pair: [2]c_int = undefined;
+        try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair));
+        defer _ = c.close(pair[0]);
+        defer _ = c.close(pair[1]);
+        const started = clock.nowMs();
+        try t.expect(agentwait.readEndContent(a, pair[0], started + 50) == null);
+        try t.expect(clock.nowMs() - started < HOOK_BUDGET_MS);
+    }
+    // No server listening there: nothing.
+    try t.expect(agentwait.askPresence(a, "/nonexistent/sketerm-test/agents.sock", "{\"kind\":\"presence\"}\n", clock.nowMs() + 50) == null);
 }
 
 /// `runUser` into a pipe; what the command printed.

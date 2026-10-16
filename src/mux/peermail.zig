@@ -31,6 +31,7 @@ const pathz = @import("../util/pathz.zig");
 const atomicwrite = @import("../util/atomicwrite.zig");
 const readfile = @import("../util/readfile.zig");
 
+const peerwake = @import("peerwake.zig");
 pub const PeerState = vocab.PeerState;
 pub const PeerOutcome = vocab.PeerOutcome;
 pub const RefuseReason = vocab.RefuseReason;
@@ -75,6 +76,8 @@ pub const SEEN_RING: usize = 256;
 pub const PENDING_MS: i64 = 5_000;
 /// Outbound mailboxes are `<this><route>`, a name no peer address can have.
 pub const ROUTE_PREFIX = "+";
+/// Addresses one `peer_send` `to_list` may name (after duplicates collapse).
+pub const PEER_TO_MAX: usize = 32;
 
 // ---------------------------------------------------------------- wire
 
@@ -136,6 +139,12 @@ pub const RegisterReq = struct {
     /// The broker keeps it with the address, not with the connection, so
     /// a server that starts again under a durable name finds it there.
     subject: ?[]const u8 = null,
+    /// This client reads slow mail: it holds a `quiet` delivery for the
+    /// session's next turn instead of waking it, and parses the outcome
+    /// `queued_slow` and the reasons `dormant`/`loop_limited`. A client
+    /// without it gets every message as a wake and older words
+    /// (`PeerOutcome.compat`).
+    slow_mail: bool = false,
 };
 
 /// `peer_list_req` body.
@@ -212,21 +221,36 @@ pub const ListReply = struct {
     federation: PeerFederation = .off,
 };
 
-/// `peer_send` body.
+/// `peer_send` body. `to_list` (welcome `peer_slow_mail`) sends ONE
+/// message, one id, to each address, duplicates collapsed, at most
+/// `PEER_TO_MAX`; `to` is then ignored.
 pub const SendReq = struct {
     req: u32 = 0,
     to: []const u8 = "",
     text: []const u8 = "",
     reply_to: ?[]const u8 = null,
+    /// Never wake the recipient: slow mail (welcome `peer_slow_mail`).
+    quiet: bool = false,
+    to_list: []const []const u8 = &.{},
 };
 
-/// `peer_send_reply` body; `id` is empty when refused.
+/// What became of a message for one address of a `to_list`.
+pub const RecipientResult = struct {
+    to: []const u8,
+    outcome: PeerOutcome,
+    reason: ?RefuseReason = null,
+    to_state: ?PeerState = null,
+};
+
+/// `peer_send_reply` body; `id` is empty when refused. A `to_list` send
+/// answers in `results`, one per address in the list's order.
 pub const SendReply = struct {
     req: u32 = 0,
     id: []const u8 = "",
     outcome: PeerOutcome = .refused,
     reason: ?RefuseReason = null,
     to_state: ?PeerState = null,
+    results: []const RecipientResult = &.{},
 };
 
 /// `peer_ack` body: ids the server has handed to its client.
@@ -253,6 +277,9 @@ pub const Deliver = struct {
     /// The sender's user-set subject at delivery, empty = none (or a
     /// broker that predates it).
     sender_subject: []const u8 = "",
+    /// Slow mail: the server hands it with the session's next turn (or
+    /// `peer_read`) and never wakes the session with it.
+    quiet: bool = false,
 };
 
 /// `peer_event` body: what became of a message this connection sent.
@@ -263,6 +290,8 @@ pub const Event = struct {
     to: []const u8 = "",
     /// How long it waited.
     queued_ms: i64 = 0,
+    /// Slow mail, as `Deliver.quiet`: the owner is dormant.
+    quiet: bool = false,
 };
 
 /// `peer_hub_hello` body.
@@ -271,12 +300,16 @@ pub const HubHello = struct {
     host: []const u8 = "",
     /// The name the hub knows the member by (its `[domain.<name>]`).
     as: []const u8 = "",
+    /// The hub reads slow mail and keys relays by (id, to) (welcome `peer_slow_mail`).
+    slow_mail: bool = false,
 };
 
 /// `peer_member_hello` body.
 pub const MemberHello = struct {
     /// The member's host: the hub's `[domain.<host>]` with `peer_link = inbound`.
     host: []const u8 = "",
+    /// As `HubHello.slow_mail`, for the member.
+    slow_mail: bool = false,
 };
 
 /// `peer_subject` body. On a broker connection `address` names the peer
@@ -344,6 +377,9 @@ pub const Relay = struct {
     of: Item.Kind = .message,
     peers: []const PeerInfo = &.{},
     hosts: []const HostInfo = &.{},
+    /// `mail`: slow mail (`SendReq.quiet`); a far broker without
+    /// `slow_mail` ignores it and wakes the recipient.
+    quiet: bool = false,
 };
 
 /// The one rule for times on a relay: an age out, a local time back in;
@@ -407,6 +443,8 @@ pub const Item = struct {
     queued_ms: i64 = 0,
     /// An event in an outbound mailbox: the far-side address it is for.
     owner: []const u8 = "",
+    /// A message: slow mail (`Deliver.quiet`), decided when it was routed.
+    quiet: bool = false,
 
     pub const Kind = enum { message, event };
 };
@@ -463,8 +501,21 @@ const Box = struct {
         return std.mem.startsWith(u8, self.address, ROUTE_PREFIX);
     }
 
-    fn find(self: *const Box, id: []const u8, kind: Item.Kind) ?usize {
-        for (self.items.items, 0..) |s, i| if (s.item.kind == kind and std.mem.eql(u8, s.item.id, id)) return i;
+    /// Item `id` of `kind` for recipient `to` (null: any recipient).
+    fn findTo(self: *const Box, id: []const u8, kind: Item.Kind, to: ?[]const u8) ?usize {
+        for (self.items.items, 0..) |s, i| {
+            if (s.item.kind != kind or !std.mem.eql(u8, s.item.id, id)) continue;
+            if (to) |x| if (!std.mem.eql(u8, s.item.to, x)) continue;
+            return i;
+        }
+        return null;
+    }
+
+    /// A message `id` for a recipient other than `to`.
+    fn findOther(self: *const Box, id: []const u8, to: []const u8) ?usize {
+        for (self.items.items, 0..) |s, i| {
+            if (s.item.kind == .message and std.mem.eql(u8, s.item.id, id) and !std.mem.eql(u8, s.item.to, to)) return i;
+        }
         return null;
     }
 
@@ -504,6 +555,12 @@ const Peer = struct {
     model: []const u8,
     last_notification: []const u8,
     last_seen_ms: i64,
+    /// It reads slow mail (`RegisterReq.slow_mail`).
+    slow_mail: bool,
+    /// Wall ms of its last activity (`peerwake.Recipient.active_ms`).
+    active_ms: i64,
+    /// Its reported context size (`peerwake.contextOf`).
+    context_tokens: ?u64,
 };
 
 const GoneName = struct {
@@ -534,6 +591,9 @@ const Route = struct {
     arena: std.heap.ArenaAllocator,
     peers: []PeerInfo = &.{},
     hosts: []HostInfo = &.{},
+    /// The far broker reads slow mail and keys relays by (id, to) (its
+    /// welcome or hello said `slow_mail`); learned anew on every link-up.
+    far_slow: bool = false,
 
     fn isUplink(self: *const Route) bool {
         return self.name.len == 0;
@@ -546,11 +606,23 @@ const Waiter = union(enum) {
     client: struct { conn: u32, req: u32 },
     /// A link that relayed the item here: answered with `stored`.
     link: u32,
+    /// One recipient of a local `to_list` send: the `Multi` of this serial.
+    multi: u32,
 };
+
+/// A relayed item is identified by its id AND its recipient: one
+/// `to_list` message is several items under one id. The seen ring keeps
+/// the recipient as this key.
+fn toKey(to: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, to);
+}
 
 const Pending = struct {
     id_buf: [ID_LEN]u8 = undefined,
     id_len: u8 = 0,
+    /// The recipient as this side names it.
+    to_buf: [peeraddr.ADDRESS_MAX]u8 = undefined,
+    to_len: u16 = 0,
     waiter: Waiter,
     /// The route conn whose answer is awaited; it dropping answers early.
     route_conn: u32,
@@ -559,6 +631,29 @@ const Pending = struct {
     fn id(self: *const Pending) []const u8 {
         return self.id_buf[0..self.id_len];
     }
+
+    fn to(self: *const Pending) []const u8 {
+        return self.to_buf[0..self.to_len];
+    }
+
+    /// `to` null matches any recipient (an answer from a broker that
+    /// predates (id, to) keys names none).
+    fn matches(self: *const Pending, item_id: []const u8, item_to: ?[]const u8) bool {
+        if (!std.mem.eql(u8, self.id(), item_id)) return false;
+        return if (item_to) |x| std.mem.eql(u8, self.to(), x) else true;
+    }
+};
+
+/// A local `to_list` send waiting for some recipients' far answers.
+const Multi = struct {
+    serial: u32,
+    conn: u32,
+    req: u32,
+    id_buf: [ID_LEN]u8 = undefined,
+    id_len: u8 = 0,
+    arena: std.heap.ArenaAllocator,
+    results: []RecipientResult,
+    outstanding: usize,
 };
 
 /// A relayed item taken here, and the answer it got.
@@ -566,6 +661,7 @@ const Seen = struct {
     id_buf: [ID_LEN]u8 = undefined,
     id_len: u8 = 0,
     kind: Item.Kind = .message,
+    to_key: u64 = 0,
     outcome: PeerOutcome = .delivered,
     reason: ?RefuseReason = null,
 };
@@ -584,10 +680,12 @@ pub const Options = struct {
     domains: []const []const u8 = &.{},
     /// Hub only: those of `domains` whose member calls in (`peer_link = inbound`).
     inbound: []const []const u8 = &.{},
+    /// The dormancy thresholds (rigs shorten the silence).
+    wake: peerwake.Policy = .{},
     emit: Emit,
 };
 
-pub const Error = error{ NotRegistered, BadAddress, OutOfMemory, NoEntropy };
+pub const Error = error{ NotRegistered, BadAddress, OutOfMemory, NoEntropy, TooManyRecipients };
 /// A federation call on a connection that carries no link (or, for a hello,
 /// on a hub).
 pub const LinkError = Error || error{NotLinked};
@@ -611,6 +709,7 @@ const Msg = struct {
     sent_ms: i64,
     text: []const u8,
     reply_to: ?[]const u8 = null,
+    quiet: bool = false,
 };
 
 pub const Store = struct {
@@ -637,6 +736,10 @@ pub const Store = struct {
     /// Bumped whenever a peer comes, goes or changes subject: the owner
     /// re-derives what depends on the set of live peers.
     roster_gen: u32 = 0,
+    wake: peerwake.Policy = .{},
+    limiter: peerwake.Limiter = .{},
+    multis: std.ArrayList(*Multi) = .empty,
+    next_multi: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, opts: Options) error{OutOfMemory}!Store {
         const dir = if (opts.dir) |d| try allocator.dupe(u8, d) else null;
@@ -650,6 +753,7 @@ pub const Store = struct {
             .ttl_ms = opts.ttl_ms,
             .emit = opts.emit,
             .hub = opts.hub,
+            .wake = opts.wake,
         };
         if (opts.hub) for (opts.domains) |name| {
             const r = s.addRoute(name) catch |e| {
@@ -671,6 +775,9 @@ pub const Store = struct {
         for (self.boxes.items) |b| self.freeBox(b);
         self.boxes.deinit(self.allocator);
         self.pending.deinit(self.allocator);
+        for (self.multis.items) |m| freeMulti(self.allocator, m);
+        self.multis.deinit(self.allocator);
+        self.limiter.deinit(self.allocator);
         if (self.dir) |d| self.allocator.free(d);
         self.allocator.free(self.host);
         self.allocator.free(self.as_name);
@@ -739,6 +846,10 @@ pub const Store = struct {
             .pid = req.pid,
             .state = req.state,
             .last_seen_ms = now,
+            .slow_mail = req.slow_mail,
+            // A new server: its client started now, as far as we know.
+            .active_ms = now,
+            .context_tokens = null,
         };
         errdefer self.allocator.free(p.address);
         p.requested = try self.allocator.dupe(u8, req.address);
@@ -800,22 +911,92 @@ pub const Store = struct {
 
     // ------------------------------------------------------------- mail
 
+    // ------------------------------------------------------------- mail
+
     /// Accept one message from `conn`, stamping `from` and `sent_ms`; a
     /// `host/name` of another host goes to that host's route.
     /// @return error.NotRegistered when `conn` never registered.
     pub fn send(self: *Store, conn: u32, req: SendReq, now: i64, id_buf: *[ID_LEN]u8) Error!SendResult {
         const sender = self.peerOf(conn) orelse return error.NotRegistered;
+        // Sending is activity: the session is in a turn.
+        sender.active_ms = now;
         if (req.text.len > PEER_TEXT_MAX) return refused(.too_large);
-        return self.route(.{
+        return self.route(self.msgFrom(sender, req, now, null), .{ .client = .{ .conn = conn, .req = req.req } }, now, id_buf);
+    }
+
+    /// What a `to_list` send answers now.
+    pub const Many = struct {
+        /// Borrowed from the caller's `id_buf`; empty when nothing was sent.
+        id: []const u8 = "",
+        /// One per distinct address, in list order; allocated in the
+        /// caller's arena, `to` borrowed from the request.
+        results: []RecipientResult = &.{},
+        /// Some recipient waits for a far broker: the whole answer comes
+        /// later as one `Out.reply`.
+        deferred: bool = false,
+    };
+
+    /// One message from `conn` to every address of `req.to_list` under ONE
+    /// id, each recipient judged on its own (`route`); duplicates collapse.
+    /// @return error.TooManyRecipients above `PEER_TO_MAX` distinct addresses.
+    pub fn sendMany(self: *Store, arena: std.mem.Allocator, conn: u32, req: SendReq, now: i64, id_buf: *[ID_LEN]u8) Error!Many {
+        const sender = self.peerOf(conn) orelse return error.NotRegistered;
+        // Sending is activity: the session is in a turn.
+        sender.active_ms = now;
+        var tos: std.ArrayList([]const u8) = .empty;
+        for (req.to_list) |to| {
+            if (contains(tos.items, to)) continue;
+            if (tos.items.len == PEER_TO_MAX) return error.TooManyRecipients;
+            try tos.append(arena, to);
+        }
+        const results = try arena.alloc(RecipientResult, tos.items.len);
+        if (req.text.len > PEER_TEXT_MAX) {
+            for (tos.items, results) |to, *r| r.* = .{ .to = to, .outcome = .refused, .reason = .too_large };
+            return .{ .results = results };
+        }
+        const id = try mintId(id_buf);
+        self.next_multi +%= 1;
+        const serial = self.next_multi;
+        var outstanding: usize = 0;
+        var scratch: [ID_LEN]u8 = undefined;
+        for (tos.items, results) |to, *r| {
+            var one = req;
+            one.to = to;
+            const res = try self.route(self.msgFrom(sender, one, now, id), .{ .multi = serial }, now, &scratch);
+            r.* = .{ .to = to, .outcome = res.outcome, .reason = res.reason, .to_state = res.to_state };
+            outstanding += @intFromBool(res.deferred);
+        }
+        if (outstanding == 0) return .{ .id = id, .results = results };
+        const m = try self.allocator.create(Multi);
+        m.* = .{ .serial = serial, .conn = conn, .req = req.req, .arena = .init(self.allocator), .results = &.{}, .outstanding = outstanding };
+        errdefer freeMulti(self.allocator, m);
+        @memcpy(m.id_buf[0..id.len], id);
+        m.id_len = @intCast(id.len);
+        const a = m.arena.allocator();
+        m.results = try a.alloc(RecipientResult, results.len);
+        for (results, m.results) |r, *o| {
+            o.* = r;
+            o.to = try a.dupe(u8, r.to);
+        }
+        try self.multis.append(self.allocator, m);
+        return .{ .id = id, .results = results, .deferred = true };
+    }
+
+    fn msgFrom(self: *const Store, sender: *const Peer, req: SendReq, now: i64, id: ?[]const u8) Msg {
+        return .{
+            .id = id,
             .from = .{ .address = sender.address, .host = self.host, .cwd = sender.cwd, .app = sender.app, .pid = sender.pid },
             .to = req.to,
             .sent_ms = now,
             .text = req.text,
             .reply_to = req.reply_to,
-        }, .{ .client = .{ .conn = conn, .req = req.req } }, now, id_buf);
+            .quiet = req.quiet,
+        };
     }
 
-    /// Route `msg` to a local mailbox or a route's outbound one.
+    /// Route `msg` to a local mailbox or a route's outbound one. A live
+    /// recipient of this host is woken or handed slow mail by
+    /// `peerwake.judge`, here, where its presence is known.
     fn route(self: *Store, msg: Msg, waiter: Waiter, now: i64, id_buf: *[ID_LEN]u8) Error!SendResult {
         const addr = peeraddr.Address.parse(msg.to) catch return refused(.unknown_address);
         if (addr.host) |h| {
@@ -832,6 +1013,12 @@ pub const Store = struct {
         };
         if (full(box, msg.text.len)) return refused(.mailbox_full);
 
+        // A recipient that cannot hold slow mail is woken, as before.
+        const verdict: peerwake.Verdict = if (live) |l| (if (l.slow_mail) peerwake.judge(self.wake, &self.limiter, self.allocator, msg.quiet, msg.from.address, addr.name, recipientOf(l), now) else .wake) else .wake;
+        const slow = switch (verdict) {
+            .wake => false,
+            .slow => true,
+        };
         const id = msg.id orelse try mintId(id_buf);
         const s = try self.newStored(.{
             .kind = .message,
@@ -842,12 +1029,17 @@ pub const Store = struct {
             .text = msg.text,
             .reply_to = msg.reply_to,
             .queued = live == null,
+            // Mail waiting for a server keeps the sender's word.
+            .quiet = if (live != null) slow else msg.quiet,
         });
         try self.appendItem(box, s);
         if (live) |l| {
             if (self.push(l.conn, s, now)) {
                 s.delivered_to = l.conn;
-                return .{ .id = id, .outcome = .delivered, .to_state = l.state };
+                return switch (verdict) {
+                    .wake => .{ .id = id, .outcome = .delivered, .to_state = l.state },
+                    .slow => |why| .{ .id = id, .outcome = .queued_slow, .reason = why, .to_state = l.state },
+                };
             }
             return .{ .id = id, .outcome = .queued, .to_state = l.state };
         }
@@ -863,6 +1055,9 @@ pub const Store = struct {
             .up, .down => {},
         }
         if (full(r.box, msg.text.len)) return refused(.mailbox_full);
+        // A far broker that keys relays by id alone would take a second
+        // recipient of one `to_list` message as a redelivery of the first.
+        if (msg.id) |id| if (!r.far_slow and r.box.findOther(id, msg.to) != null) return refused(.federation_unavailable);
         const id = msg.id orelse try mintId(id_buf);
         const s = try self.newStored(.{
             .kind = .message,
@@ -872,10 +1067,11 @@ pub const Store = struct {
             .sent_ms = msg.sent_ms,
             .text = msg.text,
             .reply_to = msg.reply_to,
+            .quiet = msg.quiet,
         });
         try self.appendItem(r.box, s);
         if (r.conn != 0 and self.relayItem(r, s, now)) {
-            try self.addPending(id, waiter, r.conn, now);
+            try self.addPending(id, msg.to, waiter, r.conn, now);
             return .{ .id = id, .outcome = .queued, .deferred = true };
         }
         return .{ .id = id, .outcome = .queued, .reason = .host_unreachable };
@@ -1022,6 +1218,18 @@ pub const Store = struct {
         return if (self.peerOf(conn)) |p| p.address else null;
     }
 
+    /// The answer `conn` gets: in older words when its client predates
+    /// slow mail (`RegisterReq.slow_mail`), which would not parse them.
+    pub fn replyFor(self: *const Store, conn: u32, reply: SendReply) SendReply {
+        const p = self.peerOf(conn) orelse return reply;
+        if (p.slow_mail) return reply;
+        var r = reply;
+        r.outcome = r.outcome.compat();
+        r.reason = if (r.reason) |why| why.compat() else null;
+        r.results = &.{};
+        return r;
+    }
+
     /// Set (or with "" clear) the subject of `address`: a live peer of this
     /// host or a durable address (`knows`). A durable one persists it at once.
     /// @return error.UnknownAddress when it is neither.
@@ -1078,10 +1286,12 @@ pub const Store = struct {
         return out.items;
     }
 
-    /// Hub: the link to `domain` came up as connection `conn`; its
-    /// outbound mail is relayed at once.
-    pub fn linkUp(self: *Store, domain: []const u8, conn: u32, now: i64) void {
+    /// Hub: the link to `domain` came up as connection `conn`, its far
+    /// broker reading slow mail when `far_slow`; its outbound mail is
+    /// relayed at once.
+    pub fn linkUp(self: *Store, domain: []const u8, conn: u32, far_slow: bool, now: i64) void {
         const r = self.routeNamed(domain) orelse return;
+        r.far_slow = far_slow;
         self.attach(r, conn, now);
     }
 
@@ -1112,6 +1322,7 @@ pub const Store = struct {
         if (r.conn != 0 and r.conn != conn) self.detach(r, now);
         self.touchFile(r.box);
         r.direction = direction;
+        r.far_slow = hello.slow_mail;
         self.attach(r, conn, now);
     }
 
@@ -1207,9 +1418,11 @@ pub const Store = struct {
 
     fn takeMail(self: *Store, r: *Route, rl: Relay, now: i64) Error!void {
         if (!validId(rl.id)) return self.warnf("peermail: relayed mail from {s} without a valid id dropped", .{r.host});
-        if (self.seenFind(rl.id, .message)) |sn| return self.answerStored(r, rl.id, .message, .{ .outcome = sn.outcome, .reason = sn.reason });
+        var tb: [peeraddr.ADDRESS_MAX]u8 = undefined;
+        const to = self.inAddr(&tb, r, rl.to);
+        if (self.seenFind(rl.id, .message, to)) |sn| return self.answerStored(r, rl.id, .message, to, .{ .outcome = sn.outcome, .reason = sn.reason });
         // Still waiting for a third host's answer: answer this link instead.
-        if (self.pendingIndex(rl.id)) |i| {
+        if (self.pendingIndex(rl.id, to)) |i| {
             self.pending.items[i].waiter = .{ .link = r.conn };
             return;
         }
@@ -1217,43 +1430,47 @@ pub const Store = struct {
         const foreign = if (self.hub)
             std.mem.indexOfScalar(u8, rl.from.address, '/') != null
         else blk: {
-            const to = peeraddr.Address.parse(rl.to) catch break :blk false;
-            break :blk if (to.host) |h| !self.isSelfHost(h) else false;
+            const addr = peeraddr.Address.parse(rl.to) catch break :blk false;
+            break :blk if (addr.host) |h| !self.isSelfHost(h) else false;
         };
-        if (foreign) return self.answerStored(r, rl.id, .message, .{ .outcome = .refused, .reason = .unknown_address });
-        if (rl.text.len > PEER_TEXT_MAX) return self.answerStored(r, rl.id, .message, .{ .outcome = .refused, .reason = .too_large });
+        if (foreign) return self.answerStored(r, rl.id, .message, to, .{ .outcome = .refused, .reason = .unknown_address });
+        if (rl.text.len > PEER_TEXT_MAX) return self.answerStored(r, rl.id, .message, to, .{ .outcome = .refused, .reason = .too_large });
         var fb: [peeraddr.ADDRESS_MAX]u8 = undefined;
-        var tb: [peeraddr.ADDRESS_MAX]u8 = undefined;
         var idb: [ID_LEN]u8 = undefined;
         const res = try self.route(.{
             .id = rl.id,
             .from = .{ .address = self.inAddr(&fb, r, rl.from.address), .host = rl.from.host, .cwd = rl.from.cwd, .app = rl.from.app, .pid = rl.from.pid },
-            .to = self.inAddr(&tb, r, rl.to),
+            .to = to,
             .sent_ms = RelayAge.at(now, rl.age_ms),
             .text = rl.text,
             .reply_to = rl.reply_to,
+            .quiet = rl.quiet,
         }, .{ .link = r.conn }, now, &idb);
-        if (!res.deferred) self.answerStored(r, rl.id, .message, .{ .outcome = res.outcome, .reason = res.reason, .to_state = res.to_state });
+        if (!res.deferred) self.answerStored(r, rl.id, .message, to, .{ .outcome = res.outcome, .reason = res.reason, .to_state = res.to_state });
     }
 
     fn takeEvent(self: *Store, r: *Route, rl: Relay, now: i64) void {
         if (!validId(rl.id)) return self.warnf("peermail: relayed event from {s} without a valid id dropped", .{r.host});
-        if (self.seenFind(rl.id, .event)) |sn| return self.answerStored(r, rl.id, .event, .{ .outcome = sn.outcome });
-        var ob: [peeraddr.ADDRESS_MAX]u8 = undefined;
         var tb: [peeraddr.ADDRESS_MAX]u8 = undefined;
+        const to = self.inAddr(&tb, r, rl.to);
+        if (self.seenFind(rl.id, .event, to)) |sn| return self.answerStored(r, rl.id, .event, to, .{ .outcome = sn.outcome });
+        var ob: [peeraddr.ADDRESS_MAX]u8 = undefined;
         const owner = self.inAddr(&ob, r, rl.owner);
         const local = if (peeraddr.Address.parse(owner)) |o| (if (o.host) |h| self.isSelfHost(h) else true) else |_| false;
         if (self.hub or local) {
-            self.deliverEvent(owner, .{ .id = rl.id, .outcome = rl.outcome, .reason = rl.reason, .to = self.inAddr(&tb, r, rl.to), .queued_ms = rl.queued_ms }, now);
+            self.deliverEvent(owner, .{ .id = rl.id, .outcome = rl.outcome, .reason = rl.reason, .to = to, .queued_ms = rl.queued_ms }, now);
         } else self.warnf("peer event {s} for {s}, not a peer here, dropped", .{ rl.id, owner });
-        self.answerStored(r, rl.id, .event, .{ .outcome = .delivered });
+        self.answerStored(r, rl.id, .event, to, .{ .outcome = .delivered });
     }
 
     fn takeStored(self: *Store, r: *Route, rl: Relay, now: i64) void {
         const ans: Answer = .{ .outcome = rl.outcome, .reason = rl.reason, .to_state = rl.to_state };
-        const i = r.box.find(rl.id, rl.of) orelse {
+        var tb: [peeraddr.ADDRESS_MAX]u8 = undefined;
+        // A far broker that predates (id, to) keys names no recipient.
+        const to: ?[]const u8 = if (rl.to.len > 0) self.inAddr(&tb, r, rl.to) else null;
+        const i = r.box.findTo(rl.id, rl.of, to) orelse {
             // A duplicate answer, or one for an item that expired meanwhile.
-            if (rl.of == .message) if (self.takePending(rl.id)) |p| self.answer(p, ans);
+            if (rl.of == .message) if (self.takePending(rl.id, to)) |p| self.answer(p, ans);
             return;
         };
         const s = r.box.items.orderedRemove(i);
@@ -1261,7 +1478,7 @@ pub const Store = struct {
         self.compact(r.box);
         switch (rl.of) {
             .event => {},
-            .message => if (self.takePending(rl.id)) |p| {
+            .message => if (self.takePending(rl.id, s.item.to)) |p| {
                 self.answer(p, ans);
             } else if (rl.outcome == .refused) {
                 // The sender was told `queued` already: the refusal is news.
@@ -1308,6 +1525,7 @@ pub const Store = struct {
                 .age_ms = RelayAge.of(now, it.sent_ms),
                 .text = it.text,
                 .reply_to = it.reply_to,
+                .quiet = it.quiet,
             },
             .event => .{
                 .kind = .event,
@@ -1324,36 +1542,71 @@ pub const Store = struct {
         return true;
     }
 
-    /// Tell link `r` that item `id` was taken here (or refused), and
-    /// remember the answer for a redelivery.
-    fn answerStored(self: *Store, r: *Route, id: []const u8, of: Item.Kind, ans: Answer) void {
-        self.seenAdd(id, of, ans);
+    /// Tell link `r` that item `id` for `to` (as this side names it) was
+    /// taken here (or refused), and remember the answer for a redelivery.
+    /// A far broker that predates slow mail is answered in older words.
+    fn answerStored(self: *Store, r: *Route, id: []const u8, of: Item.Kind, to: []const u8, ans: Answer) void {
+        self.seenAdd(id, of, to, ans);
         if (r.conn == 0) return;
-        _ = self.emit.call(r.conn, .{ .relay = .{ .kind = .stored, .id = id, .of = of, .outcome = ans.outcome, .reason = ans.reason, .to_state = ans.to_state } });
+        var tb: [peeraddr.ADDRESS_MAX]u8 = undefined;
+        _ = self.emit.call(r.conn, .{ .relay = .{
+            .kind = .stored,
+            .id = id,
+            .of = of,
+            .to = self.outAddr(&tb, r, to),
+            .outcome = if (r.far_slow) ans.outcome else ans.outcome.compat(),
+            .reason = if (r.far_slow) ans.reason else if (ans.reason) |why| why.compat() else null,
+            .to_state = ans.to_state,
+        } });
     }
 
     fn answer(self: *Store, p: Pending, ans: Answer) void {
         switch (p.waiter) {
-            .client => |w| _ = self.emit.call(w.conn, .{ .reply = .{ .req = w.req, .id = p.id(), .outcome = ans.outcome, .reason = ans.reason, .to_state = ans.to_state } }),
-            .link => |lc| if (self.routeByConn(lc)) |o| self.answerStored(o, p.id(), .message, ans),
+            .client => |w| _ = self.emit.call(w.conn, .{ .reply = self.replyFor(w.conn, .{ .req = w.req, .id = p.id(), .outcome = ans.outcome, .reason = ans.reason, .to_state = ans.to_state }) }),
+            .link => |lc| if (self.routeByConn(lc)) |o| self.answerStored(o, p.id(), .message, p.to(), ans),
+            .multi => |serial| self.answerMulti(serial, p.to(), ans),
         }
     }
 
-    fn addPending(self: *Store, id: []const u8, waiter: Waiter, route_conn: u32, now: i64) error{OutOfMemory}!void {
+    /// One recipient of a `to_list` send was answered; the last answer
+    /// sends the whole reply.
+    fn answerMulti(self: *Store, serial: u32, to: []const u8, ans: Answer) void {
+        const mi = for (self.multis.items, 0..) |m, k| {
+            if (m.serial == serial) break k;
+        } else return;
+        const m = self.multis.items[mi];
+        for (m.results) |*r| if (std.mem.eql(u8, r.to, to) and r.outcome == .queued and r.reason == null) {
+            r.outcome = ans.outcome;
+            r.reason = ans.reason;
+            r.to_state = ans.to_state;
+            m.outstanding -|= 1;
+            break;
+        };
+        if (m.outstanding > 0) return;
+        _ = self.multis.orderedRemove(mi);
+        defer freeMulti(self.allocator, m);
+        const first = if (m.results.len > 0) m.results[0] else RecipientResult{ .to = "", .outcome = .refused };
+        _ = self.emit.call(m.conn, .{ .reply = self.replyFor(m.conn, .{ .req = m.req, .id = m.id_buf[0..m.id_len], .outcome = first.outcome, .reason = first.reason, .to_state = first.to_state, .results = m.results }) });
+    }
+
+    fn addPending(self: *Store, id: []const u8, to: []const u8, waiter: Waiter, route_conn: u32, now: i64) error{OutOfMemory}!void {
         var p = Pending{ .waiter = waiter, .route_conn = route_conn, .deadline_ms = now + PENDING_MS };
         const n = @min(id.len, ID_LEN);
         @memcpy(p.id_buf[0..n], id[0..n]);
         p.id_len = @intCast(n);
+        const tn = @min(to.len, p.to_buf.len);
+        @memcpy(p.to_buf[0..tn], to[0..tn]);
+        p.to_len = @intCast(tn);
         try self.pending.append(self.allocator, p);
     }
 
-    fn pendingIndex(self: *const Store, id: []const u8) ?usize {
-        for (self.pending.items, 0..) |*p, i| if (std.mem.eql(u8, p.id(), id)) return i;
+    fn pendingIndex(self: *const Store, id: []const u8, to: ?[]const u8) ?usize {
+        for (self.pending.items, 0..) |*p, i| if (p.matches(id, to)) return i;
         return null;
     }
 
-    fn takePending(self: *Store, id: []const u8) ?Pending {
-        const i = self.pendingIndex(id) orelse return null;
+    fn takePending(self: *Store, id: []const u8, to: ?[]const u8) ?Pending {
+        const i = self.pendingIndex(id, to) orelse return null;
         return self.pending.orderedRemove(i);
     }
 
@@ -1383,8 +1636,8 @@ pub const Store = struct {
         }
     }
 
-    fn seenAdd(self: *Store, id: []const u8, kind: Item.Kind, ans: Answer) void {
-        var e = Seen{ .kind = kind, .outcome = ans.outcome, .reason = ans.reason };
+    fn seenAdd(self: *Store, id: []const u8, kind: Item.Kind, to: []const u8, ans: Answer) void {
+        var e = Seen{ .kind = kind, .to_key = toKey(to), .outcome = ans.outcome, .reason = ans.reason };
         const n = @min(id.len, ID_LEN);
         @memcpy(e.id_buf[0..n], id[0..n]);
         e.id_len = @intCast(n);
@@ -1397,9 +1650,10 @@ pub const Store = struct {
         }
     }
 
-    fn seenFind(self: *const Store, id: []const u8, kind: Item.Kind) ?Seen {
+    fn seenFind(self: *const Store, id: []const u8, kind: Item.Kind, to: []const u8) ?Seen {
+        const key = toKey(to);
         for (self.seen[0..self.seen_len]) |e| {
-            if (e.kind == kind and std.mem.eql(u8, e.id_buf[0..e.id_len], id)) return e;
+            if (e.kind == kind and e.to_key == key and std.mem.eql(u8, e.id_buf[0..e.id_len], id)) return e;
         }
         return null;
     }
@@ -1658,6 +1912,7 @@ pub const Store = struct {
                     .sender_state = sp.state,
                     .sender_subject = sp.subject,
                     .queued = it.queued,
+                    .quiet = it.quiet,
                 } });
             },
             .event => self.emit.call(conn, .{ .event = .{
@@ -1666,6 +1921,9 @@ pub const Store = struct {
                 .reason = it.reason,
                 .to = it.to,
                 .queued_ms = it.queued_ms,
+                // Events never count against the loop cap, but a dormant
+                // owner is not woken by one either.
+                .quiet = self.dormantConn(conn, now),
             } }),
         };
     }
@@ -1678,6 +1936,12 @@ pub const Store = struct {
             if (std.mem.eql(u8, p.address, address)) return .{ .live = p.live and linkOf(r, p.link) == .up, .state = p.state, .subject = p.subject };
         };
         return .{ .live = false, .state = .gone, .subject = subject };
+    }
+
+    /// The live peer on `conn` reads slow mail and is dormant now.
+    fn dormantConn(self: *const Store, conn: u32, now: i64) bool {
+        const p = self.peerOf(conn) orelse return false;
+        return p.slow_mail and peerwake.dormant(self.wake, recipientOf(p), now);
     }
 
     fn notifySender(self: *Store, msg: *const Item, ev: Event, now: i64) void {
@@ -1760,7 +2024,10 @@ pub const Store = struct {
         p.app = app;
         p.cwd = cwd;
         p.pid = req.pid;
+        // A turn going on, starting or just ending is activity.
+        if (peerwake.working(p.state) or peerwake.working(req.state)) p.active_ms = now;
         p.state = req.state;
+        p.slow_mail = req.slow_mail;
         p.last_seen_ms = now;
         try self.setPresence(p, req);
     }
@@ -1787,6 +2054,7 @@ pub const Store = struct {
         p.facts_json = facts;
         p.model = model;
         p.last_notification = note;
+        p.context_tokens = peerwake.contextOf(req.facts);
     }
 
     fn ensureBox(self: *Store, address: []const u8, durable: bool) error{OutOfMemory}!*Box {
@@ -1884,6 +2152,16 @@ fn freeStored(allocator: std.mem.Allocator, s: *Stored) void {
     allocator.destroy(s);
 }
 
+fn freeMulti(allocator: std.mem.Allocator, m: *Multi) void {
+    m.arena.deinit();
+    allocator.destroy(m);
+}
+
+/// What `peerwake` judges of a live peer.
+fn recipientOf(p: *const Peer) peerwake.Recipient {
+    return .{ .state = p.state, .active_ms = p.active_ms, .context_tokens = p.context_tokens };
+}
+
 fn refused(reason: RefuseReason) SendResult {
     return .{ .outcome = .refused, .reason = reason };
 }
@@ -1960,6 +2238,8 @@ const Rec = struct {
         req: u32 = 0,
         relay: ?RelayKind = null,
         sender_subject: []const u8 = "",
+        quiet: bool = false,
+        results: []const RecipientResult = &.{},
     };
 
     fn init() Rec {
@@ -1979,9 +2259,9 @@ const Rec = struct {
         const a = self.arena.allocator();
         for (self.dead.items) |d| if (d == conn) return false;
         const g: Got = switch (out) {
-            .deliver => |d| .{ .conn = conn, .kind = .deliver, .id = a.dupe(u8, d.id) catch "", .to = a.dupe(u8, d.to) catch "", .queued = d.queued, .age_ms = d.age_ms, .text = a.dupe(u8, d.text) catch "", .from = a.dupe(u8, d.from.address) catch "", .sender_state = d.sender_state, .sender_subject = a.dupe(u8, d.sender_subject) catch "" },
-            .event => |e| .{ .conn = conn, .kind = .event, .id = a.dupe(u8, e.id) catch "", .outcome = e.outcome, .reason = e.reason, .to = a.dupe(u8, e.to) catch "", .queued_ms = e.queued_ms },
-            .reply => |r| .{ .conn = conn, .kind = .reply, .id = a.dupe(u8, r.id) catch "", .outcome = r.outcome, .reason = r.reason, .to_state = r.to_state, .req = r.req },
+            .deliver => |d| .{ .conn = conn, .kind = .deliver, .id = a.dupe(u8, d.id) catch "", .to = a.dupe(u8, d.to) catch "", .queued = d.queued, .age_ms = d.age_ms, .text = a.dupe(u8, d.text) catch "", .from = a.dupe(u8, d.from.address) catch "", .sender_state = d.sender_state, .sender_subject = a.dupe(u8, d.sender_subject) catch "", .quiet = d.quiet },
+            .event => |e| .{ .conn = conn, .kind = .event, .id = a.dupe(u8, e.id) catch "", .outcome = e.outcome, .reason = e.reason, .to = a.dupe(u8, e.to) catch "", .queued_ms = e.queued_ms, .quiet = e.quiet },
+            .reply => |r| .{ .conn = conn, .kind = .reply, .id = a.dupe(u8, r.id) catch "", .outcome = r.outcome, .reason = r.reason, .to_state = r.to_state, .req = r.req, .results = dupeResults(a, r.results) },
             .relay => |r| .{ .conn = conn, .kind = .relay, .id = a.dupe(u8, r.id) catch "", .relay = r.kind, .outcome = r.outcome, .reason = r.reason },
             .warn => |w| .{ .conn = conn, .kind = .warn, .text = a.dupe(u8, w) catch "" },
         };
@@ -2002,6 +2282,22 @@ const Rec = struct {
 
 fn reg(address: []const u8, durable: bool) RegisterReq {
     return .{ .address = address, .durable = durable, .app = "claude-code", .cwd = "/w", .pid = 42, .state = .idle };
+}
+
+/// A current client: it reads slow mail.
+fn regSlow(address: []const u8) RegisterReq {
+    var r = reg(address, true);
+    r.slow_mail = true;
+    return r;
+}
+
+fn dupeResults(a: std.mem.Allocator, rs: []const RecipientResult) []const RecipientResult {
+    const out = a.alloc(RecipientResult, rs.len) catch return &.{};
+    for (rs, out) |r, *o| {
+        o.* = r;
+        o.to = a.dupe(u8, r.to) catch "";
+    }
+    return out;
 }
 
 fn sendText(s: *Store, conn: u32, to: []const u8, text: []const u8, now: i64, id_buf: *[ID_LEN]u8) !SendResult {
@@ -2493,6 +2789,172 @@ test "presence: a re-registration's state, facts, model and notification reach p
     for (try s.list(a)) |p| if (std.mem.eql(u8, p.address, "carol")) try t.expect(p.facts == null);
 }
 
+test "wake rules: quiet, a dormant recipient and the loop cap become slow mail; older clients read older words" {
+    var rec = Rec.init();
+    defer rec.deinit();
+    var s = try Store.init(t.allocator, .{ .host = "h", .emit = rec.emit() });
+    defer s.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const big = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"context_used_tokens\":300000}", .{});
+    const small = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"context_used_tokens\":299999}", .{});
+    const MIN: i64 = 60_000;
+    var alice = regSlow("alice");
+    try s.register(1, alice, 0);
+    var bob = regSlow("bob");
+    try s.register(2, bob, 0);
+    var idb: [ID_LEN]u8 = undefined;
+    // 1. quiet: slow mail without a reason, the delivery marked quiet.
+    const q = try s.send(1, .{ .to = "bob", .text = "fyi", .quiet = true }, 1000, &idb);
+    try t.expectEqual(PeerOutcome.queued_slow, q.outcome);
+    try t.expectEqual(@as(?RefuseReason, null), q.reason);
+    try t.expect(rec.last().quiet);
+    // 2. bob's turn ends at 2000 with 300k of context: 61 minutes later he
+    // is dormant, 59 minutes later he is not.
+    bob.state = .working;
+    try s.register(2, bob, 1500);
+    bob.state = .idle;
+    bob.facts = big;
+    try s.register(2, bob, 2000);
+    const d = try sendText(&s, 1, "bob", "wake?", 2000 + 61 * MIN, &idb);
+    try t.expectEqual(PeerOutcome.queued_slow, d.outcome);
+    try t.expectEqual(@as(?RefuseReason, .dormant), d.reason);
+    try t.expect(rec.last().quiet);
+    try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 1, "bob", "x", 2000 + 59 * MIN, &idb)).outcome);
+    try t.expect(!rec.last().quiet);
+    // Under 300k he is always woken; working, never dormant.
+    bob.facts = small;
+    try s.register(2, bob, 2000 + 61 * MIN);
+    try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 1, "bob", "x", 2000 + 61 * MIN, &idb)).outcome);
+    bob.facts = big;
+    bob.state = .working;
+    try s.register(2, bob, 2000 + 120 * MIN);
+    try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 1, "bob", "x", 2000 + 300 * MIN, &idb)).outcome);
+    // 3. What became of a message is not a wake for a dormant sender either.
+    try s.register(5, .{ .app = "x", .slow_mail = true }, 0);
+    const anon = try a.dupe(u8, s.addressOf(5).?);
+    _ = try sendText(&s, 1, anon, "bye", 3 * 60 * MIN, &idb);
+    alice.facts = big;
+    try s.register(1, alice, 3 * 60 * MIN);
+    // Sending is activity: an hour after it she is dormant.
+    s.deregister(5, 4 * 60 * MIN + 1);
+    const ev = lastOf(&rec, 1, .event) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(?RefuseReason, .not_durable_gone), ev.reason);
+    try t.expect(ev.quiet);
+    // 4. The loop cap: carol wakes dave six times in ten minutes, the
+    // seventh is slow mail.
+    try s.register(3, regSlow("carol"), 0);
+    try s.register(4, regSlow("dave"), 0);
+    const base: i64 = 1_000_000_000;
+    for (0..peerwake.LOOP_WAKES_MAX) |i| try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 3, "dave", "ping", base + @as(i64, @intCast(i)) * 1000, &idb)).outcome);
+    const lim = try sendText(&s, 3, "dave", "ping", base + 7000, &idb);
+    try t.expectEqual(PeerOutcome.queued_slow, lim.outcome);
+    try t.expectEqual(@as(?RefuseReason, .loop_limited), lim.reason);
+    // 5. A client that predates slow mail reads delivered, never a word it
+    // cannot parse; a current one reads the real answer.
+    try s.register(6, reg("old", true), 0);
+    const word: SendReply = .{ .outcome = .queued_slow, .reason = .dormant, .results = &.{.{ .to = "x", .outcome = .queued_slow }} };
+    const old = s.replyFor(6, word);
+    try t.expectEqual(PeerOutcome.delivered, old.outcome);
+    try t.expectEqual(@as(?RefuseReason, null), old.reason);
+    try t.expectEqual(@as(usize, 0), old.results.len);
+    try t.expectEqual(PeerOutcome.queued_slow, s.replyFor(3, word).outcome);
+    // 6. A recipient whose server predates slow mail is woken, quiet or not.
+    try s.register(7, reg("legacy", true), 0);
+    try t.expectEqual(PeerOutcome.delivered, (try s.send(3, .{ .to = "legacy", .text = "q", .quiet = true }, base, &idb)).outcome);
+    try t.expect(!rec.last().quiet);
+    // 7. Quiet mail for an away durable address stays quiet when it returns.
+    s.deregister(4, base + 8000);
+    try t.expectEqual(PeerOutcome.queued, (try s.send(3, .{ .to = "dave", .text = "later", .quiet = true }, base + 9000, &idb)).outcome);
+    try s.register(8, regSlow("dave"), base + 10_000);
+    s.flush(8, base + 10_000);
+    try t.expect((lastOf(&rec, 8, .deliver) orelse return error.TestUnexpectedResult).quiet);
+}
+
+test "to_list: one id, one outcome per recipient in list order; duplicates collapse, self is refused, the cap holds" {
+    var rec = Rec.init();
+    defer rec.deinit();
+    var s = try Store.init(t.allocator, .{ .host = "h", .emit = rec.emit() });
+    defer s.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try s.register(1, regSlow("alice"), 0);
+    try s.register(2, regSlow("bob"), 0);
+    try s.register(3, regSlow("carol"), 0);
+    s.deregister(3, 0);
+    var idb: [ID_LEN]u8 = undefined;
+    // 1. A live, an away, a duplicate, oneself and an unknown address.
+    const m = try s.sendMany(a, 1, .{ .req = 4, .to_list = &.{ "bob", "carol", "bob", "alice", "nobody" }, .text = "all hands" }, 1000, &idb);
+    try t.expect(!m.deferred);
+    try t.expectEqual(@as(usize, 4), m.results.len);
+    try t.expectEqualStrings("bob", m.results[0].to);
+    try t.expectEqual(PeerOutcome.delivered, m.results[0].outcome);
+    try t.expectEqual(PeerOutcome.queued, m.results[1].outcome);
+    try t.expectEqual(@as(?RefuseReason, .self), m.results[2].reason);
+    try t.expectEqual(@as(?RefuseReason, .unknown_address), m.results[3].reason);
+    const id = try a.dupe(u8, m.id);
+    // bob got it once, carol gets it on her return, both under the one id.
+    try t.expectEqual(@as(usize, 1), rec.count(2, .deliver));
+    try t.expectEqualStrings(id, (lastOf(&rec, 2, .deliver) orelse return error.TestUnexpectedResult).id);
+    try s.register(5, regSlow("carol"), 2000);
+    s.flush(5, 2000);
+    try t.expectEqualStrings(id, (lastOf(&rec, 5, .deliver) orelse return error.TestUnexpectedResult).id);
+    // 2. quiet holds for every recipient; a text too large refuses each.
+    const q = try s.sendMany(a, 1, .{ .to_list = &.{ "bob", "carol" }, .text = "fyi", .quiet = true }, 3000, &idb);
+    for (q.results) |r| try t.expectEqual(PeerOutcome.queued_slow, r.outcome);
+    const huge = try a.alloc(u8, PEER_TEXT_MAX + 1);
+    @memset(huge, 'x');
+    const big = try s.sendMany(a, 1, .{ .to_list = &.{ "bob", "carol" }, .text = huge }, 3000, &idb);
+    for (big.results) |r| try t.expectEqual(@as(?RefuseReason, .too_large), r.reason);
+    // 3. Past the cap of distinct addresses, the whole send is refused;
+    // duplicates do not count.
+    const over = try a.alloc([]const u8, PEER_TO_MAX + 1);
+    for (over, 0..) |*o, i| o.* = try std.fmt.allocPrint(a, "p{d}", .{i});
+    try t.expectError(error.TooManyRecipients, s.sendMany(a, 1, .{ .to_list = over, .text = "x" }, 4000, &idb));
+    for (over[PEER_TO_MAX..]) |*o| o.* = "p0";
+    try t.expectEqual(PEER_TO_MAX, (try s.sendMany(a, 1, .{ .to_list = over, .text = "x" }, 4000, &idb)).results.len);
+}
+
+test "federation: one to_list message to two peers of one far host keeps one id; an older far broker takes only one" {
+    for ([_]bool{ true, false }) |slow| {
+        var net: Net = undefined;
+        try net.init(null);
+        defer net.deinit();
+        net.slow = slow;
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        try net.hub.register(1, regSlow("Zenit"), 0);
+        try net.mem.register(1, regSlow("alice"), 0);
+        try net.mem.register(2, regSlow("bob"), 0);
+        try net.connect(100);
+        try net.pump(100);
+        var idb: [ID_LEN]u8 = undefined;
+        const m = try net.hub.sendMany(a, 1, .{ .req = 9, .to_list = &.{ "box/alice", "box/bob" }, .text = "both" }, 200, &idb);
+        try t.expect(m.deferred);
+        const id = try a.dupe(u8, m.id);
+        try net.pump(200);
+        const rep = lastOf(&net.hub_rec, 1, .reply) orelse return error.TestUnexpectedResult;
+        try t.expectEqual(@as(u32, 9), rep.req);
+        try t.expectEqualStrings(id, rep.id);
+        try t.expectEqual(@as(usize, 2), rep.results.len);
+        try t.expectEqual(PeerOutcome.delivered, rep.results[0].outcome);
+        try t.expectEqualStrings(id, (lastOf(&net.mem_rec, 1, .deliver) orelse return error.TestUnexpectedResult).id);
+        if (slow) {
+            // Two items under one id, each stored and answered on its own.
+            try t.expectEqual(PeerOutcome.delivered, rep.results[1].outcome);
+            try t.expectEqualStrings(id, (lastOf(&net.mem_rec, 2, .deliver) orelse return error.TestUnexpectedResult).id);
+            try t.expectEqual(@as(usize, 0), net.hub.routeNamed("box").?.box.items.items.len);
+        } else {
+            // A far broker keying by id alone would take bob's as alice's again.
+            try t.expectEqual(@as(?RefuseReason, .federation_unavailable), rep.results[1].reason);
+            try t.expectEqual(@as(usize, 0), net.mem_rec.count(2, .deliver));
+        }
+    }
+}
+
 // ---------------------------------------------------------- federation
 
 /// The hub's connection id for its link to `box`, and the member's id for
@@ -2516,6 +2978,8 @@ const Net = struct {
     mem_direction: PeerLinkDirection = .inbound,
     queue: std.ArrayList(struct { to_hub: bool, json: []u8 }) = .empty,
     skew: i64 = 0,
+    /// Each side announces slow mail (both current); false = both predate it.
+    slow: bool = true,
 
     fn init(net: *Net, dir: ?[]const u8) !void {
         return net.initLink(dir, .outbound);
@@ -2551,8 +3015,8 @@ const Net = struct {
 
     fn connect(net: *Net, now: i64) !void {
         net.up = true;
-        try net.mem.uplinkUp(net.mem_link, .{ .host = "hub", .as = "box" }, net.mem_direction, now + net.skew);
-        net.hub.linkUp("box", net.hub_link, now);
+        try net.mem.uplinkUp(net.mem_link, .{ .host = "hub", .as = "box", .slow_mail = net.slow }, net.mem_direction, now + net.skew);
+        net.hub.linkUp("box", net.hub_link, net.slow, now);
     }
 
     /// Both ends see the link drop; the next one gets new connection ids.

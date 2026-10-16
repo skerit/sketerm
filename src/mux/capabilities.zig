@@ -143,6 +143,14 @@ pub const Flag = enum {
     /// `peer_member_hello` and gets `peer_hub_hello` back on the same
     /// connection. Absent = a call-in member lists its hub `unsupported`.
     peer_callin,
+    /// The broker judges whether a peer message may wake its recipient
+    /// (`peer_send` `quiet`, dormancy, the loop cap; `peerwake.zig`) and
+    /// hands the rest as slow mail (`peer_deliver`/`peer_event` `quiet`,
+    /// outcome `queued_slow`), takes `peer_send` `to_list` (one message to
+    /// several addresses, answered per recipient in `results`), and keys
+    /// relayed mail by (id, to). Absent = never send `quiet` or `to_list`:
+    /// every message wakes its recipient, as before.
+    peer_slow_mail,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

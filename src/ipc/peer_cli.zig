@@ -172,6 +172,8 @@ const MessageLine = struct {
     text: []const u8,
     sender_subject: ?[]const u8 = null,
     reply_to: ?[]const u8 = null,
+    /// Slow mail (it would not have woken an assistant).
+    slow: ?bool = null,
 };
 
 const EventLine = struct {
@@ -221,23 +223,50 @@ pub fn itemText(arena: std.mem.Allocator, item: agentpush.PeerItem, json: bool) 
             .text = m.text,
             .sender_subject = nonEmpty(m.sender_subject),
             .reply_to = m.reply_to,
+            .slow = if (m.quiet) true else null,
         }),
         .event => |e| jsonLine(arena, EventLine{ .id = e.id, .outcome = @tagName(e.outcome), .reason = if (e.reason) |r| @tagName(r) else null, .to = e.to, .queued_ms = e.queued_ms }),
         .expired_away => |x| jsonLine(arena, ExpiredLine{ .id = x.id, .from = x.from, .sent_ms = x.sent_ms, .expired_ms = x.expired_ms }),
     };
 }
 
+/// What a send printed: one line per recipient (a `to_list` send answers in
+/// `results`, one id for all).
 fn sentText(arena: std.mem.Allocator, from: []const u8, to: []const u8, r: peermail.SendReply, json: bool) ![]const u8 {
-    if (json) return jsonLine(arena, SentLine{
-        .id = r.id,
-        .from = from,
-        .to = to,
-        .outcome = @tagName(r.outcome),
-        .reason = if (r.reason) |why| @tagName(why) else null,
-        .to_state = if (r.to_state) |st| @tagName(st) else null,
-    });
-    if (r.reason) |why| return std.fmt.allocPrint(arena, "{s} to {s}: {s} ({s}: {s})\n", .{ if (r.id.len > 0) r.id else "message", to, @tagName(r.outcome), @tagName(why), why.describe() });
-    return std.fmt.allocPrint(arena, "{s} to {s}: {s}\n", .{ r.id, to, @tagName(r.outcome) });
+    const one = [_]peermail.RecipientResult{.{ .to = to, .outcome = r.outcome, .reason = r.reason, .to_state = r.to_state }};
+    const each: []const peermail.RecipientResult = if (r.results.len > 0) r.results else &one;
+    var out: std.ArrayList(u8) = .empty;
+    for (each) |x| {
+        const line = if (json) try jsonLine(arena, SentLine{
+            .id = r.id,
+            .from = from,
+            .to = x.to,
+            .outcome = @tagName(x.outcome),
+            .reason = if (x.reason) |why| @tagName(why) else null,
+            .to_state = if (x.to_state) |st| @tagName(st) else null,
+        }) else if (x.reason) |why|
+            try std.fmt.allocPrint(arena, "{s} to {s}: {s} ({s}: {s})\n", .{ if (r.id.len > 0) r.id else "message", x.to, @tagName(x.outcome), @tagName(why), why.describe() })
+        else
+            try std.fmt.allocPrint(arena, "{s} to {s}: {s}\n", .{ r.id, x.to, @tagName(x.outcome) });
+        try out.appendSlice(arena, line);
+    }
+    return out.items;
+}
+
+/// Whether any recipient refused the send.
+fn anyRefused(r: peermail.SendReply) bool {
+    if (r.results.len == 0) return r.outcome == .refused;
+    for (r.results) |x| if (x.outcome == .refused) return true;
+    return false;
+}
+
+/// The request for `to`: one address, or a comma-separated list (`to_list`).
+fn sendReq(arena: std.mem.Allocator, to: []const u8, text: []const u8, reply_to: ?[]const u8, quiet: bool) !peermail.SendReq {
+    if (std.mem.indexOfScalar(u8, to, ',') == null) return .{ .to = to, .text = text, .reply_to = reply_to, .quiet = quiet };
+    var list: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.tokenizeScalar(u8, to, ',');
+    while (it.next()) |a| try list.append(arena, std.mem.trim(u8, a, " "));
+    return .{ .to_list = list.items, .text = text, .reply_to = reply_to, .quiet = quiet };
 }
 
 // ── arguments ────────────────────────────────────────────────────
@@ -254,13 +283,16 @@ pub const Cli = struct {
     /// `subject --clear`.
     clear: bool = false,
     reply_to: ?[]const u8 = null,
-    /// `send`: the address, then the text (null: read from stdin).
-    /// `subject`: the text (null: print the current one).
+    /// `send --quiet`: slow mail, never waking the recipient.
+    quiet: bool = false,
+    /// `send`: the address (or a comma-separated list), then the text
+    /// (null: read from stdin). `subject`: the text (null: print the
+    /// current one).
     to: ?[]const u8 = null,
     text: ?[]const u8 = null,
     help: bool = false,
 
-    pub const ParseError = error{ UnknownFlag, MissingValue, ExtraArgument, UnknownVerb, NoName, NoAddress, BadName, NotForVerb } || peermail.SubjectError;
+    pub const ParseError = error{ UnknownFlag, MissingValue, ExtraArgument, UnknownVerb, NoName, NoAddress, BadName, NotForVerb, TooManyAddresses } || peermail.SubjectError;
 
     /// `env_name` (SKETERM_PEER_NAME) names the peer for send and read; a
     /// subject is set on another peer only by an explicit `--name`, so
@@ -280,6 +312,8 @@ pub const Cli = struct {
                 o.follow = true;
             } else if (eql(u8, a, "--detail")) {
                 o.detail = true;
+            } else if (eql(u8, a, "--quiet")) {
+                o.quiet = true;
             } else if (eql(u8, a, "--clear")) {
                 o.clear = true;
             } else if (eql(u8, a, "--name") or eql(u8, a, "--app") or eql(u8, a, "--reply-to")) {
@@ -316,7 +350,8 @@ pub const Cli = struct {
             },
         }
         if (o.follow and verb != .read) return error.NotForVerb;
-        if (o.reply_to != null and verb != .send) return error.NotForVerb;
+        if ((o.reply_to != null or o.quiet) and verb != .send) return error.NotForVerb;
+        if (verb == .send and std.mem.count(u8, o.to.?, ",") >= peermail.PEER_TO_MAX) return error.TooManyAddresses;
         if (o.clear and verb != .subject) return error.NotForVerb;
         if (verb != .list) {
             const n = o.name orelse if (verb == .subject) return o else return error.NoName;
@@ -329,7 +364,7 @@ pub const Cli = struct {
 
 pub const HELP =
     \\Usage: sketerm peer list [--json] [--detail]
-    \\       sketerm peer send --name NAME [--json] [--reply-to ID] TO [TEXT]
+    \\       sketerm peer send --name NAME [--json] [--quiet] [--reply-to ID] TO[,TO...] [TEXT]
     \\       sketerm peer read --name NAME [--json] [--follow]
     \\       sketerm peer subject [--name NAME] [TEXT | --clear]
     \\       sketerm peer hub add NAME [--host SSH_TARGET] [--inbound] [--dry-run]
@@ -342,16 +377,18 @@ pub const HELP =
     \\Takes part in peer messaging (the peer_* tools of `sketerm mcp`) from any
     \\program. NAME (or SKETERM_PEER_NAME) is the durable address this program
     \\is reached at; mail for it waits in the per-user daemon while no reader
-    \\runs. send sends TEXT (or stdin when absent) and prints what became of it;
+    \\runs. send sends TEXT (or stdin when absent) and prints what became of it,
+    \\one line per address (TO may be a comma-separated list: one message,
+    \\one id); --quiet makes it slow mail, which never wakes an assistant;
     \\read prints the messages waiting for NAME and exits; read --follow keeps
     \\NAME registered and prints each message as it arrives (acknowledged once
     \\printed), reconnecting when the daemon goes away, until SIGINT/SIGTERM or
     \\the end of its stdin (when stdin is a pipe, socket or terminal). While it
-    \\follows, each line on its stdin {"to":ADDR,"text":TEXT,"reply_to":ID?}
-    \\is sent from NAME, answered with a "sent" line. --json prints one JSON
-    \\object per line: messages {"kind":"message","id","from","sent_ms",
+    \\follows, each line on its stdin {"to":ADDR,"text":TEXT,"reply_to":ID?,
+    \\"quiet":BOOL?} is sent from NAME, answered with a "sent" line. --json
+    \\prints one JSON object per line: messages {"kind":"message","id","from","sent_ms",
     \\"age_ms","queued","sender_live","sender_state","sender_subject"?,"text",
-    \\"reply_to"?}, and "event" / "expired_away" for what became of mail.
+    \\"reply_to"?,"slow"?}, and "event" / "expired_away" for what became of mail.
     \\
     \\subject sets what a session works on, shown by peer_list, in its peer
     \\messages and on its sketerm tab: at most 200 bytes of text without
@@ -424,7 +461,8 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             error.NoName => "peer: --name NAME (or SKETERM_PEER_NAME) is required: the address this program is reached at\n",
             error.NoAddress => "peer: send needs the address to send to\n",
             error.BadName => "peer: the name must be 1-64 of A-Za-z0-9._- (no host)\n",
-            error.NotForVerb => "peer: --follow is for read, --reply-to for send, --clear for subject\n",
+            error.NotForVerb => "peer: --follow is for read, --reply-to and --quiet for send, --clear for subject\n",
+            error.TooManyAddresses => std.fmt.comptimePrint("peer: send takes at most {d} addresses\n", .{peermail.PEER_TO_MAX}),
             error.SubjectTooLong, error.SubjectNotText => {
                 _ = fail("{s}", .{peermail.subjectRefusal(@errorCast(err))});
                 return 2;
@@ -471,9 +509,10 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         .send => {
             const text = o.text orelse readAllStdin(arena) orelse return fail("could not read the text from stdin", .{});
             link.register(arena, o) catch |e| return fail("{s}", .{linkError(e)});
-            const reply = link.peer.send(arena, o.to.?, text, o.reply_to, REPLY_MS) catch return fail("the daemon did not answer the send", .{});
+            const req = sendReq(arena, o.to.?, text, o.reply_to, o.quiet) catch return 1;
+            const reply = link.peer.send(arena, req, REPLY_MS) catch |e| return fail("{s}", .{sendError(e)});
             say(1, sentText(arena, o.name.?, o.to.?, reply.value, o.json) catch return 1);
-            return if (reply.value.outcome == .refused) 1 else 0;
+            return if (anyRefused(reply.value)) 1 else 0;
         },
         .read => {
             link.register(arena, o) catch |e| return fail("{s}", .{linkError(e)});
@@ -585,7 +624,7 @@ pub const Link = struct {
     fn register(self: *Link, arena: std.mem.Allocator, o: Cli) LinkError!void {
         var cwd_buf: [4096]u8 = undefined;
         const cwd: []const u8 = if (c.getcwd(&cwd_buf, cwd_buf.len)) |p| std.mem.span(@as([*:0]u8, @ptrCast(p))) else "";
-        self.peer.register(.{ .address = o.name.?, .durable = true, .app = o.app, .cwd = cwd, .pid = @intCast(c.getpid()) }) catch return error.Unreachable;
+        self.peer.register(.{ .address = o.name.?, .durable = true, .app = o.app, .cwd = cwd, .pid = @intCast(c.getpid()), .slow_mail = true }) catch return error.Unreachable;
         const deadline = clock.nowMs() + REPLY_MS;
         while (clock.nowMs() < deadline) {
             const push = (self.peer.nextPush(arena, deadline - clock.nowMs()) catch return error.Unreachable) orelse break;
@@ -645,7 +684,12 @@ fn stdinWatched() bool {
 }
 
 /// A line a follower read on its stdin.
-const SendLine = struct { to: []const u8 = "", text: []const u8 = "", reply_to: ?[]const u8 = null };
+const SendLine = struct { to: []const u8 = "", text: []const u8 = "", reply_to: ?[]const u8 = null, quiet: bool = false };
+
+/// Why a send got no answer.
+fn sendError(e: anyerror) []const u8 {
+    return if (e == error.Unsupported) "the daemon predates slow mail and address lists (--quiet, TO,TO); restart it idle with a newer build" else "the daemon did not answer the send";
+}
 
 /// `read --follow`: until a quit signal or the end of a watched stdin.
 fn follow(allocator: std.mem.Allocator, o: Cli) u8 {
@@ -734,7 +778,11 @@ fn sendLines(arena: std.mem.Allocator, link: *Link, o: Cli, inbuf: *std.ArrayLis
             _ = fail("a stdin line names no \"to\"; skipped", .{});
             continue;
         }
-        const reply = link.peer.send(arena, line.to, line.text, line.reply_to, REPLY_MS) catch return false;
+        const reply = link.peer.send(arena, .{ .to = line.to, .text = line.text, .reply_to = line.reply_to, .quiet = line.quiet }, REPLY_MS) catch |e| {
+            if (e != error.Unsupported) return false;
+            _ = fail("{s}", .{sendError(e)});
+            continue;
+        };
         say(1, sentText(arena, o.name.?, line.to, reply.value, o.json) catch continue);
     }
     return true;
@@ -799,6 +847,28 @@ test "arguments: a name for send and read (flag or SKETERM_PEER_NAME), none for 
     try t.expectError(error.SubjectNotText, Cli.parse(&.{ "subject", "two\nlines" }, null));
     try t.expectError(error.BadName, Cli.parse(&.{ "subject", "--name", "h/w", "x" }, null));
     try t.expectError(error.NotForVerb, Cli.parse(&.{ "list", "--clear" }, null));
+}
+
+test "send: --quiet and a comma list of addresses, one line per recipient; the cap" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const o = try Cli.parse(&.{ "send", "--quiet", "--name", "w", "alice, bob", "hi" }, null);
+    try t.expect(o.quiet);
+    const req = try sendReq(a, o.to.?, o.text.?, null, o.quiet);
+    try t.expectEqual(@as(usize, 2), req.to_list.len);
+    try t.expectEqualStrings("bob", req.to_list[1]);
+    try t.expect(req.quiet);
+    try t.expectEqualStrings("alice", (try sendReq(a, "alice", "hi", null, false)).to);
+    try t.expectError(error.NotForVerb, Cli.parse(&.{ "read", "--quiet", "--name", "w" }, null));
+    var many: std.ArrayList(u8) = .empty;
+    for (0..peermail.PEER_TO_MAX + 1) |i| try many.print(a, "{s}p{d}", .{ if (i == 0) "" else ",", i });
+    try t.expectError(error.TooManyAddresses, Cli.parse(&.{ "send", "--name", "w", many.items, "hi" }, null));
+    const r: peermail.SendReply = .{ .id = "m-1", .results = &.{ .{ .to = "alice", .outcome = .queued_slow, .reason = .dormant }, .{ .to = "bob", .outcome = .refused, .reason = .unknown_address } } };
+    const text = try sentText(a, "w", "alice,bob", r, false);
+    try t.expect(std.mem.startsWith(u8, text, "m-1 to alice: queued_slow (dormant: "));
+    try t.expect(std.mem.indexOf(u8, text, "\nm-1 to bob: refused (unknown_address: ") != null);
+    try t.expect(anyRefused(r));
 }
 
 test "subject prints a confirmation, or the current subject alone" {

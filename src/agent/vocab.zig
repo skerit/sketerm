@@ -88,7 +88,8 @@ pub const PeerState = enum {
 /// What became of one peer message; `peer_send` answers with one and
 /// every later `peer_event` reuses it.
 pub const PeerOutcome = enum {
-    /// Handed to the recipient's live server.
+    /// Handed to the recipient's live server, which pushes it into the
+    /// session (a Claude Code channel message starts a turn).
     delivered,
     /// Waiting in a durable address's mailbox for its next server.
     queued,
@@ -96,11 +97,25 @@ pub const PeerOutcome = enum {
     refused,
     /// Its time-to-live passed while it waited (expiry IS the bounce).
     expired,
+    /// Slow mail: handed to the recipient's live server, which does NOT
+    /// wake the session with it; the session gets it with its next turn
+    /// (or `peer_read`). The sender asked `quiet`, or the reason says why
+    /// (`dormant`, `loop_limited`).
+    queued_slow,
+
+    /// What a client that predates `queued_slow` reads instead: such a
+    /// client fails to parse a member it does not know.
+    pub fn compat(self: PeerOutcome) PeerOutcome {
+        return switch (self) {
+            .queued_slow => .delivered,
+            .delivered, .queued, .refused, .expired => self,
+        };
+    }
 };
 
 /// Why a peer message was refused, why a queued one ended unread
 /// (`not_durable_gone`, or any refusal a far broker made of relayed mail),
-/// or (`host_unreachable`, the one `queues` reason) why it waits.
+/// or (the `queues` reasons) why it waits.
 pub const RefuseReason = enum {
     unknown_address,
     not_durable_gone,
@@ -110,6 +125,12 @@ pub const RefuseReason = enum {
     federation_unavailable,
     name_taken_ambiguous,
     host_unreachable,
+    /// `queued_slow`: the recipient is dormant (silent past the threshold
+    /// with a large context), so waking it would re-read its whole context.
+    dormant,
+    /// `queued_slow`: this sender already woke this recipient the maximum
+    /// number of times in the loop window.
+    loop_limited,
 
     /// The sentence a sender reads.
     pub fn describe(self: RefuseReason) []const u8 {
@@ -122,15 +143,26 @@ pub const RefuseReason = enum {
             .federation_unavailable => "host/name addresses need federation, which this daemon (or that host's) does not offer",
             .name_taken_ambiguous => "that name's owner is offline while another live server claims it",
             .host_unreachable => "the link to that host is down; the message waits on this side until it is back",
+            .dormant => "that session has been silent for a long time with a large context; it is not woken, and reads this when its user next talks to it",
+            .loop_limited => "you already woke that session the maximum number of times recently; it reads this with its next turn",
         };
     }
 
-    /// Whether this reason comes with `queued` (the message waits) rather
-    /// than with `refused` or an ended message.
+    /// Whether this reason comes with a non-refused outcome (the message
+    /// waits: `queued` or `queued_slow`) rather than with `refused` or an
+    /// ended message.
     pub fn queues(self: RefuseReason) bool {
         return switch (self) {
-            .host_unreachable => true,
+            .host_unreachable, .dormant, .loop_limited => true,
             .unknown_address, .not_durable_gone, .too_large, .mailbox_full, .self, .federation_unavailable, .name_taken_ambiguous => false,
+        };
+    }
+
+    /// What a client that predates slow mail reads instead (null: no reason).
+    pub fn compat(self: RefuseReason) ?RefuseReason {
+        return switch (self) {
+            .dormant, .loop_limited => null,
+            .unknown_address, .not_durable_gone, .too_large, .mailbox_full, .self, .federation_unavailable, .name_taken_ambiguous, .host_unreachable => self,
         };
     }
 };
@@ -496,9 +528,13 @@ test "peer vocabulary: every state ranked except unknown, every reason described
     for (std.enums.values(RefuseReason)) |r| try t.expect(r.describe().len > 0);
     for (std.enums.values(PeerUnavailable)) |r| try t.expect(r.describe().len > 0);
     try t.expectEqualStrings("waiting_user", names(PeerState)[3]);
-    try t.expectEqual(@as(usize, 4), names(PeerOutcome).len);
+    try t.expectEqual(@as(usize, 5), names(PeerOutcome).len);
     try t.expect(RefuseReason.host_unreachable.queues());
+    try t.expect(RefuseReason.dormant.queues() and RefuseReason.loop_limited.queues());
     try t.expect(!RefuseReason.unknown_address.queues());
+    // An old client never sees a member it predates.
+    for (std.enums.values(PeerOutcome)) |o| try t.expect(o.compat() != .queued_slow);
+    for (std.enums.values(RefuseReason)) |r| if (r.compat()) |x| try t.expect(x != .dormant and x != .loop_limited);
     try t.expectEqualStrings("unsupported", names(PeerLink)[2]);
     try t.expectEqualStrings("member", names(PeerFederation)[1]);
     try t.expectEqualStrings("inbound", names(PeerLinkDirection)[1]);

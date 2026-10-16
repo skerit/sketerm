@@ -20,6 +20,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const log = @import("log.zig");
 const peermail = @import("peermail.zig");
+const peerwake = @import("peerwake.zig");
 const peerlink = @import("peerlink.zig");
 const daemon_control = @import("daemon_control.zig");
 const platform = @import("../util/platform.zig");
@@ -136,7 +137,7 @@ pub fn handleRegister(d: *Daemon, cl: *Client, payload: []const u8) void {
     const now = clock.wallMs();
     s.register(cl.id, parsed.value, now) catch |e| return cl.queueErrFor(switch (e) {
         error.BadAddress => "peer_register: the address is not a peer name (1-64 of A-Za-z0-9._-, no host)",
-        error.NotRegistered, error.OutOfMemory, error.NoEntropy => "peer_register failed on the broker",
+        error.NotRegistered, error.OutOfMemory, error.NoEntropy, error.TooManyRecipients => "peer_register failed on the broker",
     }, "peer_register");
     queueList(d, s, cl, 0);
     s.flush(cl.id, now);
@@ -152,25 +153,42 @@ pub fn handleListReq(d: *Daemon, cl: *Client, payload: []const u8) void {
 }
 
 /// `peer_send`: the broker stamps `from` and `sent_ms` and answers the
-/// outcome with `peer_send_reply`, echoing `req`.
+/// outcome with `peer_send_reply`, echoing `req` (one `results` entry per
+/// address of a `to_list`).
 pub fn handleSend(d: *Daemon, cl: *Client, payload: []const u8) void {
     const s = storeFor(d, cl, "peer_send") orelse return;
     var parsed = std.json.parseFromSlice(peermail.SendReq, d.allocator, payload, .{ .ignore_unknown_fields = true }) catch
         return cl.queueErrFor("bad peer_send request", "peer_send");
     defer parsed.deinit();
+    const req = parsed.value;
     var id_buf: [peermail.ID_LEN]u8 = undefined;
-    const r = s.send(cl.id, parsed.value, clock.wallMs(), &id_buf) catch |e| return cl.queueErrFor(switch (e) {
-        error.NotRegistered => "peer_send before peer_register",
-        error.BadAddress, error.OutOfMemory, error.NoEntropy => "peer_send failed on the broker",
-    }, "peer_send");
+    const failed = struct {
+        fn text(e: peermail.Error) []const u8 {
+            return switch (e) {
+                error.NotRegistered => "peer_send before peer_register",
+                error.TooManyRecipients => std.fmt.comptimePrint("peer_send: to_list names more than {d} addresses", .{peermail.PEER_TO_MAX}),
+                error.BadAddress, error.OutOfMemory, error.NoEntropy => "peer_send failed on the broker",
+            };
+        }
+    };
+    if (req.to_list.len > 0) {
+        var arena: std.heap.ArenaAllocator = .init(d.allocator);
+        defer arena.deinit();
+        const m = s.sendMany(arena.allocator(), cl.id, req, clock.wallMs(), &id_buf) catch |e| return cl.queueErrFor(failed.text(e), "peer_send");
+        if (m.deferred) return;
+        const first = if (m.results.len > 0) m.results[0] else peermail.RecipientResult{ .to = "", .outcome = .refused };
+        cl.queueJson(.peer_send_reply, s.replyFor(cl.id, .{ .req = req.req, .id = m.id, .outcome = first.outcome, .reason = first.reason, .to_state = first.to_state, .results = m.results }));
+        return;
+    }
+    const r = s.send(cl.id, req, clock.wallMs(), &id_buf) catch |e| return cl.queueErrFor(failed.text(e), "peer_send");
     if (r.deferred) return;
-    cl.queueJson(.peer_send_reply, peermail.SendReply{
-        .req = parsed.value.req,
+    cl.queueJson(.peer_send_reply, s.replyFor(cl.id, .{
+        .req = req.req,
         .id = r.id,
         .outcome = r.outcome,
         .reason = r.reason,
         .to_state = r.to_state,
-    });
+    }));
 }
 
 /// `peer_ack`: the ids leave this connection's mailbox; no reply.
@@ -194,7 +212,7 @@ pub fn handleHubHello(d: *Daemon, cl: *Client, payload: []const u8) void {
     defer parsed.deinit();
     s.uplinkUp(cl.id, parsed.value, .inbound, clock.wallMs()) catch |e| return cl.queueErrFor(switch (e) {
         error.BadAddress => "peer_hub_hello: the hub's host or this host's name is not an address host",
-        error.NotLinked, error.NotRegistered, error.OutOfMemory, error.NoEntropy => "peer_hub_hello failed on the broker",
+        error.NotLinked, error.NotRegistered, error.OutOfMemory, error.NoEntropy, error.TooManyRecipients => "peer_hub_hello failed on the broker",
     }, frame);
     log.info("peer federation: hub {s} linked, calling this host {s}", .{ parsed.value.host, parsed.value.as });
 }
@@ -216,8 +234,8 @@ pub fn handleMemberHello(d: *Daemon, cl: *Client, payload: []const u8) void {
         error.NotInbound => "peer_member_hello: that host's [domain] is peer_link = outbound here; the hub dials it, it never calls in",
     }, frame);
     // The hello goes out before `up` relays the domain's queued mail.
-    cl.queueJson(.peer_hub_hello, peermail.HubHello{ .host = s.host, .as = l.domain });
-    const old = links.acceptCallin(l, cl.id, s, clock.wallMs());
+    cl.queueJson(.peer_hub_hello, peermail.HubHello{ .host = s.host, .as = l.domain, .slow_mail = true });
+    const old = links.acceptCallin(l, cl.id, parsed.value.slow_mail, s, clock.wallMs());
     if (old != 0) if (liveClient(d, old)) |gone| {
         gone.dead = true;
     };
@@ -237,7 +255,7 @@ pub fn handleRelay(d: *Daemon, cl: *Client, ftype: wire.FrameType, payload: []co
     defer parsed.deinit();
     s.relayIn(cl.id, parsed.value, clock.wallMs()) catch |e| return cl.queueErrFor(switch (e) {
         error.NotLinked => if (s.hub) "peer_member_relay before peer_member_hello on this connection" else "peer_hub_relay before peer_hub_hello on this connection",
-        error.BadAddress, error.NotRegistered, error.OutOfMemory, error.NoEntropy => "a relay failed on the broker",
+        error.BadAddress, error.NotRegistered, error.OutOfMemory, error.NoEntropy, error.TooManyRecipients => "a relay failed on the broker",
     }, frame);
 }
 
@@ -474,6 +492,7 @@ fn ensure(d: *Daemon) ?*peermail.Store {
         .hub = hub,
         .domains = domains,
         .inbound = inbound,
+        .wake = wakePolicy(),
         .emit = .{ .ctx = d, .func = emit },
     }) catch {
         log.warn("peermail: out of memory starting the store", .{});
@@ -508,6 +527,15 @@ fn ttlMs(cfg: *const Config) i64 {
 fn parseTtlMs(text: []const u8) ?i64 {
     const v = std.fmt.parseInt(i64, text, 10) catch return null;
     return if (v < 0) null else v;
+}
+
+/// The dormancy thresholds, with a rig's `peerwake.SILENCE_ENV` silence.
+fn wakePolicy() peerwake.Policy {
+    var p: peerwake.Policy = .{};
+    if (env.nonEmpty(peerwake.SILENCE_ENV)) |v| {
+        if (peerwake.parseSilence(v)) |ms| p.silence_ms = ms else log.warn("peermail: ignoring {s}={s}: not a non-negative integer", .{ peerwake.SILENCE_ENV, v });
+    }
+    return p;
 }
 
 fn emit(ctx: *anyopaque, conn: u32, out: peermail.Out) bool {

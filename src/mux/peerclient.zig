@@ -61,12 +61,22 @@ pub const Peer = struct {
         return self.awaitReply(peermail.ListReply, allocator, .peer_list, req, timeout_ms);
     }
 
-    /// Send one message and wait for its outcome.
-    pub fn send(self: *Peer, allocator: std.mem.Allocator, to: []const u8, text: []const u8, reply_to: ?[]const u8, timeout_ms: i64) !std.json.Parsed(peermail.SendReply) {
+    /// Send one message (`req.req` is set here) and wait for its outcome.
+    /// `quiet` and `to_list` need `slowMail()`; an older daemon would
+    /// ignore them and wake every recipient of `to` alone.
+    pub fn send(self: *Peer, allocator: std.mem.Allocator, req: peermail.SendReq, timeout_ms: i64) !std.json.Parsed(peermail.SendReply) {
         if (!self.available()) return error.Unsupported;
-        const req = self.nextReq();
-        try self.conn.sendJson(.peer_send, peermail.SendReq{ .req = req, .to = to, .text = text, .reply_to = reply_to });
-        return self.awaitReply(peermail.SendReply, allocator, .peer_send_reply, req, timeout_ms);
+        if ((req.quiet or req.to_list.len > 0) and !self.slowMail()) return error.Unsupported;
+        var r = req;
+        r.req = self.nextReq();
+        try self.conn.sendJson(.peer_send, r);
+        return self.awaitReply(peermail.SendReply, allocator, .peer_send_reply, r.req, timeout_ms);
+    }
+
+    /// Whether the broker judges wakes and takes slow mail and `to_list`
+    /// (welcome flag `peer_slow_mail`).
+    pub fn slowMail(self: *const Peer) bool {
+        return self.conn.caps.peer_slow_mail;
     }
 
     /// These ids were handed to the client; the broker forgets them.

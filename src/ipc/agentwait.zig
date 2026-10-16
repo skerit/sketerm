@@ -28,7 +28,10 @@
 //!
 //! A first line `{"kind":"presence",...}` (`Presence`) is no subscription:
 //! `sketerm mcp hook` / `statusline` report the session's presence to the
-//! server its client started, then close without reading a reply.
+//! server its client started, then close without reading a reply; with
+//! `take_slow` (the `UserPromptSubmit` hook) the server's end line carries
+//! the slow peer mail waiting for this turn as `content`, which the hook
+//! prints (a server that predates it ends without content).
 //!
 //! A waiter shares the agent's ONE delivery state with the agent_* tools
 //! (`events.Cursor`): what it prints is delivered, so no result repeats
@@ -168,6 +171,9 @@ pub const Presence = struct {
     /// rides this line rather than a line kind of its own: one parse, one
     /// handler, one re-registration.
     subject: ?[]const u8 = null,
+    /// The session's next turn begins: answer with its slow peer mail
+    /// (`content` of the end line).
+    take_slow: bool = false,
 };
 
 /// Whether the line is a presence post.
@@ -294,7 +300,64 @@ pub fn wakeMessage(arena: std.mem.Allocator, agent: []const u8, state: vocab.Sta
 }
 
 pub fn encodeEnd(arena: std.mem.Allocator, reason: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{f}\n", .{std.json.fmt(Message{ .type = "end", .reason = reason }, .{ .emit_null_optional_fields = false })});
+    return encodeEndWith(arena, reason, null);
+}
+
+/// The end line, carrying `content` (a presence post's slow mail).
+pub fn encodeEndWith(arena: std.mem.Allocator, reason: []const u8, content: ?[]const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{f}\n", .{std.json.fmt(Message{ .type = "end", .reason = reason, .content = content }, .{ .emit_null_optional_fields = false })});
+}
+
+/// Post one presence line asking for an answer (`take_slow`), then wait
+/// until `deadline_ms` for the server's end line, never longer.
+/// @return that line's `content`, or null on any failure or without one.
+pub fn askPresence(arena: std.mem.Allocator, socket: []const u8, line: []const u8, deadline_ms: i64) ?[]const u8 {
+    const fd = platform.socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+    if (fd < 0) return null;
+    defer _ = c.close(fd);
+    const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
+    _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
+    var addr: c.struct_sockaddr_un = undefined;
+    @import("../mux/sockpath.zig").fillSockaddrUn(&addr, socket) catch return null;
+    if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) return null;
+    const n = c.send(fd, line.ptr, line.len, c.MSG_NOSIGNAL | c.MSG_DONTWAIT);
+    if (n != @as(isize, @intCast(line.len))) return null;
+    return readEndContent(arena, fd, deadline_ms);
+}
+
+/// Read lines from `fd` until the end line (or EOF, or `deadline_ms`).
+/// @return the end line's non-empty `content`, else null.
+pub fn readEndContent(arena: std.mem.Allocator, fd: c_int, deadline_ms: i64) ?[]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    while (true) {
+        if (std.mem.indexOfScalar(u8, buf.items, '\n')) |nl| {
+            const m = std.json.parseFromSliceLeaky(Message, arena, buf.items[0..nl], .{ .ignore_unknown_fields = true }) catch return null;
+            if (!std.mem.eql(u8, m.type, "end")) {
+                buf.replaceRange(arena, 0, nl + 1, &.{}) catch return null;
+                continue;
+            }
+            const content = m.content orelse return null;
+            return if (content.len > 0) content else null;
+        }
+        const left = deadline_ms - clock.nowMs();
+        if (left <= 0) return null;
+        var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
+        const rc = c.poll(&pfd, 1, @intCast(@min(left, 1000)));
+        if (rc < 0) {
+            if (std.posix.errno(rc) == .INTR) continue;
+            return null;
+        }
+        if (rc == 0) continue;
+        var tmp: [16384]u8 = undefined;
+        const n = c.read(fd, &tmp, tmp.len);
+        if (n == 0) return null;
+        if (n < 0) {
+            const e = std.posix.errno(n);
+            if (e == .INTR or e == .AGAIN) continue;
+            return null;
+        }
+        buf.appendSlice(arena, tmp[0..@intCast(n)]) catch return null;
+    }
 }
 
 /// One printed line for a wake-up: the agent, the kind that decides it

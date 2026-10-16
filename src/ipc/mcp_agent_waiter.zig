@@ -338,7 +338,16 @@ fn serviceSub(a: std.mem.Allocator, s: *Sub, now_ms: i64) void {
         if (agentwait.isPresence(arena, first)) {
             const p = std.json.parseFromSliceLeaky(agentwait.Presence, arena, first, .{ .ignore_unknown_fields = true }) catch
                 return endSub(s, "bad presence line");
-            @import("mcp_peer.zig").applyPresence(p);
+            const peer = @import("mcp_peer.zig");
+            peer.applyPresence(p);
+            // A turn begins: its slow peer mail rides the end line, and is
+            // handed out only once the whole line was written.
+            if (p.take_slow) if (peer.slowText(arena)) |slow| {
+                sendLine(s, agentwait.encodeEndWith(arena, "presence taken", slow.text) catch return endSub(s, "presence taken"));
+                if (!s.done) peer.slowHanded(arena, slow.seqs);
+                s.done = true;
+                return;
+            };
             return endSub(s, "presence taken");
         }
         // The client left right after subscribing: nobody to wake.
