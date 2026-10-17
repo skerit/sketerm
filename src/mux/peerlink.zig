@@ -109,7 +109,7 @@ pub fn relayFrame(hub: bool) wire.FrameType {
     return if (hub) .peer_hub_relay else .peer_member_relay;
 }
 
-/// `greeting`: a call-in member's dialed link waiting for the hub's hello.
+/// `greeting`: a dialed link waiting for the far side to accept its hello.
 const Phase = enum { waiting, dialing, greeting, up };
 
 pub const Link = struct {
@@ -228,12 +228,12 @@ pub const Links = struct {
                 var st: c_int = 0;
                 if (c.waitpid(l.dial_pid, &st, c.WNOHANG) != 0) l.dial_pid = -1;
             }
-            if (l.broken) self.drop(l, store, now, wall, .dropped, l.hangup orelse "its connection stopped taking data");
+            self.retireBroken(l, store, now, wall);
             if (l.phase == .dialing and now - l.dial_started_ms > DIAL_TIMEOUT_MS) {
                 if (l.dial_pid > 0) _ = c.kill(l.dial_pid, c.SIGKILL);
                 self.dialFailed(l, store, now, wall, .dial_failed, std.fmt.comptimePrint("no answer within {d} s", .{@divExact(DIAL_TIMEOUT_MS, 1000)}));
             }
-            if (l.phase == .greeting and now - l.dial_started_ms > DIAL_TIMEOUT_MS) self.drop(l, store, now, wall, .dropped, "the hub never answered the hello");
+            if (l.phase == .greeting and now - l.dial_started_ms > DIAL_TIMEOUT_MS) self.drop(l, store, now, wall, .dropped, "the far side never accepted the hello");
             switch (l.direction) {
                 .outbound => if (l.phase == .waiting and l.dial_pid < 0 and l.backoff.due(now)) self.startDial(d, store, l, now, wall),
                 .inbound => {},
@@ -426,26 +426,37 @@ pub const Links = struct {
                 l.conn.?.caps.peer_callin = res.peer_callin;
                 l.conn.?.caps.peer_slow_mail = res.peer_slow_mail;
                 l.conn.?.caps.peer_link_beat = res.peer_link_beat;
-                const far: peermail.Far = .{ .beats = res.peer_link_beat, .slow = res.peer_slow_mail };
                 const hello = if (self.hub)
                     l.conn.?.queueJson(.peer_hub_hello, peermail.HubHello{ .host = store.host, .as = l.domain, .slow_mail = true, .instance = store.selfInstance(), .beat = true })
                 else
                     l.conn.?.queueJson(.peer_member_hello, peermail.MemberHello{ .host = store.host, .slow_mail = true, .instance = store.selfInstance(), .beat = true });
                 hello catch return self.drop(l, store, now, wall, .dropped, "the hello could not be sent");
-                if (self.hub) return self.up(l, id, far, store, wall, now);
+                // A transport welcome is not acceptance of the federation
+                // hello. Keep mail queued and the retry history intact until
+                // the member relays something (or the hub answers our hello).
                 l.phase = .greeting;
                 l.dial_started_ms = now;
                 store.linkWhy(l.domain, .greeting, "", 0, wall);
-                log.info("peer federation: called in to {s}; waiting for its hello", .{l.domain});
+                log.info("peer federation: connected to {s}; waiting for it to accept the hello", .{l.domain});
             },
         }
     }
 
+    /// A sink's immediate flush can fail before the next poll. Preserve
+    /// answers already received there too; a deliberate store hangup
+    /// (replacement/silence) has already detached the route.
+    fn retireBroken(self: *Links, l: *Link, store: *peermail.Store, now: i64, wall: i64) void {
+        if (!l.broken) return;
+        if (l.hangup == null) self.serviceUp(l, c.POLLIN, store, now, wall);
+        if (l.conn != null) self.drop(l, store, now, wall, .dropped, l.hangup orelse "its connection stopped taking data");
+    }
+
     fn serviceUp(self: *Links, l: *Link, revents: c_short, store: *peermail.Store, now: i64, wall: i64) void {
         const conn = if (l.conn) |*cc| cc else return;
-        if (revents & c.POLLOUT != 0) conn.flushQueued() catch return self.drop(l, store, now, wall, .dropped, "a write failed");
-        if (revents & (c.POLLIN | c.POLLHUP | c.POLLERR) == 0) return;
-        const alive = conn.fillAvailable();
+        // Read the tail before writing: a reset can make both directions
+        // ready at once. A failed write must not discard an already-arrived
+        // `stored` acknowledgement or the reason the hello was refused.
+        const alive = if (revents & (c.POLLIN | c.POLLHUP | c.POLLERR) != 0) conn.fillAvailable() else true;
         while (true) {
             const f = conn.takeFrame() catch return self.drop(l, store, now, wall, .dropped, "a malformed frame arrived");
             const frame = f orelse break;
@@ -462,6 +473,11 @@ pub const Links = struct {
                         continue;
                     };
                     defer parsed.deinit();
+                    if (self.hub and l.phase == .greeting) {
+                        // Members (including older ones) relay queued mail or
+                        // presence only after taking peer_hub_hello.
+                        self.up(l, l.conn_id, .{ .beats = conn.caps.peer_link_beat, .slow = conn.caps.peer_slow_mail }, store, wall, now);
+                    }
                     store.relayIn(l.conn_id, parsed.value, wall) catch |e| log.warn("peer federation: a relay from {s} failed: {s}", .{ l.domain, @errorName(e) });
                 },
                 // A call-in member's hub answers its hello; the member's
@@ -501,7 +517,8 @@ pub const Links = struct {
             }
             if (l.conn == null) return;
         }
-        if (!alive) self.drop(l, store, now, wall, .dropped, "the far side closed it");
+        if (!alive) return self.drop(l, store, now, wall, .dropped, "the far side closed it");
+        if (revents & c.POLLOUT != 0) conn.flushQueued() catch return self.drop(l, store, now, wall, .dropped, "a write failed");
     }
 
     fn dialFailed(self: *Links, l: *Link, store: *peermail.Store, now: i64, wall: i64, why: PeerLinkWhy, detail: []const u8) void {
@@ -723,6 +740,147 @@ test "a failed dial names why: unreachable, a refused login, a route's hop, else
     const back = try std.json.parseFromSlice(DialResult, t.allocator, json, .{ .ignore_unknown_fields = true });
     defer back.deinit();
     try t.expectEqual(@as(?PeerLinkWhy, .@"unreachable"), back.value.why);
+}
+
+/// A real dial-result fd handoff and a socket-backed member, without SSH.
+const TestHub = struct {
+    links: Links,
+    store: peermail.Store,
+
+    fn init(self: *TestHub) !void {
+        var cfg = try Config.loadFromBytes(t.allocator, "peer_hub = true\n[domain.box]\nhost = box\npeers = true\n");
+        defer cfg.deinit();
+        self.links = try Links.init(t.allocator, &cfg, "hub");
+        errdefer self.links.deinit();
+        self.store = try peermail.Store.init(t.allocator, .{ .host = "hub", .hub = true, .domains = &.{"box"}, .emit = .{ .ctx = &self.links, .func = emit } });
+    }
+
+    fn deinit(self: *TestHub) void {
+        self.store.deinit();
+        self.links.deinit();
+    }
+
+    fn emit(ctx: *anyopaque, conn: u32, out: peermail.Out) bool {
+        const links: *Links = @ptrCast(@alignCast(ctx));
+        return switch (out) {
+            .relay => |r| links.queue(conn, r),
+            .beat => links.queueBeat(conn),
+            .hangup => |why| blk: {
+                links.hangup(conn, why);
+                break :blk true;
+            },
+            else => true,
+        };
+    }
+
+    fn dial(self: *TestHub, now: i64) !muxclient.Conn {
+        var data: [2]c_int = undefined;
+        try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&data));
+        defer _ = c.close(data[0]);
+        errdefer _ = c.close(data[1]);
+        var control: [2]c_int = undefined;
+        try t.expectEqual(@as(c_int, 0), platform.controlSocketpair(&control, 2048));
+        defer _ = c.close(control[1]);
+        const l = self.links.items.items[0];
+        l.dial_fd = control[0];
+        l.phase = .dialing;
+        const json = try std.json.Stringify.valueAlloc(t.allocator, DialResult{ .ok = true, .proto = wire.PROTO_VERSION, .server_proto = wire.PROTO_VERSION, .peers = true, .peer_federation = true, .peer_slow_mail = true }, .{});
+        defer t.allocator.free(json);
+        try t.expect(@import("daemon_control.zig").controlSend(control[1], json, data[0]));
+        self.links.dialDone(l, &self.store, now, now);
+        try t.expect(l.conn != null);
+        return .{ .allocator = t.allocator, .fd = data[1] };
+    }
+
+    fn service(self: *TestHub, events: c_short, now: i64) void {
+        self.links.serviceUp(self.links.items.items[0], events, &self.store, now, now);
+    }
+};
+
+test "a dialed hub link stays down until accepted and refused hellos preserve backoff" {
+    var h: TestHub = undefined;
+    try h.init();
+    defer h.deinit();
+    const l = h.links.items.items[0];
+    for (0..3) |i| {
+        const now: i64 = @intCast(i * 100_000);
+        var far = try h.dial(now);
+        defer far.deinit();
+        try t.expectEqual(Phase.greeting, l.phase);
+        try t.expectEqual(PeerLink.down, h.store.routes.items[0].link);
+        try t.expectEqual(@as(u32, @intCast(i)), l.backoff.attempts);
+        h.service(c.POLLOUT, now);
+        const hello = try far.recvExpectFor(&.{.peer_hub_hello}, 1000);
+        hello.deinit(t.allocator);
+        try far.sendJson(.err, peermail.LinkRefused{ .@"error" = "another hub holds this host's uplink", .link_held = true });
+        try t.expectEqual(@as(c_int, 0), c.shutdown(far.fd, c.SHUT_RDWR));
+        try wire.appendFrame(&l.conn.?.wbuf, t.allocator, .peer_link_beat, "");
+        h.service(c.POLLIN | c.POLLOUT | c.POLLHUP, now + 1);
+        try t.expectEqual(Phase.waiting, l.phase);
+        try t.expectEqual(@as(u32, @intCast(i + 1)), l.backoff.attempts);
+        try t.expectEqual(@as(?PeerLinkWhy, .taken), h.store.routes.items[0].why);
+    }
+    var far = try h.dial(400_000);
+    defer far.deinit();
+    (try far.recvExpectFor(&.{.peer_hub_hello}, 1000)).deinit(t.allocator);
+    try h.store.register(1, .{ .address = "sender", .durable = true }, 400_000);
+    var id_buf: [peermail.ID_LEN]u8 = undefined;
+    const queued_mail = try h.store.send(1, .{ .to = "box/recipient", .text = "wait for acceptance" }, 400_000, &id_buf);
+    try t.expectEqual(peermail.PeerOutcome.queued, queued_mail.outcome);
+    try t.expect(!queued_mail.deferred);
+    try t.expect(far.fillAvailable());
+    try t.expect((try far.takeFrame()) == null);
+    // An old member's first relay is already proof it accepted the hello;
+    // no new wire flag or extra round-trip is needed.
+    try far.sendJson(.peer_member_relay, peermail.Relay{ .kind = .presence });
+    h.service(c.POLLIN | c.POLLOUT, 400_001);
+    try t.expectEqual(Phase.up, l.phase);
+    try t.expectEqual(PeerLink.up, h.store.routes.items[0].link);
+    try t.expectEqual(@as(u32, 0), l.backoff.attempts);
+    (try far.recvExpectFor(&.{.peer_hub_relay}, 1000)).deinit(t.allocator);
+}
+
+test "a final stored reply survives a simultaneous broken write and is not replayed" {
+    // Match the daemon's SIGPIPE policy on platforms without MSG_NOSIGNAL.
+    const old_sigpipe = c.signal(c.SIGPIPE, c.SIG_IGN);
+    defer _ = c.signal(c.SIGPIPE, old_sigpipe);
+    for ([_]bool{ false, true }) |immediate| {
+        var h: TestHub = undefined;
+        try h.init();
+        defer h.deinit();
+        var far = try h.dial(0);
+        defer far.deinit();
+        try far.sendJson(.peer_member_relay, peermail.Relay{ .kind = .presence });
+        h.service(c.POLLIN | c.POLLOUT, 1);
+        (try far.recvExpectFor(&.{.peer_hub_hello}, 1000)).deinit(t.allocator);
+        try h.store.register(1, .{ .address = "sender", .durable = true }, 2);
+        var id_buf: [peermail.ID_LEN]u8 = undefined;
+        const sent = try h.store.send(1, .{ .to = "box/recipient", .text = "only once" }, 3, &id_buf);
+        h.service(c.POLLOUT, 3);
+        (try far.recvExpectFor(&.{.peer_hub_relay}, 1000)).deinit(t.allocator);
+        try t.expectEqual(@as(usize, 1), h.store.routes.items[0].box.items.items.len);
+        try far.sendJson(.peer_member_relay, peermail.Relay{ .kind = .stored, .id = sent.id, .to = "recipient", .outcome = .delivered });
+        // The remote has finished and will accept no more input. Exercise
+        // both a failing POLLOUT flush and a sink's immediate write failure.
+        try t.expectEqual(@as(c_int, 0), c.shutdown(far.fd, c.SHUT_RDWR));
+        const l = h.links.items.items[0];
+        if (immediate) {
+            try t.expect(!h.links.queueBeat(l.conn_id));
+            h.links.retireBroken(l, &h.store, 4, 4);
+        } else {
+            try wire.appendFrame(&l.conn.?.wbuf, t.allocator, .peer_link_beat, "");
+            h.service(c.POLLIN | c.POLLOUT | c.POLLHUP, 4);
+        }
+        try t.expectEqual(@as(usize, 0), h.store.routes.items[0].box.items.items.len);
+        try t.expectEqual(Phase.waiting, l.phase);
+        var again = try h.dial(3000);
+        defer again.deinit();
+        try again.sendJson(.peer_member_relay, peermail.Relay{ .kind = .presence });
+        h.service(c.POLLIN | c.POLLOUT, 3001);
+        (try again.recvExpectFor(&.{.peer_hub_hello}, 1000)).deinit(t.allocator);
+        try t.expect(again.fillAvailable());
+        try t.expect((try again.takeFrame()) == null);
+    }
 }
 
 const PeerLink = peermail.PeerLink;

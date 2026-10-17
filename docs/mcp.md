@@ -3411,6 +3411,15 @@ whose config says so; every other daemon is dialed by it, or calls in
   listed with their last state and `link: down`; a host whose daemon
   predates federation is listed `unsupported` and refused
   `federation_unavailable`.
+- **Connection acceptance and recovery**: a successful SSH/UDP connection
+  alone does not make a federation link `up`. A dialing hub waits for the
+  member's first relay (presence or queued mail); a call-in member waits for
+  the hub's hello. Until then the link is `down` / `greeting` and outbound
+  mail stays queued. A refused hello preserves the reconnect backoff.
+  When a connection fails, already-arrived acknowledgements and refusals
+  are read before closing it, including when an outgoing write fails, so
+  acknowledged mail is not unnecessarily replayed and the refusal reason
+  is retained.
 - **Why a link is down**: every link that is not up says why, from where
   it failed (`peerlink`, the dialing or awaiting side; the one vocabulary
   is `PeerLinkWhy`): `dialing` (the first dial), `unreachable` (ssh's own
@@ -3421,8 +3430,8 @@ whose config says so; every other daemon is dialed by it, or calls in
   predates peer federation (no peer_federation)`, the version from its
   welcome), `refused` (the far daemon's own words), `dropped` (how an up
   link ended), `awaiting_dial` (the far side dials it: a call-in member,
-  or a member's hub) and `greeting` (a call-in member waiting for its
-  hub's hello), `taken` (another daemon of that host holds the link and
+  or a member's hub) and `greeting` (a dialed link waiting for hello
+  acceptance), `taken` (another daemon of that host holds the link and
   is live: this one was refused, the far side's words naming the holder's
   pid, socket and instance; it dials again after 20 s, never at the 2 s
   floor) and `flapping` (the one reason an UP link carries: it keeps

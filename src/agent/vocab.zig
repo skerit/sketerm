@@ -260,7 +260,7 @@ pub const PeerLinkWhy = enum {
     /// The far side dials this link (a hub's call-in member, or a member's
     /// hub) and has not (yet, or again).
     awaiting_dial,
-    /// A call-in member waiting for its hub's hello.
+    /// A dialed link waiting for the far side to accept its hello.
     greeting,
     /// Another daemon of the same host holds the link and is live: this
     /// one was refused (detail: the far side's words, naming the holder)
@@ -281,7 +281,7 @@ pub const PeerLinkWhy = enum {
             .refused => "refused",
             .dropped => "dropped",
             .awaiting_dial => "waiting for it to dial in",
-            .greeting => "waiting for the hub's hello",
+            .greeting => "waiting for hello acceptance",
             .taken => "another daemon of that host holds the link",
             .flapping => "flapping: two daemons keep replacing each other",
         };

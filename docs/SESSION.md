@@ -1,5 +1,18 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-17: federation waits for acceptance and preserves disconnect replies
+
+`peerlink` keeps a dialed hub link in `greeting` until the member's first
+relay proves it accepted `peer_hub_hello`. Previously the transport welcome
+marked it up and reset backoff even when the member would refuse it.
+Outbound mail now stays queued through that handshake. Both poll-time write
+failures and immediate sink failures drain already-arrived replies before
+teardown, preserving `stored` acknowledgements and `link_held` refusals.
+Socket-backed regressions cover refused hellos, queued handshake mail, and
+an acknowledgement immediately before disconnect with no replay on redial.
+Verified with `zig build test-core` and `zig build smoke-broker` (including
+both federation directions, link cuts, queued delivery and call-in recovery).
+
 ## 2026-10-16: MCP results are text by default; `--structured` opts into the facts lane
 
 `sketerm mcp` answers with the text block (plus images) alone and declares no
