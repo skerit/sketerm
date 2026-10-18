@@ -308,12 +308,7 @@ pub const Client = struct {
         self.bridge = br;
         self.fd = fd;
         self.state = .ready;
-        self.read_watch = c.g_unix_fd_add(
-            fd,
-            c.G_IO_IN | c.G_IO_HUP | c.G_IO_ERR,
-            @ptrCast(&onReadable),
-            self,
-        );
+        self.watchReadable();
         br.spawn();
         self.post(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "sketerm-gui" });
         // Before any view exists (the frame-mode contract): everything
@@ -631,12 +626,7 @@ pub const Client = struct {
         _ = c.fcntl(fd, c.F_SETFL, c.O_NONBLOCK);
         self.fd = fd;
         self.state = .ready;
-        self.read_watch = c.g_unix_fd_add(
-            fd,
-            c.G_IO_IN | c.G_IO_HUP | c.G_IO_ERR,
-            @ptrCast(&onReadable),
-            self,
-        );
+        self.watchReadable();
         self.post(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = if (self.observer) "sketerm-gui-watch" else "sketerm-gui" });
         if (self.observer) {
             for (self.faces.items) |f| f.onClientReady();
@@ -806,6 +796,25 @@ pub const Client = struct {
         }
         self.flush();
         return 0;
+    }
+
+    /// GLib priority of the helper socket's read watch: BELOW
+    /// `GDK_PRIORITY_REDRAW`, because GLib dispatches only the highest
+    /// ready priority and a frame stream that keeps the socket readable
+    /// (encoded frames are acked on receipt, so the next one is already
+    /// there) would otherwise starve the frame clock: frames decoded,
+    /// nothing ever painted.
+    const READ_PRIORITY: c_int = c.GDK_PRIORITY_REDRAW + 10;
+
+    fn watchReadable(self: *Client) void {
+        self.read_watch = c.g_unix_fd_add_full(
+            READ_PRIORITY,
+            self.fd,
+            c.G_IO_IN | c.G_IO_HUP | c.G_IO_ERR,
+            @ptrCast(&onReadable),
+            self,
+            null,
+        );
     }
 
     fn onReadable(_: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
