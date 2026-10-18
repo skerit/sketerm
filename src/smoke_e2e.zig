@@ -19007,6 +19007,24 @@ fn assistantRemoteWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App
         say(std.fmt.bufPrint(&msg, "assistant remote web watch: encoded frames with {d} video codec(s) offered; the GUI decoded video tiles", .{codecs}) catch "video decoded");
     }
 
+    // ── follow: the assistant closes its only tab and opens another ──
+    // The viewer waits on a placeholder and must PAINT the next page,
+    // not only show its address.
+    {
+        const closed = m.call("web_close", "{}", 30_000) orelse return "web_close on hosta timed out";
+        if (mcpHas(closed, "isError")) return whyf("web_close on hosta failed: {s}", .{closed[0..@min(closed.len, 300)]});
+        var waited: u32 = 0;
+        while (waited < 15_000 and waitColorBox(app, win_id, isBlue, 250) != null) : (waited += 250) pumpFor(app, 250);
+        if (waitColorBox(app, win_id, isBlue, 250) != null) return "the closed remote page's pixels stayed on screen";
+        const reopened = m.call("web_open", open_args, 90_000) orelse return "the second web_open on hosta timed out";
+        if (mcpHas(reopened, "isError")) return whyf("the second web_open on hosta failed: {s}", .{reopened[0..@min(reopened.len, 400)]});
+        if (waitColorBox(app, win_id, isBlue, 30_000) == null) {
+            shotTo(allocator, app, win_id, "zig-out/smoke-e2e-rwatch-follow.png");
+            return "the viewer followed the assistant's next tab but never painted it (see zig-out/smoke-e2e-rwatch-follow.png)";
+        }
+    }
+    say("assistant remote web watch: after the last tab closed, the viewer followed and painted the next one");
+
     // ── read-only, then Take control and click the target ──
     const cx = blue.x + blue.w / 2;
     const cy = blue.y + blue.h / 2;
