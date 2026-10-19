@@ -387,6 +387,31 @@ const grid_page =
     "<div class=r><div class=c>PC-6</div><div class=c>LAN 6</div><div class=c>10.47.1.6</div><div class=c><button onclick=\"document.title='edit:6'\">Edit</button></div></div>" ++
     "</div><div class=note><span>Footer text in a span</span></div></body></html>";
 
+/// The shapes reader mode used to turn into textContent soup: a layout
+/// table (Hacker News), a card whose title, read-more and overlay link
+/// all name one target, stacked divs, hidden text, a <br> in a heading,
+/// a decorative image, a logo <svg> as the <h1>, a labelled field and a
+/// menu inside <main>.
+const reader_shapes_page =
+    "data:text/html,<html><head><title>Shapes</title></head><body><main>" ++
+    "<h1><svg role=img aria-label=\"LogoNews\"><title>LogoNews</title></svg></h1>" ++
+    "<nav><a href=\"https://ex.test/menu\">MENU-ITEM</a></nav>" ++
+    "<h2>Welkom bij<br>de Stad</h2>" ++
+    "<p>Visible <span style=\"display:none\">SECRET-HIDDEN</span>text<span aria-hidden=\"true\">ARIA-HIDDEN</span> here.</p>" ++
+    // data: so the fixture issues no request: stage 22d reads the first
+    // page of the request log and must find its blocked url there.
+    "<img src=\"data:image/gif;base64,R0lGODlhAQABAAAAACw=\" alt=\"\">" ++
+    "<table><tr><td><table>" ++
+    "<tr><td>1.</td><td><a href=\"https://ex.test/vote?id=1\"><div style=\"width:9px;height:9px\"></div></a></td>" ++
+    "<td><span><a href=\"https://ex.test/a\">Story A</a> (<a href=\"https://ex.test/from\">ex.test</a>)</span></td></tr>" ++
+    "<tr><td colspan=2></td><td>12 points by <a href=\"https://ex.test/user\">alice</a> <a href=\"https://ex.test/item?id=1\">1 hour ago</a> | <a href=\"https://ex.test/item?id=1\">5 comments</a></td></tr>" ++
+    "</table></td></tr></table>" ++
+    "<ul><li><article><h4>Maak een afspraak</h4><a href=\"https://ex.test/afspraak\">Maak een afspraak</a></article>" ++
+    "<a href=\"https://ex.test/afspraak\">Maak een afspraak</a></li></ul>" ++
+    "<div>Price 10 EUR<div>Add to cart</div></div>" ++
+    "<label for=mail>E-mail</label><input id=mail>" ++
+    "</main></body></html>";
+
 /// Rich reader proof: the only actionable node returned by reader mode
 /// changes the title on a trusted click. Its sibling mutation button is
 /// outside <article>, so it never appears as a reader entity.
@@ -10353,6 +10378,34 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     pass("stage 12b div grid");
 
+    // ── Stage 12c: reader shapes that used to read as textContent ──
+    cl.navigate(reader_shapes_page);
+    {
+        const seq = cl.md_seq;
+        cl.send(proto.SemRead{ .view = view_id });
+        if (!cl.waitSeq(&cl.md_seq, seq, 20_000)) fail("stage 12c reader shapes: no sem_read_result");
+        const md = cl.md[0..cl.md_len];
+        const want = [_][]const u8{
+            "# LogoNews\n",
+            "## Welkom bij de Stad\n",
+            "Visible text here.",
+            "1. [Story A](https://ex.test/a) ([ex.test](https://ex.test/from))\n12 points by [alice](https://ex.test/user) [1 hour ago](https://ex.test/item?id=1) | [5 comments](https://ex.test/item?id=1)",
+            "- [Maak een afspraak](https://ex.test/afspraak)\n",
+            "Price 10 EUR\n\nAdd to cart",
+            "- E-mail: (empty)",
+        };
+        const banned = [_][]const u8{ "SECRET-HIDDEN", "ARIA-HIDDEN", "MENU-ITEM", "[](", "![](", "afspraak) Maak", "Price 10 EURAdd", "\n\nE-mail\n" };
+        for (want) |w| if (std.mem.indexOf(u8, md, w) == null) {
+            std.debug.print("smoke-web: missing {s}\nmarkdown was:\n{s}\n", .{ w, md });
+            fail("stage 12c reader shapes: an expected reader line is missing");
+        };
+        for (banned) |b| if (std.mem.indexOf(u8, md, b) != null) {
+            std.debug.print("smoke-web: unexpected {s}\nmarkdown was:\n{s}\n", .{ b, md });
+            fail("stage 12c reader shapes: the markdown carries soup the reader must drop");
+        };
+    }
+    pass("stage 12c reader shapes");
+
     // ── Stage 41: reader ids activate one exact, fresh entity ──────
     cl.navigate(reader_ids_page);
     {
@@ -11144,13 +11197,23 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // at on_before_resource_load, before it ever leaves the process.
     {
         if (!cl.acks(.intercept)) fail("stage 22d: hello_ack lacks the intercept capability");
+        // Read only what this stage's load adds: the log is the view's
+        // whole history, so an earlier stage's requests would otherwise
+        // fill the 64-entry page and push the blocked url off it.
+        var log_from: u32 = 0;
+        var pages: usize = 0;
+        while (pages < 256) : (pages += 1) {
+            if (!cl.pullLog(log_from, 15_000)) fail("stage 22d: the request log never answered");
+            if (cl.int_log_next == log_from) break;
+            log_from = cl.int_log_next;
+        }
         cl.navigate(blocked_img_page);
         if (!cl.waitBlocked(1, 20_000)) {
             std.debug.print("smoke-web: intercept status blocked={d} total={d} rules={d}\n", .{ cl.int_blocked, cl.int_total, cl.int_rules });
             fail("stage 22d: the seeded filter did not block the doubleclick.net image");
         }
         if (cl.int_rules == 0) fail("stage 22d: no filter rules were loaded");
-        if (!cl.pullLog(0, 15_000)) fail("stage 22d: the request log never answered");
+        if (!cl.pullLog(log_from, 15_000)) fail("stage 22d: the request log never answered");
         const log = cl.logSlice();
         if (std.mem.indexOf(u8, log, "doubleclick.net") == null)
             fail("stage 22d: the request log does not mention the blocked url");

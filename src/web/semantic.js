@@ -1042,7 +1042,7 @@
       dropChrome = false;
       chromeExempt = null;
     }
-    var md = out.join("\n\n") + "\n";
+    var md = distinctBlocks(out).join("\n\n") + "\n";
     res.total_chars = md.length;
     res.truncated = md.length > PAGE_TEXT_MAX;
     res.text = res.truncated ? md.slice(0, PAGE_TEXT_MAX) : md;
@@ -1466,28 +1466,153 @@
     entities.push(entity);
   }
 
-  function inline(el, entities) {
-    var out = "";
-    for (var i = 0; i < el.childNodes.length; i++) {
-      var n = el.childNodes[i];
-      if (n.nodeType === 3) {
-        out += n.nodeValue.replace(/\s+/g, " ");
-        continue;
-      }
-      if (n.nodeType !== 1) continue;
-      var t = n.tagName;
-      if (SKIP_TAG[t]) continue;
-      if (t === "A" && n.hasAttribute("href")) {
-        readerEntity(n, "link", entities);
-        out += "[" + inline(n, entities).trim() + "](" + n.getAttribute("href") + ")";
-      } else if (t === "STRONG" || t === "B") out += "**" + inline(n, entities).trim() + "**";
-      else if (t === "EM" || t === "I") out += "*" + inline(n, entities).trim() + "*";
-      else if (t === "CODE") out += "`" + inline(n, entities).trim() + "`";
-      else if (t === "BR") out += "\n";
-      else if (t === "IMG") out += "![" + (n.getAttribute("alt") || "") + "](" + (n.getAttribute("src") || "") + ")";
-      else out += inline(n, entities);
+  // -- reader units ----------------------------------------------------
+  //
+  // A reader UNIT is one line of output: a paragraph, a list item (a
+  // card), a layout-table row. Inside one, a second link to the same
+  // target that says nothing new (a card's "read more", the invisible
+  // overlay link spanning it) is dropped, and a card whose title is not
+  // itself a link gets the card's one target as the title's link.
+  var unit = null;
+
+  function newUnit() {
+    return { hrefs: {}, suppress: "", noImages: false, skip: null };
+  }
+
+  function withUnit(fn) {
+    var saved = unit;
+    unit = newUnit();
+    try {
+      return fn();
+    } finally {
+      unit = saved;
     }
+  }
+
+  // Computed display decides what renders apart: textContent glues two
+  // stacked divs ("PriceAdd to cart"), which is the soup this avoids.
+  var BLOCK_DISPLAY = {
+    block: 1,
+    flex: 1,
+    grid: 1,
+    "list-item": 1,
+    "flow-root": 1,
+    table: 1,
+    "table-row": 1,
+    "table-row-group": 1,
+    "table-header-group": 1,
+    "table-footer-group": 1,
+    "table-cell": 1,
+    "table-caption": 1
+  };
+
+  function displayOf(el) {
+    try {
+      return window.getComputedStyle(el).display || "";
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function isBlockEl(el) {
+    return !!BLOCK_DISPLAY[displayOf(el)];
+  }
+
+  function spacesChildren(el) {
+    var d = displayOf(el);
+    return d === "flex" || d === "inline-flex" || d === "grid" || d === "inline-grid";
+  }
+
+  function hasBlockChild(el) {
+    for (var i = 0; i < el.children.length; i++) {
+      if (!hidden(el.children[i]) && isBlockEl(el.children[i])) return true;
+    }
+    return false;
+  }
+
+  // Collapse whitespace runs (keeping the line breaks a <br> made).
+  function squash(s) {
+    return s.replace(/[ \t ]+/g, " ").replace(/ *\n */g, "\n").replace(/\n{2,}/g, "\n").trim();
+  }
+
+  function oneLine(s) {
+    return squash(s).replace(/\n/g, " ");
+  }
+
+  // The resolved target: what a reader can open from anywhere, not the
+  // page-relative "item?id=4" it was written as. A script URL is none.
+  function linkUrl(a) {
+    var abs = "";
+    try {
+      abs = String(a.href || "");
+    } catch (e) {}
+    var url = abs || a.getAttribute("href") || "";
+    return /^\s*javascript:/i.test(url) ? "" : url;
+  }
+
+  // An image without alt text is decorative (that is what an empty alt
+  // means); a data: URI is bytes, not something to read.
+  function imageMd(img) {
+    var alt = oneLine(img.getAttribute("alt") || "");
+    if (!alt) return "";
+    var src = "";
+    try {
+      src = String(img.currentSrc || img.src || "");
+    } catch (e) {}
+    if (!src || /^data:/i.test(src)) return "[image: " + alt + "]";
+    return "![" + alt + "](" + src + ")";
+  }
+
+  function wrap(mark, s) {
+    return s ? mark + s + mark : "";
+  }
+
+  function inline(el, entities) {
+    if (!unit)
+      return withUnit(function () {
+        return inlineKids(el, entities);
+      });
+    return inlineKids(el, entities);
+  }
+
+  function inlineKids(el, entities) {
+    var spaced = el.nodeType === 1 && spacesChildren(el);
+    var out = "";
+    for (var i = 0; i < el.childNodes.length; i++) out += inlineNode(el.childNodes[i], entities, spaced);
     return out;
+  }
+
+  function inlineNode(n, entities, spaced) {
+    if (n.nodeType === 3) return n.nodeValue.replace(/\s+/g, " ");
+    if (n.nodeType !== 1) return "";
+    var t = n.tagName;
+    if (SKIP_TAG[t] || hidden(n) || (unit && unit.skip === n)) return "";
+    if (t === "svg") return svgLabel(n);
+    var piece = inlineEl(n, t, entities);
+    if (!piece) return "";
+    return spaced || isBlockEl(n) ? " " + piece + " " : piece;
+  }
+
+  function inlineEl(n, t, entities) {
+    if (t === "A" && n.hasAttribute("href")) {
+      var url = linkUrl(n);
+      if (url && unit.suppress === url) return "";
+      var text = oneLine(inline(n, entities));
+      // An icon-only link (a vote arrow, a bare logo) reads as nothing.
+      if (!text) return "";
+      if (!url) return text;
+      var first = unit.hrefs[url];
+      if (first !== undefined && (first === text || first.indexOf(text) >= 0 || text.indexOf(first) >= 0)) return "";
+      if (first === undefined) unit.hrefs[url] = text;
+      readerEntity(n, "link", entities);
+      return "[" + text + "](" + url + ")";
+    }
+    if (t === "STRONG" || t === "B") return wrap("**", oneLine(inline(n, entities)));
+    if (t === "EM" || t === "I") return wrap("*", oneLine(inline(n, entities)));
+    if (t === "CODE") return wrap("`", oneLine(inline(n, entities)));
+    if (t === "BR") return "\n";
+    if (t === "IMG") return unit.noImages ? "" : imageMd(n);
+    return inline(n, entities);
   }
 
   function markdown(el, depth, out, entities) {
@@ -1495,58 +1620,303 @@
     for (var i = 0; i < el.children.length; i++) markdownNode(el.children[i], depth, out, entities);
   }
 
+  // A block's own text with its block children rendered apart: inline
+  // runs become paragraphs, a block child goes through markdownNode.
+  function blockSplit(el, depth, out, entities) {
+    if (!unit)
+      return withUnit(function () {
+        blockSplit(el, depth, out, entities);
+      });
+    var run = "";
+    var flush = function () {
+      var s = squash(run);
+      if (s) out.push(s);
+      run = "";
+    };
+    var spaced = spacesChildren(el);
+    for (var i = 0; i < el.childNodes.length; i++) {
+      var k = el.childNodes[i];
+      if (k.nodeType === 1 && !SKIP_TAG[k.tagName] && !hidden(k) && (isBlockEl(k) || hasStructure(k) || STRUCTURE_TAG[k.tagName])) {
+        flush();
+        markdownNode(k, depth + 1, out, entities);
+      } else {
+        run += inlineNode(k, entities, spaced);
+      }
+    }
+    flush();
+  }
+
+  var STRUCTURE_TAG = { TABLE: 1, UL: 1, OL: 1, DL: 1, P: 1, PRE: 1, BLOCKQUOTE: 1, H1: 1, H2: 1, H3: 1, H4: 1, H5: 1, H6: 1 };
+
+  // The one target every visible link of `el` points at, or "".
+  function soleTarget(el) {
+    var links = el.querySelectorAll("a[href]");
+    var target = "";
+    for (var i = 0; i < links.length; i++) {
+      if (hidden(links[i])) continue;
+      var u = linkUrl(links[i]);
+      if (!u) continue;
+      if (target && u !== target) return "";
+      target = u;
+    }
+    return target;
+  }
+
+  function firstVisible(el, sel) {
+    var all = el.querySelectorAll(sel);
+    for (var i = 0; i < all.length; i++) if (!hidden(all[i])) return all[i];
+    return null;
+  }
+
+  // A list item as one line: a card's title linked to the card's target,
+  // then its other text; nested lists and tables stay indented below.
+  function itemLine(li, depth, entities) {
+    return withUnit(function () {
+      var title = "";
+      var heading = firstVisible(li, "h1,h2,h3,h4,h5,h6");
+      var target = soleTarget(li);
+      if (heading && target && !heading.querySelector("a[href]")) {
+        var h = oneLine(inline(heading, entities));
+        if (h) {
+          title = "[" + h + "](" + target + ")";
+          unit.suppress = target;
+          unit.skip = heading;
+          var a = firstVisible(li, "a[href]");
+          if (a) readerEntity(a, "link", entities);
+        }
+      }
+      unit.noImages = textOf(li).length > 0;
+      var pieces = [];
+      if (hasStructure(li) || hasBlockChild(li)) blockSplit(li, depth + 1, pieces, entities);
+      else {
+        var s = squash(inline(li, entities));
+        if (s) pieces.push(s);
+      }
+      return joinItem(title, pieces);
+    });
+  }
+
+  function joinItem(title, pieces) {
+    var head = [];
+    var tail = [];
+    for (var i = 0; i < pieces.length; i++) {
+      var p = pieces[i].replace(/^#{1,6} /, "");
+      if (/\n/.test(p) || /^(- |\d+\. |\| )/.test(p)) tail.push(p);
+      else head.push(p);
+    }
+    var line = oneLine(head.join(" "));
+    if (title) line = line ? title + ": " + line : title;
+    for (var k = 0; k < tail.length; k++) line += "\n  " + tail[k].replace(/\n/g, "\n  ");
+    return line.replace(/^\n\s*/, "");
+  }
+
+  // A table used for LAYOUT (Hacker News is one: nested tables, rows of
+  // spans and colspans, no header) is read row by row; forcing it into a
+  // pipe table flattened the whole front page into one cell.
+  function isLayoutTable(tbl) {
+    if (tbl.tagName !== "TABLE") return false;
+    var role = roleAttr(tbl);
+    if (role === "presentation" || role === "none") return true;
+    if (tbl.querySelector("table")) return true;
+    if (tbl.caption || tbl.tHead || tbl.querySelector("th")) return false;
+    var rows = tbl.rows;
+    if (rows.length < 2) return true;
+    var cols = 0;
+    for (var r = 0; r < rows.length; r++) {
+      var cells = rows[r].cells;
+      if (cells.length > cols) cols = cells.length;
+      for (var c = 0; c < cells.length; c++) if (cells[c].colSpan > 1 || cells[c].rowSpan > 1) return true;
+    }
+    return cols < 2;
+  }
+
+  function layoutTable(tbl, depth, out, entities) {
+    var lines = [];
+    var flushLines = function () {
+      if (lines.length) out.push(lines.join("\n"));
+      lines = [];
+    };
+    var rows = tbl.rows;
+    for (var r = 0; r < rows.length; r++) {
+      if (hidden(rows[r])) continue;
+      withUnit(function () {
+        var parts = [];
+        var cells = rows[r].cells;
+        for (var c = 0; c < cells.length; c++) {
+          var cell = cells[c];
+          if (hidden(cell)) continue;
+          if (hasStructure(cell)) {
+            var before = oneLine(parts.join(" "));
+            if (before) lines.push(before);
+            parts = [];
+            flushLines();
+            blockSplit(cell, depth + 1, out, entities);
+          } else {
+            var s = oneLine(inline(cell, entities));
+            if (s) parts.push(s);
+          }
+        }
+        var line = oneLine(parts.join(" "));
+        if (line) lines.push(line);
+      });
+    }
+    flushLines();
+  }
+
+  // A <label for> whose control renders its own "name: value" line.
+  function labelsControl(label) {
+    var id = label.getAttribute("for");
+    if (!id) return false;
+    var el = document.getElementById(id);
+    return !!el && /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName) && !hidden(el);
+  }
+
   // One element. The region `read` picks can itself be the row
   // container (the densest div on a device list IS the list), so the
   // region goes through here too rather than straight to its children.
   function markdownNode(n, depth, out, entities) {
     var t = n.tagName;
-    if (SKIP_TAG[t] || hidden(n)) return;
+    if (SKIP_TAG[t] || hidden(n) || (unit && unit.skip === n)) return;
     if (dropChrome && n !== chromeExempt && isChrome(n)) return;
     if (/^H[1-6]$/.test(t)) {
+      var h = oneLine(inline(n, entities));
+      if (!h) return;
       readerEntity(n, "heading", entities);
-      out.push(new Array(+t[1] + 1).join("#") + " " + inline(n, entities).trim());
+      out.push(new Array(+t[1] + 1).join("#") + " " + h);
     } else if (t === "P") {
-      var p = inline(n, entities).trim();
+      var p = squash(inline(n, entities));
       if (p) out.push(p);
     } else if (t === "PRE") {
       out.push("```\n" + (n.textContent || "").replace(/\s+$/, "") + "\n```");
     } else if (t === "BLOCKQUOTE") {
-      out.push("> " + inline(n, entities).trim());
+      var q = oneLine(inline(n, entities));
+      if (q) out.push("> " + q);
     } else if (t === "UL" || t === "OL") {
       var items = n.children;
-      for (var k = 0; k < items.length; k++) {
-        if (items[k].tagName !== "LI") continue;
+      var lines = [];
+      for (var k = 0, num = 0; k < items.length; k++) {
+        if (items[k].tagName !== "LI" || hidden(items[k])) continue;
+        num++;
         readerEntity(items[k], "item", entities);
-        out.push((t === "OL" ? k + 1 + ". " : "- ") + inline(items[k], entities).trim());
+        var line = itemLine(items[k], depth, entities);
+        if (line) lines.push((t === "OL" ? num + ". " : "- ") + line);
       }
+      if (lines.length) out.push(lines.join("\n"));
     } else if (t === "HR") {
       out.push("---");
     } else if (t === "IMG") {
-      out.push("![" + (n.getAttribute("alt") || "") + "](" + (n.getAttribute("src") || "") + ")");
+      var img = unit && unit.noImages ? "" : imageMd(n);
+      if (img) out.push(img);
     } else if (t === "TABLE" || TABLE_ROLES[roleAttr(n)]) {
-      table(n, out, entities);
+      if (isLayoutTable(n)) layoutTable(n, depth, out, entities);
+      else table(n, out, entities);
     } else if (t === "DL") {
       definitions(n, out, entities);
+    } else if (t === "A" && n.hasAttribute("href")) {
+      // A link the walk reaches as a block keeps its target and the
+      // unit's suppression, exactly as one met inline does.
+      var al = hasStructure(n) || hasBlockChild(n) ? linkCard(n, depth, entities) : linkPiece(n, entities);
+      if (al) out.push(al);
+    } else if (t === "LABEL" && labelsControl(n)) {
+      return;
+    } else if (t === "LABEL" && n.querySelector("input,select,textarea")) {
+      // A label wrapping its control: the label's text IS the control's
+      // name, which the control's own "name: value" line carries.
+      markdown(n, depth + 1, out, entities);
     } else if (t === "INPUT" || t === "SELECT" || t === "TEXTAREA") {
       var fl = fieldLine(n);
       if (fl) out.push(fl);
     } else if (!hasStructure(n) && repeatedRows(n)) {
       rowsBlock(n, repeatedRows(n), depth, out, entities);
+    } else if (shortFlexRow(n)) {
+      // A metadata row ("[738d2be] · Nov 27, 2025") is laid out side
+      // by side: one line, not one paragraph per piece.
+      var fr = squash(inline(n, entities));
+      if (fr) out.push(fr);
     } else if (!hasStructure(n) && ownText(n)) {
       // A block that carries text of its own is a paragraph, whatever
       // its tag: an admin page is divs and spans, and dropping every
-      // one of them read the page as its heading alone. A block that
-      // also holds controls or other blocks is walked instead, so a
-      // <label>Owner <input></label> keeps its "Owner: jelle" line.
-      var own = inline(n, entities).trim();
-      if (own) out.push(own);
+      // one of them read the page as its heading alone. Its block
+      // children render apart rather than glued onto that text.
+      if (hasBlockChild(n)) blockSplit(n, depth, out, entities);
+      else {
+        var own = squash(inline(n, entities));
+        if (own) out.push(own);
+      }
     } else {
       // A custom element keeps its content in an open shadow root
       // (a <pl-table>'s rows live there); the walk descends, so the
       // reader must too, or an admin page reads as its heading alone.
       if (n.shadowRoot && n.shadowRoot.children) markdown(n.shadowRoot, depth + 1, out, entities);
-      markdown(n, depth + 1, out, entities);
+      if (ownText(n)) blockSplit(n, depth, out, entities);
+      else markdown(n, depth + 1, out, entities);
     }
+  }
+
+  // An icon reads as nothing; a labelled graphic (a logo that IS the
+  // page's <h1>) reads as its label.
+  function svgLabel(svg) {
+    var label = svg.getAttribute("aria-label") || "";
+    if (!label && svg.getAttribute("role") === "img") {
+      var title = svg.querySelector("title");
+      label = title ? title.textContent || "" : "";
+    }
+    return oneLine(label);
+  }
+
+  function shortFlexRow(el) {
+    if (el.children.length < 2 || hasStructure(el)) return false;
+    var st;
+    try {
+      st = window.getComputedStyle(el);
+    } catch (e) {
+      return false;
+    }
+    if (st.display !== "flex" && st.display !== "inline-flex") return false;
+    if (st.flexDirection !== "row" && st.flexDirection !== "row-reverse") return false;
+    if (st.flexWrap !== "nowrap") return false;
+    return textOf(el).length <= 200;
+  }
+
+  function linkPiece(a, entities) {
+    if (!unit)
+      return withUnit(function () {
+        return linkPiece(a, entities);
+      });
+    return oneLine(inlineEl(a, "A", entities));
+  }
+
+  // A link wrapping a whole card (a teaser that is one big <a>): its
+  // heading, else its first text, becomes the link; the rest follows.
+  // Inside a card already linked to the same target it adds nothing.
+  function linkCard(a, depth, entities) {
+    var url = linkUrl(a);
+    if (unit && url && (unit.suppress === url || unit.hrefs[url] !== undefined)) return "";
+    if (unit && url) unit.hrefs[url] = textOf(a);
+    return withUnit(function () {
+      unit.suppress = url;
+      unit.noImages = textOf(a).length > 0;
+      var title = "";
+      var heading = firstVisible(a, "h1,h2,h3,h4,h5,h6");
+      if (heading) {
+        title = oneLine(inline(heading, entities));
+        unit.skip = heading;
+      }
+      var pieces = [];
+      blockSplit(a, depth + 1, pieces, entities);
+      if (!title && pieces.length && !/\n/.test(pieces[0])) title = oneLine(pieces.shift().replace(/^#{1,6} /, ""));
+      if (!title) return joinItem("", pieces);
+      if (url) readerEntity(a, "link", entities);
+      return joinItem(url ? "[" + title + "](" + url + ")" : title, pieces);
+    });
+  }
+
+  // The output without a block that repeats the one before it (a
+  // responsive page renders the same teaser for two breakpoints).
+  function distinctBlocks(out) {
+    var kept = [];
+    for (var i = 0; i < out.length; i++) if (!kept.length || kept[kept.length - 1] !== out[i]) kept.push(out[i]);
+    return kept;
   }
 
   // -- tables and forms: what an admin page is made of -------------
@@ -1740,8 +2110,17 @@
     var title = (document.title || "").trim();
     if (title) out.push("# " + title);
     if (withIds && /^(ARTICLE|MAIN|SECTION)$/.test(region.tagName || "")) readerEntity(region, "section", entities);
-    markdownNode(region, 0, out, entities);
-    var reply = { op: "markdown", req: req, url: String(location.href), md: out.join("\n\n") + "\n" };
+    // As pageText without include_chrome: navigation, banners and asides
+    // inside the region are not the content (a wiki's menus live in <main>).
+    dropChrome = true;
+    chromeExempt = region;
+    try {
+      markdownNode(region, 0, out, entities);
+    } finally {
+      dropChrome = false;
+      chromeExempt = null;
+    }
+    var reply = { op: "markdown", req: req, url: String(location.href), md: distinctBlocks(out).join("\n\n") + "\n" };
     if (withIds) {
       reply.doc = DOC;
       reply.nodes = nodes;
