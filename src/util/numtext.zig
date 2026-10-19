@@ -27,6 +27,28 @@ pub fn count(buf: []u8, n: u64) []const u8 {
     unreachable;
 }
 
+const BYTE_UNITS = [_][]const u8{ "KiB", "MiB", "GiB", "TiB" };
+
+/// `n` bytes in binary units with one decimal below 10 of a unit ("1.2 MiB",
+/// "340 KiB"); exact bytes below 1 KiB, so a small file never reads "0 KiB".
+pub fn bytes(buf: []u8, n: u64) []const u8 {
+    if (n < 1024) return std.fmt.bufPrint(buf, "{d} B", .{n}) catch "?";
+    var div: u64 = 1024;
+    for (BYTE_UNITS, 0..) |suffix, i| {
+        const whole = (n + div / 2) / div;
+        // 1023.6 KiB reads as 1 MiB, never as 1024 KiB.
+        if (whole >= 1024 and i + 1 < BYTE_UNITS.len) {
+            div *= 1024;
+            continue;
+        }
+        const tenths = (n * 10 + div / 2) / div;
+        if (tenths < 100 and tenths % 10 != 0)
+            return std.fmt.bufPrint(buf, "{d}.{d} {s}", .{ tenths / 10, tenths % 10, suffix }) catch "?";
+        return std.fmt.bufPrint(buf, "{d} {s}", .{ whole, suffix }) catch "?";
+    }
+    unreachable;
+}
+
 test "count rounds to what a reader needs" {
     const t = std.testing;
     var buf: [24]u8 = undefined;
@@ -40,4 +62,17 @@ test "count rounds to what a reader needs" {
     try t.expectEqualStrings("1M", count(&buf, 999_600));
     try t.expectEqualStrings("1.5M", count(&buf, 1_480_000));
     try t.expectEqualStrings("1.5G", count(&buf, 1_480_000_000));
+}
+
+test "bytes reads in binary units, exact under 1 KiB" {
+    const t = std.testing;
+    var buf: [24]u8 = undefined;
+    try t.expectEqualStrings("0 B", bytes(&buf, 0));
+    try t.expectEqualStrings("1023 B", bytes(&buf, 1023));
+    try t.expectEqualStrings("1 KiB", bytes(&buf, 1024));
+    try t.expectEqualStrings("1.5 KiB", bytes(&buf, 1536));
+    try t.expectEqualStrings("340 KiB", bytes(&buf, 340 * 1024));
+    try t.expectEqualStrings("1 MiB", bytes(&buf, 1024 * 1024 - 100));
+    try t.expectEqualStrings("1.2 MiB", bytes(&buf, 1258291));
+    try t.expectEqualStrings("3 GiB", bytes(&buf, 3 << 30));
 }
