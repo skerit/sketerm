@@ -13,6 +13,7 @@ const mcp = @import("mcp.zig");
 const eql = std.mem.eql;
 const mcp_tools = @import("mcp_tools.zig");
 const clock = @import("../util/clock.zig");
+const numtext = @import("../util/numtext.zig");
 const template = @import("../util/template.zig");
 const pattern = @import("../util/pattern.zig");
 const mcp_testkit = @import("mcp_testkit.zig");
@@ -125,16 +126,158 @@ fn wordBoxesJson(arena: std.mem.Allocator, o: OcrOut) ![]const u8 {
     return aw.written();
 }
 
-/// One a11y node as a text line: the id a caller acts on, its role and
-/// name. The full node (every attribute) rides structuredContent.
+/// The word boxes of an OCR pass as a text block, one `@cx,cy wxh conf% word`
+/// row per box (the centre is what app_click takes).
+fn wordBoxesText(arena: std.mem.Allocator, o: OcrOut) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeAll("--- words (click centre, size, confidence, text) ---");
+    for (o.words) |wd| {
+        try w.print("\n@{d},{d} {d}x{d} {d:.0}% {s}", .{
+            wd.x + wd.w / 2, wd.y + wd.h / 2, wd.w, wd.h, wd.conf, wd.text,
+        });
+    }
+    return aw.written();
+}
+
+/// AT-SPI role names indexed by role number (`AtspiRole`, atspi-constants.h).
+const ATSPI_ROLES = [_][]const u8{
+    "invalid",              "accelerator_label",     "alert",               "animation",          "arrow",
+    "calendar",             "canvas",                "check_box",           "check_menu_item",    "color_chooser",
+    "column_header",        "combo_box",             "date_editor",         "desktop_icon",       "desktop_frame",
+    "dial",                 "dialog",                "directory_pane",      "drawing_area",       "file_chooser",
+    "filler",               "focus_traversable",     "font_chooser",        "frame",              "glass_pane",
+    "html_container",       "icon",                  "image",               "internal_frame",     "label",
+    "layered_pane",         "list",                  "list_item",           "menu",               "menu_bar",
+    "menu_item",            "option_pane",           "page_tab",            "page_tab_list",      "panel",
+    "password_text",        "popup_menu",            "progress_bar",        "push_button",        "radio_button",
+    "radio_menu_item",      "root_pane",             "row_header",          "scroll_bar",         "scroll_pane",
+    "separator",            "slider",                "spin_button",         "split_pane",         "status_bar",
+    "table",                "table_cell",            "table_column_header", "table_row_header",   "tearoff_menu_item",
+    "terminal",             "text",                  "toggle_button",       "tool_bar",           "tool_tip",
+    "tree",                 "tree_table",            "unknown",             "viewport",           "window",
+    "extended",             "header",                "footer",              "paragraph",          "ruler",
+    "application",          "autocomplete",          "editbar",             "embedded",           "entry",
+    "chart",                "caption",               "document_frame",      "heading",            "page",
+    "section",              "redundant_object",      "form",                "link",               "input_method_window",
+    "table_row",            "tree_item",             "document_spreadsheet", "document_presentation", "document_text",
+    "document_web",         "document_email",        "comment",             "list_box",           "grouping",
+    "image_map",            "notification",          "info_bar",            "level_bar",          "title_bar",
+    "block_quote",          "audio",                 "video",               "definition",         "article",
+    "landmark",             "log",                   "marquee",             "math",               "rating",
+    "timer",                "static",                "math_fraction",       "math_root",          "subscript",
+    "superscript",          "description_list",      "description_term",    "description_value",  "footnote",
+    "content_deletion",     "content_insertion",     "mark",                "suggestion",         "push_button_menu",
+    "switch",
+};
+
+/// AT-SPI state bits (`AtspiStateType`) a caller acts on, in print order;
+/// the always-on ones (enabled, sensitive, showing, visible, focusable)
+/// are left out because a node line names only what is NOT the default.
+const A11Y_STATES = [_]struct { bit: u6, name: []const u8 }{
+    .{ .bit = 12, .name = "focused" },
+    .{ .bit = 1, .name = "active" },
+    .{ .bit = 4, .name = "checked" },
+    .{ .bit = 32, .name = "indeterminate" },
+    .{ .bit = 20, .name = "pressed" },
+    .{ .bit = 23, .name = "selected" },
+    .{ .bit = 10, .name = "expanded" },
+    .{ .bit = 7, .name = "editable" },
+    .{ .bit = 43, .name = "read_only" },
+    .{ .bit = 33, .name = "required" },
+    .{ .bit = 36, .name = "invalid" },
+    .{ .bit = 16, .name = "modal" },
+    .{ .bit = 3, .name = "busy" },
+};
+
+/// One a11y node as a text line: `id role(N) "name" [states] value=V
+/// @x,y wxh`, each part left out when empty. The full node rides
+/// structuredContent.
 fn a11yNodeLine(arena: std.mem.Allocator, node: std.json.Value) ![]const u8 {
     if (node != .object) return "(malformed node)";
-    const id = if (node.object.get("id")) |v| (if (v == .string) v.string else "") else "";
-    const role: i64 = if (node.object.get("role")) |v| (if (v == .integer) v.integer else -1) else -1;
-    const nm = if (node.object.get("name")) |v| (if (v == .string) v.string else "") else "";
-    return std.fmt.allocPrint(arena, "{s} role {d}{s}{s}", .{
-        id, role, if (nm.len > 0) " " else "", nm,
-    });
+    const o = node.object;
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeAll(jsonStr(o.get("id")));
+    const role: i64 = if (o.get("role")) |v| (if (v == .integer) v.integer else -1) else -1;
+    if (role >= 0 and role < ATSPI_ROLES.len)
+        try w.print(" {s}({d})", .{ ATSPI_ROLES[@intCast(role)], role })
+    else
+        try w.print(" role({d})", .{role});
+    const nm = jsonStr(o.get("name"));
+    if (nm.len > 0) try w.print(" {f}", .{std.json.fmt(nm, .{})});
+    const aid = jsonStr(o.get("accessible_id"));
+    if (aid.len > 0) try w.print(" aid={s}", .{aid});
+    if (o.get("states")) |sv| if (sv == .array and sv.array.items.len == 2) {
+        const lo = sv.array.items[0];
+        const hi = sv.array.items[1];
+        if (lo == .integer and hi == .integer) {
+            const word = struct {
+                fn f(x: i64) u64 {
+                    return @as(u32, @truncate(@as(u64, @bitCast(x))));
+                }
+            }.f;
+            const mask: u64 = (word(hi.integer) << 32) | word(lo.integer);
+            try a11yStates(w, mask);
+        }
+    };
+    if (o.get("value")) |v| switch (v) {
+        .integer => |n| try w.print(" value={d}", .{n}),
+        .float => |f| try w.print(" value={d}", .{f}),
+        .number_string => |s| try w.print(" value={s}", .{s}),
+        else => {},
+    };
+    if (o.get("rect")) |rv| if (rv == .array and rv.array.items.len == 4) {
+        var r: [4]i64 = undefined;
+        for (rv.array.items, &r) |e, *d| d.* = if (e == .integer) e.integer else 0;
+        if (r[2] > 0 and r[3] > 0) try w.print(" @{d},{d} {d}x{d}", .{ r[0], r[1], r[2], r[3] });
+    };
+    const desc = jsonStr(o.get("desc"));
+    if (desc.len > 0) try w.print(" desc={f}", .{std.json.fmt(desc, .{})});
+    return aw.written();
+}
+
+/// The ` [a,b]` state list of a node line, from its 64-bit AT-SPI mask.
+/// `disabled` (neither enabled nor sensitive), `collapsed` (expandable,
+/// not expanded) and `hidden` (visible, not showing) are derived, and a
+/// zero mask (a node that reports no states) prints nothing.
+fn a11yStates(w: *std.Io.Writer, mask: u64) !void {
+    if (mask == 0) return;
+    const has = struct {
+        fn f(m: u64, bit: u6) bool {
+            return m & (@as(u64, 1) << bit) != 0;
+        }
+    }.f;
+    var n: usize = 0;
+    const sep = struct {
+        fn f(wr: *std.Io.Writer, count: *usize) !void {
+            try wr.writeAll(if (count.* == 0) " [" else ",");
+            count.* += 1;
+        }
+    }.f;
+    if (!has(mask, 8) and !has(mask, 24)) {
+        try sep(w, &n);
+        try w.writeAll("disabled");
+    }
+    for (A11Y_STATES) |s| if (has(mask, s.bit)) {
+        try sep(w, &n);
+        try w.writeAll(s.name);
+    };
+    if (has(mask, 9) and !has(mask, 10)) {
+        try sep(w, &n);
+        try w.writeAll("collapsed");
+    }
+    if (has(mask, 30) and !has(mask, 25)) {
+        try sep(w, &n);
+        try w.writeAll("hidden");
+    }
+    if (n > 0) try w.writeAll("]");
+}
+
+/// A JSON string value, or "" for a missing or non-string one.
+fn jsonStr(v: ?std.json.Value) []const u8 {
+    const x = v orelse return "";
+    return if (x == .string) x.string else "";
 }
 
 /// Indented outline of an a11y subtree — the text-lane rendering of a
@@ -532,6 +675,12 @@ fn listInstalledApps(arena: std.mem.Allocator, args: std.json.Value) ![]const u8
         try res.text("--- installed apps (name: command) ---");
         for (parsed.apps) |a| try res.textf("{s}: {s}", .{ a.name, a.exec });
     }
+    // Partial discovery (one directory unreadable) still lists what it
+    // found, but the caller must know the list may be short.
+    if (parsed.@"error".len > 0) {
+        try res.field("partial_error", parsed.@"error");
+        try res.textf("discovery was partial on the daemon host: {s}", .{parsed.@"error"});
+    }
     return res.finish();
 }
 
@@ -691,7 +840,14 @@ fn appMacros(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
                 try res.textf("{d}. {s}", .{ i + 1, jw.written() });
             }
         } else {
-            try res.text("the stored macro is not the expected {actions:[...]} shape — inspect it with app_macros show");
+            // Show what IS stored: pointing at "app_macros show" from
+            // inside app_macros show sent callers round in a circle.
+            try res.text("the stored macro is not a replayable {actions:[...]} document (another shape, no steps, or over the 200-step cap); fix it with app_macro_save or delete it");
+            const cap = 4096;
+            const head = bytes[0..@min(bytes.len, cap)];
+            if (std.unicode.utf8ValidateSlice(head)) {
+                try res.textf("--- stored ({d} bytes{s}) ---\n{s}", .{ bytes.len, if (bytes.len > cap) ", first 4096 shown" else "", head });
+            } else try res.textf("({d} stored bytes, not UTF-8 text)", .{bytes.len});
         }
         return res.finish();
     }
@@ -916,7 +1072,8 @@ fn appLog(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *appdriv
         }
         const l = found orelse
             return errRes(arena, .not_found, "line not available (dropped from the ring, never emitted, or beyond the post-exit stash)");
-        const age_s = @as(f64, @floatFromInt(now_wall - l.t)) / 1000.0;
+        var age_buf: [32]u8 = undefined;
+        const age = logAge(&age_buf, now_wall - l.t);
         var res = Res.init(arena);
         try res.fact("app", appIdOf(app));
         try res.fact("line_id", l.id);
@@ -928,8 +1085,8 @@ fn appLog(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *appdriv
             if (app.markerImage(line_id)) |img| {
                 try res.fact("marker_screenshot", true);
                 if (img.shared_from != 0) try res.fact("screenshot_shared_from", img.shared_from);
-                try res.textf("marker line {d} ({d:.1}s ago): '{s}' — window at that instant below{s}", .{
-                    l.id, age_s, l.text,
+                try res.textf("marker line {d} ({s} ago): '{s}' — window at that instant below{s}", .{
+                    l.id, age, l.text,
                     if (img.shared_from != 0)
                         try std.fmt.allocPrint(arena, " (frame unchanged since marker {d}; screenshot shared)", .{img.shared_from})
                     else
@@ -939,14 +1096,14 @@ fn appLog(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *appdriv
             }
             try res.fact("marker_screenshot", false);
             try res.textf(
-                "marker line {d} ({d:.1}s ago): '{s}' (no screenshot was stashed: no rendered window at the time, or the marker aged out)",
-                .{ l.id, age_s, l.text },
+                "marker line {d} ({s} ago): '{s}' (no screenshot was stashed: no rendered window at the time, or the marker aged out)",
+                .{ l.id, age, l.text },
             );
             return res.finish();
         }
-        try res.textf("line {d}, {d:.1}s ago{s}", .{
+        try res.textf("line {d}, {s} ago{s}", .{
             l.id,
-            age_s,
+            age,
             if (l.truncated) ", was longer than the 4KB line cap" else "",
         });
         try res.textf("--- line ---\n{s}", .{l.text});
@@ -1018,16 +1175,17 @@ fn appLog(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *appdriv
         aw.clearRetainingCapacity();
         try w.writeAll("--- log ---");
         for (lines) |l| {
-            const age_s = @as(f64, @floatFromInt(now_wall - l.t)) / 1000.0;
+            var age_buf: [32]u8 = undefined;
+            const age = logAge(&age_buf, now_wall - l.t);
             if (l.marker) {
                 const has_shot = app.markerImage(l.id) != null;
-                try w.print("\n{d} [-{d:.1}s] [marker '{s}'{s}]", .{
-                    l.id, age_s, l.text,
+                try w.print("\n{d} [-{s}] [marker '{s}'{s}]", .{
+                    l.id, age, l.text,
                     if (has_shot) " — screenshot stashed, fetch it by this line's id" else "",
                 });
             } else {
-                try w.print("\n{d} [-{d:.1}s] {s}{s}", .{
-                    l.id,                                     age_s, l.text,
+                try w.print("\n{d} [-{s}] {s}{s}", .{
+                    l.id,                                     age, l.text,
                     if (l.cut or l.truncated) " [+]" else "",
                 });
             }
@@ -1224,7 +1382,8 @@ fn screenshotApp(arena: std.mem.Allocator, tool: Tool, args: std.json.Value, app
         try res.fact("file_bytes", full.png.len);
         try res.fact("file_w", full.img_w);
         try res.fact("file_h", full.img_h);
-        try res.textf("saved {d}x{d} PNG ({d} KiB) to {s}", .{ full.img_w, full.img_h, full.png.len / 1024, path });
+        var size_buf: [32]u8 = undefined;
+        try res.textf("saved {d}x{d} PNG ({s}) to {s}", .{ full.img_w, full.img_h, numtext.bytes(&size_buf, full.png.len), path });
     }
     // inline:false skips the image block (a file-only capture costs
     // no image tokens); the facts still describe the frame.
@@ -1407,8 +1566,12 @@ fn appClick(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *appdr
             return res.finish();
         };
         defer app_state.allocator.free(shot.png);
-        if (want_mark)
-            try res.text("the red crosshair marks the click point on the post-click frame. Coordinates are delivered to the app verbatim; a pointer-LOCKED app tracks its own cursor from relative deltas, so its internal cursor can differ (calibrate with app_mouse_move dx/dy).");
+        // The pointer-lock caveat is the same for every click, so it is
+        // said once per server, not appended to every reply.
+        if (want_mark and !crosshair_explained) {
+            crosshair_explained = true;
+            try res.text("red crosshair = the click point, delivered verbatim; a pointer-LOCKED app moves its own cursor from relative deltas, so calibrate that one with app_mouse_move dx/dy");
+        }
         try addShotFacts(&res, arena, app, win_id, shot);
         return res.finishWithImages(&.{shot.png}, &.{"click"});
     }
@@ -1476,7 +1639,7 @@ fn appPerformAction(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app
         return errRes(arena, .unavailable, "a11y action failed (daemon unreachable?)");
     defer app_state.allocator.free(reply);
     if (std.mem.indexOf(u8, reply, "\"ok\"") == null)
-        return errRes(arena, .not_found, try std.fmt.allocPrint(arena, "the accessibility layer refused the action: {s}", .{reply}));
+        return errRes(arena, .not_found, try std.fmt.allocPrint(arena, "the accessibility layer refused the action: {s}", .{a11yReplyError(arena, reply)}));
     _ = app.waitIdle(200, 2_000);
     var res = Res.init(arena);
     try res.fact("element", elem_id);
@@ -1513,7 +1676,7 @@ fn appSetValue(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *ap
         return errRes(arena, .unavailable, "a11y set failed (daemon unreachable?)");
     defer app_state.allocator.free(reply);
     if (std.mem.indexOf(u8, reply, "\"ok\"") == null)
-        return errRes(arena, .not_found, try std.fmt.allocPrint(arena, "the accessibility layer refused the write: {s}", .{reply}));
+        return errRes(arena, .not_found, try std.fmt.allocPrint(arena, "the accessibility layer refused the write: {s}", .{a11yReplyError(arena, reply)}));
     _ = app.waitIdle(200, 2_000);
     var res = Res.init(arena);
     try res.fact("element", elem_id);
@@ -1759,7 +1922,7 @@ fn appWait(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *appdri
     try res.textf("observed: window {d} committed {d} frame(s) during the {d}ms wait (now at frame {d})", .{
         wid, delta, nowMs() - t0, app.frameCount(wid),
     });
-    try addAppSummary(&res, arena, app);
+    try addAppBrief(&res, arena, app);
     return res.finish();
 }
 
@@ -1789,7 +1952,7 @@ fn appA11yTree(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *ap
     // structuredContent for anything that wants every attribute.
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, copy, .{}) catch
         return appErr(arena, "malformed accessibility reply");
-    try res.text("AT-SPI tree. Each node's id drives app_perform_action (press/activate/toggle) or app_set_value (write a text field/slider) WITHOUT coordinates; that is the reliable path. Roles (common): 8 checkbox, 14 dialog/frame, 18 filler, 25 label, 28 menu, 29 menubar, 30 menuitem, 34 canvas, 35 page-tab, 37 panel, 42 push-button, 43 radiobutton, 44 root/desktop, 46 scrollbar, 60 table, 62 text, 71 toolbar, 74 tree, 75 application, 84 entry. rect is unreliable for headless apps (no screen position), so prefer perform_action/set_value over pixel clicks.");
+    try res.text("AT-SPI tree, one node per line: id role(number) \"name\" [states] value=V @x,y wxh, each part left out when empty. The id drives app_perform_action (press/activate/toggle) or app_set_value (write a text field/slider) WITHOUT coordinates, the reliable path; the role number is what app_wait_for_element takes. The @ rect is in screen coordinates and unreliable for headless apps (no screen position), so prefer perform_action/set_value over pixel clicks.");
     var ow: std.Io.Writer.Allocating = .init(arena);
     try ow.writer.writeAll("--- tree ---");
     if (parsed == .object) {
@@ -1846,7 +2009,8 @@ fn appRecordStop(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *
     try res.fact("format", ext);
     try res.fact("frames", result.frames);
     try res.fact("bytes", result.data.len);
-    try res.textf("saved {d} frames ({d} KiB {s}) to {s}", .{ result.frames, result.data.len / 1024, ext, path });
+    var size_buf: [32]u8 = undefined;
+    try res.textf("saved {d} frames ({s} {s}) to {s}", .{ result.frames, numtext.bytes(&size_buf, result.data.len), ext, path });
     return res.finish();
 }
 
@@ -1868,6 +2032,7 @@ fn appReadText(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *ap
             try res.raw("boxes", try wordBoxesJson(arena, o));
             try res.textf("OCR of window {d} at scale {d}: {d} word box(es)", .{ wid, o.scale, o.words.len });
             try res.textf("--- ocr text ---\n{s}", .{o.text});
+            if (o.words.len > 0) try res.text(try wordBoxesText(arena, o));
             return res.finish();
         },
     }
@@ -2948,7 +3113,7 @@ fn appWatch(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *appdr
     }
     if (watch.exited) try res.text("the app EXITED during the watch (details below)");
     try res.textf("pass min_frame:{d} to screenshot_app for a capture provably newer than the start of this watch", .{frame_at_start});
-    try addAppSummary(&res, arena, app);
+    try addAppBrief(&res, arena, app);
 
     // Thumbnails: encoded AFTER the watch, from stashed pixels, so PNG
     // encoding never perturbs the sampling it is describing.
@@ -3109,7 +3274,7 @@ fn hoverMap(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *appdr
     } else {
         try res.textf("{d} cell(s) responded to hover. A cell is one grid step wide, so the centres below are approximate — re-sweep a promising area with a region + finer grid to localise it.", .{hits});
     }
-    try addAppSummary(&res, arena, app);
+    try addAppBrief(&res, arena, app);
 
     var mw: std.Io.Writer.Allocating = .init(arena);
     try mw.writer.writeAll("--- map (# = responded to hover) ---");
@@ -3187,7 +3352,7 @@ fn appBacktrace(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *a
     }
     try res.text("The app was STOPPED while this was taken and has been resumed; wall-clock timings across this call are not meaningful.");
     if (rep.truncated) try res.text("output truncated at the daemon's cap — the head is retained");
-    try addAppSummary(&res, arena, app);
+    try addAppBrief(&res, arena, app);
     try res.textf("--- backtrace ---\n{s}", .{std.mem.trimEnd(u8, rep.text, "\n")});
     return res.finish();
 }
@@ -3349,6 +3514,45 @@ test "app_macros show re-serializes the stored macro, never echoes it" {
     const actions = sc.get("actions").?.object.get("actions").?.array;
     try t.expectEqual(@as(usize, 1), actions.items.len);
     try t.expectEqual(@as(i64, 100), actions.items[0].object.get("wait").?.integer);
+}
+
+test "app_macros show prints a malformed macro's stored bytes in text mode" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const saved_mode = mcp.result_mode;
+    defer mcp.result_mode = saved_mode;
+    mcp.result_mode = .text;
+
+    var dirbuf = "/tmp/sketerm-macrobad-XXXXXX".*;
+    const dir_z = c.mkdtemp(&dirbuf) orelse return error.SkipZigTest;
+    const dir = std.mem.span(@as([*:0]u8, @ptrCast(dir_z)));
+    var envbuf: [160]u8 = undefined;
+    const env = try std.fmt.bufPrintZ(&envbuf, "{s}", .{dir});
+    var saved: EnvSave = .{};
+    try saved.override("XDG_STATE_HOME", env);
+    var zbuf: [4096]u8 = undefined;
+    defer {
+        saved.restore();
+        if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm/macros/bad.json", .{dir})) |f| {
+            _ = c.unlink(f.ptr);
+        } else |_| {}
+        if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm/macros", .{dir})) |d| _ = c.rmdir(d.ptr) else |_| {}
+        if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm", .{dir})) |d| _ = c.rmdir(d.ptr) else |_| {}
+        _ = c.rmdir(dir_z);
+    }
+    try mcpassets.save(t.allocator, .macro, "bad", "{\"steps\":[1]}");
+
+    app_state.ready = true;
+    defer app_state.ready = false;
+    const args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"show\":\"bad\"}", .{});
+    const result = try appTool(arena, .app_macros, args);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, result, .{});
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    // It used to say "inspect it with app_macros show", the call just made.
+    try t.expect(std.mem.indexOf(u8, text, "inspect it with app_macros show") == null);
+    try t.expect(std.mem.indexOf(u8, text, "--- stored (13 bytes) ---\n{\"steps\":[1]}") != null);
 }
 
 test "burstMs defaults and clamps to the per-wait cap" {
@@ -3928,8 +4132,7 @@ pub fn appSummaryText(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 
         if (app.exited and app.exit_status >= 0)
             try w.writeAll("; the exit status above belongs to the WRAPPER, not the app");
     }
-    if (std.mem.indexOf(u8, app.log_buf.items, "Sanitizer") != null or
-        std.mem.indexOf(u8, app.log_buf.items, "runtime error:") != null)
+    if (sanitizerReported(app))
         try w.writeAll("\na sanitizer wrote a report to stderr — read it in full with app_log");
     const primary_id = firstToplevelId(app);
     var shown: usize = 0;
@@ -3939,6 +4142,9 @@ pub fn appSummaryText(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 
         try w.print("\nwindow {d}: {d}x{d} scale {d} frame {d}", .{ win.id, win.w, win.h, win.scale, win.frames });
         if (win.id == primary_id) try w.writeAll(" primary");
         if (win.popup) try w.writeAll(" popup");
+        if (win.maximized) try w.writeAll(" maximized");
+        if (win.fullscreen) try w.writeAll(" fullscreen");
+        if (win.app_id) |aid| try w.print(" app_id={s}", .{aid});
         if (win.title) |t| try w.print(" title={s}", .{t});
     }
     if (shown == 0) try w.writeAll("\nno rendered window");
@@ -3955,6 +4161,52 @@ pub fn addAppSummary(res: *Res, arena: std.mem.Allocator, app: *appdrive.App) !v
     try appFacts(res, arena, app, true);
     try res.text(try appSummaryText(arena, app));
 }
+
+/// addAppSummary for a reply about something else (a wait, a watch, a
+/// backtrace): the same facts, but a one-line text unless the app died,
+/// vanished or reported a fault, which still gets the full summary.
+pub fn addAppBrief(res: *Res, arena: std.mem.Allocator, app: *appdrive.App) !void {
+    if (app.exited or app.presentationGone() or debuggerSignal(app.log_buf.items) != null or sanitizerReported(app))
+        return addAppSummary(res, arena, app);
+    try appFacts(res, arena, app, true);
+    var shown: usize = 0;
+    for (app.windows.items) |win| {
+        if (win.frames != 0) shown += 1;
+    }
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.print("app {d} ({s})", .{ appIdOf(app), app.name });
+    if (app.pid != 0) try w.print(" pid {d}", .{app.pid});
+    try w.print(" running, {d} rendered window(s)", .{shown});
+    const primary_id = firstToplevelId(app);
+    if (primary_id != 0) try w.print(", primary {d}", .{primary_id});
+    try res.text(aw.written());
+}
+
+/// Whether the app's log carries a sanitizer report.
+fn sanitizerReported(app: *appdrive.App) bool {
+    return std.mem.indexOf(u8, app.log_buf.items, "Sanitizer") != null or
+        std.mem.indexOf(u8, app.log_buf.items, "runtime error:") != null;
+}
+
+/// How long ago a log line was: tenths of a second under 90 s, where
+/// lines a moment apart must stay apart, else a `clock.span`.
+fn logAge(buf: []u8, ms: i64) []const u8 {
+    if (ms < 90_000) return std.fmt.bufPrint(buf, "{d:.1}s", .{@as(f64, @floatFromInt(@max(ms, 0))) / 1000.0}) catch "?";
+    return clock.span(buf, ms, .short);
+}
+
+/// The `error` string of a refused a11y op reply (`{"error":"..."}`),
+/// or the reply itself when it is not that shape.
+fn a11yReplyError(arena: std.mem.Allocator, reply: []const u8) []const u8 {
+    const R = struct { @"error": []const u8 = "" };
+    const r = std.json.parseFromSliceLeaky(R, arena, reply, .{ .ignore_unknown_fields = true }) catch
+        return std.mem.trim(u8, reply, " \r\n");
+    return if (r.@"error".len > 0) r.@"error" else std.mem.trim(u8, reply, " \r\n");
+}
+
+/// Set once the click-crosshair caveat has been said in this server.
+var crosshair_explained = false;
 
 /// Screenshot caption: window identity + how to map image coordinates
 /// back to app_click surface coordinates (crop origin + scale). One
@@ -5019,6 +5271,77 @@ test "a11yTreeIsBare only flags a registry with no widgets under it" {
     try t.expect(!a11yTreeIsBare(arena, "not json"));
 }
 
+test "a11y node lines carry role name, states, value and rect, empty parts left out" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    comptime std.debug.assert(ATSPI_ROLES.len == 131);
+    try t.expectEqualStrings("label", ATSPI_ROLES[29]);
+    try t.expectEqualStrings("push_button", ATSPI_ROLES[43]);
+    try t.expectEqualStrings("application", ATSPI_ROLES[75]);
+    try t.expectEqualStrings("heading", ATSPI_ROLES[83]);
+    try t.expectEqualStrings("document_web", ATSPI_ROLES[95]);
+    try t.expectEqualStrings("switch", ATSPI_ROLES[130]);
+
+    // enabled(8) sensitive(24) showing(25) visible(30) are defaults and
+    // stay unprinted; focused(12) and checked(4) are what the line names.
+    const lo: u64 = (1 << 8) | (1 << 24) | (1 << 25) | (1 << 30) | (1 << 12) | (1 << 4);
+    const json = try std.fmt.allocPrint(arena,
+        \\{{"id":":1.5/w12","role":43,"name":"OK","accessible_id":"ok_btn","states":[{d},0],"rect":[10,20,80,24],"value":3}}
+    , .{lo});
+    const node = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+    try t.expectEqualStrings(
+        \\:1.5/w12 push_button(43) "OK" aid=ok_btn [focused,checked] value=3 @10,20 80x24
+    , try a11yNodeLine(arena, node));
+
+    // No name, a zero state mask, a no-size rect: only id and role remain.
+    const bare = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"id":"app","role":75,"name":"","states":[0,0],"rect":[0,0,0,0]}
+    , .{});
+    try t.expectEqualStrings("app application(75)", try a11yNodeLine(arena, bare));
+
+    // Derived states: neither enabled nor sensitive, expandable not
+    // expanded, visible not showing; read_only lives in the high word.
+    const derived = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"id":"x","role":200,"states":[1073742336,2048],"value":0.5}
+    , .{});
+    try t.expectEqualStrings("x role(200) [disabled,read_only,collapsed,hidden] value=0.5", try a11yNodeLine(arena, derived));
+}
+
+test "OCR word boxes reach the text lane with their click centres" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var words = [_]ocr.Word{
+        .{ .text = try arena.dupe(u8, "File"), .x = 10, .y = 4, .w = 30, .h = 12, .conf = 96.4 },
+        .{ .text = try arena.dupe(u8, "Edit"), .x = 50, .y = 4, .w = 28, .h = 12, .conf = 88 },
+    };
+    const o: OcrOut = .{ .text = try arena.dupe(u8, "File Edit"), .words = &words, .scale = 1 };
+    try t.expectEqualStrings(
+        "--- words (click centre, size, confidence, text) ---\n@25,10 30x12 96% File\n@64,10 28x12 88% Edit",
+        try wordBoxesText(arena, o),
+    );
+}
+
+test "logAge keeps tenths under 90s and spans above" {
+    const t = std.testing;
+    var buf: [32]u8 = undefined;
+    try t.expectEqualStrings("1.2s", logAge(&buf, 1_234));
+    try t.expectEqualStrings("0.0s", logAge(&buf, -5));
+    try t.expectEqualStrings("5m", logAge(&buf, 5 * 60_000));
+}
+
+test "a refused a11y op names the daemon's reason, not its JSON" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try t.expectEqualStrings("unknown a11y op", a11yReplyError(arena, "{\"error\":\"unknown a11y op\"}"));
+    try t.expectEqualStrings("garbage", a11yReplyError(arena, "garbage\n"));
+}
+
 test "regionOf accepts the object shape and the array shorthand" {
     const t = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
@@ -5477,6 +5800,53 @@ test "app_click reports a crash during its held click" {
     try t.expect(std.mem.indexOf(u8, text, "no pixels yet") == null);
 }
 
+test "text mode: the crosshair caveat is said once, a wait gets a one-line app summary" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fixture = try testActionApp(t.allocator, true);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+    app_state.ready = true;
+    try app_state.apps.put(t.allocator, 1, fixture.app);
+    defer {
+        Journal.deinitAll();
+        LogDelta.deinitAll();
+        MacroNudge.deinitAll();
+        _ = app_state.apps.fetchSwapRemove(1);
+        app_state.apps.deinit(t.allocator);
+        app_state.apps = .empty;
+        app_state.ready = false;
+    }
+    const saved_mode = mcp.result_mode;
+    defer mcp.result_mode = saved_mode;
+    mcp.result_mode = .text;
+    const saved_explained = crosshair_explained;
+    defer crosshair_explained = saved_explained;
+    crosshair_explained = false;
+    const app_tools = @import("mcp_app.zig");
+    const textOf = struct {
+        fn f(a: std.mem.Allocator, out: []const u8) ![]const u8 {
+            const p = try std.json.parseFromSliceLeaky(std.json.Value, a, out, .{});
+            return p.object.get("content").?.array.items[0].object.get("text").?.string;
+        }
+    }.f;
+
+    const click = "{\"app\":1,\"window\":1,\"x\":0,\"y\":0,\"wait_change\":false,\"retry\":0}";
+    const first = try textOf(arena, try app_tools.appTool(arena, .app_click, try parseTestValue(arena, click)));
+    try t.expect(std.mem.indexOf(u8, first, "pointer-LOCKED") != null);
+    const second = try textOf(arena, try app_tools.appTool(arena, .app_click, try parseTestValue(arena, click)));
+    try t.expect(std.mem.indexOf(u8, second, "clicked (0,0)") != null);
+    try t.expect(std.mem.indexOf(u8, second, "pointer-LOCKED") == null);
+
+    // A live app's wait reply names it in one line; the window list is
+    // what app_windows is for.
+    const waited = try textOf(arena, try app_tools.appTool(arena, .app_wait, try parseTestValue(arena, "{\"app\":1,\"quiet_ms\":10,\"timeout_ms\":200}")));
+    try t.expect(std.mem.indexOf(u8, waited, "running, 1 rendered window(s), primary 1") != null);
+    try t.expect(std.mem.indexOf(u8, waited, "window 1: 1x1") == null);
+}
+
 test "app tools speak both lanes: windows, wait, pointer and the roster" {
     const t = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
@@ -5615,6 +5985,15 @@ test "screenshot_app path writes a full-resolution PNG and inline:false skips th
     const bad = try app_tools.appTool(arena, .screenshot_app, try parseTestValue(arena, "{\"app\":1,\"window\":1,\"path\":\"shot.png\"}"));
     const bparsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, bad, .{});
     try t.expect(bparsed.object.get("isError").?.bool);
+    // Text mode: the saved size reads as bytes, never "0 KiB".
+    const saved_mode = mcp.result_mode;
+    defer mcp.result_mode = saved_mode;
+    mcp.result_mode = .text;
+    const tresult = try app_tools.appTool(arena, .screenshot_app, try parseTestValue(arena, args));
+    const tparsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, tresult, .{});
+    const ttext = tparsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    const want = try std.fmt.allocPrint(arena, "saved 1x1 PNG ({d} B) to {s}", .{ st.st_size, path });
+    try t.expect(std.mem.indexOf(u8, ttext, want) != null);
 }
 
 test "get_app_state stats_only still reports the app it describes" {

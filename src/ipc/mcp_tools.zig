@@ -653,7 +653,7 @@ const TOOL_DECLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"host":{"type":"string","description":"SSH host (user@box); omit = local"}}}
         ,
-        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"apps\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},\"count\":{\"type\":\"integer\"},\"host\":{\"type\":\"string\"}" ++ "},\"required\":[\"apps\",\"count\"]}",
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"apps\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},\"count\":{\"type\":\"integer\"},\"host\":{\"type\":\"string\"},\"partial_error\":{\"type\":\"string\",\"description\":\"Set when discovery was partial (a directory unreadable): the list may be short\"}" ++ "},\"required\":[\"apps\",\"count\"]}",
     },
     .{
         .name = "launch_app",
@@ -962,7 +962,7 @@ const TOOL_DECLS = [_]ToolDef{
         .group = .app,
         .mutates = false,
         .description =
-        \\Read the app's accessibility (AT-SPI) tree as JSON: every widget's role, name, AT-SPI accessible identifier when exposed, description, states and screen rectangle. Desktop app identities come from the rendered windows' Wayland app_id instead. Target elements by name/role instead of pixel-hunting a screenshot. Works for GTK/Qt apps. When NOTHING published a tree (raw SDL/OpenGL/framebuffer apps and games have no toolkit to do so) the reply says exactly that, so an empty tree is never confused with having asked too early — in that case drive the app with screenshot_app + app_click coordinates and app_template_save/app_find_image, and do not expect app_perform_action/app_set_value to work.
+        \\Read the app's accessibility (AT-SPI) tree, one line per widget: its role, name, AT-SPI accessible identifier when exposed, description, states and screen rectangle. Desktop app identities come from the rendered windows' Wayland app_id instead. Target elements by name/role instead of pixel-hunting a screenshot. Works for GTK/Qt apps. When NOTHING published a tree (raw SDL/OpenGL/framebuffer apps and games have no toolkit to do so) the reply says exactly that, so an empty tree is never confused with having asked too early — in that case drive the app with screenshot_app + app_click coordinates and app_template_save/app_find_image, and do not expect app_perform_action/app_set_value to work.
         ,
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Max wait (max 120000 - larger values are clamped)"}}}
@@ -998,7 +998,7 @@ const TOOL_DECLS = [_]ToolDef{
         .group = .app,
         .mutates = false,
         .description =
-        \\OCR: read the TEXT rendered in an app window (or a region of it) — for custom-drawn UIs and games with no accessibility tree, this turns pixels into assertable strings. Returns the recognized text plus per-word boxes in surface coordinates with click centers (cx,cy) — read a label, then app_click its cx/cy. Needs tesseract installed on the machine running the MCP server (loaded at runtime; install tesseract + tesseract-data-eng). Crop with region for speed and accuracy; small pixel fonts are auto-upscaled (override with scale).
+        \\OCR: read the TEXT rendered in an app window (or a region of it) — for custom-drawn UIs and games with no accessibility tree, this turns pixels into assertable strings. Returns the recognized text plus per-word boxes in surface coordinates with click centers (each word's @x,y), so a label just read can be app_click'ed at that point. Needs tesseract installed on the machine running the MCP server (loaded at runtime; install tesseract + tesseract-data-eng). Crop with region for speed and accuracy; small pixel fonts are auto-upscaled (override with scale).
         ,
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = the PRIMARY toplevel)"},"region":{"type":"object","description":"Read only this sub-rectangle (surface pixels)","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"scale":{"type":"integer","description":"Integer pre-upscale for tiny bitmap fonts (1-8; 0/omit = auto)"},"psm":{"type":"integer","description":"Tesseract page segmentation: 6 uniform text block (default, dialogs), 11 sparse scattered labels, 7 single line, 3 full auto"},"lang":{"type":"string","description":"Language code(s), default eng (e.g. \"eng+deu\")"}}}

@@ -155,7 +155,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 - `app_watch` (read-only): Watch a window for a while and report WHEN it changed, as a timeline.
 - `app_hover_map`: Sweep the pointer over a grid and report which cells made the window repaint — empirical discovery of interactive regions for an app with no accessibility tree (games, raw framebuffer UIs), where the only alternative is guessing coordinates.
 - `app_backtrace`: Attach a debugger to the app on the daemon host and return every thread's backtrace.
-- `app_a11y_tree` (read-only): Read the app's accessibility (AT-SPI) tree as JSON: every widget's role, name, AT-SPI accessible identifier when exposed, description, states and screen rectangle.
+- `app_a11y_tree` (read-only): Read the app's accessibility (AT-SPI) tree, one line per widget: its role, name, AT-SPI accessible identifier when exposed, description, states and screen rectangle.
 - `app_record_start`: Start recording a window's frames (a visual log of what you do).
 - `app_record_stop`: Stop the recording and save it (WebM or GIF per app_record_start).
 - `app_read_text` (read-only): OCR: read the TEXT rendered in an app window (or a region of it) — for custom-drawn UIs and games with no accessibility tree, this turns pixels into assertable strings.
