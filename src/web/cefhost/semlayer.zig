@@ -1001,7 +1001,7 @@ pub fn onScriptMessage(self: *Host, v: *View, json: []const u8) void {
         };
         postActFor(self, v, &p, a.value.ok, msg);
     } else if (std.mem.eql(u8, op, "text")) {
-        const Txt = struct { off: u32 = 0, text: []const u8 = "" };
+        const Txt = struct { off: u32 = 0, text: []const u8 = "", total: ?i64 = null };
         const t = std.json.parseFromSlice(Txt, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
         defer t.deinit();
         self.post(proto.SemExpandResult{
@@ -1009,6 +1009,7 @@ pub fn onScriptMessage(self: *Host, v: *View, json: []const u8) void {
             .id = p.sid,
             .off = t.value.off,
             .text = t.value.text[0..@min(t.value.text.len, max_expand)],
+            .total = if (t.value.total) |n| @intCast(std.math.clamp(n, 0, proto.EXPAND_TOTAL_UNKNOWN - 1)) else proto.EXPAND_TOTAL_UNKNOWN,
         });
     } else if (std.mem.eql(u8, op, "markdown") and p.kind == .read_ids) {
         const tree = semantic.parseTree(self.gpa, json) catch return;

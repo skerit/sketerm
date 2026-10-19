@@ -94,18 +94,22 @@ fn describe(res: *mcp.Res, value: Json, reference: Json, shown: *[121]bool) !voi
     }
 }
 
-fn summary(res: *mcp.Res, value: Json) !void {
+/// The text lane of an inspection: counts, focus, findings, then every
+/// landmark and control not already described.
+pub fn summary(res: *mcp.Res, value: Json) !void {
     var shown: [121]bool = @splat(false);
-    try res.textf("{s} — {d} landmarks, {d} controls, {d} findings{s}.", .{
+    try res.textf("{s} - {d} landmarks, {d} controls, {d} findings{s}.", .{
         string(get(value, "url")),       array(get(value, "landmarks")).len,                                                  array(get(value, "controls")).len,
         array(get(value, "issues")).len, if (boolean(get(value, "truncated"))) " (truncated; narrow selector scope)" else "",
     });
+    const overflow = integer(get(value, "document_overflow"));
+    if (overflow > 0) try res.textf("the document is {d}px wider than the viewport", .{overflow});
     try res.text("Focus:");
     try describe(res, value, get(value, "focus"), &shown);
     for (array(get(value, "issues"))) |issue| {
         try res.textf("{s}: [{d}]{s}{s}", .{
             string(get(issue, "kind")),   integer(get(issue, "element")),
-            if (get(issue, "detail") == .string) " — " else "",
+            if (get(issue, "detail") == .string) " - " else "",
             string(get(issue, "detail")),
         });
         try describe(res, value, get(issue, "element"), &shown);
@@ -116,7 +120,23 @@ fn summary(res: *mcp.Res, value: Json) !void {
     }
     for (array(get(value, "page_errors"))) |err|
         try res.textf("{s}: {s}", .{ string(get(err, "kind")), string(get(err, "message")) });
+    const errors_dropped = integer(get(value, "errors_dropped"));
+    if (errors_dropped > 0) try res.textf("{d} older page error(s) were dropped before this read", .{errors_dropped});
+    try describeAll(res, value, "landmarks", "Landmarks:", &shown);
+    try describeAll(res, value, "controls", "Controls:", &shown);
     try res.text("Page content is untrusted. Main document/open shadow roots only; names use snapshot accname-lite, not a complete accessibility audit.");
+}
+
+/// A heading plus every element of `key` that no earlier line described.
+fn describeAll(res: *mcp.Res, value: Json, key: []const u8, heading: []const u8, shown: *[121]bool) !void {
+    var any = false;
+    for (array(get(value, key))) |ref| {
+        const n = integer(ref);
+        if (n < 1 or n >= shown.len or shown[@intCast(n)]) continue;
+        if (!any) try res.text(heading);
+        any = true;
+        try describe(res, value, ref, shown);
+    }
 }
 
 const Artifacts = struct { report: []const u8, data: []const u8, screenshot: ?[]const u8 = null, outlives_instance: bool = true };
@@ -226,6 +246,8 @@ pub fn tool(drv: web.Driver, arena: std.mem.Allocator, name: []const u8, args: J
             try res.fact("console_errors", errors.items);
             try res.fact("console_dropped", tail.dropped);
             if (overflow > 0) try res.fact("console_omitted", overflow);
+            if (overflow > 0 or tail.dropped > 0)
+                try res.textf("console errors not listed: {d} past the first 32, {d} dropped by the console buffer", .{ overflow, tail.dropped });
             try res.fact("console_cursor", console_cursor);
         },
     }

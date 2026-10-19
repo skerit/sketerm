@@ -678,11 +678,12 @@ fn answer(job: *Job) !void {
     // site sets lands in that jar.
     const persist = try web.enginePersistence(ar, web.headlessEngine(), .default, "", 0);
     try res.fact("persistence", persist);
-    try res.textf("web_fetch: {d} url(s): {d} done, {d} failed, {d} timed out, {d} invalid; at most {d} tab(s) of this call open at once (per call {d}, server-wide {d}); the longest queue wait {d}ms", .{
-        rows.len, counts.get(.done), counts.get(.failed), counts.get(.timed_out), counts.get(.invalid_url),
-        peak, webfetch.PER_CALL_TABS, g_queue.cap, queued_max,
+    try res.textf("web_fetch: {d} url(s): {d} done, {d} failed, {d} timed out, {d} invalid; at most {d} tab(s) of this call open at once (per call {d}, server-wide {d}){s}", .{
+        rows.len,                                                                               counts.get(.done), counts.get(.failed), counts.get(.timed_out), counts.get(.invalid_url),
+        peak,                                                                                   webfetch.PER_CALL_TABS, g_queue.cap,
+        if (queued_max > 0) try std.fmt.allocPrint(ar, "; the longest queue wait {d}ms", .{queued_max}) else "",
     });
-    try res.textf("fetch tabs browse in the default identity: {s}", .{try webpersist.sentence(ar, persist)});
+    try res.textf("fetch tabs use the default identity: {s}", .{if (persist.durable) |d| (if (d) "what sites store there persists" else "nothing persists") else "persistence unknown"});
     if (lost_files > 0)
         try res.textf("{d} saved file(s) {s} (to_dir keeps them)", .{ lost_files, webpersist.DIES_WITH_INSTANCE });
     if (!job.background_honoured)
@@ -690,7 +691,7 @@ fn answer(job: *Job) !void {
     for (rows) |r| {
         const nav_line: []const u8 = if (r.navigation) |n| try webnav.sentence(ar, n) else "no navigation";
         try res.textf("[{d}] {s}: {s}; {s}{s}{s}", .{ r.index, try web.clip(ar, r.url, web.URL_MAX), @tagName(r.status), nav_line, if (r.@"error" != null) "; " else "", r.@"error" orelse "" });
-        if (r.path) |p| try res.textf("[{d}] {d} bytes at {s}", .{ r.index, r.bytes, p });
+        if (r.path) |p| try res.textf("[{d}] {s} at {s}", .{ r.index, try web.bytesText(ar, r.bytes), p });
         if (job.opts.mode == .regex and r.status == .done and r.kind != .file) {
             try res.textf("[{d}] {d} match(es){s}", .{ r.index, r.match_count, if (r.matches_capped) " (more than shown)" else "" });
             try web.writeMatches(&res, r.matches);

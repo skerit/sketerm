@@ -44,6 +44,8 @@ pub const AutoMeta = struct {
     rev: u32 = 0,
     snap_kind: u8 = 0,
     reader_ids: bool = false,
+    /// Expand only: the node's whole text length, when the helper sent it.
+    total: ?u32 = null,
 };
 
 /// A finished round trip, waiting to be collected by `autoTake`. `text`

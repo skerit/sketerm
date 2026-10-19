@@ -201,6 +201,8 @@ pub const OpOut = struct {
     /// `proto.MotionResult` and the replay's duration, for an act.
     motion: u8 = 0,
     duration_ms: u32 = 0,
+    /// Expand only: the node's whole text length, when the helper sent it.
+    total: ?u32 = null,
 };
 
 /// A completed reply parked until the in-flight runOp collects it.
@@ -212,6 +214,7 @@ const Sem = struct {
     snap_kind: u8 = 0,
     motion: u8 = 0,
     duration_ms: u32 = 0,
+    total: ?u32 = null,
 };
 
 /// This engine's motion pack and what the current helper made of it
@@ -4183,6 +4186,7 @@ pub const Engine = struct {
                         .snap_kind = sem.snap_kind,
                         .motion = sem.motion,
                         .duration_ms = sem.duration_ms,
+                        .total = sem.total,
                     };
                 }
             } else return error.NoView;
@@ -4715,7 +4719,10 @@ pub const Engine = struct {
             },
             .sem_expand_result => {
                 const ev = proto.decode(proto.SemExpandResult, frame.payload) catch return;
-                if (self.findView(ev.view)) |v| self.park(v, .expand, request, true, ev.text, 0, 0, 0);
+                if (self.findView(ev.view)) |v| {
+                    if (self.parkAccepted(v, .expand, request, true, ev.text, 0, 0, 0) and ev.total != proto.EXPAND_TOTAL_UNKNOWN)
+                        v.inbox[@intFromEnum(OpKind.expand)].?.total = ev.total;
+                }
             },
             .sem_query_result => {
                 const ev = proto.decode(proto.SemQueryResult, frame.payload) catch return;

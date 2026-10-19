@@ -1206,6 +1206,9 @@ pub const OpReply = struct {
     timed_out: bool = false,
     /// An act's replay duration when the helper replayed recorded motion.
     motion_ms: ?u32 = null,
+    /// Expand only: the node's whole text length in the page's UTF-16
+    /// units, when the helper reports it (an older one does not).
+    total: ?i64 = null,
 };
 
 /// One described backend failure: the sentence a caller reads AND the
@@ -2050,6 +2053,7 @@ fn runOpOnce(drv: Driver, arena: std.mem.Allocator, handle: u32, op: Op, budget:
                 .reader_ids = req.kind == .read and e.has(.reader_ids),
                 .timed_out = out.timed_out,
                 .motion_ms = if (out.motion == @intFromEnum(web_proto.MotionResult.replayed)) out.duration_ms else null,
+                .total = if (out.total) |n| n else null,
             } };
         },
     }
@@ -2100,6 +2104,7 @@ fn runOpGui(backend: mcp.Backend, arena: std.mem.Allocator, pane: u32, op: Op, b
                 .doc_gen = if (obj.get("doc_gen")) |v| (if (v == .integer) v.integer else 0) else 0,
                 .rev = if (obj.get("rev")) |v| (if (v == .integer) v.integer else 0) else 0,
                 .reader_ids = if (obj.get("reader_ids")) |v| (v == .bool and v.bool) else false,
+                .total = if (obj.get("total")) |v| (if (v == .integer) v.integer else null) else null,
             } };
         }
         if (backend.nowMs(backend.ctx) >= deadline) {
@@ -2563,6 +2568,18 @@ pub fn section(res: *mcp.Res, name: []const u8, body: []const u8) !void {
     try res.text(body);
 }
 
+/// `n` bytes as `numtext.bytes` reads them ("1.2 MiB"), in `arena`.
+pub fn bytesText(arena: std.mem.Allocator, n: u64) ![]const u8 {
+    var buf: [32]u8 = undefined;
+    return arena.dupe(u8, numtext.bytes(&buf, n));
+}
+
+/// `ms` as a `clock.span` duration ("4 minutes"), in `arena`.
+fn spanText(arena: std.mem.Allocator, ms: i64) ![]const u8 {
+    var buf: [32]u8 = undefined;
+    return arena.dupe(u8, clock.span(&buf, ms, .long));
+}
+
 // ── per-tool result builders (pure: no driver, no helper) ─────────
 
 fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
@@ -2667,7 +2684,7 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
     if (mode == .headless) {
         for (vs.views) |v| {
             if (!v.handoff_available) continue;
-            try res.text("These assistant-owned tabs can be shown through Sketerm's orange AI badge: Watch or Take control. 'headless' is the automation backend, not a visibility verdict. Reuse a tab with web_navigate and leave it open during manual login.");
+            try res.text(HANDOFF_TABS_LINE);
             break;
         }
     }
@@ -2679,7 +2696,7 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
         if (idleCloseSecs() == 0)
             try res.text("idle closing is off (web_idle_close_secs = 0)")
         else
-            try res.textf("an assistant tab untouched for {d}s closes itself, unless someone is watching it (Watch / Take control); web_idle_close_secs sets the time", .{idleCloseSecs()});
+            try res.textf("an untouched assistant tab closes after {s} unless someone is watching it (web_idle_close_secs sets the time)", .{try spanText(arena, @as(i64, idleCloseSecs()) * 1000)});
     }
     return res.finish();
 }
@@ -2698,9 +2715,15 @@ fn idleMark(arena: std.mem.Allocator, v: View) ![]const u8 {
         .off => "",
         .watched => if (v.controlled) " (watched, under Take control: never idle-closed)" else " (watched: never idle-closed)",
         .unknown => " (idle close paused: this browser helper cannot report watchers)",
-        .closes_in_ms => |ms| try std.fmt.allocPrint(arena, " (closes in {d}s if untouched)", .{@divTrunc(ms + 999, 1000)}),
+        .closes_in_ms => |ms| try std.fmt.allocPrint(arena, " (closes in {s} if untouched)", .{try spanText(arena, ms + 999)}),
     };
 }
+
+/// The handoff sentence of a tabs listing that holds an assistant-owned tab.
+const HANDOFF_TABS_LINE = "handoff: the user can Watch or Take control of these assistant-owned tabs from Sketerm's orange AI badge ('headless' means assistant-owned, not invisible); keep a tab open during a manual login and continue in it with web_navigate";
+
+/// The handoff sentence of a `web_open` whose tab the user can take over.
+const HANDOFF_OPEN_LINE = "handoff: the user can Watch or Take control of this assistant-owned tab from Sketerm's orange AI badge ('headless' means assistant-owned, not invisible), also of later tabs in this browser; keep it open during a manual login and continue in it with web_navigate";
 
 /// A view's route text, with a missing or empty field read as direct
 /// (an older GUI's `web-list` carries no route at all).
@@ -2924,7 +2947,7 @@ fn openResult(
         try res.textf("{d} web views are now open, this one included (web_tabs lists them; web_close drops the ones you are done with)", .{open_views});
     if (mode == .headless) {
         try res.fact("handoff", .{ .available = v.handoff_available, .name = v.browser_name });
-        if (v.handoff_available) try res.text("This is an assistant-owned browser tab. 'headless' describes ownership, not whether you can see it: the user can open Sketerm's orange AI badge and choose Watch or Take control to log in manually. Keep this tab open during handoff; use web_navigate to continue in it. The viewer follows new tabs in the same browser, including after the last tab closes.");
+        if (v.handoff_available) try res.text(HANDOFF_OPEN_LINE);
         try res.fact("profile", v.profile);
         try res.fact("profile_kind", @tagName(v.identity));
         try res.fact("context", v.context);
@@ -2958,7 +2981,10 @@ fn openResult(
         try res.text("the page had not finished loading inside the timeout; this describes the view at that moment - call web_snapshot for the settled page");
     if (where_ignored) {
         try res.fact("where_ignored", true);
-        try res.text("'where' does not open a viewer for an assistant-owned tab; handoff.available reports whether the user can open one from the AI badge");
+        try res.text(if (mode == .headless and v.handoff_available)
+            "'where' does not open a viewer for an assistant-owned tab; the user opens one from the AI badge (handoff above)"
+        else
+            "'where' does not open a viewer for an assistant-owned tab, and this one offers no handoff viewer");
     }
     if (snap_err) |e| {
         try res.fact("snapshot_error", e);
@@ -3133,6 +3159,7 @@ fn navigateResult(
         try res.fact("kind", snap_kind);
         try res.fact("document", s.document);
         try res.fact("revision", s.revision);
+        try res.textf("snapshot {s}: document {d}, revision {d}", .{ snap_kind, s.document, s.revision });
         try treeSection(&res, arena, "snapshot", s.tree);
         try res.text(TRUST_LINE);
     }
@@ -3462,6 +3489,7 @@ fn expandResult(
     id: i64,
     offset: i64,
     total: ?i64,
+    len: usize,
     body: []const u8,
 ) ![]const u8 {
     var res = mcp.Res.init(arena);
@@ -3478,7 +3506,20 @@ fn expandResult(
             if (total) |n| (if (offset + @as(i64, @intCast(body.len)) < n) " (more follows)" else "") else "",
         });
     } else {
-        try res.textf("node {d}, {d} chars from offset {d}", .{ id, body.len, offset });
+        const units = std.unicode.calcUtf16LeLen(body) catch body.len;
+        const next = offset + @as(i64, @intCast(units));
+        if (total) |n| {
+            if (next < n)
+                try res.textf("node {d}, {d} of {d} chars from offset {d}; more follows: continue with offset {d}", .{ id, units, n, offset, next })
+            else
+                try res.textf("node {d}, {d} of {d} chars from offset {d} (the end)", .{ id, units, n, offset });
+        } else if (units >= len)
+            // An older helper sends no total, so a page that filled the
+            // requested length is the only "more" signal there is. Offsets
+            // count the page's UTF-16 units, not these bytes.
+            try res.textf("node {d}, {d} chars from offset {d}; the page filled 'len', so more may follow: continue with offset {d}", .{ id, units, offset, next })
+        else
+            try res.textf("node {d}, {d} chars from offset {d} (the end)", .{ id, units, offset });
     }
     try section(&res, "text", body);
     try res.text(TRUST_LINE);
@@ -3536,7 +3577,7 @@ fn readResult(arena: std.mem.Allocator, mode: Mode, v: View, r: ReadOut) ![]cons
                     // The ids name the whole page: they ride the first
                     // page only, or every page would repeat them.
                     if (pg.offset == 0) try res.fact("entities", m.entities);
-                    try res.textf("document {d}, revision {d}, {d} entities{s}", .{ m.doc_gen, m.rev, m.entities.len, if (pg.offset == 0) "" else " (listed with offset 0)" });
+                    try res.textf("document {d}, revision {d}, {d} entities{s}", .{ m.doc_gen, m.rev, m.entities.len, if (pg.offset == 0) (if (m.entities.len > 0) " (ids below, for web_act)" else "") else " (listed with offset 0)" });
                 }
                 try res.fact("markdown", pg.text);
             } else try res.fact("body", pg.text);
@@ -3547,11 +3588,14 @@ fn readResult(arena: std.mem.Allocator, mode: Mode, v: View, r: ReadOut) ![]cons
                 pg.offset,
                 @tagName(r.body_source),
                 if (r.source_truncated) ", cut by the page at its own cap" else "",
-                if (pg.next != null) "; more: read on with offset next_offset" else "; the end",
+                if (pg.next) |n| try std.fmt.allocPrint(arena, "; more from offset {d}", .{n}) else "; the end",
             });
-            if (pg.next) |n| try res.textf("next_offset {d}", .{n});
             if (r.note) |n| try res.text(n);
             try section(&res, if (r.mode == .text) "article" else "source", pg.text);
+            // The ids already ride the facts lane in structured mode.
+            if (r.mode == .text and pg.offset == 0 and mcp.result_mode == .text) if (r.model) |m| {
+                if (m.entities.len > 0) try section(&res, "entities", try entityLines(arena, m.entities));
+            };
         },
         .regex => {
             const rx = r.regex.?;
@@ -3588,7 +3632,7 @@ fn readResult(arena: std.mem.Allocator, mode: Mode, v: View, r: ReadOut) ![]cons
                 if (r.selector != null) " in the selected scope" else "",
                 shown.len,
                 @min(r.offset, end),
-                if (end < p.links.len) "; more: read on with offset next_offset" else "",
+                if (end < p.links.len) try std.fmt.allocPrint(arena, "; more from offset {d}", .{end}) else "",
             });
             var lines: std.Io.Writer.Allocating = .init(arena);
             for (shown) |l| try lines.writer.print("[{s}] {s} -> {s}{s}\n", .{ @tagName(l.area), if (l.text.len > 0) l.text else "(no text)", l.href, if (l.visible) "" else " (hidden)" });
@@ -3614,7 +3658,7 @@ fn readResult(arena: std.mem.Allocator, mode: Mode, v: View, r: ReadOut) ![]cons
                 if (r.selector != null) " in the selected scope" else "",
                 scripts.len + iframes.len,
                 start,
-                if (end < all) "; more: read on with offset next_offset" else "",
+                if (end < all) try std.fmt.allocPrint(arena, "; more from offset {d}", .{end}) else "",
             });
             var lines: std.Io.Writer.Allocating = .init(arena);
             for (scripts) |sc| {
@@ -3636,6 +3680,16 @@ fn readResult(arena: std.mem.Allocator, mode: Mode, v: View, r: ReadOut) ![]cons
     }
     try res.text(TRUST_LINE);
     return res.finish();
+}
+
+/// One `[id] kind text -> url` row per reader entity.
+fn entityLines(arena: std.mem.Allocator, entities: []const reader_model.Entity) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    for (entities, 0..) |en, i| {
+        try aw.writer.print("{s}[{d}] {s} {s}", .{ if (i > 0) "\n" else "", en.id, en.kind, try clip(arena, en.text, TITLE_MAX) });
+        if (en.url.len > 0) try aw.writer.print(" -> {s}", .{try clip(arena, en.url, URL_MAX)});
+    }
+    return aw.written();
 }
 
 /// Paging facts of a list read: where the next page starts, if anywhere.
@@ -3673,7 +3727,7 @@ fn evalResult(
         try res.fact("truncated", true);
         try res.fact("total_chars", payload.len);
         try res.fact("pages", (payload.len + 7999) / 8000);
-        try res.textf("result TRUNCATED: {d} of {d} chars inline (no 'value'; 'value_text' is a prefix). Page the rest with web_expand id=0, or re-run with max_chars up to {d}, or strict:true to get an error instead of a prefix", .{ inline_limit, payload.len, EVAL_INLINE_MAX });
+        try res.textf("result TRUNCATED: {d} of {d} chars inline (the result below is a prefix). Page the rest with web_expand id=0, or re-run with max_chars up to {d}, or strict:true to get an error instead of a prefix", .{ inline_limit, payload.len, EVAL_INLINE_MAX });
         try section(&res, "result", cut);
     } else {
         // Machine data: verbatim JSON where it IS JSON, a plain string
@@ -3772,15 +3826,15 @@ fn evalToFile(
     try res.fact("truncated", truncated);
     if (total_chars) |n| try res.fact("total_chars", n);
     if (truncated) {
-        try res.textf("wrote {d} bytes ({s}) to {s} — TRUNCATED: the page serialized {d} of {d} characters. Return the value in slices to get the rest", .{
-            bytes.len,
+        try res.textf("wrote {s} ({s}) to {s} - TRUNCATED: the page serialized {d} of {d} characters. Return the value in slices to get the rest", .{
+            try bytesText(arena, bytes.len),
             format,
             path,
             bytes.len,
             total_chars orelse @as(i64, @intCast(bytes.len)),
         });
     } else {
-        try res.textf("wrote {d} bytes ({s}) to {s}; the result is not in this reply", .{ bytes.len, format, path });
+        try res.textf("wrote {s} ({s}) to {s}; the result is not in this reply", .{ try bytesText(arena, bytes.len), format, path });
     }
     return res.finish();
 }
@@ -4268,8 +4322,12 @@ fn networkResult(
         try res.text("the browser helper returned a malformed request log");
         return res.finish();
     };
+    var next_seq: ?i64 = null;
     if (obj.get("next_seq")) |n| {
-        if (n == .integer) try res.fact("next_seq", n.integer);
+        if (n == .integer) {
+            try res.fact("next_seq", n.integer);
+            next_seq = n.integer;
+        }
     }
     try res.fact("log_detail", if (obj.get("detail")) |d| d == .bool and d.bool else false);
     var entries: []const std.json.Value = &.{};
@@ -4282,6 +4340,7 @@ fn networkResult(
         }
     }
     if (!listed) try res.raw("requests", "[]");
+    if (next_seq) |n| try res.textf("since={d} lists only the requests after these", .{n});
     try res.textf("--- {d} requests (oldest first) ---", .{entries.len});
     for (entries) |e| {
         if (e != .object) continue;
@@ -4291,13 +4350,12 @@ fn networkResult(
         const rtype = if (o.get("type")) |ty| (if (ty == .string) ty.string else "") else "";
         const seq = if (o.get("seq")) |s| (if (s == .integer) s.integer else 0) else 0;
         const blocked = if (o.get("blocked")) |b| (b == .bool and b.bool) else false;
-        var state_buf: [64]u8 = undefined;
         const state: []const u8 = if (blocked)
             "BLOCKED"
         else if (o.get("status")) |st|
-            try std.fmt.bufPrint(&state_buf, "{d} {d}B {d}ms", .{
+            try std.fmt.allocPrint(arena, "{d} {s} {d}ms", .{
                 if (st == .integer) st.integer else 0,
-                if (o.get("size")) |sz| (if (sz == .integer) sz.integer else 0) else 0,
+                try bytesText(arena, if (o.get("size")) |sz| (if (sz == .integer and sz.integer > 0) @intCast(sz.integer) else 0) else 0),
                 if (o.get("duration_ms")) |d| (if (d == .integer) d.integer else 0) else 0,
             })
         else
@@ -5109,7 +5167,7 @@ pub fn webTool(
         if (id == 0) {
             switch (try evalText(drv, arena, view.pane, offset, len)) {
                 .err => |e| return failRes(arena, e),
-                .page => |p| return expandResult(arena, drv.mode(), view, 0, p.offset, p.total, p.payload),
+                .page => |p| return expandResult(arena, drv.mode(), view, 0, p.offset, p.total, len, p.payload),
             }
         }
         switch (try runOp(drv, arena, view.pane, .{
@@ -5131,7 +5189,7 @@ pub fn webTool(
                     if (try expandIdMissing(drv, arena, view, id, args)) |why|
                         return mcp.errRes(arena, .not_found, why);
                 }
-                return expandResult(arena, drv.mode(), view, id, offset, null, r.payload);
+                return expandResult(arena, drv.mode(), view, id, offset, r.total, len, r.payload);
             },
         }
     }
@@ -6020,11 +6078,15 @@ fn policyViewResult(arena: std.mem.Allocator, listed: View, fresh: *const webdri
     if (!fresh.pol_active) {
         try res.text("no policy is installed on this view (web_open's 'policy' object installs one at open)");
     } else {
-        try res.textf("{d} requests, {d} bytes, {d} navigations{s}", .{
+        try res.textf("{d} requests, {s}, {d} navigations{s}{s}", .{
             fresh.pol_requests,
-            fresh.pol_bytes,
+            try bytesText(arena, fresh.pol_bytes),
             fresh.pol_navigations,
-            if (fresh.pol_exhausted != 0) "" else " (budgets holding)",
+            if (fresh.pol_ms_left > 0) try std.fmt.allocPrint(arena, ", {s} of the deadline left", .{try spanText(arena, fresh.pol_ms_left)}) else "",
+            if (fresh.pol_exhausted != 0)
+                try std.fmt.allocPrint(arena, "; EXHAUSTED ({s}): new traffic is refused", .{web_proto.reasonName(@enumFromInt(fresh.pol_exhausted))})
+            else
+                " (budgets holding)",
         });
     }
     return res.finish();
@@ -6573,16 +6635,20 @@ fn captureListResult(
         if (i != 0) try w.writeByte(',');
         try exchangeJson(w, ent, if (i < written.len) written[i] else null);
         if (ent.trunc != 0 or ent.req_trunc != 0) truncated += 1;
-        try lines.writer.print("[{d}] seq {d} {s} {d} {s} {d} B{s} {s}\n", .{
+        try lines.writer.print("[{d}] seq {d} {s} {d} {s} {s}{s}{s}{s} {s}", .{
             ent.cursor,
             ent.seq,
             ent.method,
             ent.status,
             if (ent.mime.len > 0) ent.mime else "-",
-            ent.body_len,
-            if (ent.trunc != 0) " TRUNCATED" else "",
+            try bytesText(arena, ent.body_len),
+            if (ent.trunc != 0) " TRUNCATED " else "",
+            if (ent.trunc != 0) truncName(ent.trunc) else "",
+            if (ent.req_trunc != 0) try std.fmt.allocPrint(arena, " request body TRUNCATED {s}", .{truncName(ent.req_trunc)}) else "",
             ent.url.s,
         });
+        if (i < written.len) if (written[i]) |f| try lines.writer.print(" -> {s} ({s})", .{ f.path, try bytesText(arena, f.bytes) });
+        try lines.writer.writeByte('\n');
     }
     try w.writeByte(']');
     try res.raw("exchanges", aw.written());
@@ -6592,18 +6658,22 @@ fn captureListResult(
         since,
         stateName(list.state),
         list.next_cursor,
-        if (list.more != 0) ", MORE are held: page on with since=next_since" else "",
+        if (list.more != 0) try std.fmt.allocPrint(arena, ", MORE are held: page on with since={d}", .{list.next_cursor}) else "",
     });
-    try res.textf("{d} byte(s) held of {d}; {d} exchange(s) still in flight{s}", .{
-        list.stored,
-        list.max_total,
+    try res.textf("{s} held of {s}; {d} exchange(s) still in flight{s}", .{
+        try bytesText(arena, list.stored),
+        try bytesText(arena, list.max_total),
         list.in_flight,
         if (list.in_flight > 0) " (listed after the finished ones only with include_in_flight:true, cursor 0; a body the page never reads keeps its load open)" else "",
     });
-    if (truncated > 0) try res.textf("{d} exchange(s) here were TRUNCATED at a cap (body_truncated_reason says which)", .{truncated});
-    if (dropped_total > 0)
-        try res.textf("{d} matching exchange(s) were DROPPED, never recorded (dropped says why); free what you have read with web_capture_set action:\"clear\"", .{dropped_total});
-    if (written.len > 0 and written[0] != null) try res.text("bodies written to out_dir; each exchange carries its path, file_bytes and sha256");
+    if (truncated > 0) try res.textf("{d} exchange(s) here were TRUNCATED at a cap (each row names it)", .{truncated});
+    if (dropped_total > 0) {
+        const names = [_][]const u8{ "pending_full", "total_full", "entries_full", "no_memory" };
+        var why: std.Io.Writer.Allocating = .init(arena);
+        for (list.dropped, names) |d, n| if (d > 0) try why.writer.print("{s}{s} {d}", .{ if (why.written().len > 0) ", " else "", n, d });
+        try res.textf("{d} matching exchange(s) were DROPPED, never recorded ({s}); free what you have read with web_capture_set action:\"clear\"", .{ dropped_total, why.written() });
+    }
+    if (written.len > 0 and written[0] != null) try res.text("bodies written to out_dir: each row ends with its file and size");
     if (list.entries.len > 0) try section(&res, "exchanges", lines.written());
     try res.text(TRUST_LINE);
     return res.finish();
@@ -6682,18 +6752,20 @@ fn captureBodyResult(
         // The engine's own header list, verbatim JSON.
         const headers = if (body.headers.len > 0 and std.json.validate(arena, body.headers) catch false) body.headers else "[]";
         try res.raw("headers", headers);
+        // The facts lane carries them in structured mode.
+        if (mcp.result_mode == .text) try headerSection(&res, arena, headers);
     }
     if (!body.complete)
         try res.text("the exchange has NOT finished: this body may still grow (web_wait for:\"response\" waits for it)");
     if (body.trunc != 0)
-        try res.textf("the CAPTURE cut this body at a cap ({s}): {d} of the {d} bytes the page received are held", .{ truncName(body.trunc), body.total, body.seen });
+        try res.textf("the CAPTURE cut this body at a cap ({s}): {s} of the {s} the page received are held", .{ truncName(body.trunc), try bytesText(arena, body.total), try bytesText(arena, body.seen) });
     if (shown.transcoded_from.len > 0) try res.textf("transcoded to UTF-8 from {s}", .{shown.transcoded_from});
     if (file) |f| {
         try res.fact("out_file", f.path);
         try fileFacts(&res, f.path);
         try res.fact("bytes", f.bytes);
         try res.fact("sha256", f.sha256);
-        try res.textf("wrote {d} bytes ({s}) to {s}; the body is not in this reply", .{ f.bytes, f.encoding, f.path });
+        try res.textf("wrote {s} ({s}) to {s}; the body is not in this reply", .{ try bytesText(arena, f.bytes), f.encoding, f.path });
         return res.finish();
     }
     const binary = std.mem.eql(u8, shown.kind, "binary");
@@ -6719,10 +6791,22 @@ fn captureBodyResult(
     try res.fact("inline_truncated", cut);
     if (!binary) try res.fact("body", out);
     if (cut) try res.textf("INLINE limit: {d} of {d} bytes are in 'body'; pass out_file for the whole body, or a larger max_bytes (at most {d})", .{ out.len, shown.bytes.len, CAPTURE_INLINE_MAX });
-    try res.textf("{s} body of exchange {d}: {d} bytes as {s}", .{ part, seq, shown.bytes.len, if (binary) "base64" else "UTF-8 text" });
+    try res.textf("{s} body of exchange {d}: {s} as {s}", .{ part, seq, try bytesText(arena, shown.bytes.len), if (binary) "base64" else "UTF-8 text" });
     if (binary) try res.bulk("body", out, "--- body ---\n(binary: the base64 is in structuredContent.body)") else try section(&res, "body", out);
     try res.text(TRUST_LINE);
     return res.finish();
+}
+
+/// The response headers as `name: value` lines behind a divider.
+fn headerSection(res: *mcp.Res, arena: std.mem.Allocator, headers_json: []const u8) !void {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, headers_json, .{}) catch return;
+    if (parsed != .array or parsed.array.items.len == 0) return;
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    for (parsed.array.items) |h| {
+        if (h != .object) continue;
+        try aw.writer.print("{s}{s}: {s}", .{ if (aw.written().len > 0) "\n" else "", jsonStrOf(h.object, "name", ""), jsonStrOf(h.object, "value", "") });
+    }
+    if (aw.written().len > 0) try section(res, "headers", aw.written());
 }
 
 /// `web_capture_set`: NARROW a live capture. There is no install and
@@ -6763,12 +6847,13 @@ fn captureSetTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, v
     try res.fact("head_cursor", after.head_cursor);
     if (op == .clear) {
         if (upto == 0)
-            try res.textf("cleared every captured exchange, in-flight ones included; {d} byte(s) held now", .{after.stored})
+            try res.textf("cleared every captured exchange, in-flight ones included; {s} held now", .{try bytesText(arena, after.stored)})
         else
-            try res.textf("cleared the finished exchanges up to cursor {d}; {d} byte(s) held now", .{ upto, after.stored });
+            try res.textf("cleared the finished exchanges up to cursor {d}; {s} held now", .{ upto, try bytesText(arena, after.stored) });
     } else {
         try res.text("capture disabled: nothing new is recorded; what is held stays readable with web_capture");
     }
+    try res.textf("head cursor {d}, {d} exchange(s) in flight: web_capture or web_wait for:\"response\" with since={d} see only exchanges finishing after now", .{ after.head_cursor, after.in_flight, after.head_cursor });
     return res.finish();
 }
 
@@ -6845,7 +6930,7 @@ fn waitResponseResult(arena: std.mem.Allocator, view: View, ent: web_proto.Captu
     try exchangeJson(&aw.writer, ent, null);
     try res.raw("response", aw.written());
     try res.fact("next_since", next_since);
-    try res.textf("response finished: seq {d}, cursor {d}, status {d}, {d} body bytes (web_capture seq:{d} reads it)", .{ ent.seq, ent.cursor, ent.status, ent.body_len, ent.seq });
+    try res.textf("response finished: seq {d}, cursor {d}, status {d}, {s} body (web_capture seq:{d} reads it); since={d} waits for the next one", .{ ent.seq, ent.cursor, ent.status, try bytesText(arena, ent.body_len), ent.seq, next_since });
     try section(&res, "url", ent.url.s);
     return res.finish();
 }
@@ -7276,6 +7361,7 @@ fn resizeTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view:
                     try res.fact("kind", r.snapshot_kind);
                     try res.fact("document", r.doc_gen);
                     try res.fact("revision", r.rev);
+                    try res.textf("snapshot {s}: document {d}, revision {d}", .{ r.snapshot_kind, r.doc_gen, r.rev });
                     try treeSection(&res, arena, "snapshot", r.payload);
                     try res.text(TRUST_LINE);
                 }
@@ -7518,7 +7604,7 @@ fn printTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: 
     try res.fact("paper", @tagName(paper));
     try res.fact("css_page_size", css_page_size);
     try res.fact("no_margins", no_margins);
-    try res.textf("printed the page to {s} ({d} bytes)", .{ path, bytes });
+    try res.textf("printed the page to {s} ({s})", .{ path, try bytesText(arena, bytes) });
     return res.finish();
 }
 
@@ -7919,13 +8005,37 @@ fn downloadResult(arena: std.mem.Allocator, mode: Mode, v: View, outs_in: []cons
         try res.fact("bytes", o.bytes);
         if (o.sha256.len != 0) try res.fact("sha256", o.sha256);
         if (std.mem.eql(u8, o.state, "done"))
-            try res.textf("downloaded {d} bytes to {s}", .{ o.bytes, o.path })
+            try res.textf("downloaded {s} to {s}{s}{s}", .{ try bytesText(arena, o.bytes), o.path, if (o.sha256.len != 0) ", sha256 " else "", o.sha256 })
         else
             try res.textf("{s}: {s}", .{ o.state, if (o.reason.len != 0) o.reason else "no reason given" });
     } else {
         try res.textf("{d} of {d} downloaded into place, {d} failed, {d} unfinished", .{ done, outs.len, failed, pending });
+        var not_started: usize = 0;
+        for (outs) |o| {
+            if (std.mem.eql(u8, o.state, "not_started")) not_started += 1;
+        }
+        if (not_started > 0)
+            try res.textf("{d} url(s) not_started: the call's budget ran out before them; call again with those urls", .{not_started});
+        try section(&res, "downloads", try downloadRows(arena, outs, false));
     }
     return res.finish();
+}
+
+/// One `state size path from url (reason)` row per download; `clip_urls`
+/// shortens urls the caller did not pass itself.
+fn downloadRows(arena: std.mem.Allocator, rows: []const DlOutcome, clip_urls: bool) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    for (rows, 0..) |r, i| {
+        if (i > 0) try w.writeByte('\n');
+        try w.writeAll(r.state);
+        if (r.bytes > 0 or std.mem.eql(u8, r.state, "done")) try w.print(" {s}", .{try bytesText(arena, r.bytes)});
+        try w.print(" {s}", .{if (r.path.len > 0) r.path else "(no file yet)"});
+        if (r.url.len > 0) try w.print(" from {s}", .{if (clip_urls) try clip(arena, r.url, URL_MAX) else r.url});
+        // A not_started row's reason is the batch's, said once above it.
+        if (r.reason.len > 0 and !std.mem.eql(u8, r.state, "not_started")) try w.print(" ({s})", .{r.reason});
+    }
+    return aw.written();
 }
 
 /// Each download with its `outlives_instance`.
@@ -7979,15 +8089,7 @@ fn downloadListResult(drv: Driver, arena: std.mem.Allocator, view: View) ![]cons
     try res.fact("downloads", try withFates(arena, rows.items));
     try res.fact("listing", true);
     try res.textf("{d} download(s) known to this view; pass 'url' or 'urls' to fetch one", .{rows.items.len});
-    if (rows.items.len > 0) {
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        for (rows.items, 0..) |r, i| {
-            var nb: [24]u8 = undefined;
-            try aw.writer.print("{s}{s} {s}B {s} from {s}", .{ if (i > 0) "\n" else "", r.state, numtext.count(&nb, r.bytes), if (r.path.len > 0) r.path else "(no file yet)", try clip(arena, r.url, URL_MAX) });
-            if (r.reason.len > 0) try aw.writer.print(" ({s})", .{r.reason});
-        }
-        try section(&res, "downloads", aw.written());
-    }
+    if (rows.items.len > 0) try section(&res, "downloads", try downloadRows(arena, rows.items, true));
     return res.finish();
 }
 
@@ -8597,7 +8699,7 @@ test "assistant-owned browser handoff is independent of headless backend" {
     try std.testing.expect(handoff.get("available").?.bool);
     try std.testing.expectEqualStrings("Account login", handoff.get("name").?.string);
     const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
-    try std.testing.expect(std.mem.indexOf(u8, text, "Take control to log in manually") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Watch or Take control of this assistant-owned tab from Sketerm's orange AI badge") != null);
 }
 
 test "web_snapshot: kind/document/revision structured, unchanged said once" {
@@ -9546,7 +9648,7 @@ test "web_network: counters plus a compact request table" {
     try t.expectEqual(@as(usize, 2), lsc.get("requests").?.array.items.len);
     const ltext = lp.object.get("content").?.array.items[0].object.get("text").?.string;
     try t.expect(std.mem.indexOf(u8, ltext, "blocking on: 3 blocked of 11 requests, 4200 rules loaded") != null);
-    try t.expect(std.mem.indexOf(u8, ltext, "5 GET 200 900B 41ms document https://example.com/") != null);
+    try t.expect(std.mem.indexOf(u8, ltext, "5 GET 200 900 B 41ms document https://example.com/") != null);
     try t.expect(std.mem.indexOf(u8, ltext, "6 GET BLOCKED script https://ads.test/t.js") != null);
 
     // A helper that answers garbage says so instead of crashing.
@@ -9710,7 +9812,7 @@ test "web_wait / web_expand / web_query shapes" {
     try t.expectEqualStrings("Example", wsc.get("arg").?.string);
     try t.expect(wsc.get("settled").?.bool);
 
-    const expanded = try expandResult(arena, .headless, EXAMPLE, 0, 100, 9000, "the tail of an eval result");
+    const expanded = try expandResult(arena, .headless, EXAMPLE, 0, 100, 9000, 8000, "the tail of an eval result");
     const ep = try mcp.expectToolResultShape(arena, "web_expand", expanded);
     const esc = ep.object.get("structuredContent").?.object;
     try t.expectEqual(@as(i64, 0), esc.get("id").?.integer);
@@ -10936,4 +11038,136 @@ test "web_untrusted is a build fact, and lifecycle facts never come from the unt
     try std.testing.expectEqual(@as(?bool, false), restrictedCapability(.untrusted_web));
     untrusted.state = .idle;
     ordinary.state = .idle;
+}
+
+/// The text block of a tool result, for text-mode assertions.
+fn resultText(arena: std.mem.Allocator, out: []const u8) ![]const u8 {
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, out, .{});
+    return v.object.get("content").?.array.items[0].object.get("text").?.string;
+}
+
+fn expectText(text: []const u8, needle: []const u8) !void {
+    if (std.mem.indexOf(u8, text, needle) != null) return;
+    std.debug.print("missing \"{s}\" in:\n{s}\n", .{ needle, text });
+    return error.TestExpectedText;
+}
+
+test "text mode: what a web result's next call needs is in the text lane" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+    const saved = mcp.result_mode;
+    defer mcp.result_mode = saved;
+    mcp.result_mode = .text;
+
+    // web_download batch: each url with its path, state and reason; the
+    // budget sentence once, not per url.
+    const dl = try resultText(arena, try downloadResult(arena, .headless, EXAMPLE, &[_]DlOutcome{
+        .{ .url = "https://x.test/r.pdf", .path = "/tmp/d/r.pdf", .state = "done", .bytes = 2048 },
+        .{ .url = "https://y.test/r.pdf", .path = "/tmp/d/r (2).pdf", .state = "failed", .reason = "HTTP 404" },
+        .{ .url = "https://z.test/q.pdf", .path = "/tmp/d/q.pdf", .state = "not_started", .reason = "the call's budget ran out before this url was reached; call again with the urls that are left" },
+    }));
+    try expectText(dl, "1 of 3 downloaded into place, 1 failed, 1 unfinished");
+    try expectText(dl, "1 url(s) not_started");
+    try expectText(dl, "done 2 KiB /tmp/d/r.pdf from https://x.test/r.pdf");
+    try expectText(dl, "failed /tmp/d/r (2).pdf from https://y.test/r.pdf (HTTP 404)");
+    try expectText(dl, "not_started /tmp/d/q.pdf from https://z.test/q.pdf");
+    try t.expect(std.mem.indexOf(u8, dl, "urls that are left") == null);
+    try t.expect(std.mem.indexOf(u8, dl, "\"downloads\"") == null);
+
+    // web_read: reader ids reach web_act, and paging names its offset.
+    const md = "# Heading\n\nprose that goes on for a while";
+    const rd = try resultText(arena, try readResult(arena, .headless, EXAMPLE, .{
+        .body = md,
+        .max_chars = 10,
+        .model = .{ .doc_gen = 3, .rev = 11, .markdown = md, .entities = &.{
+            .{ .id = 4, .kind = "link", .text = "Story", .url = "https://example.com/s" },
+            .{ .id = 5, .kind = "heading", .text = "Heading" },
+        } },
+    }));
+    try expectText(rd, "--- entities ---\n[4] link Story -> https://example.com/s\n[5] heading Heading");
+    try expectText(rd, "; more from offset ");
+    try t.expect(std.mem.indexOf(u8, rd, "next_offset") == null);
+
+    // web_expand on a node: a filled page says where to go on.
+    try expectText(try resultText(arena, try expandResult(arena, .headless, EXAMPLE, 7, 0, null, 5, "abcde")), "more may follow: continue with offset 5");
+    try expectText(try resultText(arena, try expandResult(arena, .headless, EXAMPLE, 7, 5, null, 8000, "fgh")), "node 7, 3 chars from offset 5 (the end)");
+    // A helper that reports the node's total says exactly whether more follows.
+    try expectText(try resultText(arena, try expandResult(arena, .headless, EXAMPLE, 7, 0, 9, 5, "abcde")), "node 7, 5 of 9 chars from offset 0; more follows: continue with offset 5");
+    try expectText(try resultText(arena, try expandResult(arena, .headless, EXAMPLE, 7, 5, 9, 5, "fghi")), "node 7, 4 of 9 chars from offset 5 (the end)");
+
+    // web_capture list: cursors, caps, files and drop reasons are named.
+    const list = web_proto.CaptureList{
+        .view = 12,
+        .serial = 1,
+        .state = @intFromEnum(web_proto.CaptureState.active),
+        .more = 1,
+        .max_body = 1024,
+        .max_total = 1 << 20,
+        .stored = 1044,
+        .in_flight = 0,
+        .next_cursor = 3,
+        .head_cursor = 7,
+        .dropped = .{ 0, 5, 0, 0 },
+        .entries = &.{CAP_ENTRY},
+    };
+    const written = [_]?Written{.{ .path = "/tmp/x/41.json", .bytes = 1024, .sha256 = "ab" ** 32, .encoding = "utf8" }};
+    const cl = try resultText(arena, try captureListResult(arena, EXAMPLE, .{ .mime_prefixes = &.{"application/json"} }, list, 0, &written));
+    try expectText(cl, "page on with since=3");
+    try expectText(cl, "1 KiB TRUNCATED body_cap");
+    try expectText(cl, "-> /tmp/x/41.json (1 KiB)");
+    try expectText(cl, "(total_full 5)");
+    try expectText(cl, "1 KiB held of 1 MiB");
+    try t.expect(std.mem.indexOf(u8, cl, "body_truncated_reason") == null);
+
+    // web_capture seq: the response headers are readable.
+    const body = WholeBody{
+        .data = "{}",
+        .total = 2,
+        .seen = 2,
+        .trunc = 0,
+        .complete = true,
+        .status = 200,
+        .mime = "application/json",
+        .charset = "",
+        .headers = "[{\"name\":\"content-type\",\"value\":\"application/json\"}]",
+    };
+    const shown = try present(arena, body.mime, body.charset, body.data);
+    try expectText(try resultText(arena, try captureBodyResult(arena, EXAMPLE, 41, "response", body, shown, null, 1024)), "--- headers ---\ncontent-type: application/json");
+
+    // The cursors a next call pages or waits with.
+    try expectText(try resultText(arena, try waitResponseResult(arena, EXAMPLE, CAP_ENTRY, 3)), "since=3 waits for the next one");
+    const counters = NetCounters{ .enabled = true, .blocked = 0, .total = 1, .rules = 1 };
+    const log = "{\"next_seq\":7,\"entries\":[{\"seq\":6,\"blocked\":false,\"type\":\"document\",\"method\":\"GET\",\"url\":\"https://example.com/\",\"status\":200,\"duration_ms\":4,\"size\":3000}]}";
+    const net = try resultText(arena, try networkResult(arena, .headless, EXAMPLE, counters, log));
+    try expectText(net, "since=7 lists only the requests after these");
+    try expectText(net, "6 GET 200 2.9 KiB 4ms");
+
+    // web_open names what it means instead of a field the text lacks.
+    var hv = EXAMPLE;
+    hv.handoff_available = true;
+    const op = try resultText(arena, try openResult(arena, .headless, hv, true, true, null, null, null, "none", null, 1, .{}));
+    try expectText(op, "the user opens one from the AI badge");
+    try t.expect(std.mem.indexOf(u8, op, "handoff.available") == null);
+
+    // web_tabs: an idle countdown reads as a duration.
+    const tb = try resultText(arena, try tabsResult(arena, .headless, .{
+        .views = &.{.{ .pane = 2, .url = "https://other.test/", .focused = true, .idle = .{ .closes_in_ms = 4200 } }},
+        .helper = "ready",
+    }));
+    try expectText(tb, "(closes in 5 seconds if untouched)");
+
+    // web_inspect: every landmark and control, not only their counts.
+    const review = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"url":"https://example.com/","elements":[{"ref":1,"tag":"main","role":"main","name":""},{"ref":2,"tag":"button","role":"button","name":"Save"},{"ref":3,"tag":"a","role":"link","name":"Help","dom_id":"help"}],"focus":2,"landmarks":[1],"controls":[2,3],"issues":[],"page_errors":[],"document_overflow":12}
+    , .{});
+    var rr = mcp.Res.init(arena);
+    try @import("mcp_web_review.zig").summary(&rr, review);
+    const rv = try resultText(arena, try rr.finish());
+    try expectText(rv, "https://example.com/ - 1 landmarks, 2 controls, 0 findings.");
+    try expectText(rv, "Focus:\n  [2] <button>, button \"Save\"");
+    try expectText(rv, "Landmarks:\n  [1] <main>, main \"\"");
+    try expectText(rv, "Controls:\n  [3] <a> #help, link \"Help\"");
+    try expectText(rv, "12px wider than the viewport");
 }

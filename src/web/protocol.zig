@@ -2841,13 +2841,33 @@ pub const SemExpand = struct {
     len: u32,
 };
 
+/// `total` is the OPTIONAL TRAILING field: the node's whole text length in
+/// the page's UTF-16 units, so a client tells a cut from the end. It is
+/// `EXPAND_TOTAL_UNKNOWN` from an older helper and on a reply that is a
+/// message rather than the node's text (discarded, navigating, unknown id).
 pub const SemExpandResult = struct {
     pub const tag: Tag = .sem_expand_result;
     view: u32,
     id: u32,
     off: u32,
     text: []const u8,
+    total: u32 = EXPAND_TOTAL_UNKNOWN,
+
+    pub fn decodeFrom(payload: []const u8) !SemExpandResult {
+        var cur = Cur{ .buf = payload };
+        var out: SemExpandResult = .{
+            .view = try cur.readU32(),
+            .id = try cur.readU32(),
+            .off = try cur.readU32(),
+            .text = try cur.readStr(),
+        };
+        out.total = cur.readU32() catch EXPAND_TOTAL_UNKNOWN;
+        return out;
+    }
 };
+
+/// `SemExpandResult.total` when the length is not known.
+pub const EXPAND_TOTAL_UNKNOWN: u32 = std.math.maxInt(u32);
 
 pub const SemQueryReq = struct {
     pub const tag: Tag = .sem_query;
@@ -6093,6 +6113,7 @@ test "round-trip: semantic layer frames" {
     try roundTrip(SemActResult, .{ .view = 7, .id = 4, .ok = 1, .msg = "click at 40,20" });
     try roundTrip(SemExpand, .{ .view = 7, .id = 4, .off = 160, .len = 4096 });
     try roundTrip(SemExpandResult, .{ .view = 7, .id = 4, .off = 160, .text = "the rest of it" });
+    try roundTrip(SemExpandResult, .{ .view = 7, .id = 4, .off = 160, .text = "the rest of it", .total = 9000 });
     try roundTrip(SemQueryReq, .{ .view = 7, .kind = @intFromEnum(SemQuery.subtree), .arg = "4" });
     try roundTrip(SemQueryResult, .{ .view = 7, .payload = .{ .s = "query subtree [4]\n" } });
     try roundTrip(SemRead, .{ .view = 7 });
@@ -7323,4 +7344,17 @@ test "view_screen is a fresh owner-only block and validates its rects" {
     bad.window_w = 0;
     try std.testing.expect(!bad.valid());
     try std.testing.expect(!observerAllows(.view_screen, true));
+}
+
+test "a sem_expand_result without the trailing total decodes as unknown" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try putU32(gpa, &out, 7);
+    try putU32(gpa, &out, 4);
+    try putU32(gpa, &out, 160);
+    try putStr(gpa, &out, "older helper");
+    const ev = try decode(SemExpandResult, out.items);
+    try std.testing.expectEqual(EXPAND_TOTAL_UNKNOWN, ev.total);
+    try std.testing.expectEqualStrings("older helper", ev.text);
 }

@@ -1222,7 +1222,9 @@ pub const Client = struct {
             },
             .sem_expand_result => {
                 const ev = proto.decode(proto.SemExpandResult, frame.payload) catch return;
-                if (self.findFace(ev.view)) |face| face.completeOp(.expand, request, true, ev.text, .{});
+                if (self.findFace(ev.view)) |face| face.completeOp(.expand, request, true, ev.text, .{
+                    .total = if (ev.total == proto.EXPAND_TOTAL_UNKNOWN) null else ev.total,
+                });
             },
             .sem_query_result => {
                 const ev = proto.decode(proto.SemQueryResult, frame.payload) catch return;
