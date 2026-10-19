@@ -664,7 +664,7 @@ fn ensure(d: *Daemon) ?*peermail.Store {
         return null;
     };
     const s = &d.peers.store.?;
-    s.load();
+    s.load(clock.wallMs());
     if (hub) log.info("peer federation: hub {s}, {d} domain(s)", .{ host, domains.len });
     if (callin) |dom| log.info("peer federation: call-in member {s}, dialing hub domain {s}", .{ host, dom.name });
     return s;

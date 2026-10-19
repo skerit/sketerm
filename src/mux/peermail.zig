@@ -64,6 +64,12 @@ pub const PEER_MAIL_MAX: usize = 256;
 pub const PEER_MAIL_MAX_BYTES: usize = 1024 * 1024;
 /// Expired ids remembered per recipient (`expired_while_away`).
 pub const EXPIRED_RING: usize = 64;
+/// How long a gone durable mailbox holding nothing is kept when mail never
+/// expires (`ttl_ms` 0); otherwise it is kept for the mail TTL.
+pub const GONE_KEEP_MS: i64 = 6 * 3_600_000;
+/// How long a gone durable mailbox holding nothing but a subject is kept,
+/// so a session returning within it still finds what its user set.
+pub const GONE_SUBJECT_KEEP_MS: i64 = 7 * 24 * 3_600_000;
 /// Gone non-durable addresses remembered (`not_durable_gone`).
 pub const GONE_RING: usize = 256;
 /// Message ids are this prefix plus `ID_CHARS` alphabet characters.
@@ -188,6 +194,8 @@ pub const AddressMeta = struct {
     /// The alias came from the working directory (no title yet): the
     /// first title replaces it once (`offerTitle`).
     alias_from_dir: bool = false,
+    /// Wall ms its last server left (`Box.last_seen_ms`); 0 = unknown.
+    last_seen_ms: i64 = 0,
 };
 
 /// `peer_register` body; re-sent whenever a field changes.
@@ -739,6 +747,13 @@ const Box = struct {
         return self.hook_ms > 0 and now - self.hook_ms <= HOOK_FRESH_MS;
     }
 
+    /// Wall ms of its last sign of life, never before `floor`.
+    fn lastActive(self: *const Box, floor: i64) i64 {
+        var at = @max(floor, @max(self.last_seen_ms, self.hook_ms));
+        for (self.expired[0..self.expired_len]) |e| at = @max(at, e.expired_ms);
+        return at;
+    }
+
     fn messageCount(self: *const Box) usize {
         var n: usize = 0;
         for (self.items.items) |s| n += @intFromBool(s.item.kind == .message);
@@ -1093,6 +1108,9 @@ pub const Store = struct {
     /// Bumped whenever a peer comes, goes or changes subject: the owner
     /// re-derives what depends on the set of live peers.
     roster_gen: u32 = 0,
+    /// Wall ms `load` ran: a loaded mailbox is never pruned for a gone
+    /// time it served before this daemon started.
+    loaded_ms: i64 = 0,
     wake: peerwake.Policy = .{},
     limiter: peerwake.Limiter = .{},
     multis: std.ArrayList(*Multi) = .empty,
@@ -1281,7 +1299,7 @@ pub const Store = struct {
         box.client_pid = p.client_pid;
         box.work = .{};
         self.clearNote(box);
-        if (box.durable) return;
+        if (box.durable) return self.writeMeta(box);
         _ = self.boxes.orderedRemove(bi);
         defer self.freeBox(box);
         self.goneAdd(p.address);
@@ -1514,6 +1532,7 @@ pub const Store = struct {
     /// tombstone for its recipient (none for a route's outbound mail); an
     /// expired event is dropped with a warning.
     pub fn sweep(self: *Store, now: i64) void {
+        self.pruneGone(now);
         if (self.ttl_ms <= 0) return;
         var bi: usize = 0;
         while (bi < self.boxes.items.len) : (bi += 1) {
@@ -1544,6 +1563,25 @@ pub const Store = struct {
                 freeStored(self.allocator, s);
             }
             if (changed) self.compact(box);
+        }
+    }
+
+    /// Forget every durable mailbox that holds nothing and whose server has
+    /// been gone longer than it is kept (`GONE_KEEP_MS`,
+    /// `GONE_SUBJECT_KEEP_MS`); its session registers the address afresh.
+    fn pruneGone(self: *Store, now: i64) void {
+        const keep = if (self.ttl_ms > 0) self.ttl_ms else GONE_KEEP_MS;
+        var i: usize = 0;
+        while (i < self.boxes.items.len) {
+            const b = self.boxes.items[i];
+            const limit = if (b.subject.len > 0) @max(keep, GONE_SUBJECT_KEEP_MS) else keep;
+            if (!b.durable or b.isRoute() or b.items.items.len > 0 or self.livePeer(b.address) != null or
+                now - b.lastActive(self.loaded_ms) < limit)
+            {
+                i += 1;
+                continue;
+            }
+            self.dropBox(b);
         }
     }
 
@@ -2693,10 +2731,11 @@ pub const Store = struct {
 
     // ------------------------------------------------------ persistence
 
-    /// Load every durable mailbox under `dir`. A file that cannot be read
-    /// or a line that does not parse costs that file or line, never the
-    /// start: a warning is emitted and the rest loads.
-    pub fn load(self: *Store) void {
+    /// Load every durable mailbox under `dir` at wall ms `now`. A file that
+    /// cannot be read or a line that does not parse costs that file or
+    /// line, never the start: a warning is emitted and the rest loads.
+    pub fn load(self: *Store, now: i64) void {
+        self.loaded_ms = now;
         const dir = self.dir orelse return;
         var z: [4096]u8 = undefined;
         const dz = pathz.pathZ(&z, dir) catch return;
@@ -2737,11 +2776,11 @@ pub const Store = struct {
         if (!box.durable or self.dir == null) return;
         var pbuf: [4096]u8 = undefined;
         const path = self.metaPath(&pbuf, box.address) orelse return;
-        if (box.subject.len == 0 and box.alias.len == 0 and !box.titled and !box.alias_from_dir) return self.unlinkPath(path);
+        if (box.subject.len == 0 and box.alias.len == 0 and !box.titled and !box.alias_from_dir and box.last_seen_ms == 0) return self.unlinkPath(path);
         pathz.makeDirs(self.dir.?, 0o700) catch return self.warnf("peermail: cannot create {s}; the subject and alias of {s} are kept in memory only", .{ self.dir.?, box.address });
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
-        std.json.Stringify.value(AddressMeta{ .subject = box.subject, .alias = box.alias, .titled = box.titled, .alias_from_dir = box.alias_from_dir }, .{}, &aw.writer) catch return self.warnf("peermail: out of memory writing {s}", .{path});
+        std.json.Stringify.value(AddressMeta{ .subject = box.subject, .alias = box.alias, .titled = box.titled, .alias_from_dir = box.alias_from_dir, .last_seen_ms = box.last_seen_ms }, .{}, &aw.writer) catch return self.warnf("peermail: out of memory writing {s}", .{path});
         atomicwrite.writeFileExact(path, aw.written(), 0o600) catch |e| self.warnf("peermail: cannot write {s} ({s})", .{ path, @errorName(e) });
     }
 
@@ -2755,6 +2794,7 @@ pub const Store = struct {
         const m = parsed.value;
         box.titled = m.titled;
         box.alias_from_dir = m.alias_from_dir;
+        box.last_seen_ms = m.last_seen_ms;
         if (m.alias.len > 0) {
             if (!peeraddr.validAlias(m.alias)) {
                 self.warnf("peermail: {s}: the alias is not one, ignored", .{path});
@@ -3605,6 +3645,77 @@ test "TTL expiry: the recipient keeps a tombstone, an offline sender finds the e
     try t.expectEqual(before + 1, rec.count(3, .deliver));
 }
 
+/// Whether `s` lists `address` at `now`.
+fn listsAddress(s: *Store, address: []const u8, now: i64) !bool {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    for (try s.list(arena.allocator(), now)) |p| if (std.mem.eql(u8, p.address, address)) return true;
+    return false;
+}
+
+test "gone mailboxes holding nothing are forgotten: after the TTL, a week with a subject, never while mail waits" {
+    var td = pathz.TempDir.make("peermail-prune") orelse return error.SkipZigTest;
+    defer td.remove();
+    var rec = Rec.init();
+    defer rec.deinit();
+    var idb: [ID_LEN]u8 = undefined;
+    {
+        var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .ttl_ms = 1000, .emit = rec.emit() });
+        defer s.deinit();
+        s.load(0);
+        try s.register(1, reg("Live", true), 0);
+        try s.register(2, reg("Empty", true), 0);
+        try s.register(3, reg("Titled", true), 0);
+        try s.register(4, reg("Mail", true), 0);
+        try s.setSubject("Titled", "Proteus");
+        s.deregister(2, 100);
+        s.deregister(3, 100);
+        s.deregister(4, 100);
+        _ = try sendText(&s, 1, "Mail", "waiting", 150, &idb);
+        // 1. Within the TTL everything stays.
+        s.sweep(1099);
+        try t.expect(try listsAddress(&s, "Empty", 1099));
+        // 2. Past it the empty one goes, files and all; the live one never.
+        s.sweep(1100);
+        try t.expect(!try listsAddress(&s, "Empty", 1100));
+        try t.expect(try listsAddress(&s, "Live", 1100));
+        try t.expect(try listsAddress(&s, "Titled", 1100));
+        // 3. The waiting message holds Mail; its expiry tombstone holds it one TTL more.
+        try t.expect(try listsAddress(&s, "Mail", 1100));
+        s.sweep(1150);
+        try t.expect(try listsAddress(&s, "Mail", 1150));
+        s.sweep(2149);
+        try t.expect(try listsAddress(&s, "Mail", 2149));
+        s.sweep(2150);
+        try t.expect(!try listsAddress(&s, "Mail", 2150));
+        // 4. A subject keeps its mailbox for a week.
+        s.sweep(100 + GONE_SUBJECT_KEEP_MS - 1);
+        try t.expect(try listsAddress(&s, "Titled", 100 + GONE_SUBJECT_KEEP_MS - 1));
+        // 5. The forgotten address comes back on its next registration.
+        try s.register(5, reg("Empty", true), 3000);
+        try t.expect(try listsAddress(&s, "Empty", 3000));
+        s.deregister(5, 3000);
+    }
+    // 6. A restart keeps when each server left, and gives every loaded
+    // mailbox a full keep from the load before it can be forgotten.
+    var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .ttl_ms = 1000, .emit = rec.emit() });
+    defer s.deinit();
+    s.load(10_000);
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    try t.expect(try listsAddress(&s, "Empty", 10_000));
+    for (try s.list(arena.allocator(), 10_000)) |p| if (std.mem.eql(u8, p.address, "Empty")) try t.expectEqual(@as(i64, 3000), p.last_seen_ms);
+    s.sweep(10_999);
+    try t.expect(try listsAddress(&s, "Empty", 10_999));
+    try t.expect(try listsAddress(&s, "Titled", 10_999));
+    s.sweep(11_000);
+    try t.expect(!try listsAddress(&s, "Empty", 11_000));
+    try t.expect(try listsAddress(&s, "Titled", 11_000));
+    try t.expect(!try listsAddress(&s, "Mail", 11_000));
+    s.sweep(10_000 + GONE_SUBJECT_KEEP_MS);
+    try t.expect(!try listsAddress(&s, "Titled", 10_000 + GONE_SUBJECT_KEEP_MS));
+}
+
 test "durable mailboxes survive a restart: append, compaction on ack, unreadable lines skipped" {
     var td = pathz.TempDir.make("peermail") orelse return error.SkipZigTest;
     defer td.remove();
@@ -3642,7 +3753,7 @@ test "durable mailboxes survive a restart: append, compaction on ack, unreadable
     var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
     defer s.deinit();
     const warns_before = rec.count(0, .warn);
-    s.load();
+    s.load(0);
     try t.expectEqual(warns_before + 2, rec.count(0, .warn));
     // Known after restart: Qq (mail), Idle (registered, no mail), Zenit.
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
@@ -3717,7 +3828,7 @@ test "subject: set by a registration, kept across re-registrations, a new server
     {
         var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
         defer s.deinit();
-        s.load();
+        s.load(0);
         try t.expectEqualStrings("template links", s.subjectOf("Arcana"));
         try t.expectEqualStrings("reviewing", (listed(&s, a, "bob") orelse return error.TestUnexpectedResult).subject);
         try s.register(1, .{ .address = "Arcana", .durable = true, .subject = "" }, 50);
@@ -3726,7 +3837,7 @@ test "subject: set by a registration, kept across re-registrations, a new server
     {
         var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
         defer s.deinit();
-        s.load();
+        s.load(0);
         try t.expectEqualStrings("", s.subjectOf("Arcana"));
         try t.expectEqualStrings("reviewing", s.subjectOf("bob"));
     }
@@ -3920,7 +4031,7 @@ test "aliases: the first title is the alias and the default subject; a live hold
     {
         var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
         defer s.deinit();
-        s.load();
+        s.load(0);
         try t.expectEqualStrings("zenit", s.aliasOf("p-00000001"));
         try t.expectEqualStrings("zenit-1", s.aliasOf("p-00000002"));
         try s.register(1, regPane("00000001"), 0);
@@ -3982,7 +4093,7 @@ test "aliases: an untitled peer takes its working directory's name; the first ti
     {
         var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
         defer s.deinit();
-        s.load();
+        s.load(0);
         try s.register(4, regIn("00000004", ws), 100);
         try s.offerTitle("p-00000004", "", 100);
         try t.expectEqualStrings("zenit-workspace", s.aliasOf("p-00000004"));
@@ -4055,7 +4166,7 @@ test "aliases: a new session resumes a gone holder's alias with its mail and sub
     {
         var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
         defer s.deinit();
-        s.load();
+        s.load(0);
         try s.register(9, regPane("00000009"), 100);
         try s.register(2, regPane("00000002"), 100);
         try s.offerTitle("p-00000002", "Zenit", 100);
@@ -4075,7 +4186,7 @@ test "aliases: a new session resumes a gone holder's alias with its mail and sub
     {
         var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
         defer s.deinit();
-        s.load();
+        s.load(0);
         try t.expect(!s.knows("p-00000001"));
         try t.expectEqualStrings("zenit", s.aliasOf("p-00000002"));
         try t.expectEqual(@as(u32, 1), (listed(&s, a, "p-00000002") orelse return error.TestUnexpectedResult).pending);
@@ -4097,7 +4208,7 @@ test "aliases: migration gives a named mailbox from before aliases its slug, whi
     {
         var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
         defer s.deinit();
-        s.load();
+        s.load(0);
         // 1. Each takes its slug, the later in address order a suffix: nothing merged.
         try t.expectEqualStrings("qq", s.aliasOf("Qq"));
         try t.expectEqualStrings("qq-1", s.aliasOf("qq"));
@@ -4105,7 +4216,7 @@ test "aliases: migration gives a named mailbox from before aliases its slug, whi
     }
     var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });
     defer s.deinit();
-    s.load();
+    s.load(0);
     // 2. One-way: the restart reads the aliases back.
     try t.expectEqualStrings("qq", s.aliasOf("Qq"));
     try t.expectEqualStrings("qq-1", s.aliasOf("qq"));
@@ -4831,7 +4942,7 @@ test "federation: the outbound mailbox and membership survive a restart" {
     defer rec.deinit();
     var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "boxhost", .emit = rec.emit() });
     defer s.deinit();
-    s.load();
+    s.load(0);
     try t.expectEqual(PeerFederation.member, s.federation());
     try t.expectEqual(@as(usize, 1), s.uplink().?.box.items.items.len);
     try t.expectEqualStrings("hub/Zenit", s.uplink().?.box.items.items[0].item.to);

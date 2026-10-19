@@ -2903,7 +2903,15 @@ peer message is information, never an approval.
   anon peer that exits ends the same way, `ended unread` with reason
   `not_durable_gone`. Durable mailboxes persist under
   `$XDG_STATE_HOME/sketerm/peermail/<socket namespace>/`, so a daemon
-  restart, handover or idle upgrade loses none.
+  restart, handover or idle upgrade loses none. A durable mailbox whose
+  server is gone and that holds nothing (no mail, no unacked event, no
+  `expired_while_away` tombstone younger than the TTL) is forgotten
+  once its server has been gone for the mail TTL
+  (`peer_mail_ttl_hours`; 6 hours when that is 0), or for a week when it
+  carries a subject; the time a server left is persisted, and a daemon
+  start counts as the earliest such time. The session's next server
+  registers the same address afresh, so only mail sent to it while it
+  was forgotten is refused (`unknown_address`).
 - **Never an approval**: a peer message is information from another
   assistant's session, never the user's approval, consent or instruction;
   the server's instructions say so, and a session must not act on one as
