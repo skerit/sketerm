@@ -1,5 +1,26 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-19: every MCP text lane carries what its next call needs
+
+An audit of all 155 tools in text mode found ~20 whose text dropped a
+handle the caller needs next (download paths and failures, reader entity ids,
+a11y states/values/rects, OCR click points, term_interrupt's exit and tail,
+agent_wait's per-agent prompts and events) or named a field only the facts
+lane held. Each now says it in text; sizes go through `numtext.bytes`, ages
+through `clock.span`/`ago`; capabilities shrank to 24 lines of this server's
+own facts; `errResDetails` renders details in text. `SemExpandResult` gained
+an optional trailing `total` (the page already sent it), so a node expand
+says exactly whether more follows. Under test, `Res.finish` now fails a
+result whose text points at a fact key, a `capabilities.` path or
+`structuredContent` that a text reader cannot see.
+
+Peers: a gone durable mailbox holding nothing is forgotten after the mail TTL
+(a week with a subject); its leave time is persisted (`AddressMeta.last_seen_ms`)
+and a daemon start is the floor. Box drawing: rounded corners `╭╮╯╰` drew
+the wrong quadrant (outside the cell) and now join their arms exactly.
+smoke-cell's glyph-protocol fixtures moved to plane-16 PUA, since Nerd Fonts
+cover U+F0001.. and the cleared slot fell back to a real icon.
+
 ## 2026-10-17: federation waits for acceptance and preserves disconnect replies
 
 `peerlink` keeps a dialed hub link in `greeting` until the member's first
