@@ -993,6 +993,69 @@
     return Array.from(new Set(out));
   }
 
+  // Query keys that only tell a site (or its ad and mail tools) where a
+  // click came from: exact names, then prefixes. Nothing that changes
+  // what the URL addresses is on this list, so stripping is lossless.
+  var TRACKING_KEYS = {
+    fbclid: 1,
+    gclid: 1,
+    gclsrc: 1,
+    dclid: 1,
+    gbraid: 1,
+    wbraid: 1,
+    msclkid: 1,
+    yclid: 1,
+    twclid: 1,
+    ttclid: 1,
+    igshid: 1,
+    mc_cid: 1,
+    mc_eid: 1,
+    _hsenc: 1,
+    _hsmi: 1,
+    mkt_tok: 1,
+    ref_src: 1,
+    srsltid: 1,
+    _ga: 1,
+    _gl: 1,
+    pk_campaign: 1,
+    pk_kwd: 1,
+    pk_keyword: 1,
+    pk_source: 1,
+    pk_medium: 1,
+    pk_content: 1,
+    pk_cid: 1
+  };
+  var TRACKING_PREFIXES = ["utm_", "oly_", "vero_", "mtm_", "hsa_"];
+
+  function isTrackingKey(key) {
+    var k = key.toLowerCase();
+    if (TRACKING_KEYS[k]) return true;
+    for (var i = 0; i < TRACKING_PREFIXES.length; i++) if (k.indexOf(TRACKING_PREFIXES[i]) === 0) return true;
+    return false;
+  }
+
+  // `url` without its tracking query parameters. The rest of the query is
+  // kept byte for byte (not re-encoded), and a URL with none is returned
+  // as it came.
+  function cleanUrl(url) {
+    var q = url.indexOf("?");
+    if (q < 0) return url;
+    var h = url.indexOf("#", q);
+    var query = h < 0 ? url.slice(q + 1) : url.slice(q + 1, h);
+    var frag = h < 0 ? "" : url.slice(h);
+    var parts = query.split("&");
+    var kept = [];
+    for (var i = 0; i < parts.length; i++) {
+      var key = parts[i].split("=")[0];
+      try {
+        key = decodeURIComponent(key.replace(/\+/g, " "));
+      } catch (e) {}
+      if (!isTrackingKey(key)) kept.push(parts[i]);
+    }
+    if (kept.length === parts.length) return url;
+    return url.slice(0, q) + (kept.length ? "?" + kept.join("&") : "") + frag;
+  }
+
   function absUrl(el, attr) {
     var v = el[attr];
     if (typeof v === "string") return v;
@@ -1069,7 +1132,7 @@
     for (var i = 0; i < els.length && links.length < PAGE_LINKS_MAX; i++) {
       var el = els[i];
       if (SKIP_TAG[el.tagName]) continue;
-      links.push({ text: linkText(el), href: absUrl(el, "href").slice(0, 2000), area: areaOf(el), visible: visibleBox(el) });
+      links.push({ text: linkText(el), href: cleanUrl(absUrl(el, "href")).slice(0, 2000), area: areaOf(el), visible: visibleBox(el) });
     }
     res.links = links;
     res.links_total = els.length;
@@ -1547,7 +1610,7 @@
       abs = String(a.href || "");
     } catch (e) {}
     var url = abs || a.getAttribute("href") || "";
-    return /^\s*javascript:/i.test(url) ? "" : url;
+    return /^\s*javascript:/i.test(url) ? "" : cleanUrl(url);
   }
 
   // An image without alt text is decorative (that is what an empty alt
@@ -1560,7 +1623,7 @@
       src = String(img.currentSrc || img.src || "");
     } catch (e) {}
     if (!src || /^data:/i.test(src)) return "[image: " + alt + "]";
-    return "![" + alt + "](" + src + ")";
+    return "![" + alt + "](" + cleanUrl(src) + ")";
   }
 
   function wrap(mark, s) {

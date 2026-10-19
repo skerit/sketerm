@@ -410,6 +410,8 @@ const reader_shapes_page =
     "<a href=\"https://ex.test/afspraak\">Maak een afspraak</a></li></ul>" ++
     "<div>Price 10 EUR<div>Add to cart</div></div>" ++
     "<label for=mail>E-mail</label><input id=mail>" ++
+    "<p><a href=\"https://ex.test/p?id=7&utm_source=news&fbclid=abc%23part\">Tracked</a> <a href=\"https://ex.test/q?utm_medium=mail\">Bare</a> " ++
+    "<img src=\"data:image/gif;base64,R0lGODlhAQABAAAAACw=?w=1&utm_campaign=x\" alt=\"Flag\"></p>" ++
     "</main></body></html>";
 
 /// Rich reader proof: the only actionable node returned by reader mode
@@ -10393,8 +10395,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             "- [Maak een afspraak](https://ex.test/afspraak)\n",
             "Price 10 EUR\n\nAdd to cart",
             "- E-mail: (empty)",
+            "[Tracked](https://ex.test/p?id=7#part) [Bare](https://ex.test/q)",
         };
-        const banned = [_][]const u8{ "SECRET-HIDDEN", "ARIA-HIDDEN", "MENU-ITEM", "[](", "![](", "afspraak) Maak", "Price 10 EURAdd", "\n\nE-mail\n" };
+        const banned = [_][]const u8{ "SECRET-HIDDEN", "ARIA-HIDDEN", "MENU-ITEM", "[](", "![](", "afspraak) Maak", "Price 10 EURAdd", "\n\nE-mail\n", "utm_", "fbclid" };
         for (want) |w| if (std.mem.indexOf(u8, md, w) == null) {
             std.debug.print("smoke-web: missing {s}\nmarkdown was:\n{s}\n", .{ w, md });
             fail("stage 12c reader shapes: an expected reader line is missing");
