@@ -17,6 +17,7 @@ const mcp = @import("mcp.zig");
 const mcp_term = @import("mcp_term.zig");
 const termdrive = @import("termdrive.zig");
 const protocol = @import("protocol.zig");
+const clock = @import("../util/clock.zig");
 const Backend = mcp.Backend;
 const Res = mcp.Res;
 const ErrCode = mcp.ErrCode;
@@ -495,7 +496,10 @@ fn listHeadless(arena: std.mem.Allocator, family: Family) ![]const u8 {
         if (t.remote_host) |rh| try res.textf("  host: {s} (sketerm-mux)", .{rh});
         if (t.hasPendingCommand()) try res.text("  pending_command: true");
         if (t.hasPendingExec()) try res.text("  pending_exec: true");
-        if (busy) |b| if (b.command) |cmd| try res.textf("  busy: {s} `{s}` for {d}s", .{ b.kind, cmd, @divTrunc(b.running_ms.?, 1000) }) else try res.textf("  busy: {s}", .{b.kind});
+        if (busy) |b| if (b.command) |cmd| {
+            var sb: [32]u8 = undefined;
+            try res.textf("  busy: {s} `{s}` for {s}", .{ b.kind, cmd, clock.span(&sb, b.running_ms.?, .short) });
+        } else try res.textf("  busy: {s}", .{b.kind});
         if (last.len > 0) try res.textf("  last line: {s}", .{last});
         if (cast) |p| try res.textf("  recording: {s}", .{p});
     }
@@ -618,10 +622,10 @@ pub fn waitIdle(arena: std.mem.Allocator, family: Family, backend: ?Backend, arg
     try res.fact("quiet_ms", quiet_ms);
     try res.fact("desynced", desynced);
     if (running) |r| try res.fact("foreground_running", r);
-    try res.text(if (desynced)
+    if (!settled and !desynced) {
+        try res.textf("still active after {s}", .{try waitedFor(arena, timeout_ms)});
+    } else try res.text(if (desynced)
         "NOT idle: this terminal's mirror lost sync with the session and could not be rebuilt, so quiescence cannot be observed. Close it (term_close) and open a new one"
-    else if (!settled)
-        "still active at timeout"
     else if (running == true)
         "idle, but a foreground command is still RUNNING (output is quiet, not finished)"
     else if (running == false)
@@ -629,6 +633,16 @@ pub fn waitIdle(arena: std.mem.Allocator, family: Family, backend: ?Backend, arg
     else
         "idle");
     return res.finish();
+}
+
+/// How long a wait ran before it gave up ("30s", "200ms"), naming the cap
+/// when the wait was clamped to it.
+pub fn waitedFor(arena: std.mem.Allocator, ms: i64) ![]const u8 {
+    if (ms < 1000) return std.fmt.allocPrint(arena, "{d}ms", .{@max(ms, 0)});
+    var b: [32]u8 = undefined;
+    const s = clock.span(&b, ms, .short);
+    if (ms >= WAIT_CAP_MS) return std.fmt.allocPrint(arena, "{s}, the most one call waits", .{s});
+    return arena.dupe(u8, s);
 }
 
 /// Output-idle defaults shared by run_command/term_run and wait_idle/term_wait_idle.
@@ -691,7 +705,7 @@ pub fn runCommand(arena: std.mem.Allocator, family: Family, backend: ?Backend, a
     try res.fact("settled", settled);
     try res.fact("timed_out", !settled);
     try res.fact("went_to_foreground_stdin", busy_before);
-    if (!settled) try res.text("still producing output after the timeout");
+    if (!settled) try res.textf("still producing output after {s}", .{try waitedFor(arena, timeout_ms)});
     if (busy_before)
         try res.text("a foreground command was already running when this text was sent: it went to that program's stdin, or the shell queued it as pending input; it did NOT start as a new shell command. Wait with wait_idle, or interrupt with send_keys ctrl+c");
 
@@ -858,7 +872,8 @@ fn focusPane(arena: std.mem.Allocator, backend: Backend, args: std.json.Value) !
         .fail => |f| return failRes(arena, f),
     }
     var res = Res.init(arena);
-    try res.field("pane", pane);
+    try res.fact("pane", pane);
+    try res.textf("focused pane {d}", .{pane});
     try res.fact("focused", true);
     return res.finish();
 }
@@ -870,7 +885,8 @@ fn closePane(arena: std.mem.Allocator, backend: Backend, args: std.json.Value) !
         .fail => |f| return failRes(arena, f),
     }
     var res = Res.init(arena);
-    try res.field("pane", pane);
+    try res.fact("pane", pane);
+    try res.textf("closed pane {d}", .{pane});
     try res.fact("closed", true);
     return res.finish();
 }
@@ -1277,4 +1293,41 @@ test "list_terminals flattens the GUI's tabs into addressable panes" {
     const empty = try listTerminalsResult(arena, try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"ok\":true,\"tabs\":[]}", .{}));
     const eparsed = try expectToolResultShape(arena, "list_terminals", empty);
     try t.expectEqual(@as(i64, 0), eparsed.object.get("structuredContent").?.object.get("count").?.integer);
+}
+
+test "text mode: waits say how long they waited, pane verbs say what happened" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const saved = mcp.result_mode;
+    defer mcp.result_mode = saved;
+    mcp.result_mode = .text;
+
+    try t.expectEqualStrings("200ms", try waitedFor(arena, 200));
+    try t.expectEqualStrings("30s", try waitedFor(arena, 30_000));
+    try t.expectEqualStrings("2m, the most one call waits", try waitedFor(arena, waitCap(600_000, 30_000)));
+
+    var bufs: [8][]const u8 = undefined;
+    var storage: [8][96]u8 = undefined;
+    for (0..8) |n| {
+        bufs[n] = std.fmt.bufPrint(&storage[n], "{{\"ok\":true,\"screen\":{{\"seq\":{d}}}}}", .{n}) catch unreachable;
+    }
+    var flowing = FakeBackend{ .responses = &bufs, .allocator = t.allocator };
+    defer flowing.deinit();
+    const waited = try rpcToolResult(arena, handleMessage(arena, flowing.backend(),
+        \\{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"wait_idle","arguments":{"quiet_ms":100,"timeout_ms":200}}}
+    ).?);
+    const wobj = (try std.json.parseFromSliceLeaky(std.json.Value, arena, waited, .{})).object;
+    try t.expect(wobj.get("structuredContent") == null);
+    try t.expect(std.mem.indexOf(u8, wobj.get("content").?.array.items[0].object.get("text").?.string, "still active after 200ms") != null);
+
+    for ([_][2][]const u8{ .{ "focus_pane", "focused pane 4" }, .{ "close_pane", "closed pane 4" } }) |c| {
+        var fake = FakeBackend{ .responses = &.{"{\"ok\":true}"}, .allocator = t.allocator };
+        defer fake.deinit();
+        const msg = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\",\"arguments\":{{\"pane\":4}}}}}}", .{c[0]});
+        const out = try rpcToolResult(arena, handleMessage(arena, fake.backend(), msg).?);
+        const obj = (try std.json.parseFromSliceLeaky(std.json.Value, arena, out, .{})).object;
+        try t.expectEqualStrings(c[1], obj.get("content").?.array.items[0].object.get("text").?.string);
+    }
 }

@@ -19,7 +19,9 @@ const argInt = mcp.argInt;
 const argStr = mcp.argStr;
 const appErr = mcp.appErr;
 const tailLines = mcp.tailLines;
-const nowMs = @import("../util/clock.zig").nowMs;
+const clock = @import("../util/clock.zig");
+const nowMs = clock.nowMs;
+const numtext = @import("../util/numtext.zig");
 const shellquote = mcp.shellquote;
 const sshroute = @import("../mux/sshroute.zig");
 const sshmaster = @import("../mux/sshmaster.zig");
@@ -187,7 +189,7 @@ pub fn execResult(arena: std.mem.Allocator, r: termdrive.ExecOutcome, screen_tai
         try res.fact("alt_screen", r.alt_screen);
         try res.fact("output_idle_ms", r.idle_ms);
         try res.fact("interactive_prompt", r.interactive_hint);
-        try res.textf("alt_screen: {}, output_idle_ms: {d}", .{ r.alt_screen, r.idle_ms });
+        try res.text(try pendingActivity(arena, r.alt_screen, r.idle_ms));
         if (screen_tail) |tail| try res.fact("screen", tail);
     }
     var file_note: ?[]const u8 = null;
@@ -199,7 +201,8 @@ pub fn execResult(arena: std.mem.Allocator, r: termdrive.ExecOutcome, screen_tai
         } else if (writeFileBytes(path, r.output)) {
             try res.fact("output_file", path);
             try res.fact("output_bytes", r.output.len);
-            try res.textf("output_file: {s} ({d} bytes)", .{ path, r.output.len });
+            var nb: [24]u8 = undefined;
+            try res.textf("output_file: {s} ({s})", .{ path, numtext.bytes(&nb, r.output.len) });
             inline_cap = @min(inline_cap, 2_000);
         } else {
             file_note = "output_file could not be written (dir missing / not writable?) - full output inline";
@@ -238,6 +241,15 @@ pub fn execResult(arena: std.mem.Allocator, r: termdrive.ExecOutcome, screen_tai
     try res.text("--- output ---");
     try res.text(inline_out);
     return res.finish();
+}
+
+/// A pending exec's activity in one line: how long its output has been
+/// quiet, and whether a full-screen program holds the terminal.
+fn pendingActivity(arena: std.mem.Allocator, alt_screen: bool, idle_ms: i64) ![]const u8 {
+    const alt = if (alt_screen) "; a full-screen program holds the alternate screen" else "";
+    if (idle_ms < 1000) return std.fmt.allocPrint(arena, "output is still arriving{s}", .{alt});
+    var b: [32]u8 = undefined;
+    return std.fmt.allocPrint(arena, "no output for {s}{s}", .{ clock.span(&b, idle_ms, .long), alt });
 }
 
 /// A safe interpreter name/path for term_exec's `shell` option: it is
@@ -613,7 +625,7 @@ pub fn busyInfo(arena: std.mem.Allocator, t: *termdrive.Term, term_id: u32) !?Bu
     else
         "term_open (with the same host, if this terminal is an ssh session)";
     const what = if (b.command) |cmd|
-        try std.fmt.allocPrint(arena, "the {s} `{s}` this MCP server sent {d}s ago is still running", .{ b.kind, cmd, @divTrunc(b.running_ms.?, 1000) })
+        try runningSentence(arena, b.kind, cmd, b.running_ms.?)
     else
         "a foreground command typed outside term_exec/term_run is still running (shell integration shows its zone open)";
     b.msg = try std.fmt.allocPrint(
@@ -622,6 +634,12 @@ pub fn busyInfo(arena: std.mem.Allocator, t: *termdrive.Term, term_id: u32) !?Bu
         .{ term_id, what, b.wait_with, sibling },
     );
     return b;
+}
+
+/// "the term_exec `make` this MCP server sent 3 minutes ago is still running".
+fn runningSentence(arena: std.mem.Allocator, kind: []const u8, cmd: []const u8, running_ms: i64) ![]const u8 {
+    var b: [32]u8 = undefined;
+    return std.fmt.allocPrint(arena, "the {s} `{s}` this MCP server sent {s} ago is still running", .{ kind, cmd, clock.span(&b, running_ms, .long) });
 }
 
 /// `busyInfo` as a `conflict` refusal whose details repeat the facts.
@@ -849,7 +867,25 @@ fn interruptResult(
         .unverified => try res.textf("terminal {d}: interrupts sent, but nothing here can tell whether the command stopped (plain ssh without shell integration); check with term_read", .{term_id}),
         .no => try res.textf("terminal {d}: the command did NOT stop; close the terminal with term_close (it kills the session) or open a sibling with term_open", .{term_id}),
     }
+    if (busy) |b| if (b.command) |cmd| try res.textf("was running: {s} `{s}`", .{ b.kind, cmd });
+    if ((verdict == .no or verdict == .unverified) and steps.len > 0) {
+        var tried: std.Io.Writer.Allocating = .init(arena);
+        for (steps, 0..) |s, i| try tried.writer.print("{s}{s}{s}", .{ if (i > 0) ", " else "", s.step, if (s.sent) "" else " (not sent)" });
+        try res.textf("tried: {s}", .{tried.written()});
+    }
+    for (steps) |s| if (s.@"error") |e| try res.textf("{s} failed: {s}", .{ s.step, e });
+    if (foreground.len > 0) try res.textf("in the foreground now: {s}", .{foreground});
     if (watch.tracker_abandoned) try res.text("the tracked command never reported completing; its tracker was dropped, so the terminal takes commands again");
+    if (watch.exec_tail) |tail| {
+        if (watch.exec_status) |st|
+            try res.textf("the interrupted term_exec ended with exit {d}", .{st})
+        else
+            try res.text("the interrupted term_exec ended, exit status unknown");
+        if (tail.len > 0) {
+            try res.text("--- exec output tail ---");
+            try res.text(tail);
+        }
+    }
     return res.finish();
 }
 
@@ -906,12 +942,12 @@ pub fn runCommandMode(arena: std.mem.Allocator, t: *termdrive.Term, cmd: []const
     t.sendText(line) catch return mcp.errRes(arena, .conflict, "send failed (terminal exited?)");
     t.trackCommand(token, cmd);
     const result = t.waitCommand(token, @max(0, timeout_ms - (nowMs() - started)));
-    return completionReply(arena, t, result, output_only);
+    return completionReply(arena, t, result, output_only, timeout_ms);
 }
 
 /// A command-mode completion, with the command's own zone as the output
 /// when asked for and the shell reported one, else the screen.
-fn completionReply(arena: std.mem.Allocator, t: *termdrive.Term, result: termdrive.CommandCompletion, output_only: bool) ![]const u8 {
+fn completionReply(arena: std.mem.Allocator, t: *termdrive.Term, result: termdrive.CommandCompletion, output_only: bool, timeout_ms: i64) ![]const u8 {
     var owned_output: ?[]u8 = null;
     defer if (owned_output) |text| term_state.allocator.free(text);
     var output_kind: []const u8 = "screen";
@@ -923,7 +959,7 @@ fn completionReply(arena: std.mem.Allocator, t: *termdrive.Term, result: termdri
     }
     if (owned_output == null) owned_output = t.readScreen(false) catch null;
     return commandCompletionResult(arena, result, true, owned_output, output_kind, switch (result.state) {
-        .running => "timeout expired while the command was still running; output may have been idle",
+        .running => try std.fmt.allocPrint(arena, "the {s} timeout expired while the command was still running; output may have been idle", .{try mcp_panes.waitedFor(arena, timeout_ms)}),
         .unknown => "terminal disconnected before a reliable completion status was received",
         .unsupported => unreachable,
         .completed => null,
@@ -934,7 +970,7 @@ fn termWaitCommand(arena: std.mem.Allocator, args: std.json.Value, t: *termdrive
     const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
     const result = t.waitPendingCommand(timeout_ms) orelse
         return mcp.errRes(arena, .not_found, "no timed-out command is being tracked");
-    return completionReply(arena, t, result, argBool(args, "output_only"));
+    return completionReply(arena, t, result, argBool(args, "output_only"), timeout_ms);
 }
 
 fn termResize(arena: std.mem.Allocator, args: std.json.Value, t: *termdrive.Term, term_id: u32) ![]const u8 {
@@ -1139,19 +1175,29 @@ pub fn masterFacts(res: *mcp.Res, m: *const sshmaster.Report) !void {
     try res.fact("ssh_master_age_s", m.age_s);
     try res.fact("ssh_master_stopped", m.stopped);
     try res.fact("ssh_control_path", m.controlPath());
+    var age_buf: [48]u8 = undefined;
     switch (m.kind) {
         .sketerm => if (m.reused)
-            try res.textf("ssh: reuses sketerm's login from {d}s ago (fresh_login:true starts a new one)", .{m.age_s orelse 0})
+            try res.textf("ssh: reuses sketerm's login, {s} (fresh_login:true starts a new one)", .{loginAge(&age_buf, m.age_s)})
         else if (m.stopped)
             try res.text("ssh: sketerm's older login was stopped; this connection logged in afresh")
         else
             try res.text("ssh: a fresh login (no sketerm master was running)"),
         .user_config => if (m.reused)
-            try res.textf("ssh: rides a ControlMaster your ssh_config sets ({s}), {s}; sketerm does not manage it", .{ m.controlPath() orelse "?", if (m.age_s) |a| try std.fmt.allocPrint(res.arena, "logged in {d}s ago", .{a}) else "age unknown" })
+            try res.textf("ssh: rides a ControlMaster your ssh_config sets ({s}), {s}; sketerm does not manage it", .{ m.controlPath() orelse "?", loginAge(&age_buf, m.age_s) })
         else
             try res.textf("ssh: your ssh_config sets a ControlPath ({s}); no master was running", .{m.controlPath() orelse "?"}),
         .none, .unknown => {},
     }
+}
+
+/// "logged in 5 minutes ago" for a master's login age, or "age unknown".
+fn loginAge(buf: []u8, age_s: ?u64) []const u8 {
+    const a = age_s orelse return "age unknown";
+    var b: [32]u8 = undefined;
+    const secs: i64 = @intCast(@min(a, 1 << 40));
+    const ms = secs * 1000;
+    return std.fmt.bufPrint(buf, "logged in {s} ago", .{clock.span(&b, ms, .long)}) catch "age unknown";
 }
 
 /// Why the last remote spawn on `host`'s own daemon failed: no daemon
@@ -1401,8 +1447,9 @@ pub fn xferOk(arena: std.mem.Allocator, direction: []const u8, path: []const u8,
     // here after a checksum match and an atomic rename/move.
     try res.fact("verified", true);
     try res.fact("atomic", true);
+    var size_buf: [24]u8 = undefined;
     if (bytes) |b|
-        try res.textf("{s} ok: {s} ({d} bytes), sha256 verified, moved atomically", .{ direction, path, b })
+        try res.textf("{s} ok: {s} ({s}), sha256 verified, moved atomically", .{ direction, path, numtext.bytes(&size_buf, b) })
     else
         try res.textf("{s} ok: {s}, sha256 verified, moved atomically", .{ direction, path });
     try res.textf("sha256: {s}", .{sha});
@@ -2003,6 +2050,7 @@ fn syncResult(arena: std.mem.Allocator, local_dir: []const u8, targets: []SyncTa
     var deleted: usize = 0;
     var bytes: u64 = 0;
     var lines: std.Io.Writer.Allocating = .init(arena);
+    var size_buf: [24]u8 = undefined;
     for (targets, items, 0..) |tg, *it, i| {
         if (i > 0) try lines.writer.writeAll("\n");
         const where = if (tg.host) |h| try std.fmt.allocPrint(arena, "{s}:{s}", .{ h, tg.raw_path }) else tg.raw_path;
@@ -2017,7 +2065,7 @@ fn syncResult(arena: std.mem.Allocator, local_dir: []const u8, targets: []SyncTa
         sent += tg.sent;
         deleted += tg.deleted;
         bytes += tg.bytes orelse 0;
-        try lines.writer.print("ok {s} [{s}] {s} {d}, skipped {s}, {s} {d}, {d} bytes{s}", .{
+        try lines.writer.print("ok {s} [{s}] {s} {d}, skipped {s}, {s} {d}, {s}{s}", .{
             where,
             method.?,
             if (dry_run) "would send" else "sent",
@@ -2025,7 +2073,7 @@ fn syncResult(arena: std.mem.Allocator, local_dir: []const u8, targets: []SyncTa
             if (tg.skipped) |s| try std.fmt.allocPrint(arena, "{d}", .{s}) else "?",
             if (dry_run) "would delete" else "deleted",
             tg.deleted,
-            tg.bytes orelse 0,
+            numtext.bytes(&size_buf, tg.bytes orelse 0),
             if (tg.created) " (directory created)" else "",
         });
         if (dry_run and tg.changes.len > 0) {
@@ -2048,13 +2096,15 @@ fn syncResult(arena: std.mem.Allocator, local_dir: []const u8, targets: []SyncTa
     try res.fact("files_deleted", deleted);
     try res.fact("bytes_sent", bytes);
     try res.fact("local_rsync", local_rsync);
-    try res.textf("{s}sync of {s} to {d} target(s): {d} ok, {d} failed; {d} file(s) {s}, {d} {s}", .{
+    var bb: [24]u8 = undefined;
+    try res.textf("{s}sync of {s} to {d} target(s): {d} ok, {d} failed; {d} file(s) ({s}) {s}, {d} {s}", .{
         if (dry_run) "DRY RUN (nothing changed): " else "",
         local_dir,
         targets.len,
         ok,
         targets.len - ok,
         sent,
+        numtext.bytes(&bb, bytes),
         if (dry_run) "would be sent" else "sent",
         deleted,
         if (dry_run) "would be deleted" else "deleted",
@@ -2342,7 +2392,7 @@ test "scp_put result: transfer facts structured, one prose line" {
     // No "ok" field survives: isError carries success now.
     try t.expect(sc.get("ok") == null);
     const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
-    try t.expect(std.mem.indexOf(u8, text, "upload ok: /srv/app.service (16 bytes)") != null);
+    try t.expect(std.mem.indexOf(u8, text, "upload ok: /srv/app.service (16 B)") != null);
 
     // Unknown size still satisfies the schema (bytes is nullable).
     const down = try xferOk(arena, "download", "/tmp/x.bin", null, sha);
@@ -2873,4 +2923,88 @@ test "commandCompletionResult: a refused send stays a soft failure" {
     const rparsed = try expectToolResultShape(arena, "term_run", running);
     try t.expect(rparsed.object.get("isError") == null);
     try t.expect(rparsed.object.get("structuredContent").?.object.get("timed_out").?.bool);
+}
+
+/// The one text block of a text-mode tool result.
+fn textModeText(arena: std.mem.Allocator, out: []const u8) ![]const u8 {
+    const obj = (try std.json.parseFromSliceLeaky(std.json.Value, arena, out, .{})).object;
+    try std.testing.expect(obj.get("structuredContent") == null);
+    return obj.get("content").?.array.items[0].object.get("text").?.string;
+}
+
+fn expectHas(text: []const u8, part: []const u8) !void {
+    if (std.mem.indexOf(u8, text, part) == null) {
+        std.debug.print("missing {s} in:\n{s}\n", .{ part, text });
+        return error.TestExpectedSubstring;
+    }
+}
+
+test "text mode: term_interrupt reports the steps, the foreground and the interrupted exec" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const saved = mcp.result_mode;
+    defer mcp.result_mode = saved;
+    mcp.result_mode = .text;
+    const busy: BusyInfo = .{ .msg = "", .kind = "term_exec", .command = "make", .running_ms = 5_000, .wait_with = "term_exec_wait" };
+
+    // Stopped: the interrupted exec's status and output tail are in the text.
+    var done = StopWatch{ .t = undefined, .had_exec = true, .had_cmd = false, .fg = true, .exec_status = 130, .exec_tail = "make: *** [all] Interrupt" };
+    const one = [_]StepReport{.{ .step = "tty_int", .sent = true, .stopped = true, .waited_ms = 120 }};
+    const stopped = try textModeText(arena, try interruptResult(arena, 3, .yes, .tty_int, &one, busy, &done, "bash", "process_group"));
+    try expectHas(stopped, "terminal 3: stopped after tty_int");
+    try expectHas(stopped, "was running: term_exec `make`");
+    try expectHas(stopped, "in the foreground now: bash");
+    try expectHas(stopped, "the interrupted term_exec ended with exit 130");
+    try t.expect(std.mem.endsWith(u8, stopped, "--- exec output tail ---\nmake: *** [all] Interrupt"));
+    try t.expect(std.mem.indexOf(u8, stopped, "tried:") == null);
+
+    // Not stopped: every rung tried and each failure's reason.
+    var still = StopWatch{ .t = undefined, .had_exec = false, .had_cmd = false, .fg = true };
+    const ladder = [_]StepReport{
+        .{ .step = "tty_int", .sent = true, .stopped = false, .waited_ms = 2_000 },
+        .{ .step = "sigterm", .sent = false, .stopped = false, .waited_ms = 2_000, .@"error" = "no foreground process group" },
+    };
+    const failed = try textModeText(arena, try interruptResult(arena, 3, .no, null, &ladder, busy, &still, "vim", "process_group"));
+    try expectHas(failed, "the command did NOT stop");
+    try expectHas(failed, "tried: tty_int, sigterm (not sent)");
+    try expectHas(failed, "sigterm failed: no foreground process group");
+    try expectHas(failed, "in the foreground now: vim");
+    try t.expect(std.mem.indexOf(u8, failed, "interrupted term_exec") == null);
+}
+
+test "text mode: exec, transfer, busy and ssh lines read as people write them" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const saved = mcp.result_mode;
+    defer mcp.result_mode = saved;
+    mcp.result_mode = .text;
+
+    // A pending exec: quiet time in words, never `output_idle_ms: 1234`.
+    const pending = try textModeText(arena, try execResult(arena, .{ .completed = false, .pending = true, .alt_screen = true, .idle_ms = 4_200 }, "$ top", .{}));
+    try expectHas(pending, "no output for 4 seconds; a full-screen program holds the alternate screen");
+    try t.expect(std.mem.indexOf(u8, pending, "output_idle_ms") == null);
+    const flowing = try textModeText(arena, try execResult(arena, .{ .completed = false, .pending = true, .idle_ms = 300 }, null, .{}));
+    try expectHas(flowing, "output is still arriving");
+
+    // output_file sizes in binary units.
+    var pbuf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&pbuf, "/tmp/sketerm-exec-text-{d}", .{c.getpid()});
+    defer _ = c.unlink(path.ptr);
+    var big: [2048]u8 = undefined;
+    @memset(&big, 'x');
+    const filed = try textModeText(arena, try execResult(arena, .{ .completed = true, .exit_status = 0, .output = &big }, null, .{ .output_file = path }));
+    try expectHas(filed, try std.fmt.allocPrint(arena, "output_file: {s} (2 KiB)", .{path}));
+
+    const xfer = try textModeText(arena, try xferOk(arena, "scp_put", "/srv/app.tar", 1_536, "a" ** 64));
+    try expectHas(xfer, "scp_put ok: /srv/app.tar (1.5 KiB)");
+
+    try t.expectEqualStrings("the term_exec `make` this MCP server sent 3 minutes ago is still running", try runningSentence(arena, "term_exec", "make", 200_000));
+
+    var age_buf: [48]u8 = undefined;
+    try t.expectEqualStrings("logged in 5 minutes ago", loginAge(&age_buf, 300));
+    try t.expectEqualStrings("age unknown", loginAge(&age_buf, null));
 }
