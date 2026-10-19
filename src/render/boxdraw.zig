@@ -180,20 +180,27 @@ const Ctx = struct {
 
     const Dir = enum { up, down, left, right };
 
-    /// A rounded corner: the quarter arc from one cell edge to the
-    /// other, drawn as a thick circle segment centred on the corner
-    /// the two straight arms would have met at.
+    /// A rounded corner: a quarter circle tangent to both arms' centre
+    /// lines, then each arm straight on to its cell edge, so the corner
+    /// meets the neighbouring lines exactly in any cell aspect.
     fn arc(self: Ctx, vertical: Dir, horizontal: Dir) bool {
+        const ti: i64 = @intCast(self.t);
+        const cwi: i64 = @intCast(self.w);
+        const chi: i64 = @intCast(self.h);
+        // The straight lines' own columns and rows, so the joins line up.
+        const cx0 = @divTrunc(cwi - ti, 2);
+        const cy0 = @divTrunc(chi - ti, 2);
         const t: f64 = @floatFromInt(self.t);
-        const cw: f64 = @floatFromInt(self.w);
-        const ch: f64 = @floatFromInt(self.h);
-        const cx = cw / 2.0;
-        const cy = ch / 2.0;
-        // Radius: reach from the centre to the nearer edge, so the arc
-        // lands exactly where a straight line would leave the cell.
-        const r = @min(cx, cy);
-        const arc_cx = if (horizontal == .right) cx + r else cx - r;
-        const arc_cy = if (vertical == .down) cy + r else cy - r;
+        const lx = @as(f64, @floatFromInt(cx0)) + t / 2.0;
+        const ly = @as(f64, @floatFromInt(cy0)) + t / 2.0;
+        const right = horizontal == .right;
+        const down = vertical == .down;
+        // The radius is the shorter arm, so the curve fits inside the cell.
+        const reach_x = if (right) @as(f64, @floatFromInt(self.w)) - lx else lx;
+        const reach_y = if (down) @as(f64, @floatFromInt(self.h)) - ly else ly;
+        const r = @min(reach_x, reach_y);
+        const ax = if (right) lx + r else lx - r;
+        const ay = if (down) ly + r else ly - r;
 
         var y: u32 = 0;
         while (y < self.h) : (y += 1) {
@@ -201,24 +208,37 @@ const Ctx = struct {
             while (x < self.w) : (x += 1) {
                 const px = @as(f64, @floatFromInt(x)) + 0.5;
                 const py = @as(f64, @floatFromInt(y)) + 0.5;
-                // Only the quadrant facing the two arms.
-                const right_side = px >= arc_cx;
-                const down_side = py >= arc_cy;
-                if ((horizontal == .right) != right_side) continue;
-                if ((vertical == .down) != down_side) continue;
-                const d = @sqrt((px - arc_cx) * (px - arc_cx) + (py - arc_cy) * (py - arc_cy));
-                if (@abs(d - r) <= t / 2.0) self.buf[y * self.w + x] = 255;
+                // The quadrant of the circle that faces the cell centre.
+                if (if (right) px > ax else px < ax) continue;
+                if (if (down) py > ay else py < ay) continue;
+                const d = @sqrt((px - ax) * (px - ax) + (py - ay) * (py - ay));
+                // Antialiased stroke: full inside t/2, fading over one pixel.
+                const cov = std.math.clamp(t / 2.0 + 0.5 - @abs(d - r), 0.0, 1.0);
+                const v: u8 = @intFromFloat(@round(cov * 255.0));
+                const i = y * self.w + x;
+                if (v > self.buf[i]) self.buf[i] = v;
             }
         }
-        // Join the arc to the cell edges: without these the arc can
-        // fall a pixel short at the boundary and reintroduce the seam.
-        const ti: i64 = @intCast(self.t);
-        const cwi: i64 = @intCast(self.w);
-        const chi: i64 = @intCast(self.h);
-        const cx0 = @divTrunc(cwi - ti, 2);
-        const cy0 = @divTrunc(chi - ti, 2);
-        if (vertical == .down) self.fill(cx0, chi - ti, cx0 + ti, chi) else self.fill(cx0, 0, cx0 + ti, ti);
-        if (horizontal == .right) self.fill(cwi - ti, cy0, cwi, cy0 + ti) else self.fill(0, cy0, ti, cy0 + ti);
+        // The arms from where the curve ends to the cell edges, overlapping
+        // the curve's last pixel rather than leaving a gap before it.
+        const ayi: i64 = @intFromFloat(if (down) @floor(ay) else @ceil(ay));
+        const axi: i64 = @intFromFloat(if (right) @floor(ax) else @ceil(ax));
+        if (down) self.fill(cx0, ayi, cx0 + ti, chi) else self.fill(cx0, 0, cx0 + ti, ayi);
+        if (right) self.fill(axi, cy0, cwi, cy0 + ti) else self.fill(0, cy0, axi, cy0 + ti);
+        // The cell-edge pixels are what the neighbour joins: there the arm
+        // must be exactly the straight line, without the curve's soft spill.
+        const edge_row: u32 = if (down) self.h - 1 else 0;
+        const edge_col: u32 = if (right) self.w - 1 else 0;
+        var ex: u32 = 0;
+        while (ex < self.w) : (ex += 1) {
+            const in_band = ex >= cx0 and ex < cx0 + ti;
+            self.buf[edge_row * self.w + ex] = if (in_band) 255 else 0;
+        }
+        var ey: u32 = 0;
+        while (ey < self.h) : (ey += 1) {
+            const in_band = ey >= cy0 and ey < cy0 + ti;
+            self.buf[ey * self.w + edge_col] = if (in_band) 255 else 0;
+        }
         return true;
     }
 
@@ -628,6 +648,88 @@ test "covers() agrees with what draw() actually handles" {
     }
     try std.testing.expect(!covers('a'));
     try std.testing.expect(!draw('a', &buf, W, H));
+}
+
+/// Whether column `x` of a `w` x `h` coverage buffer is inked at row `y`.
+fn inkAt(buf: []const u8, w: u32, x: u32, y: u32) bool {
+    return buf[y * w + x] != 0;
+}
+
+test "rounded corners draw their curve and meet the straight lines exactly" {
+    const t = std.testing;
+    // Tall, wide, square and odd cells: the bug was a curve that only
+    // fit a square and, in every aspect, a quadrant outside the cell.
+    const sizes = [_][2]u32{ .{ 10, 20 }, .{ 9, 19 }, .{ 20, 10 }, .{ 16, 16 }, .{ 7, 15 }, .{ 24, 50 } };
+    const corners = [_]struct { cp: u32, down: bool, right: bool }{
+        .{ .cp = 0x256D, .down = true, .right = true },
+        .{ .cp = 0x256E, .down = true, .right = false },
+        .{ .cp = 0x256F, .down = false, .right = false },
+        .{ .cp = 0x2570, .down = false, .right = true },
+    };
+    var arc_buf: [24 * 50]u8 = undefined;
+    var vline: [24 * 50]u8 = undefined;
+    var hline: [24 * 50]u8 = undefined;
+    for (sizes) |sz| {
+        const w = sz[0];
+        const h = sz[1];
+        const n = w * h;
+        @memset(vline[0..n], 0);
+        @memset(hline[0..n], 0);
+        try t.expect(draw(0x2502, vline[0..n], w, h));
+        try t.expect(draw(0x2500, hline[0..n], w, h));
+        for (corners) |k| {
+            @memset(arc_buf[0..n], 0);
+            try t.expect(draw(k.cp, arc_buf[0..n], w, h));
+            const a = arc_buf[0..n];
+            // The arm's edge row and column are exactly the straight lines'.
+            const edge_row = if (k.down) h - 1 else 0;
+            const edge_col = if (k.right) w - 1 else 0;
+            var x: u32 = 0;
+            while (x < w) : (x += 1) try t.expectEqual(inkAt(vline[0..n], w, x, edge_row), inkAt(a, w, x, edge_row));
+            var y: u32 = 0;
+            while (y < h) : (y += 1) try t.expectEqual(inkAt(hline[0..n], w, edge_col, y), inkAt(a, w, edge_col, y));
+            // The opposite edges stay clear: it is a corner, not a cross.
+            x = 0;
+            while (x < w) : (x += 1) try t.expect(!inkAt(a, w, x, if (k.down) 0 else h - 1));
+            y = 0;
+            while (y < h) : (y += 1) try t.expect(!inkAt(a, w, if (k.right) 0 else w - 1, y));
+            // No gap anywhere along the stroke: every row from the cell's
+            // middle to the arm's edge, and every such column, holds ink.
+            const mid_y = h / 2;
+            const mid_x = w / 2;
+            y = if (k.down) mid_y + 1 else 0;
+            while (y < (if (k.down) h else mid_y)) : (y += 1) {
+                var any = false;
+                x = 0;
+                while (x < w) : (x += 1) any = any or inkAt(a, w, x, y);
+                try t.expect(any);
+            }
+            x = if (k.right) mid_x + 1 else 0;
+            while (x < (if (k.right) w else mid_x)) : (x += 1) {
+                var any = false;
+                y = 0;
+                while (y < h) : (y += 1) any = any or inkAt(a, w, x, y);
+                try t.expect(any);
+            }
+            // The curve itself: ink near the cell centre, on the 45-degree
+            // point between the arms, which no straight stub reaches.
+            const r: f64 = @floatFromInt(@min(w, h) / 2);
+            const off = r * (1.0 - std.math.sqrt1_2);
+            const fx = @as(f64, @floatFromInt(w)) / 2.0 + (if (k.right) off else -off);
+            const fy = @as(f64, @floatFromInt(h)) / 2.0 + (if (k.down) off else -off);
+            var lit = false;
+            var dy: i64 = -1;
+            while (dy <= 1) : (dy += 1) {
+                var dx: i64 = -1;
+                while (dx <= 1) : (dx += 1) {
+                    const sx = std.math.clamp(@as(i64, @intFromFloat(fx)) + dx, 0, @as(i64, w) - 1);
+                    const sy = std.math.clamp(@as(i64, @intFromFloat(fy)) + dy, 0, @as(i64, h) - 1);
+                    lit = lit or inkAt(a, w, @intCast(sx), @intCast(sy));
+                }
+            }
+            try t.expect(lit);
+        }
+    }
 }
 
 test "a one-pixel cell does not crash the renderer" {
