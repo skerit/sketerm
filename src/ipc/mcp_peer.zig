@@ -363,6 +363,10 @@ pub const Link = struct {
     armed_sent: ?bool = null,
     /// The session was told once that nothing is pushed into it (`tellPolls`).
     told_polls: bool = false,
+    /// How long a `peer_list` / `peer_set_note` and a `peer_send` wait for
+    /// their reply (rigs shorten them).
+    list_timeout_ms: i64 = LIST_TIMEOUT_MS,
+    send_timeout_ms: i64 = SEND_TIMEOUT_MS,
 };
 
 pub var link: Link = .{};
@@ -464,10 +468,10 @@ pub fn shutdown() void {
 fn connect() void {
     closeConn();
     const a = link.allocator;
-    const conn = a.create(muxclient.Conn) catch return lost();
-    conn.* = muxclient.Conn.connectLocalAutostartAt(a, null) catch {
+    const conn = a.create(muxclient.Conn) catch |e| return lost("connect", e);
+    conn.* = muxclient.Conn.connectLocalAutostartAt(a, null) catch |e| {
         a.destroy(conn);
-        return lost();
+        return lost("connect", e);
     };
     link.conn = conn;
     link.peer = peerclient.Peer.init(conn);
@@ -512,7 +516,7 @@ fn register() void {
         // The client that started this server, as the registry records it:
         // its hooks report to the daemon while this server is gone (`no_mcp`).
         .client_pid = @intCast(c.getppid()),
-    }) catch return lost();
+    }) catch |e| return lost("register", e);
     link.armed_sent = arm;
     if (aliases) {
         link.alias_asked = true;
@@ -592,12 +596,31 @@ fn closeConn() void {
     link.conn = null;
 }
 
-/// The link failed: drop it; the next peer tool call after the backoff
-/// reconnects and registers again (the broker redelivers unacked mail).
-fn lost() void {
+/// The link failed at `what`: drop it, and log why (the one record of
+/// it); the next peer tool call after the backoff reconnects and
+/// registers again (the broker redelivers unacked mail).
+fn lost(what: []const u8, err: anyerror) void {
     closeConn();
     link.status = .down;
-    scheduleRetry();
+    const wait = link.backoff.fail(clock.nowMs());
+    mcp.warn("peer link lost at {s} ({s}); the next peer tool call after {d} ms reconnects", .{ what, @errorName(err), wait });
+}
+
+/// A request got no usable reply. A timeout keeps the link: the late
+/// reply is skipped by its `req`, and the link is not broken, so dropping
+/// it would only re-register and turn every call of the backoff away.
+/// Anything else is a broken link.
+fn requestFailed(arena: std.mem.Allocator, tool: []const u8, err: anyerror, timeout_ms: i64) ![]const u8 {
+    if (err != error.Timeout) {
+        lost(tool, err);
+        return unavailableRes(arena, .daemon_unreachable);
+    }
+    mcp.warn("peer link: the daemon did not answer {s} within {d} ms; link kept", .{ tool, timeout_ms });
+    const what = if (std.mem.eql(u8, tool, "peer_send"))
+        " The message may still have gone out: check peer_read for its outcome before sending it again."
+    else
+        " Call it again.";
+    return errRes(arena, .timeout, try std.fmt.allocPrint(arena, "the per-user sketerm daemon did not answer {s} within {d} ms; the link to it is kept.{s}", .{ tool, timeout_ms, what }));
 }
 
 fn scheduleRetry() void {
@@ -656,7 +679,7 @@ fn drain() void {
     var n: usize = 0;
     while (n < DRAIN_MAX and link.status == .up and (buffered() or readable())) : (n += 1) {
         const p = if (link.peer) |*pp| pp else return;
-        const push = (p.nextPush(link.allocator, 0) catch return lost()) orelse return;
+        const push = (p.nextPush(link.allocator, 0) catch |e| return lost("push read", e)) orelse return;
         defer push.deinit();
         take(push);
     }
@@ -698,7 +721,7 @@ fn take(push: peerclient.Push) void {
 fn ack(ids: []const []const u8) void {
     if (ids.len == 0 or link.status != .up) return;
     const p = if (link.peer) |*pp| pp else return;
-    p.ack(ids) catch lost();
+    p.ack(ids) catch |e| lost("ack", e);
 }
 
 /// Hand wakeable pending items to the channel or the followers, oldest
@@ -805,10 +828,7 @@ fn peerList(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     if (unavailable()) |why| return unavailableRes(arena, why);
     const detail = mcp.argBool(args, "detail");
     var p = &link.peer.?;
-    const reply = p.list(arena, LIST_TIMEOUT_MS) catch {
-        lost();
-        return unavailableRes(arena, .daemon_unreachable);
-    };
+    const reply = p.list(arena, link.list_timeout_ms) catch |e| return requestFailed(arena, "peer_list", e, link.list_timeout_ms);
     var res = Res.init(arena);
     try tellPolls(arena, &res);
     try res.fact("available", true);
@@ -896,10 +916,7 @@ fn peerSend(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         .text = text,
         .reply_to = reply_to,
         .quiet = quiet,
-    }, SEND_TIMEOUT_MS) catch {
-        lost();
-        return unavailableRes(arena, .daemon_unreachable);
-    };
+    }, link.send_timeout_ms) catch |e| return requestFailed(arena, "peer_send", e, link.send_timeout_ms);
     const r = reply.value;
     var res = Res.init(arena);
     try tellPolls(arena, &res);
@@ -1010,10 +1027,7 @@ fn peerSetNote(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     var p = &link.peer.?;
     if (!p.notes()) return errRes(arena, .unavailable, "the per-user sketerm daemon predates peer notes (capabilities.peers.note is false); restart it idle with a newer build");
     if (link.address.len == 0) return errRes(arena, .unavailable, "this session is not registered with the per-user daemon yet; call peer_set_note again in a moment");
-    const reply = p.note(arena, link.address, text, LIST_TIMEOUT_MS) catch {
-        lost();
-        return unavailableRes(arena, .daemon_unreachable);
-    };
+    const reply = p.note(arena, link.address, text, link.list_timeout_ms) catch |e| return requestFailed(arena, "peer_set_note", e, link.list_timeout_ms);
     if (reply.value.refused) |why| return errRes(arena, .unavailable, why);
     var res = Res.init(arena);
     try res.fact("available", true);
@@ -1314,6 +1328,44 @@ test "an unavailable peer tool answers in its declared shape" {
     const bad = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"to\":\"a b\",\"text\":\"hi\"}", .{});
     const refused = try mcp.expectToolResultShape(a, "peer_send", try peerTool(a, .peer_send, bad));
     try t.expectEqualStrings("invalid_args", refused.object.get("structuredContent").?.object.get("error").?.object.get("code").?.string);
+}
+
+test "a reply that does not come in time fails that call alone: the link stays up and the late reply is skipped" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const wire = @import("../mux/wire.zig");
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), @import("../util/platform.zig").socketpairCloexec(&pair));
+    var broker = muxclient.Conn{ .allocator = t.allocator, .fd = pair[1], .proto = wire.PROTO_VERSION };
+    defer broker.deinit();
+    const conn = try t.allocator.create(muxclient.Conn);
+    conn.* = .{ .allocator = t.allocator, .fd = pair[0], .proto = wire.PROTO_VERSION, .caps = .{ .peers = true, .peer_slow_mail = true } };
+    const saved = link;
+    defer link = saved;
+    link = .{ .allocator = t.allocator, .configured = true, .status = .up, .conn = conn, .peer = peerclient.Peer.init(conn), .mailbox = Mailbox.init(t.allocator), .send_timeout_ms = 50, .list_timeout_ms = 2_000 };
+    defer link.mailbox.?.deinit();
+    defer closeConn();
+    // 1. A list send the broker does not answer in time: a timeout error
+    // for this call, which says the outcome is unknown; the link is kept.
+    const args = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"to\":[\"zenit\",\"hohenheim\"],\"text\":\"hi\"}", .{});
+    const out = try mcp.expectToolResultShape(a, "peer_send", try peerTool(a, .peer_send, args));
+    const err = out.object.get("structuredContent").?.object.get("error").?.object;
+    try t.expectEqualStrings("timeout", err.get("code").?.string);
+    try t.expect(std.mem.indexOf(u8, err.get("message").?.string, "peer_read") != null);
+    try t.expectEqual(Status.up, link.status);
+    try t.expect(link.conn != null);
+    // 2. Its reply arrives late, ahead of the next call's: skipped by req.
+    try broker.sendJson(.peer_send_reply, peermail.SendReply{ .req = 1, .id = "m-00000001", .outcome = .delivered });
+    try broker.sendJson(.peer_list, peermail.ListReply{ .req = 2 });
+    const listed = try mcp.expectToolResultShape(a, "peer_list", try peerTool(a, .peer_list, .null));
+    try t.expect(listed.object.get("structuredContent").?.object.get("available").?.bool);
+    try t.expectEqual(Status.up, link.status);
+    // 3. A hung-up broker is a lost link.
+    _ = c.shutdown(pair[1], c.SHUT_RDWR);
+    const gone = try mcp.expectToolResultShape(a, "peer_list", try peerTool(a, .peer_list, .null));
+    try t.expectEqualStrings("daemon_unreachable", gone.object.get("structuredContent").?.object.get("reason").?.string);
+    try t.expectEqual(Status.down, link.status);
 }
 
 test "the address is reported only once the broker's registration reply named it" {
