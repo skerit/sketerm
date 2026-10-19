@@ -971,8 +971,10 @@ const Waiter = union(enum) {
     client: struct { conn: u32, req: u32 },
     /// A link that relayed the item here: answered with `stored`.
     link: u32,
-    /// One recipient of a local `to_list` send: the `Multi` of this serial.
-    multi: u32,
+    /// One recipient of a local `to_list` send: result `index` of the
+    /// `Multi` of this serial. By index, never by address: the routed
+    /// address (an alias resolved to `host/name`) is not the one asked.
+    multi: struct { serial: u32, index: u32 },
     /// Nobody: mail a gone address forwarded to its alias's new holder
     /// (`yieldBox`); a refusal reaches its sender as an event.
     none,
@@ -1376,10 +1378,10 @@ pub const Store = struct {
         const serial = self.next_multi;
         var outstanding: usize = 0;
         var scratch: [ID_LEN]u8 = undefined;
-        for (tos.items, results) |to, *r| {
+        for (tos.items, results, 0..) |to, *r, i| {
             var one = req;
             one.to = to;
-            const res = try self.route(self.msgFrom(sender, one, now, id), .{ .multi = serial }, now, &scratch);
+            const res = try self.route(self.msgFrom(sender, one, now, id), .{ .multi = .{ .serial = serial, .index = @intCast(i) } }, now, &scratch);
             r.* = .{ .to = to, .outcome = res.outcome, .reason = res.reason, .to_state = res.to_state, .to_polls = res.to_polls, .to_no_mcp = res.to_no_mcp };
             outstanding += @intFromBool(res.deferred);
         }
@@ -2564,27 +2566,28 @@ pub const Store = struct {
         switch (p.waiter) {
             .client => |w| _ = self.emit.call(w.conn, .{ .reply = self.replyFor(w.conn, .{ .req = w.req, .id = p.id(), .outcome = ans.outcome, .reason = ans.reason, .to_state = ans.to_state, .to_polls = ans.to_polls, .to_no_mcp = ans.to_no_mcp }) }),
             .link => |lc| if (self.routeByConn(lc)) |o| self.answerStored(o, p.id(), .message, p.to(), ans),
-            .multi => |serial| self.answerMulti(serial, p.to(), ans),
+            .multi => |w| self.answerMulti(w.serial, w.index, ans),
             .none => {},
         }
     }
 
     /// One recipient of a `to_list` send was answered; the last answer
     /// sends the whole reply.
-    fn answerMulti(self: *Store, serial: u32, to: []const u8, ans: Answer) void {
+    fn answerMulti(self: *Store, serial: u32, index: u32, ans: Answer) void {
         const mi = for (self.multis.items, 0..) |m, k| {
             if (m.serial == serial) break k;
         } else return;
         const m = self.multis.items[mi];
-        for (m.results) |*r| if (std.mem.eql(u8, r.to, to) and r.outcome == .queued and r.reason == null) {
-            r.outcome = ans.outcome;
-            r.reason = ans.reason;
-            r.to_state = ans.to_state;
-            r.to_polls = ans.to_polls;
-            r.to_no_mcp = ans.to_no_mcp;
-            m.outstanding -|= 1;
-            break;
-        };
+        if (index >= m.results.len) return;
+        const r = &m.results[index];
+        // Still the `queued` it was deferred with: a second answer is ignored.
+        if (r.outcome != .queued or r.reason != null) return;
+        r.outcome = ans.outcome;
+        r.reason = ans.reason;
+        r.to_state = ans.to_state;
+        r.to_polls = ans.to_polls;
+        r.to_no_mcp = ans.to_no_mcp;
+        m.outstanding -|= 1;
         if (m.outstanding > 0) return;
         _ = self.multis.orderedRemove(mi);
         defer freeMulti(self.allocator, m);
@@ -4510,6 +4513,46 @@ test "federation: one to_list message to two peers of one far host keeps one id;
             try t.expectEqual(@as(usize, 0), net.mem_rec.count(2, .deliver));
         }
     }
+}
+
+test "federation: a to_list naming a far peer by its alias is answered; the far answer is matched by recipient, not spelling" {
+    var net: Net = undefined;
+    try net.init(null);
+    defer net.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try net.hub.register(1, regPane("000000a1"), 0);
+    try net.hub.register(2, regPane("000000a2"), 0);
+    try net.hub.offerTitle("p-000000a2", "proteus", 0);
+    try net.mem.register(1, regPane("000000b1"), 0);
+    try net.mem.offerTitle("p-000000b1", "hohenheim", 0);
+    try net.connect(100);
+    try net.pump(100);
+    try net.pump(110);
+    var idb: [ID_LEN]u8 = undefined;
+    // Before the fix the far answer, pended under "box/p-000000b1", never
+    // matched the "hohenheim" result: no reply ever, and the Multi leaked.
+    const m = try net.hub.sendMany(a, 1, .{ .req = 9, .to_list = &.{ "hohenheim", "proteus" }, .text = "both" }, 200, &idb);
+    try t.expect(m.deferred);
+    try net.pump(200);
+    const rep = lastOf(&net.hub_rec, 1, .reply) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(u32, 9), rep.req);
+    try t.expectEqual(@as(usize, 2), rep.results.len);
+    try t.expectEqualStrings("hohenheim", rep.results[0].to);
+    try t.expectEqual(PeerOutcome.delivered, rep.results[0].outcome);
+    try t.expectEqual(PeerOutcome.delivered, rep.results[1].outcome);
+    try t.expectEqual(@as(usize, 0), net.hub.multis.items.len);
+    // A far host that never answers still settles the send at the deadline.
+    net.up = false;
+    const late = try net.hub.sendMany(a, 1, .{ .req = 10, .to_list = &.{ "hohenheim", "proteus" }, .text = "again" }, 300, &idb);
+    if (late.deferred) {
+        try net.pump(300 + PENDING_MS);
+        const r2 = lastOf(&net.hub_rec, 1, .reply) orelse return error.TestUnexpectedResult;
+        try t.expectEqual(@as(u32, 10), r2.req);
+        try t.expectEqual(@as(?RefuseReason, .host_unreachable), r2.results[0].reason);
+    }
+    try t.expectEqual(@as(usize, 0), net.hub.multis.items.len);
 }
 
 // ---------------------------------------------------------- federation
