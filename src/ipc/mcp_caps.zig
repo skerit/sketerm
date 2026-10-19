@@ -36,6 +36,29 @@ fn webHelperPath(arena: std.mem.Allocator) ?[]const u8 {
     return null;
 }
 
+/// Web features sorted by verdict, so the text lane names each one once.
+pub const Verdicts = struct {
+    yes: std.ArrayList([]const u8) = .empty,
+    no: std.ArrayList([]const u8) = .empty,
+    unknown: std.ArrayList([]const u8) = .empty,
+
+    /// @param v null = not known until the browser engine starts.
+    pub fn add(self: *Verdicts, arena: std.mem.Allocator, name: []const u8, v: ?bool) !void {
+        const list = if (v) |b| (if (b) &self.yes else &self.no) else &self.unknown;
+        try list.append(arena, name);
+    }
+
+    pub fn line(self: *const Verdicts, arena: std.mem.Allocator, backend: []const u8) ![]const u8 {
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.print("web: {s} backend", .{backend});
+        if (self.yes.items.len > 0) try w.print("; here: {s}", .{try std.mem.join(arena, ", ", self.yes.items)});
+        if (self.no.items.len > 0) try w.print("; not here: {s}", .{try std.mem.join(arena, ", ", self.no.items)});
+        if (self.unknown.items.len > 0) try w.print("; known once the engine starts: {s}", .{try std.mem.join(arena, ", ", self.unknown.items)});
+        return aw.written();
+    }
+};
+
 /// The preflight: what this server can actually do right now. Facts
 /// only in structuredContent — every `*_hint` prose field this used to
 /// carry either states something the tool's own description already
@@ -54,22 +77,26 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     try res.fact("gui_socket_source", @tagName(mcp.srv_gui_socket_source));
     try res.fact("headless_terminals", headless_terms);
     try res.fact("transfers_and_forwards", headless_terms);
-    try res.textf("mode {s}: headless GUI apps {s}, headless terminals {s}, transfers/forwards {s}", .{
+    try res.textf("sketerm {s} MCP, mode {s}; results: {s}", .{
+        @import("../version.zig").string,
         mcp.srv_mode,
+        switch (mcp.result_mode) {
+            .text => "text only (--structured adds structuredContent and outputSchema)",
+            .structured => "structured (structuredContent beside the text, outputSchema in tools/list)",
+        },
+    });
+    try res.textf("headless GUI apps {s}, headless terminals {s} (transfers and forwards with them), direct GUI control socket {s} ({s}independent of both and of relayed panels)", .{
         yesNo(mcp_app.app_state.ready),
         yesNo(headless_terms),
-        yesNo(headless_terms),
-    });
-    try res.textf("direct GUI control socket: {s} ({s}) — independent of headless GUI apps and of relayed panels", .{
         yesNo(mcp.srv_gui_socket),
-        @tagName(mcp.srv_gui_socket_source),
+        if (mcp.srv_gui_socket) try std.fmt.allocPrint(arena, "{s}; ", .{@tagName(mcp.srv_gui_socket_source)}) else "",
     });
-    try res.text(switch (mcp.result_mode) {
-        .text => "results: text only (start the server with --structured for structuredContent and outputSchema)",
-        .structured => "results: structured (structuredContent beside the text, outputSchema in tools/list)",
-    });
-    if (!std.mem.eql(u8, mcp.srv_mode, "shared"))
-        try res.text("this server talks to its own PRIVATE mux daemon: sessions here are invisible to the user's `sketerm mux list` / `sketerm app`, and apps started there are invisible here (run with --shared to join the user's daemon)");
+    try res.text(if (std.mem.eql(u8, mcp.srv_mode, "shared"))
+        "sessions live on the user's own daemon and outlive this server; nothing times them out"
+    else if (std.mem.eql(u8, mcp.srv_mode, "isolated"))
+        "PRIVATE mux daemon: its sessions are invisible to the user's `sketerm mux list` / `sketerm app` (and theirs here), and it is torn down with every app and terminal when this server exits; there is no idle timeout, so an app that 'exited on its own' between sessions was killed by that teardown. --durable/--name keep sessions, --shared joins the user's daemon"
+    else
+        "PRIVATE durable mux daemon: its sessions are invisible to the user's `sketerm mux list` / `sketerm app`, survive this server's restarts and are reattached on reconnect; there is no idle timeout");
 
     // Panel delivery is independent of gui_socket: an isolated MCP can
     // relay to the GUI attached to its inherited origin session.
@@ -165,9 +192,12 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         panel_store_scope_name,
     });
     if (!panels_ready)
-        try res.text("live ui_* calls need either an origin session relay (SKETERM_SESSION plus SKETERM_MUX_SOCKET, or the connect-only default daemon fallback) or an explicit direct GUI socket. Store-only ui_save/ui_panels/ui_delete stay available while panels_store is true");
+        try res.text(if (panel_store_ready)
+            "live ui_* calls need an origin session relay (SKETERM_SESSION plus SKETERM_MUX_SOCKET, or the connect-only default daemon) or an explicit direct GUI socket; ui_save, ui_panels and ui_delete still work on saved documents"
+        else
+            "live ui_* calls need an origin session relay (SKETERM_SESSION plus SKETERM_MUX_SOCKET, or the connect-only default daemon) or an explicit direct GUI socket");
     if (!panel_store_ready)
-        try res.text("saved-panel persistence is unavailable because the exact origin identity could not be resolved; ui_save/ui_delete return the same failure and ui_panels reports saved_error. Exact origins never downgrade to reusable session storage");
+        try res.textf("saved panels are unavailable: the exact origin identity could not be resolved ({s}); ui_save and ui_delete fail the same way, and an exact origin never downgrades to reusable session storage", .{panel_store.err});
 
     const ocr_ok = ocr.available();
     try res.fact("ocr", ocr_ok);
@@ -208,6 +238,8 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     else
         "headless";
     const web_ok = helper != null and !std.mem.eql(u8, web_backend, "none");
+    // Every web feature verdict, emitted as ONE line after the section.
+    var verdicts: Verdicts = .{};
     if (helper) |wp| try res.fact("web_helper", wp) else try res.raw("web_helper", "null");
     try res.fact("web", web_ok);
     try res.fact("web_backend", web_backend);
@@ -233,8 +265,8 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             " (the server-wide GUI socket)"
         else
             "";
-        try res.textf("web_gui: the web_* tools may use the user's OWN browser and logins (granted via {s}); transport now {s}{s} -- a GUI is found or `sketerm web` started lazily at the first web call, found again if it goes away, and a web call with no reachable GUI fails 'unavailable' rather than opening a private headless view. Terminal/app/file/panel tools stay on the private daemon", .{ via, webGuiTransport().name(), sock_note });
-    } else try res.textf("web_gui: not granted -- the web_* tools use a private browser with its own cookie jar (the assistant is logged in nowhere); the user grants their own browser with {s}, {s}=1 or web_gui = true in config.conf's [mcp] section", .{ mcp_webgui.FLAG, mcp_webgui.ENV });
+        try res.textf("web_gui: granted via {s}: the web_* tools use the user's OWN browser and logins (transport now {s}{s}, found or started at the first web call); with no reachable GUI a web call fails 'unavailable', never falls back to a private browser. Terminal/app/file/panel tools stay on the private daemon", .{ via, webGuiTransport().name(), sock_note });
+    } else try res.textf("web_gui: not granted, so the web_* tools use a private browser logged in nowhere; the user grants their own browser with {s}, {s}=1 or web_gui = true in config.conf's [mcp] section", .{ mcp_webgui.FLAG, mcp_webgui.ENV });
     if (@import("mcp_web.zig").sessionInfo()) |ws| try res.fact("web_session", ws);
     const display = @import("mcp_web.zig").displayMode();
     try res.fact("web_display", if (display) |d| @tagName(d) else null);
@@ -259,7 +291,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     try res.fact("web_review", .{ .inspection = true, .checkpoints = true, .evidence_export = true, .requires_helper_capability = "review", .gui_console = false });
     try res.fact("web_diagnostics", .{ .direct_capture = true, .broker_capture = "requires engine_open diagnostics capability", .gui_capture = false, .retention = "last attempt per route until next attempt or MCP shutdown" });
     if (web_ok and !gui_web and !engine_started)
-        try res.text("the browser engine has not started yet (it spawns at the first web_* call), so web_backend/web_watch/web_session are not yet determined -- open a view and read them again rather than treating this reply as their final value");
+        try res.text("the browser engine starts at the first web_* call: whether it runs headless or on a session, and whether the user can watch it, are not decided until then (read capabilities again after one)");
     // The browser-page watch: the GUI joins this server's helper as a
     // second client and shows its pages as web pages (helper
     // capability "observe"). `web_socket` is the socket it joins.
@@ -269,7 +301,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     try res.fact("web_handoff", .{ .session_naming = !gui_web, .available = handoff_available, .entry_point = "AI badge: Watch / Take control", .backend_is_visibility = false });
     var web_sock_buf: [4096]u8 = undefined;
     if (@import("mcp_web.zig").helperSocket(&web_sock_buf)) |ws| try res.fact("web_socket", ws) else try res.raw("web_socket", "null");
-    if (web_observe) try res.text("Assistant-owned browser tabs can be shown and driven by the user: orange AI badge / Session Overview -> Watch or Take control. backend:headless does not mean invisible. Give web_open a descriptive name; keep its tab open for manual login and reuse it with web_navigate.");
+    if (web_observe) try res.text("the user can watch or take control of assistant tabs (orange AI badge / Session Overview), so backend headless does not mean invisible: give web_open a descriptive name and keep a tab open for a manual login");
     if (mcp_app.app_state.mux_sock) |ms| try res.fact("mux_socket", ms) else try res.raw("mux_socket", "null");
     if (@import("mcp_web.zig").sessionInfo()) |ws| {
         if (mcp_app.app_state.mux_sock) |ms| {
@@ -290,19 +322,19 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         const proxy = @import("mcp_web.zig").routeProxyCapability(web_ok);
         try res.fact("web_route_proxy", proxy);
         try res.fact("web_untrusted_routes", @import("mcp_web.zig").untrustedRouteWords());
-        if (proxy.available) try res.textf("route {s} sends every request of a tab through your own forward proxy, which resolves every host; {s}", .{
+        if (proxy.available) try res.textf("route {s} sends a tab's every request through your own forward proxy, which resolves every host; untrusted views {s}", .{
             proxy.grammar,
-            if (proxy.untrusted) "untrusted views may take it too, and their loader then dials that proxy and nothing else" else "untrusted views cannot open here",
+            if (proxy.untrusted) "may take it (their loader then dials that proxy and nothing else)" else "cannot open here",
         });
     }
     // How tabs are addressed when several callers share this browser.
     {
         const rules = @import("mcp_web.zig").tabRules();
         try res.fact("web_tab_rules", rules);
-        try res.text(if (rules.idle_close_secs > 0)
-            "web tabs: with more than one tab open every tab-acting web_* call must name its tab ('pane'; a call without one is refused as target_required, listing the tabs); every reply echoes the tab and its url; web_open label + web_close label group your own tabs; an assistant tab untouched for web_tab_rules.idle_close_secs closes itself unless someone is watching it; a web_open cannot rename the live browser or switch the identity it runs under"
+        if (rules.idle_close_secs > 0)
+            try res.textf("web tabs: an assistant tab untouched for {d} s closes itself unless someone is watching it", .{rules.idle_close_secs})
         else
-            "web tabs: with more than one tab open every tab-acting web_* call must name its tab ('pane'; a call without one is refused as target_required, listing the tabs); every reply echoes the tab and its url; web_open label + web_close label group your own tabs; idle closing is off; a web_open cannot rename the live browser or switch the identity it runs under");
+            try res.text("web tabs: idle closing is off");
     }
     // The discoverability half of fail-closed: without this, a
     // web_open that refuses a profile reads as a bug rather than as a
@@ -319,50 +351,36 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         // outlives this instance.
         const persist = try @import("mcp_web.zig").persistenceCapability(arena);
         try res.fact("web_persistence", persist);
-        if (persist.default) |d| try res.text(try @import("webpersist.zig").sentence(arena, d)) else try res.text("web persistence: every tab-scoped web_* reply states whether its identity persists (persistence) and every written file whether it outlives this server (outlives_instance); the default identity's answer is known once a browser engine runs");
+        if (persist.default) |d| try res.text(try @import("webpersist.zig").sentence(arena, d));
         // What a navigation produced, on web_open/web_navigate replies.
         try res.fact("web_nav_result", @import("mcp_web.zig").navResultCapability());
-        try res.text("web_open and web_navigate report the navigation's outcome (page, http_error, network_error, aborted, replaced, download, blocked, non_http), HTTP status, final url, redirect chain and content type, and take wait:{for,arg} with web_wait's conditions");
         // Reading several urls without driving a tab: its limits are
         // what a caller plans a batch around.
         const fetch = @import("mcp_webfetch.zig").capability();
         try res.fact("web_fetch", fetch);
         if (fetch.available)
-            try res.textf("web_fetch reads several urls through background tabs (modes text, raw, regex; files through the download path): at most {d} tabs per call and {d} across every concurrent call of this server, the rest queue; {d} in flight, {d} queued now", .{ fetch.per_call_tabs, fetch.max_tabs, fetch.in_flight, fetch.queued })
+            try res.textf("web_fetch: at most {d} tabs per call and {d} across every concurrent call, the rest queue; {d} in flight, {d} queued now", .{ fetch.per_call_tabs, fetch.max_tabs, fetch.in_flight, fetch.queued })
         else
             try res.textf("web_fetch is unavailable here: {s}", .{fetch.reason.?});
+        try verdicts.add(arena, "web_fetch", fetch.available);
         // Reading one tab: modes, caps, and what the running helper can
         // do, so an old helper's refusal is explicable in advance.
         const rd = @import("mcp_web.zig").readCapability();
         try res.fact("web_read", rd);
-        try res.textf("web_read reads a tab in pages of max_chars (default {d}): text (reader mode; selector and include_chrome scope it), raw (the source), regex (over text or source, with context), links (absolute url and page area each), resources (scripts and iframes); {s}", .{
-            rd.max_chars,
-            if (rd.page_read) |p| (if (p) "the running helper reads selectors, links and resources" else "the running helper predates page reading: selector, include_chrome, links and resources answer unavailable") else "page reading is known once a helper runs",
-        });
+        if (rd.page_read) |p| if (!p) try res.text("web_read: the running helper predates page reading, so selector, include_chrome, links and resources answer unavailable");
         // Downloading through a view: the only path that carries the
         // page's own session, so a consumer must be able to preflight
         // it rather than discover it by trying.
         const dl = @import("mcp_web.zig").downloadCapability();
         try res.fact("web_downloads", dl.supported);
-        if (dl.supported)
-            try res.text(if (dl.started)
-                "web_download fetches a url INSIDE a view's browser (its cookies and session) straight to a file; a download a page starts lands in the user's XDG download directory and web_download with no url lists them"
-            else
-                "web_download is available once the browser engine starts; it fetches a url INSIDE a view's browser (its cookies and session) straight to a file")
-        else
-            try res.text("this browser helper cannot download through a view (capabilities 'downloads' + 'download-start')");
+        try verdicts.add(arena, if (dl.supported and !dl.started) "downloads (once the engine starts)" else "downloads", dl.supported);
         // Printing a view: a consumer asks for an @page-sized sheet only
         // when the running helper honours it.
         const pr = @import("mcp_web.zig").printCapability();
         try res.fact("web_print_pdf", pr.supported);
         try res.fact("web_print_pdf_css_page", pr.css_page);
-        if (pr.supported)
-            try res.text(if (pr.css_page) |css| (if (css)
-                "web_print_pdf renders a view to a PDF file; css_page_size and no_margins are honoured"
-            else
-                "web_print_pdf renders a view to a PDF file; this helper predates css_page_size and no_margins")
-            else
-                "web_print_pdf renders a view to a PDF file; whether css_page_size is honoured is known once the browser engine starts");
+        try verdicts.add(arena, "print_pdf", pr.supported);
+        if (pr.supported) if (pr.css_page) |css| if (!css) try res.text("web_print_pdf: this helper predates css_page_size and no_margins");
         // Response-body capture: a fail-closed open option, so a
         // consumer must be able to preflight it rather than trip over
         // the refusal.
@@ -370,6 +388,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("web_capture", cp.supported);
         const stream = @import("mcp_web.zig").streamCapability();
         try res.fact("web_stream", web_ok and stream.supported);
+        try verdicts.add(arena, if (gui_web) "stream (headless only)" else "stream", web_ok and stream.supported);
         try res.fact("web_stream_audio", stream.audio);
         try res.fact("web_stream_encoded", stream.encoded);
         try res.fact("web_stream_popups", stream.popups);
@@ -396,34 +415,28 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         const frame_rate = @import("mcp_web.zig").frameRateCapability();
         try res.fact("web_max_fps", frame_rate.supported);
         try res.fact("web_default_max_fps", frame_rate.default);
-        if (web_ok and stream.supported)
-            try res.text("web_stream opens a helper-owned local binary socket for pushed BGRA damage (or, with encoding encoded, compressed frames), trusted input and optional runtime Opus audio; audio and encoded support are unknown until the helper handshake");
-        if (cp.supported)
-            try res.text(if (cp.started)
-                "web_open capture:{...} records the response bodies a headless view's page receives; web_capture reads them, web_wait for:\"response\" waits for the next one"
-            else
-                "response-body capture (web_open capture:{...}) is available once the browser engine starts")
-        else if (gui_web)
-            try res.text("response-body capture is headless only: the web tools drive the user's own tabs here")
-        else
-            try res.text("this browser helper cannot capture response bodies (capability 'capture'); a captured web_open is refused");
+        try verdicts.add(arena, if (gui_web) "capture (headless only)" else if (cp.supported and !cp.started) "capture (once the engine starts)" else "capture", cp.supported);
         // Driving a page by hand (web_input) and watching it (web_frame)
         // are headless tools: with a GUI the pane owns its mouse and its
         // pixels. A remote-control viewer preflights both here.
         try res.fact("web_input", web_ok and !gui_web);
         try res.fact("web_frames", web_ok and !gui_web);
-        if (web_ok and !gui_web)
-            try res.text("web_input drives a view by hand at viewport coordinates (pointer, wheel, held keys, text) and web_frame long-polls its newest painted frame as JPEG or PNG");
+        try verdicts.add(arena, if (gui_web) "input/frames (headless only)" else "input/frames", web_ok and !gui_web);
+        try verdicts.add(arena, "untrusted views", @import("mcp_web.zig").restrictedCapability(.untrusted_web));
+        try verdicts.add(arena, "policy acks", @import("mcp_web.zig").restrictedCapability(.net_policy_ack));
+        try verdicts.add(arena, "navigation guard", @import("mcp_web.zig").restrictedCapability(.navigation_guard));
+        try verdicts.add(arena, "emulation", @import("mcp_web.zig").restrictedCapability(.web_emulation));
+        try verdicts.add(arena, "software WebGL", @import("mcp_web.zig").webglCapability(.software_webgl));
+        try verdicts.add(arena, "max_fps", frame_rate.supported);
         try res.fact("web_accept_cert", !gui_web);
         try res.text(if (gui_web)
-            "certificate errors: the user's interstitial decides; results carry cert facts while a load is held"
+            "certificate errors: the user's interstitial decides"
         else
-            "certificate errors fail closed in headless views and are reported as cert facts; web_open accept_cert trusts one fingerprint for one view");
+            "certificate errors fail closed in headless views; web_open accept_cert trusts one fingerprint for one view");
         if (profiles.store.len > 0) try res.fact("web_profile_store", profiles.store);
         try res.fact("web_profile_save", @import("mcp_web.zig").profileSaveCapability());
-        if (profiles.available)
-            try res.text("named browsing profiles are available (web_open profile:\"name\"); each keeps its own cookie jar across MCP restarts")
-        else if (profiles.reason.len > 0)
+        try verdicts.add(arena, "named profiles", profiles.available);
+        if (!profiles.available and profiles.reason.len > 0)
             try res.textf("named browsing profiles are unavailable: {s}", .{profiles.reason});
     }
     // Engine lifecycle, as a FACT: a consumer once had to infer "is the
@@ -434,16 +447,16 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("web_engine_broker", eng.broker_lane);
         try res.fact("web_engine_owner", eng.owner.name());
         if (eng.broker_lane)
-            try res.textf("browser engine lifecycle: broker-owned (the mux daemon spawns sketerm-webengine and keeps it through client restarts; owner now: {s})", .{eng.owner.name()})
+            try res.textf("browser engine: broker-owned (the mux daemon keeps sketerm-webengine through client restarts), owner now {s}", .{eng.owner.name()})
         else
-            try res.textf("browser engine lifecycle: client-spawned (exits with its last client; owner now: {s})", .{eng.owner.name()});
+            try res.textf("browser engine: client-spawned (exits with its last client), owner now {s}", .{eng.owner.name()});
     }
     if (helper == null)
         try res.text("sketerm-webengine is not installed next to the sketerm binary — the web_* tools have nothing to drive, in any mode (build it with: zig build fetch-cef && zig build web)")
     else if (std.mem.eql(u8, web_backend, "none"))
         try res.text("--shared mode drives the user's GUI, but no GUI control socket was found; start the sketerm GUI (or run without --shared, where the web_* tools work headlessly with no GUI at all)")
     else
-        try res.textf("web: {s} backend", .{web_backend});
+        try res.text(try verdicts.line(arena, web_backend));
 
     try res.fact("ssh", pathz.executableOnPath("ssh"));
     try res.fact("scp", pathz.executableOnPath("scp"));
@@ -458,10 +471,16 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     try res.fact("file_sync", headless_terms);
     try res.fact("file_sync_local_rsync", pathz.executableOnPath("rsync"));
     try res.fact("mux_tor", true);
-    try res.text("mux Tor transport: supported via tor:<ssh-alias>; forced SOCKS5 remote DNS, with no UDP or direct fallback");
+    try res.textf("ssh {s}, scp {s}, local rsync for file_sync {s}; tor:<ssh-alias> transport with forced SOCKS5 remote DNS, no UDP or direct fallback", .{
+        yesNo(pathz.executableOnPath("ssh")),
+        yesNo(pathz.executableOnPath("scp")),
+        yesNo(pathz.executableOnPath("rsync")),
+    });
     if (mcp_term.rec_state.enabled) {
-        if (recDir()) |d| try res.fact("terminal_recordings", d) else try res.raw("terminal_recordings", "null");
-        try res.text("every headless terminal is auto-recorded as an asciicast v2 .cast file there (replay with asciinema play)");
+        if (recDir()) |d| {
+            try res.fact("terminal_recordings", d);
+            try res.textf("every headless terminal is auto-recorded as an asciicast v2 .cast file in {s} (replay with asciinema play)", .{d});
+        } else try res.raw("terminal_recordings", "null");
     } else try res.raw("terminal_recordings", "null");
 
     // Effective input-timing defaults, with any env override marked —
@@ -469,17 +488,19 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     {
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
+        var overrides: std.Io.Writer.Allocating = .init(arena);
         try w.writeAll("{");
-        var any_override = false;
         for (Tuning.all(), 0..) |item, i| {
             if (i > 0) try w.writeAll(",");
             try w.print("\"{s}\":{{\"value\":{d},\"built_in\":{d},\"overridden\":{}}}", .{ item.name, item.value, item.built_in, item.overridden });
-            if (item.overridden) any_override = true;
+            if (item.overridden) try overrides.writer.print("{s}{s} {d} via {s} (built-in {d})", .{
+                if (overrides.written().len > 0) ", " else "", item.name, item.value, item.env, item.built_in,
+            });
         }
         try w.writeAll("}");
         try res.raw("input_tuning", aw.written());
-        if (any_override)
-            try res.text("some input-timing defaults were overridden via SKETERM_MCP_* env (project .mcp.json); the tools/list descriptions already state the effective values");
+        if (overrides.written().len > 0)
+            try res.textf("input-timing defaults overridden by env (project .mcp.json): {s}; tools/list states the effective values", .{overrides.written()});
     }
 
     // Tool exposure. A missing tool must be explicable from inside the
@@ -515,7 +536,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try w.writeAll("]}");
         try res.raw("tool_policy", aw.written());
         if (!mcp.policy.isUnrestricted()) {
-            try res.textf("tool mcp.policy {s} (from {s}) restricts this connection; withheld tools are absent from tools/list AND refused by tools/call. A withheld tool is not a missing capability — ask the user to restart the server with --tools/--profile or $SKETERM_MCP_TOOLS", .{ mcp.policy.spec, mcp.policy_source });
+            try res.textf("tool policy {s} (from {s}) restricts this connection: withheld tools are absent from tools/list AND refused by tools/call. A withheld tool is an operator decision, not a missing capability; ask the user to restart the server with --tools/--profile or $SKETERM_MCP_TOOLS", .{ mcp.policy.spec, mcp.policy_source });
             if (suppressed.len > 0) {
                 var sw: std.Io.Writer.Allocating = .init(arena);
                 for (suppressed, 0..) |g, i| {
@@ -531,12 +552,6 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     // this server's own lifetime in isolated mode. Saying so removes a
     // whole class of "the app exited with status 0 for no reason".
     try res.fact("session_lifetime", mcp.srv_mode);
-    if (std.mem.eql(u8, mcp.srv_mode, "shared"))
-        try res.text("session lifetime: sessions live on the user's own daemon and outlive this server; nothing here times them out")
-    else if (std.mem.eql(u8, mcp.srv_mode, "isolated"))
-        try res.text("session lifetime: the private daemon and EVERY app/terminal on it are torn down when this MCP server exits. There is no idle timeout — an app that 'exited on its own' between sessions was killed by that teardown. Use --durable/--name for sessions that survive restarts")
-    else
-        try res.text("session lifetime: the daemon and its sessions survive this server's restarts and are reattached on reconnect; there is no idle timeout");
 
     // Sub-agents (the agent_* tools): available in isolated/durable mode,
     // here or on an SSH host, woken through the waiter command.
@@ -642,7 +657,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             try res.raw("peers", try mcp_peer.capabilityJson(arena));
             const pc = mcp_peer.capability();
             if (pc.available)
-                try res.textf("peers: this session is {s}{s}; peer_list, peer_send and peer_read reach the other assistants' sessions on this host, their messages {s}{s}", .{ if (pc.address.len > 0) pc.address else "(registering)", if (pc.durable) " (durable)" else "", if (pc.channel_armed) "arrive as channel messages" else "arrive through peer_read unless a follower (the opencode plugin) pushes them", if (pc.note) "; peer_set_note tells them what you are doing" else "" })
+                try res.textf("peers: this session is {s}{s}; their messages {s}{s}", .{ if (pc.address.len > 0) pc.address else "(registering)", if (pc.durable) " (durable)" else "", if (pc.channel_armed) "arrive as channel messages" else "arrive through peer_read unless a follower (the opencode plugin) pushes them", if (!pc.slow_mail) "; the per-user daemon predates quiet sends and to lists" else "" })
             else
                 try res.textf("peers: unavailable ({s})", .{pc.reason orelse "unknown"});
         }
@@ -657,23 +672,19 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             .quiet_opt_ins = vocab.names(@import("../agent/events.zig").Quiet),
         });
         if (agents_ok) {
-            try res.textf("sub-agents: agent_open runs one of {d} adapter(s) on this machine{s}, directly or through a wrapper (binary + args + env); results carry a watch_command that wakes you when it needs attention", .{ ids.len, if (agent_ssh) " or on an SSH host (host)" else " (no ssh client here, so not on SSH hosts)" });
-            try res.textf("agent_read and done results return per job its last message, earlier segment finals of {d}+ chars, messages of {d}+ chars and notices, about {d} chars per read (detail all for every message); each record reaches you once", .{ select.FINAL_MIN_CHARS, select.LONG_MIN_CHARS, select.READ_CAP_CHARS });
-            try res.text("done means settled (no subagents or background tasks left running; the done after 30 minutes idle with background tasks is quiet unless background:true / --background); results and waiters share one event delivery, and agent_wait agents / agent-wait --any watch several agents (all / --all: once every one settled)");
-            try res.textf("a prompt counts as sent only once the app shows it took it (a turn, a user record, a queue preview) within {d} s; otherwise the send fails as not_delivered and is never typed again", .{@divTrunc(mcp_agent.DELIVERY_CONFIRM_MS, 1000)});
-            try res.text("agent_send to a busy agent queues the prompt in its app for the next turn (outcome queued) unless interrupt, agents sends to several in one call (agents \"*\": every live agent), and agent_answer takes free text where the prompt allows it");
-            try res.text("agent_read final returns just the newest job's answer (the message its done named), agent_list is compact unless detail, and agent_attach relaunch starts a gone agent again under its id");
-            try res.text("agent_open takes permissions (name to allow/ask/deny, mapped to each app's own mechanism) and retry_on_overload (continue a turn a provider overload ended, off by default); a lost remote link that comes back to find the session gone ends the agent as exited, relaunchable");
-            try res.text("agent_template_save keeps named briefs (placeholders in braces) that agent_send and agent_open take as template + vars");
-            if (side_apps.len > 0) try res.textf("agent_ask asks an agent a side question (how far are you?) answered from its current context without a turn, busy or idle, recording nothing: {s}", .{try std.mem.join(arena, ", ", side_apps)});
-            try res.text("every per-agent result and agent_list carry facts: what the app reports about its context use, rate limits and cost (agent_facts names them per adapter), the context percent also in agent_list's one-line form");
+            const side_text: []const u8 = if (side_apps.len > 0) try std.fmt.allocPrint(arena, "; agent_ask side questions: {s}", .{try std.mem.join(arena, ", ", side_apps)}) else "";
+            try res.textf("sub-agents: {s} on this machine{s}{s}; agents outlive this server for {d} h unattached (mcp_agent_idle_ttl_hours) and agent_attach resumes them", .{
+                try std.mem.join(arena, ", ", ids),
+                if (agent_ssh) " or an SSH host" else " (no ssh client here, so not on SSH hosts)",
+                side_text,
+                mcp_agent.state.ttl_secs / 3600,
+            });
             if (mcp_agent.state.push == .channel)
-                try res.text("agent events are pushed into this session as Claude Code channel messages: end your turn after delegating instead of running watch_command")
+                try res.text("agent events are pushed into this session as channel messages: end your turn after delegating, no watch_command needed")
             else if (mcp_agent.followers() > 0)
-                try res.text("agent events are pushed into this session by an agent-wait --server follower (the opencode plugin): end your turn after delegating instead of running watch_command")
+                try res.text("agent events are pushed into this session by an agent-wait --server follower (the opencode plugin): end your turn after delegating, no watch_command needed")
             else
-                try res.text("agent events are not pushed into this session: Claude Code needs --dangerously-load-development-channels server:sketerm (or --channels), opencode the sketerm agents plugin; until then use watch_command");
-            try res.textf("agents outlive this server on their host's per-user daemon for {d} h unattached (mcp_agent_idle_ttl_hours): agent_open returns an id, and agent_attach {{agent: id}} resumes it after a restart", .{mcp_agent.state.ttl_secs / 3600});
+                try res.text("agent events are not pushed into this session (Claude Code needs --dangerously-load-development-channels server:sketerm or --channels, opencode the sketerm agents plugin): run a result's watch_command in the background to be woken");
         } else try res.text("sub-agents (agent_*) are unavailable in --shared mode: they run on an isolated or durable instance's private daemon");
     }
 

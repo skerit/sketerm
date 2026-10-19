@@ -5,6 +5,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const unsetEnv = @import("../util/env.zig").unset;
 const clock = @import("../util/clock.zig");
+const numtext = @import("../util/numtext.zig");
 const platform = @import("../util/platform.zig");
 const protocol = @import("protocol.zig");
 const muxclient = @import("../mux/client.zig");
@@ -104,6 +105,9 @@ const UI_FILES_MAX: usize = 64;
 /// genuinely one line. Re-showing it replaces the panel in place,
 /// which is what "here is the next epoch" wants.
 const UI_FILES_NAME = "files";
+
+/// How many failed paths one text line names before it says "and N more".
+const UI_LISTED_PATHS = 5;
 
 /// One entry of `ui_show_files`: an absolute image path plus the
 /// caption drawn under it (or, in compare mode, its side label).
@@ -783,11 +787,26 @@ fn addUiAssetFacts(res: *Res, arena: std.mem.Allocator, reply: IpcReply) !void {
     const failures = reply.value.object.get("asset_failures");
     if (failures == null or failures.? != .integer) return;
     try res.fact("asset_failures", failures.?.integer);
-    if (failures.?.integer > 0)
-        try res.textf(
-            "{d} remote image(s) could not be hydrated; the panel shows explicit placeholders and each failed logical path is listed in assets",
-            .{failures.?.integer},
-        );
+    if (failures.?.integer > 0) {
+        var aw2: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw2.writer;
+        try w.print("{d} remote image(s) could not be hydrated and show explicit placeholders:", .{failures.?.integer});
+        var shown: usize = 0;
+        for (report.array.items) |a| {
+            if (a != .object) continue;
+            const ok = a.object.get("ok");
+            if (ok != null and ok.? == .bool and ok.?.bool) continue;
+            if (shown == UI_LISTED_PATHS) {
+                try w.writeAll(" ...");
+                break;
+            }
+            try w.print("{s} {s}", .{ if (shown == 0) "" else ";", objStr(a, "path") });
+            const why = objStr(a, "error");
+            if (why.len > 0) try w.print(" ({s})", .{why});
+            shown += 1;
+        }
+        try res.text(aw2.written());
+    }
 }
 
 /// panelstore failure → the store's own diagnostic (which names the
@@ -1019,8 +1038,8 @@ fn uiShowFiles(arena: std.mem.Allocator, args: std.json.Value, transport: *UiTra
             .{items.len},
         );
         for (unreadable.items, 0..) |p, i| {
-            if (i >= 5) {
-                try w.print(" … and {d} more", .{unreadable.items.len - i});
+            if (i >= UI_LISTED_PATHS) {
+                try w.print(" ... and {d} more", .{unreadable.items.len - i});
                 break;
             }
             try w.print(" {s}", .{p});
@@ -1072,10 +1091,17 @@ fn uiShowFiles(arena: std.mem.Allocator, args: std.json.Value, transport: *UiTra
     });
     if (unreadable.items.len > 0) {
         try res.fact("unreadable", unreadable.items);
-        try res.textf(
-            "{d} of {d} file(s) could not be read; they are drawn as an explicit placeholder in the panel, the rest render normally",
-            .{ unreadable.items.len, files.len },
-        );
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.print("{d} of {d} file(s) could not be read and are drawn as explicit placeholders, the rest render normally:", .{ unreadable.items.len, files.len });
+        for (unreadable.items, 0..) |p, i| {
+            if (i == UI_LISTED_PATHS) {
+                try w.print(" ... and {d} more", .{unreadable.items.len - i});
+                break;
+            }
+            try w.print(" {s}", .{p});
+        }
+        try res.text(aw.written());
     }
     try addUiAssetFacts(&res, arena, reply);
     return res.finish();
@@ -1325,7 +1351,11 @@ fn uiPanels(arena: std.mem.Allocator, _: std.json.Value, transport: *UiTransport
             try w.writeAll(",\"title\":");
             try std.json.Stringify.value(e.title, .{}, w);
             try w.print(",\"bytes\":{d},\"mtime\":{d},\"parses\":{}}}", .{ e.bytes, e.mtime, e.ok });
-            try tw.print("\nsaved {s}  {d} bytes", .{ e.name, e.bytes });
+            var bb: [24]u8 = undefined;
+            var ab: [48]u8 = undefined;
+            try tw.print("\nsaved {s}  {s}", .{ e.name, numtext.bytes(&bb, e.bytes) });
+            const age = clock.ago(&ab, clock.wallMs(), e.mtime * 1000, .short);
+            if (age.len > 0) try tw.print("  {s}", .{age});
             if (e.title.len > 0) try tw.print("  {s}", .{e.title});
             if (!e.ok) try tw.writeAll("  (does NOT parse)");
         }
@@ -1365,8 +1395,9 @@ fn uiSave(arena: std.mem.Allocator, args: std.json.Value, transport: *UiTranspor
     try res.fact("saved", panel_name);
     try res.fact("session", session);
     try res.fact("bytes", canonical_bytes);
-    try res.textf("saved {s} in session {s}: {d} canonical bytes on disk", .{
-        panel_name, panelstore.sessionLabel(session), canonical_bytes,
+    var bb: [24]u8 = undefined;
+    try res.textf("saved {s} in session {s}: {s} on disk", .{
+        panel_name, panelstore.sessionLabel(session), numtext.bytes(&bb, canonical_bytes),
     });
     return res.finish();
 }
@@ -1973,6 +2004,60 @@ test "ui_show_files shows an image set in one call, through the ui_show path" {
     try std.testing.expect(std.mem.indexOf(u8, sent2, "\\\"caption\\\":\\\"e40.png\\\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sent2, "heading") == null);
     try std.testing.expectEqual(@as(usize, 2), fake.requests.items.len);
+}
+
+test "text mode: ui_show_files names unreadable and unhydrated paths, ui_save and ui_panels read sizes and ages" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch: UiScratch = undefined;
+    try scratch.init("files-text", true);
+    defer scratch.deinit();
+    const saved_mode = mcp.result_mode;
+    defer mcp.result_mode = saved_mode;
+    mcp.result_mode = .text;
+    const dir = scratch.buf[0..scratch.len];
+    touchFile(dir, "e40.png");
+
+    var fake = FakeBackend{
+        .responses = &.{
+            "{\"ok\":true,\"panel_id\":9,\"assets\":[{\"path\":\"remote:/r/a.png\",\"ok\":false,\"error\":\"read timed out\"},{\"path\":\"remote:/r/b.png\",\"ok\":true}],\"asset_failures\":1}",
+            "{\"ok\":true,\"panels\":[]}",
+        },
+        .allocator = t.allocator,
+    };
+    defer fake.deinit();
+
+    const shown = handleMessage(arena, fake.backend(), try std.fmt.allocPrint(arena,
+        \\{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"ui_show_files","arguments":{{"session":"","files":["{s}/e40.png","{s}/ghost.png"]}}}}}}
+    , .{ dir, dir })).?;
+    const shown_text = try uiResultText(arena, shown);
+    try t.expect(std.mem.indexOf(u8, shown_text, "1 of 2 file(s) could not be read") != null);
+    try t.expect(std.mem.indexOf(u8, shown_text, try std.fmt.allocPrint(arena, " {s}/ghost.png", .{dir})) != null);
+    try t.expect(std.mem.indexOf(u8, shown_text, "could not be hydrated and show explicit placeholders: remote:/r/a.png (read timed out)") != null);
+    try t.expect(std.mem.indexOf(u8, shown_text, "b.png") == null);
+    try t.expect(std.mem.indexOf(u8, shown, "structuredContent") == null);
+
+    const saved = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ui_save","arguments":{"name":"small","session":"","document":{"title":"S","root":"t","components":{"t":{"type":"text","text":"x"}}}}}}
+    ).?;
+    const saved_text = try uiResultText(arena, saved);
+    try t.expect(std.mem.indexOf(u8, saved_text, " B on disk") != null);
+    try t.expect(std.mem.indexOf(u8, saved_text, "canonical bytes") == null);
+
+    const listed = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ui_panels","arguments":{"session":""}}}
+    ).?;
+    const listed_text = try uiResultText(arena, listed);
+    try t.expect(std.mem.indexOf(u8, listed_text, "\nsaved small  ") != null);
+    try t.expect(std.mem.indexOf(u8, listed_text, " B  just now  S") != null);
+}
+
+/// The text block of a tools/call reply.
+fn uiResultText(arena: std.mem.Allocator, resp: []const u8) ![]const u8 {
+    const result = try std.json.parseFromSliceLeaky(std.json.Value, arena, try rpcToolResult(arena, resp), .{});
+    return result.object.get("content").?.array.items[0].object.get("text").?.string;
 }
 
 test "ui_show_files refuses bad arity, bad paths and an all-missing set" {

@@ -12,6 +12,7 @@
 //!   { "command": "sketerm", "args": ["mcp"] }
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("../c.zig").c;
 const EnvSave = @import("../util/env.zig").Saved;
 const clock = @import("../util/clock.zig");
@@ -1571,9 +1572,13 @@ pub fn errResDetails(arena: std.mem.Allocator, code: ErrCode, msg: []const u8, d
     try w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
     if (result_mode == .text) {
         // The text is all a text-mode reader gets: it must still be able
-        // to branch on the code. Details repeat what the message says.
-        const line = try std.fmt.allocPrint(arena, "error {s}{s}: {s}", .{ @tagName(code), if (code.retryable()) " (retryable)" else "", msg });
-        try std.json.Stringify.value(line, .{}, w);
+        // to branch on the code, and see the details the message lacks.
+        var lw: std.Io.Writer.Allocating = .init(arena);
+        try lw.writer.print("error {s}{s}: {s}", .{ @tagName(code), if (code.retryable()) " (retryable)" else "", msg });
+        var parts: std.ArrayList([]const u8) = .empty;
+        try detailParts(arena, &parts, msg, "", details);
+        if (parts.items.len > 0) try lw.writer.print("\ndetails: {s}", .{try std.mem.join(arena, ", ", parts.items)});
+        try std.json.Stringify.value(lw.written(), .{}, w);
         try w.writeAll("}],\"isError\":true}");
         return aw.written();
     }
@@ -1591,6 +1596,43 @@ pub fn errResDetails(arena: std.mem.Allocator, code: ErrCode, msg: []const u8, d
     try w.writeAll("}},\"isError\":true}");
     return aw.written();
 }
+
+/// `errResDetails`' details as "key value" text parts; nulls, false, zero-length
+/// and non-string lists are left out, and so is a string the message already
+/// carries (a list the reader needs is spelled out in the message itself).
+fn detailParts(arena: std.mem.Allocator, out: *std.ArrayList([]const u8), msg: []const u8, key: []const u8, value: anytype) !void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .optional => if (value) |v| try detailParts(arena, out, msg, key, v),
+        .@"struct" => |s| inline for (s.fields) |f| {
+            const sub = if (key.len == 0) f.name else try std.fmt.allocPrint(arena, "{s}.{s}", .{ key, f.name });
+            try detailParts(arena, out, msg, sub, @field(value, f.name));
+        },
+        .bool => if (value) try out.append(arena, key),
+        .int, .comptime_int => if (std.mem.endsWith(u8, key, "_ms")) {
+            const name = key[0 .. key.len - 3];
+            var buf: [32]u8 = undefined;
+            const ms: i64 = std.math.cast(i64, value) orelse std.math.maxInt(i64);
+            try out.append(arena, if (ms < 1000)
+                try std.fmt.allocPrint(arena, "{s} {d}ms", .{ name, ms })
+            else
+                try std.fmt.allocPrint(arena, "{s} {s}", .{ name, clock.span(&buf, ms, .short) }));
+        } else try out.append(arena, try std.fmt.allocPrint(arena, "{s} {d}", .{ key, value })),
+        .@"enum" => if (std.mem.indexOf(u8, msg, @tagName(value)) == null)
+            try out.append(arena, try std.fmt.allocPrint(arena, "{s} {s}", .{ key, @tagName(value) })),
+        .pointer => |p| if (p.size == .slice and p.child == u8) {
+            if (value.len == 0 or std.mem.indexOf(u8, msg, value) != null) return;
+            var n = @min(value.len, DETAIL_TEXT_MAX);
+            // Never split a UTF-8 sequence: the line is JSON-encoded next.
+            while (n < value.len and n > 0 and (value[n] & 0xC0) == 0x80) n -= 1;
+            try out.append(arena, try std.fmt.allocPrint(arena, "{s} {s}{s}", .{ key, value[0..n], if (n < value.len) "..." else "" }));
+        },
+        else => {},
+    }
+}
+
+/// Longest string a text-mode error's details line repeats in full.
+const DETAIL_TEXT_MAX = 200;
 
 /// Renders a value for the human text lane: bare strings, plain
 /// numbers, true/false — never JSON syntax.
@@ -1716,6 +1758,10 @@ pub const Res = struct {
         var aw: std.Io.Writer.Allocating = .init(self.arena);
         const w = &aw.writer;
         const t = self.tl.written();
+        if (builtin.is_test) if (try textNamesMissingField(self.arena, t, self.sc.written())) |name| {
+            std.debug.print("mcp text lane names `{s}`, which it does not carry:\n{s}\n", .{ name, t });
+            return error.TextNamesMissingField;
+        };
         try w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
         try std.json.Stringify.value(if (t.len == 0) "ok" else t, .{}, w);
         try w.writeAll("}");
@@ -1740,6 +1786,86 @@ pub const Res = struct {
         return aw.written();
     }
 };
+
+/// The first name `text` points a reader at that only the facts lane holds
+/// (a fact key, `capabilities.x`, `structuredContent`), or null; a text-mode
+/// reader cannot follow such a pointer. Tool and argument names are fine.
+fn textNamesMissingField(arena: std.mem.Allocator, text: []const u8, sc: []const u8) !?[]const u8 {
+    if (result_mode == .text and std.mem.indexOf(u8, text, "structuredContent") != null) return "structuredContent";
+    if (std.mem.indexOf(u8, text, "capabilities.")) |i| {
+        const after = text[i + "capabilities.".len ..];
+        if (after.len > 0 and std.ascii.isLower(after[0])) return "capabilities.<field>";
+    }
+    if (sc.len == 0) return null;
+    const facts = std.json.parseFromSliceLeaky(std.json.Value, arena, try std.fmt.allocPrint(arena, "{{{s}}}", .{sc}), .{}) catch return null;
+    if (facts != .object) return null;
+    var it = facts.object.iterator();
+    while (it.next()) |e| {
+        const key = e.key_ptr.*;
+        if (std.mem.indexOfScalar(u8, key, '_') == null) continue;
+        if (isToolOrArgName(key)) continue;
+        if (namesWithoutValue(text, key)) return key;
+    }
+    return null;
+}
+
+/// Names a reader can act on: a tool, an argument, or an error code.
+fn isToolOrArgName(name: []const u8) bool {
+    if (std.meta.stringToEnum(ErrCode, name) != null) return true;
+    for (mcp_tools.TOOLS) |tool| {
+        if (std.mem.eql(u8, tool.name, name)) return true;
+        var pat_buf: [128]u8 = undefined;
+        const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\":", .{name}) catch continue;
+        if (std.mem.indexOf(u8, tool.input_schema, pat) != null) return true;
+    }
+    return false;
+}
+
+/// Whether `text` mentions `key` as a word but never gives it a value
+/// (`key: v`, `key=v`, `key v` with a digit, or a `--- key ---` block).
+fn namesWithoutValue(text: []const u8, key: []const u8) bool {
+    const word = struct {
+        fn ch(cc: u8) bool {
+            return std.ascii.isAlphanumeric(cc) or cc == '_' or cc == '.';
+        }
+    }.ch;
+    var mentioned = false;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, key)) |i| {
+        from = i + key.len;
+        if (i > 0 and word(text[i - 1])) continue;
+        const rest = text[i + key.len ..];
+        if (rest.len > 0 and word(rest[0]) and rest[0] != '.') continue;
+        mentioned = true;
+        if (rest.len > 0 and (rest[0] == ':' or rest[0] == '=')) return false;
+        if (rest.len > 1 and rest[0] == ' ' and std.ascii.isDigit(rest[1])) return false;
+        if (std.mem.startsWith(u8, rest, " ---") and i >= 4 and std.mem.eql(u8, text[i - 4 .. i], "--- ")) return false;
+    }
+    return mentioned;
+}
+
+test "a text lane that points at a fact it does not carry is caught" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try t.expectEqualStrings("next_offset", (try textNamesMissingField(a, "read on with offset next_offset", "\"next_offset\":5")).?);
+    try t.expectEqual(@as(?[]const u8, null), try textNamesMissingField(a, "more from next_offset 5", "\"next_offset\":5"));
+    try t.expectEqual(@as(?[]const u8, null), try textNamesMissingField(a, "next_offset: 5", "\"next_offset\":5"));
+    try t.expectEqual(@as(?[]const u8, null), try textNamesMissingField(a, "--- watch_command ---\nsketerm mcp agent-wait", "\"watch_command\":\"x\""));
+    try t.expect((try textNamesMissingField(a, "see capabilities.peers.slow_mail", "")) != null);
+    // Pointing at structuredContent is right only where it is sent.
+    try t.expectEqual(@as(?[]const u8, null), try textNamesMissingField(a, "bytes are in structuredContent.base64", ""));
+    const saved = result_mode;
+    defer result_mode = saved;
+    result_mode = .text;
+    try t.expect((try textNamesMissingField(a, "bytes are in structuredContent.base64", "")) != null);
+    result_mode = saved;
+    // Tool names and argument names are things a reader can use.
+    try t.expectEqual(@as(?[]const u8, null), try textNamesMissingField(a, "take a web_snapshot", "\"web_snapshot\":1"));
+    try t.expectEqual(@as(?[]const u8, null), try textNamesMissingField(a, "pass timeout_ms to wait longer", "\"timeout_ms\":5"));
+    try t.expectEqual(@as(?[]const u8, null), try textNamesMissingField(a, "the reply's sha256 is gone", "\"file_bytes\":3"));
+}
 
 // ── Tools ─────────────────────────────────────────────────────────
 //
@@ -2665,6 +2791,24 @@ test "errRes: uniform shape, code tag, retryable fact" {
     try t.expect(std.mem.indexOf(u8, ae, "\"isError\":true") != null);
 }
 
+test "text mode: capabilities names each web feature once, by verdict" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var v: mcp_caps.Verdicts = .{};
+    try v.add(arena, "downloads", true);
+    try v.add(arena, "capture (headless only)", false);
+    try v.add(arena, "print_pdf", true);
+    try v.add(arena, "untrusted views", null);
+    try t.expectEqualStrings(
+        "web: headless backend; here: downloads, print_pdf; not here: capture (headless only); known once the engine starts: untrusted views",
+        try v.line(arena, "headless"),
+    );
+    var none: mcp_caps.Verdicts = .{};
+    try t.expectEqualStrings("web: gui backend", try none.line(arena, "gui"));
+}
+
 test "text mode: no structuredContent, no outputSchema, the error code in the text" {
     const t = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
@@ -2701,7 +2845,22 @@ test "text mode: no structuredContent, no outputSchema, the error code in the te
     try t.expect(nf.get("structuredContent") == null);
     try t.expectEqualStrings("error not_found: no web view with id 4", nf.get("content").?.array.items[0].object.get("text").?.string);
     const to = try errResDetails(arena, .timeout, "did not settle", @as(?struct { waited_ms: i64 }, .{ .waited_ms = 5 }));
-    try t.expect(std.mem.indexOf(u8, to, "\"error timeout (retryable): did not settle\"") != null);
+    try t.expect(std.mem.indexOf(u8, to, "\"error timeout (retryable): did not settle\\ndetails: waited 5ms\"") != null);
+    // Details the message lacks reach the text; what it already says, nulls,
+    // false and lists do not, and no JSON syntax leaks in.
+    const diag = try errResDetails(arena, .unavailable, "helper failed to start\nstage: hello; diagnostic: attempt-1\nhelper stderr:\nboom", @as(?struct {
+        id: []const u8,
+        stage: enum { hello, other },
+        exit_code: ?u8,
+        stderr: []const u8,
+        truncated: bool,
+        stderr_available: bool,
+        best_effort: bool,
+        running_ms: i64,
+        tabs: []const struct { url: []const u8 },
+    }, .{ .id = "attempt-1", .stage = .hello, .exit_code = null, .stderr = "boom", .truncated = true, .stderr_available = true, .best_effort = false, .running_ms = 125_000, .tabs = &.{.{ .url = "https://a" }} }));
+    const diag_text = (try std.json.parseFromSliceLeaky(std.json.Value, arena, diag, .{})).object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.endsWith(u8, diag_text, "\ndetails: truncated, stderr_available, running 2m"));
     try t.expect(std.mem.indexOf(u8, to, "structuredContent") == null);
 
     var fake = FakeBackend{ .responses = &.{}, .allocator = std.testing.allocator };

@@ -781,6 +781,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const caps = m.callTool("capabilities", "{}");
         if (std.mem.indexOf(u8, caps, "\"structuredContent\":") != null) fail("text mode: capabilities carried structuredContent");
         if (std.mem.indexOf(u8, caps, "results: text only") == null) fail("text mode: capabilities did not state the result mode");
+        for ([_][]const u8{ "panels_store", "web_tab_rules", "agent_facts" }) |name| {
+            if (std.mem.indexOf(u8, caps, name) != null) fail("text mode: capabilities text named a field only the facts lane carries");
+        }
         const peers = m.callTool("peer_list", "{}");
         if (std.mem.indexOf(u8, peers, "\"structuredContent\":") != null) fail("text mode: peer_list carried structuredContent");
         const bad = m.callTool("no_such_tool", "{}");
@@ -962,7 +965,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             var jb: [1024]u8 = undefined;
             _ = m.callTool("file_mkdir", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}\"}}", .{fsd}) catch unreachable);
             const wr = m.callTool("file_write", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}/a.txt\",\"content\":\"MCP-FS-PAYLOAD\"}}", .{fsd}) catch unreachable);
-            if (std.mem.indexOf(u8, wr, "14 bytes written") == null) fail("file_write failed");
+            if (std.mem.indexOf(u8, wr, "14 B written") == null) fail("file_write failed");
             const ls = m.callTool("file_list", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}\"}}", .{fsd}) catch unreachable);
             if (std.mem.indexOf(u8, ls, "a.txt") == null or std.mem.indexOf(u8, ls, "1 entries") == null)
                 fail("file_list missing the written file");
@@ -970,7 +973,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (std.mem.indexOf(u8, rd, "MCP-FS-PAYLOAD") == null or std.mem.indexOf(u8, rd, "eof") == null)
                 fail("file_read did not return the content");
             const cp = m.callTool("file_copy", std.fmt.bufPrint(&jb, "{{\"src\":\"{s}/a.txt\",\"dst\":\"{s}/b.txt\"}}", .{ fsd, fsd }) catch unreachable);
-            if (std.mem.indexOf(u8, cp, "done: 14 bytes") == null) fail("file_copy job failed");
+            if (std.mem.indexOf(u8, cp, "done: 14 B") == null) fail("file_copy job failed");
             const h1 = m.callTool("file_hash", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}/a.txt\"}}", .{fsd}) catch unreachable);
             const h2 = m.callTool("file_hash", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}/b.txt\"}}", .{fsd}) catch unreachable);
             // The digest is a machine fact now; the text lane repeats it.
@@ -993,7 +996,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             const kept = m.callTool("file_read", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}/c.txt\"}}", .{fsd}) catch unreachable);
             if (std.mem.indexOf(u8, kept, "KEEP") == null) fail("a refused copy/rename changed the destination");
             const cp_over = m.callTool("file_copy", std.fmt.bufPrint(&jb, "{{\"src\":\"{s}/a.txt\",\"dst\":\"{s}/c.txt\",\"overwrite\":true}}", .{ fsd, fsd }) catch unreachable);
-            if (std.mem.indexOf(u8, cp_over, "done: 14 bytes") == null) fail("file_copy overwrite:true failed");
+            if (std.mem.indexOf(u8, cp_over, "done: 14 B") == null) fail("file_copy overwrite:true failed");
             const mv_over = m.callTool("file_rename", std.fmt.bufPrint(&jb, "{{\"from\":\"{s}/c.txt\",\"to\":\"{s}/b.txt\",\"overwrite\":true}}", .{ fsd, fsd }) catch unreachable);
             if (std.mem.indexOf(u8, mv_over, "\"renamed\":true") == null) fail("file_rename overwrite:true failed");
             const del = m.callTool("file_delete", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}/b.txt\"}}", .{fsd}) catch unreachable);

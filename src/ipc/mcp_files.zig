@@ -4,6 +4,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const clock = @import("../util/clock.zig");
+const numtext = @import("../util/numtext.zig");
 const fsdrive = @import("fsdrive.zig");
 const muxclient = @import("../mux/client.zig");
 const mcp_tools = @import("mcp_tools.zig");
@@ -253,7 +254,8 @@ fn fsAwaitJob(arena: std.mem.Allocator, fs: *fsdrive.Fs, job: u64, opname: []con
     try res.fact("bytes", end.bytes_done);
     if (end.resumed_from > 0) try res.fact("resumed_from", end.resumed_from);
     if (end.has_hash) try res.fact("sha256", end.hash[0..]);
-    try res.textf("{s} job {d} done: {d} bytes", .{ opname, job, end.bytes_done });
+    var bb: [24]u8 = undefined;
+    try res.textf("{s} job {d} done: {s}", .{ opname, job, numtext.bytes(&bb, end.bytes_done) });
     if (end.resumed_from > 0) try res.textf("resumed from {d} (partial verified by hash)", .{end.resumed_from});
     if (end.has_hash) try res.textf("sha256 {s}", .{end.hash[0..]});
     return res.finish();
@@ -369,9 +371,14 @@ fn fileRead(arena: std.mem.Allocator, fs: *fsdrive.Fs, args: std.json.Value) ![]
     try res.fact("eof", info.eof);
     try res.fact("more", !info.eof);
     try res.fact("binary", !textual);
-    try res.textf("{s}: read {d} of {d} bytes at offset {d}, {s}", .{
-        path, data.items.len, info.size, off, if (info.eof) "eof" else "MORE remains",
-    });
+    var nb: [24]u8 = undefined;
+    var sb: [24]u8 = undefined;
+    const got = numtext.bytes(&nb, data.items.len);
+    const size = numtext.bytes(&sb, info.size);
+    if (info.eof)
+        try res.textf("{s}: read {s} of {s} at offset {d}, eof", .{ path, got, size, off })
+    else
+        try res.textf("{s}: read {s} of {s} at offset {d}, MORE remains (next offset {d})", .{ path, got, size, off, off + data.items.len });
     if (textual) {
         // Text content is the payload the text lane exists for;
         // duplicating it into structuredContent would double a
@@ -400,7 +407,8 @@ fn fileWrite(arena: std.mem.Allocator, fs: *fsdrive.Fs, args: std.json.Value) ![
     try res.fact("path", path);
     try res.fact("bytes", n);
     try res.fact("append", append);
-    try res.textf("{s}: {d} bytes {s}", .{ path, n, if (append) "appended" else "written" });
+    var nb: [24]u8 = undefined;
+    try res.textf("{s}: {s} {s}", .{ path, numtext.bytes(&nb, n), if (append) "appended" else "written" });
     return res.finish();
 }
 
@@ -544,7 +552,13 @@ fn fileJobs(arena: std.mem.Allocator, fs: *fsdrive.Fs, _: std.json.Value) ![]con
         try std.json.Stringify.value(row.message, .{}, jw);
         try jw.writeAll("}");
         if (i > 0) try tw.writeAll("\n");
-        try tw.print("job {d}: {s} {s} {d}/{d} bytes", .{ row.job, row.op, row.state, row.done, row.total });
+        var db: [24]u8 = undefined;
+        var tb: [24]u8 = undefined;
+        try tw.print("job {d}: {s} {s} {s}", .{ row.job, row.op, row.state, numtext.bytes(&db, row.done) });
+        if (row.total > 0) try tw.print(" of {s}", .{numtext.bytes(&tb, row.total)});
+        if (row.src.len > 0) try tw.print("  {s}{s}{s}", .{ row.src_host, if (row.src_host.len > 0) ":" else "", row.src });
+        if (row.dst.len > 0) try tw.print(" -> {s}{s}{s}", .{ row.dst_host, if (row.dst_host.len > 0) ":" else "", row.dst });
+        if (row.message.len > 0) try tw.print("  ({s})", .{row.message});
     }
     try jw.writeAll("]");
     var res = Res.init(arena);
@@ -722,4 +736,37 @@ test "file_read frees the bytes it read" {
     const args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"path\":\"/tmp/hello\"}", .{});
     const result = try fileRead(arena, &fs, args);
     try t.expect(std.mem.indexOf(u8, result, "hello") != null);
+}
+
+test "text mode: file_read states sizes in units and file_jobs each job's paths" {
+    const t = std.testing;
+    const saved = mcp.result_mode;
+    defer mcp.result_mode = saved;
+    mcp.result_mode = .text;
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair));
+    var fs = fsdrive.Fs.initConn(t.allocator, .{ .allocator = t.allocator, .fd = pair[0] });
+    defer fs.deinit();
+    var peer = muxclient.Conn{ .allocator = t.allocator, .fd = pair[1] };
+    defer peer.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A partial read names the offset to continue from.
+    const req = fs.next_req;
+    var data: [17]u8 = undefined;
+    std.mem.writeInt(u32, data[0..4], req, .little);
+    std.mem.writeInt(u64, data[4..12], 0, .little);
+    @memcpy(data[12..], "hello");
+    try peer.sendFrame(.fs_data, &data);
+    var reply_buf: [256]u8 = undefined;
+    try peer.sendFrame(.fs_reply, try std.fmt.bufPrint(&reply_buf, "{{\"req\":{d},\"ok\":true,\"size\":3000,\"eof\":false}}", .{req}));
+    const read = try fileRead(arena, &fs, try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"path\":\"/tmp/hello\"}", .{}));
+    try t.expect(std.mem.indexOf(u8, read, "/tmp/hello: read 5 B of 2.9 KiB at offset 0, MORE remains (next offset 5)") != null);
+
+    try peer.sendFrame(.fs_reply, try std.fmt.bufPrint(&reply_buf, "{{\"req\":{d},\"ok\":true,\"jobs\":[{{\"job\":3,\"op\":\"copy\",\"state\":\"failed\",\"done\":2048,\"total\":4096,\"src\":\"/a\",\"dst\":\"/b\",\"dst_host\":\"box\",\"message\":\"NOSPC\"}}]}}", .{fs.next_req}));
+    const jobs = try fileJobs(arena, &fs, .null);
+    try t.expect(std.mem.indexOf(u8, jobs, "job 3: copy failed 2 KiB of 4 KiB  /a -> box:/b  (NOSPC)") != null);
+    try t.expect(std.mem.indexOf(u8, jobs, "structuredContent") == null);
 }

@@ -883,7 +883,7 @@ fn peerSend(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         .many => true,
     };
     if ((quiet or many) and !p.slowMail())
-        return errRes(arena, .unavailable, "the per-user sketerm daemon predates slow mail and to lists (capabilities.peers.slow_mail is false); send to one address without quiet, or restart the daemon idle with a newer build");
+        return errRes(arena, .unavailable, "the per-user sketerm daemon predates slow mail, so it cannot take quiet sends or to lists; send to one address without quiet, or restart the daemon idle with a newer build");
     const reply = p.send(arena, .{
         .to = switch (to) {
             .one => |s| s,
