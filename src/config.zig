@@ -743,10 +743,15 @@ pub const McpProfile = struct {
     /// The screen a headless view reports (`web/screengeom.zig`
     /// `headless`); null leaves 1920x1080.
     web_screen: ?@import("web/screengeom.zig").Size = null,
+    /// The user's URL shortener: a GET template holding `{url}` whose
+    /// reply is the short URL (`ipc/urlshort.zig`); empty = off.
+    web_url_shortener: []const u8 = "",
+    /// URLs at least this long are shortened; null leaves 120.
+    web_url_shorten_min: ?u16 = null,
 
     /// Whether serializing this record writes anything.
     pub fn isEmpty(self: *const McpProfile) bool {
-        return self.tools.len == 0 and self.web_gui == null and self.web_max_fps == null and self.web_idle_close_secs == null and self.web_fetch_max_tabs == null and self.web_webgl == null and self.web_motion_default == null and self.web_motion_pack.len == 0 and self.web_motion_idle_drift == null and self.web_screen == null;
+        return self.tools.len == 0 and self.web_gui == null and self.web_max_fps == null and self.web_idle_close_secs == null and self.web_fetch_max_tabs == null and self.web_webgl == null and self.web_motion_default == null and self.web_motion_pack.len == 0 and self.web_motion_idle_drift == null and self.web_screen == null and self.web_url_shortener.len == 0 and self.web_url_shorten_min == null;
     }
 
     pub fn cloneInto(self: *const McpProfile, arena: std.mem.Allocator) error{OutOfMemory}!McpProfile {
@@ -754,6 +759,7 @@ pub const McpProfile = struct {
         out.name = try arena.dupe(u8, self.name);
         out.tools = try arena.dupe(u8, self.tools);
         out.web_motion_pack = try arena.dupe(u8, self.web_motion_pack);
+        out.web_url_shortener = try arena.dupe(u8, self.web_url_shortener);
         return out;
     }
 };
@@ -2386,6 +2392,13 @@ fn applyMcpKv(prof: *McpProfile, arena: std.mem.Allocator, key: []const u8, valu
         prof.web_motion_idle_drift = try parseBool(value);
     } else if (std.mem.eql(u8, key, "web_screen")) {
         prof.web_screen = @import("web/screengeom.zig").Size.parse(value) orelse return error.BadValue;
+    } else if (std.mem.eql(u8, key, "web_url_shortener")) {
+        if (value.len > 0 and !@import("ipc/urlshort.zig").validTemplate(value)) return error.BadValue;
+        prof.web_url_shortener = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "web_url_shorten_min")) {
+        const n = std.fmt.parseInt(u16, value, 10) catch return error.BadValue;
+        if (n < 20) return error.BadValue;
+        prof.web_url_shorten_min = n;
     } else return error.UnknownKey;
 }
 
@@ -2402,6 +2415,8 @@ fn serialiseMcpKeys(prof: *const McpProfile, w: *std.Io.Writer) !void {
     if (prof.web_motion_pack.len > 0) try w.print("web_motion_pack = {s}\n", .{prof.web_motion_pack});
     if (prof.web_motion_idle_drift) |v| try w.print("web_motion_idle_drift = {s}\n", .{if (v) "true" else "false"});
     if (prof.web_screen) |v| try w.print("web_screen = {f}\n", .{v});
+    if (prof.web_url_shortener.len > 0) try w.print("web_url_shortener = {s}\n", .{prof.web_url_shortener});
+    if (prof.web_url_shorten_min) |v| try w.print("web_url_shorten_min = {d}\n", .{v});
 }
 
 fn applyDomainKv(dom: *Domain, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
@@ -4603,6 +4618,8 @@ test "config: bare [mcp] defaults and web_gui parse and round-trip" {
         \\web_motion_pack = my-mouse
         \\web_motion_idle_drift = true
         \\web_screen = 2560x1440
+        \\web_url_shortener = https://sho.rt/rest/v3/short-urls/shorten?apiKey=K&format=txt&longUrl={url}
+        \\web_url_shorten_min = 90
         \\
         \\[mcp.locked]
         \\tools = files:ro
@@ -4653,6 +4670,9 @@ test "config: bare [mcp] defaults and web_gui parse and round-trip" {
     try std.testing.expect(cfg2.mcpProfile("quiet").?.web_motion_default == null);
     try std.testing.expectEqual(true, cfg2.mcp.web_motion_idle_drift.?);
     try std.testing.expectEqual(false, cfg2.mcpProfile("locked").?.web_motion_idle_drift.?);
+    try std.testing.expectEqualStrings("https://sho.rt/rest/v3/short-urls/shorten?apiKey=K&format=txt&longUrl={url}", cfg2.mcp.web_url_shortener);
+    try std.testing.expectEqual(@as(u16, 90), cfg2.mcp.web_url_shorten_min.?);
+    try std.testing.expectEqualStrings("", cfg2.mcpProfile("locked").?.web_url_shortener);
     try std.testing.expect(cfg2.mcpProfile("quiet").?.web_motion_idle_drift == null);
     // The profile's screen overrides the bare one; a profile that does
     // not say leaves it unstated, so the bare value applies.

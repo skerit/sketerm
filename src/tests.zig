@@ -302,6 +302,7 @@ comptime {
     _ = @import("ipc/webnav.zig");
     _ = @import("ipc/webfetch.zig");
     _ = @import("ipc/webread.zig");
+    _ = @import("ipc/urlshort.zig");
     _ = @import("ipc/mcp.zig");
     _ = @import("ipc/mcp_app.zig");
     _ = @import("ipc/mcp_files.zig");

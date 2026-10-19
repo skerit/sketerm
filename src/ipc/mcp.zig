@@ -878,6 +878,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     var idle_drift_source: MotionSource = if (cfg.mcp.web_motion_idle_drift != null) .config else .built_in;
     var web_screen = cfg.mcp.web_screen orelse @import("../web/screengeom.zig").headless_screen_default;
     var web_screen_source: MotionSource = if (cfg.mcp.web_screen != null) .config else .built_in;
+    var url_shortener: []const u8 = cfg.mcp.web_url_shortener;
+    var url_shorten_min = cfg.mcp.web_url_shorten_min;
     if (opts.profile) |name| {
         const prof = mcpProfileRecord(&cfg, name) catch return 2;
         if (prof.web_max_fps) |fps| web_max_fps = fps;
@@ -900,6 +902,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             web_screen = s;
             web_screen_source = .profile;
         }
+        if (prof.web_url_shortener.len > 0) url_shortener = prof.web_url_shortener;
+        if (prof.web_url_shorten_min) |n| url_shorten_min = n;
     }
     if (opts.web_motion_default) |m| {
         motion_default = m;
@@ -915,6 +919,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     @import("mcp_web.zig").configureWebgl(web_webgl orelse .auto);
     @import("mcp_web.zig").configureScreen(web_screen, web_screen_source);
     mcp_webfetch.configure(web_fetch_max_tabs);
+    @import("urlshort.zig").configure(allocator, url_shortener, url_shorten_min) catch {
+        _ = c.fputs("sketerm mcp: web_url_shortener is not an http(s) URL template holding {url}\n", platform.stderr());
+        return 2;
+    };
+    defer @import("urlshort.zig").deinit(1000);
 
     if (opts.log_dir) |ld| {
         mcp_log = McpLog.open(allocator, ld) orelse {

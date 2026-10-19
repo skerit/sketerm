@@ -37,6 +37,7 @@
 const std = @import("std");
 const diagnostic = @import("../web/diagnostic.zig");
 const numtext = @import("../util/numtext.zig");
+const urlshort = @import("urlshort.zig");
 const mcp = @import("mcp.zig");
 const protocol = @import("protocol.zig");
 const webdrive = @import("webdrive.zig");
@@ -2568,6 +2569,15 @@ pub fn section(res: *mcp.Res, name: []const u8, body: []const u8) !void {
     try res.text(body);
 }
 
+/// `section`, with the long URLs in `body` replaced by the user's
+/// shortener's (`[mcp] web_url_shortener`) and a line saying so. Text
+/// lane only: the facts keep every URL whole.
+pub fn shortSection(res: *mcp.Res, arena: std.mem.Allocator, name: []const u8, body: []const u8) !void {
+    const short = try urlshort.rewrite(arena, body, urlshort.WAIT_MS);
+    try section(res, name, short);
+    if (short.ptr != body.ptr) try res.text("long URLs above are shortened by the configured URL shortener; each redirects to the original");
+}
+
 /// `n` bytes as `numtext.bytes` reads them ("1.2 MiB"), in `arena`.
 pub fn bytesText(arena: std.mem.Allocator, n: u64) ![]const u8 {
     var buf: [32]u8 = undefined;
@@ -3591,10 +3601,10 @@ fn readResult(arena: std.mem.Allocator, mode: Mode, v: View, r: ReadOut) ![]cons
                 if (pg.next) |n| try std.fmt.allocPrint(arena, "; more from offset {d}", .{n}) else "; the end",
             });
             if (r.note) |n| try res.text(n);
-            try section(&res, if (r.mode == .text) "article" else "source", pg.text);
+            if (r.mode == .text) try shortSection(&res, arena, "article", pg.text) else try section(&res, "source", pg.text);
             // The ids already ride the facts lane in structured mode.
             if (r.mode == .text and pg.offset == 0 and mcp.result_mode == .text) if (r.model) |m| {
-                if (m.entities.len > 0) try section(&res, "entities", try entityLines(arena, m.entities));
+                if (m.entities.len > 0) try shortSection(&res, arena, "entities", try entityLines(arena, m.entities));
             };
         },
         .regex => {
@@ -3636,7 +3646,7 @@ fn readResult(arena: std.mem.Allocator, mode: Mode, v: View, r: ReadOut) ![]cons
             });
             var lines: std.Io.Writer.Allocating = .init(arena);
             for (shown) |l| try lines.writer.print("[{s}] {s} -> {s}{s}\n", .{ @tagName(l.area), if (l.text.len > 0) l.text else "(no text)", l.href, if (l.visible) "" else " (hidden)" });
-            try section(&res, "links", lines.written());
+            try shortSection(&res, arena, "links", lines.written());
         },
         .resources => {
             const p = r.page.?;

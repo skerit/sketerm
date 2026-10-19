@@ -415,6 +415,15 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         const frame_rate = @import("mcp_web.zig").frameRateCapability();
         try res.fact("web_max_fps", frame_rate.supported);
         try res.fact("web_default_max_fps", frame_rate.default);
+        {
+            // The template may hold an API key: only whether one is set.
+            var eb: [160]u8 = undefined;
+            const us = @import("urlshort.zig").stats(&eb);
+            try res.fact("web_url_shortener", .{ .configured = us.configured, .min_len = us.min_len, .shortened = us.shortened, .failed = us.failed, .last_error = us.last_error });
+            if (us.configured) try res.textf("url shortener: on for URLs of {d}+ bytes in web text lanes; {d} shortened, {d} failed{s}{s}", .{
+                us.min_len, us.shortened, us.failed, if (us.last_error.len > 0) " (last: " else "", if (us.last_error.len > 0) try std.fmt.allocPrint(arena, "{s})", .{us.last_error}) else "",
+            });
+        }
         try verdicts.add(arena, if (gui_web) "capture (headless only)" else if (cp.supported and !cp.started) "capture (once the engine starts)" else "capture", cp.supported);
         // Driving a page by hand (web_input) and watching it (web_frame)
         // are headless tools: with a GUI the pane owns its mouse and its

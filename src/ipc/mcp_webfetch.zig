@@ -577,6 +577,9 @@ fn readBody(job: *Job, it: *Item, e: *webdrive.Engine, kind: webfetch.Kind, nav:
         }
         return;
     }
+    // Reader text may come out with its long URLs shortened: start those
+    // lookups now, so the answer seldom has to wait for them.
+    if (body.source == .reader) @import("urlshort.zig").prefetch(body.text);
     const cut = webread.truncate(body.text, o.max_chars);
     it.row.body = cut.text;
     it.row.truncated = it.row.truncated or cut.truncated;
@@ -697,7 +700,10 @@ fn answer(job: *Job) !void {
             try web.writeMatches(&res, r.matches);
         }
         if (r.body) |b| {
-            try web.section(&res, try std.fmt.allocPrint(ar, "[{d}] {s}{s}", .{ r.index, @tagName(r.body_source.?), if (r.truncated) " (truncated)" else "" }), b);
+            if (r.body_source == .reader)
+                try web.shortSection(&res, ar, try std.fmt.allocPrint(ar, "[{d}] {s}{s}", .{ r.index, @tagName(r.body_source.?), if (r.truncated) " (truncated)" else "" }), b)
+            else
+                try web.section(&res, try std.fmt.allocPrint(ar, "[{d}] {s}{s}", .{ r.index, @tagName(r.body_source.?), if (r.truncated) " (truncated)" else "" }), b);
         }
     }
     if (any_body) try res.text(web.TRUST_LINE);

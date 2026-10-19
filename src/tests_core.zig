@@ -142,6 +142,7 @@ comptime {
     _ = @import("ipc/webnav.zig");
     _ = @import("ipc/webfetch.zig");
     _ = @import("ipc/webread.zig");
+    _ = @import("ipc/urlshort.zig");
     _ = @import("ipc/xkblayout.zig");
     // Enforced network policy: std-only decision half of the web
     // helper's request gate, shared with the GUI-side client.
