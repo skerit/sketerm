@@ -211,7 +211,7 @@ pub fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, wat
         if (background) |n|
             try res.textf("a quiet done (background): {d} minutes idle with {d} background task(s) still running; the turn is not settled, and its done wakes you once they end", .{ @divTrunc(select.BACKGROUND_DONE_CAP_MS, 60_000), n });
         if (w.timed_out and pushing()) {
-            try res.textf("{s}: its events are pushed into this session as they happen, so end your turn here; no watch_command, Monitor or agent_wait is needed", .{outcome});
+            try res.textf("{s}: its events are pushed into this session as they happen, so end your turn here", .{outcome});
         } else if (w.timed_out) {
             if (std.mem.eql(u8, outcome, @tagName(vocab.WaitOutcome.queued)))
                 try res.text("queued; the agent was busy and takes the prompt when its current turn ends: run watch_command in the background (or as a Monitor with --follow) to be woken once it has answered it")
@@ -251,28 +251,36 @@ pub fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, wat
     for (extra) |b| try block(res, b);
     // The job block holds the message among its selected ones.
     if (job_block) |b| try block(res, b) else if (message) |m| try block(res, .{ .name = "message", .body = m });
-    if (dv.items.len > 0) {
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        for (dv.items, 0..) |ev, i| {
-            if (i > 0) try aw.writer.writeAll("\n");
-            try aw.writer.print("{d} {s}", .{ ev.event.seq, @tagName(ev.kind) });
-            if (ev.event.count > 1) try aw.writer.print(" (x{d})", .{ev.event.count});
-            if (ev.event.record) |id| try aw.writer.print(" [{d}]", .{id});
-            if (ev.event.text.len > 0) try aw.writer.print(": {s}", .{agentwait.clip(eventText(ev), 300)});
-        }
-        try block(res, .{ .name = "events", .body = aw.written() });
-    }
-    if (it) |x| {
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        try aw.writer.print("{s}: {s}", .{ @tagName(x.kind), x.title });
-        if (x.detail.len > 0) try aw.writer.print("\n{s}", .{x.detail});
-        for (x.options, 1..) |o, n| try aw.writer.print("\n{d}. {s}{s}", .{ n, o.label, if (o.selected) " (selected)" else "" });
-        if (x.hint.len > 0) try aw.writer.print("\n{s}", .{x.hint});
-        if (x.free_text) try aw.writer.writeAll("\n(a free-text answer is accepted: agent_answer text)");
-        try block(res, .{ .name = "prompt", .body = aw.written() });
-    }
-    if (cmd) |x| try block(res, .{ .name = "watch_command", .body = x });
+    if (dv.items.len > 0) try block(res, .{ .name = "events", .body = try eventsBody(arena, dv.items) });
+    if (it) |x| try block(res, .{ .name = "prompt", .body = try promptBody(arena, x) });
+    // Pushed events make the command pointless: never offer it then.
+    if (cmd) |x| if (!pushing()) try block(res, .{ .name = "watch_command", .body = x });
     return res.finish();
+}
+
+/// The text lane's `events` block body: one line per event.
+pub fn eventsBody(arena: std.mem.Allocator, items: []const events.Item) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    for (items, 0..) |ev, i| {
+        if (i > 0) try aw.writer.writeAll("\n");
+        try aw.writer.print("{d} {s}", .{ ev.event.seq, @tagName(ev.kind) });
+        if (ev.event.count > 1) try aw.writer.print(" (x{d})", .{ev.event.count});
+        if (ev.event.record) |id| try aw.writer.print(" [{d}]", .{id});
+        if (ev.event.text.len > 0) try aw.writer.print(": {s}", .{agentwait.clip(eventText(ev), 300)});
+    }
+    return aw.written();
+}
+
+/// The text lane's `prompt` block body: the pending interaction with its
+/// numbered options.
+pub fn promptBody(arena: std.mem.Allocator, x: output.Interaction) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try aw.writer.print("{s}: {s}", .{ @tagName(x.kind), x.title });
+    if (x.detail.len > 0) try aw.writer.print("\n{s}", .{x.detail});
+    for (x.options, 1..) |o, n| try aw.writer.print("\n{d}. {s}{s}", .{ n, o.label, if (o.selected) " (selected)" else "" });
+    if (x.hint.len > 0) try aw.writer.print("\n{s}", .{x.hint});
+    if (x.free_text) try aw.writer.writeAll("\n(a free-text answer is accepted: agent_answer text)");
+    return aw.written();
 }
 
 /// The app conversation `e` runs (what `agent_open resume` takes), or null
@@ -324,12 +332,24 @@ fn goneFacts(arena: std.mem.Allocator, res: *Res, e: *Entry) !void {
 /// The retry policy and where its episode stands, when one is set.
 fn retryFacts(res: *Res, e: *const Entry) !void {
     const p = e.retry.policy orelse return;
+    const next_in_ms: ?i64 = if (e.retry.due_ms) |d| @max(0, d - clock.nowMs()) else null;
     try res.fact("retry_on_overload", .{
         .max = p.max,
         .backoff_s = p.backoff_s,
         .used = e.retry.used,
         .pending = e.retry.active,
-        .next_in_ms = if (e.retry.due_ms) |d| @max(0, d - clock.nowMs()) else null,
+        .next_in_ms = next_in_ms,
+    });
+    // The policy alone is what agent_set reported; an episode is news.
+    if (e.retry.used == 0 and !e.retry.active) return;
+    var buf: [32]u8 = undefined;
+    try res.textf("{s}: retry_on_overload used {d} of {d} retr{s}{s}{s}", .{
+        e.id,
+        e.retry.used,
+        p.max,
+        if (p.max == 1) "y" else "ies",
+        if (e.retry.active) "; an overload is held and retried" else "",
+        if (next_in_ms) |ms| try std.fmt.allocPrint(res.arena, ", the next in {s}", .{clock.span(&buf, ms, .short)}) else "",
     });
 }
 

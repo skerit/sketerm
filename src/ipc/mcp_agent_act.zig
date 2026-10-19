@@ -191,11 +191,12 @@ pub fn templatesTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8
         for (tpl.vars) |v| try vn.append(arena, v.name);
         try items.append(arena, .{ .name = n, .description = tpl.description, .vars = vn.items });
     }
-    try res.textf("{d} template(s){s}", .{ items.items.len, if (problems.items.len > 0) " and stored files that do not load (problems)" else "" });
+    try res.textf("{d} template(s){s}", .{ items.items.len, if (problems.items.len > 0) try std.fmt.allocPrint(arena, ", and {d} stored file(s) that do not load (problems below)", .{problems.items.len}) else "" });
     for (items.items) |it| try res.textf("{s}: variables {s}", .{ it.name, if (it.vars.len == 0) "none" else try std.mem.join(arena, ", ", it.vars) });
     try res.raw("templates", try toJson(arena, items.items));
     try res.fact("count", items.items.len);
     try res.fact("problems", problems.items);
+    if (problems.items.len > 0) try block(&res, .{ .name = "problems", .body = try std.mem.join(arena, "\n", problems.items) });
     return res.finish();
 }
 

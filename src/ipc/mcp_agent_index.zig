@@ -787,7 +787,9 @@ fn goneResult(arena: std.mem.Allocator, d: Descriptor, why: *const AttachWhy, re
         (if (g.signal) |s| try std.fmt.allocPrint(arena, "its app was killed by signal {d}", .{s}) else try std.fmt.allocPrint(arena, "its app exited with status {d}", .{g.exit_status orelse 0}))
     else
         goneDetail(g);
-    try res.textf("agent {s} is gone: {s}", .{ d.id, detail });
+    var ago_buf: [48]u8 = undefined;
+    const ended = if (why.tomb) |tb| clock.ago(&ago_buf, clock.wallMs(), tb.ended_ms, .long) else "";
+    try res.textf("agent {s} is gone: {s}{s}{s}{s}", .{ d.id, detail, if (ended.len > 0) " (ended " else "", ended, if (ended.len > 0) ")" else "" });
     if (why.msg.len > 0) try res.textf("the daemon said: {s}", .{why.msg});
     if (relaunchable)
         try res.textf("agent_attach with agent \"{s}\" and relaunch: true starts it again with its launch settings, resuming its conversation, under the same id and name", .{d.name orelse d.id})
@@ -890,4 +892,20 @@ test "a gone descriptor stays for a relaunch only when it can be started again" 
         var again = try agentindex.claim(lp, false);
         again.release(lp, true);
     }
+}
+
+test "a gone agent's attach says in words when it ended" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const saved = mcp.result_mode;
+    defer mcp.result_mode = saved;
+    mcp.result_mode = .text;
+    const d = Descriptor{ .id = "claude-k3f9", .app = "claude", .session = "agent-claude-k3f9", .origin = "o", .binary = "/bin/claude" };
+    const why = AttachWhy{ .session = d.session, .tomb = .{ .found = true, .ended_ms = clock.wallMs() - 5 * 60_000, .exit_status = 0 } };
+    const out = try goneResult(a, d, &why, true);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, out, .{});
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try testing.expect(std.mem.indexOf(u8, text, "agent claude-k3f9 is gone: ") != null);
+    try testing.expect(std.mem.indexOf(u8, text, " (ended 5 minutes ago)\n") != null);
 }

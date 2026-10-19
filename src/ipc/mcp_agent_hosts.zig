@@ -10,6 +10,7 @@ const termdrive = @import("termdrive.zig");
 const hoststats = @import("../agent/hoststats.zig");
 const facts_mod = @import("../agent/facts.zig");
 const clock = @import("../util/clock.zig");
+const numtext = @import("../util/numtext.zig");
 const readfile = @import("../util/readfile.zig");
 const Res = mcp.Res;
 
@@ -196,8 +197,10 @@ pub fn hostsReport(arena: std.mem.Allocator, res: *Res, until: i64) !void {
             it.mem_total_mb = st.totalMb();
             it.load = .{ st.load1, st.load5, st.load15 };
             it.age_s = @divTrunc(later - p.read_ms, 1000);
-            if (st.availMb()) |m| try w.print(", {d} MB available", .{m}) else try w.writeAll(", memory unknown");
-            if (st.totalMb()) |m| try w.print(" of {d} MB", .{m});
+            var avail_buf: [16]u8 = undefined;
+            var total_buf: [16]u8 = undefined;
+            if (st.avail_kb) |k| try w.print(", {s} available", .{numtext.bytes(&avail_buf, k *| 1024)}) else try w.writeAll(", memory unknown");
+            if (st.total_kb) |k| try w.print(" of {s}", .{numtext.bytes(&total_buf, k *| 1024)});
             if (st.load1) |l| try w.print(", load {d:.2} {d:.2} {d:.2}", .{ l, st.load5 orelse 0, st.load15 orelse 0 }) else try w.writeAll(", load unknown");
         } else {
             it.unknown = p.problem;

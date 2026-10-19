@@ -63,6 +63,17 @@ pub const ToolRig = struct {
         const args = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
         return agentTool(a, tool, args);
     }
+
+    /// `call` in text result mode: the one text block a text client reads.
+    pub fn callText(self: *ToolRig, tool: Tool, json: []const u8) ![]const u8 {
+        const saved = mcp.result_mode;
+        defer mcp.result_mode = saved;
+        mcp.result_mode = .text;
+        const out = try self.call(tool, json);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, self.arena.allocator(), out, .{});
+        try testing.expect(parsed.object.get("structuredContent") == null);
+        return parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    }
 };
 
 /// Stop the private broker a tool call autostarted on the rig's socket.

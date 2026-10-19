@@ -252,13 +252,13 @@ pub fn sendManyTool(arena: std.mem.Allocator, args: std.json.Value, list: []cons
     };
     if (sent.items.len > 0) {
         if (pushing())
-            try res.text("their events are pushed into this session as they happen, so end your turn here; no watch_command, Monitor or agent_wait is needed")
+            try res.text("their events are pushed into this session as they happen, so end your turn here")
         else if (sent.items.len > 1)
             try res.text("run watch_command in the background to be woken ONCE when every one of them has settled (agent-wait --all; --any wakes on the first), then agent_read final per agent")
         else
             try res.text("run watch_command in the background to be woken when it has answered");
     }
-    if (cmd) |x| try block(&res, .{ .name = "watch_command", .body = x });
+    if (cmd) |x| if (!pushing()) try block(&res, .{ .name = "watch_command", .body = x });
     return res.finish();
 }
 
@@ -329,6 +329,9 @@ pub fn waitAllTool(arena: std.mem.Allocator, args: std.json.Value, list: []const
         try res.textf("all {d} agent(s) settled", .{w.entries.len})
     else
         try res.textf("{d} of {d} agent(s) settled when the wait ran out", .{ settled, w.entries.len });
+    // Each settled agent's events and pending prompt, as agent_wait on
+    // that one agent shows them (the cursor advances past those events).
+    var payload: std.ArrayList(Block) = .empty;
     for (w.entries, items) |e, *o| {
         const st = e.agent.state();
         o.* = .{ .agent = e.id, .name = e.name, .outcome = outcomeOf(&.{}, st, e.sent_seq != null, false), .state = @tagName(st), .settled = false, .text = "", .record = null, .conversation = conversationOf(e), .events = &.{} };
@@ -338,7 +341,11 @@ pub fn waitAllTool(arena: std.mem.Allocator, args: std.json.Value, list: []const
             o.text = line.text;
             o.record = line.record;
             o.settled = true;
-            if (try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena)) |d| o.events = try eventsJson(arena, d.items);
+            if (try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena)) |d| {
+                o.events = try eventsJson(arena, d.items);
+                if (d.items.len > 0) try payload.append(arena, .{ .name = try std.fmt.allocPrint(arena, "{s} events", .{e.id}), .body = try mcp_agent_results.eventsBody(arena, d.items) });
+            }
+            if (e.agent.interaction()) |x| try payload.append(arena, .{ .name = try std.fmt.allocPrint(arena, "{s} prompt", .{e.id}), .body = try mcp_agent_results.promptBody(arena, x) });
         }
         try res.textf("{s}: {s}{s}{s}", .{ e.id, o.outcome, if (o.text.len > 0) ": " else "", agentwait.clip(events.firstLine(o.text), 160) });
     }
@@ -351,10 +358,11 @@ pub fn waitAllTool(arena: std.mem.Allocator, args: std.json.Value, list: []const
         try res.text("their events are pushed into this session as they happen, so end your turn here")
     else if (!all)
         try res.text("run watch_command in the background to be woken once every one of them has settled");
+    for (payload.items) |b| try block(&res, b);
     if (state.exe) |exe| if (state.waiter.path) |sock| {
         const cmd = try agentwait.watchCommand(arena, exe, sock, w.ids, .{}, .all);
         try res.fact("watch_command", cmd);
-        try block(&res, .{ .name = "watch_command", .body = cmd });
+        if (!pushing()) try block(&res, .{ .name = "watch_command", .body = cmd });
     };
     return res.finish();
 }
@@ -578,22 +586,36 @@ pub fn setTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]con
     }
     service(clock.nowMs());
     var res = Res.init(arena);
-    try res.textf("{s}: {s} set for this session only{s}", .{
-        e.id,
-        if (model != null and effort != null) "model and effort" else if (model != null) "model" else "effort",
-        if (relaunched) " (restarted with it; the conversation was resumed)" else "",
-    });
+    // What took effect: an API app may substitute (a provider default).
+    var current_model: ?[]const u8 = null;
+    var current_effort: ?[]const u8 = null;
+    switch (e.agent.source) {
+        .opencode_api => |*api| {
+            if (api.currentModel()) |m| current_model = try std.fmt.allocPrint(arena, "{s}/{s}", .{ m.provider, m.model });
+            current_effort = api.currentEffort();
+        },
+        .screen => {},
+    }
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.print("{s}:", .{e.id});
+    if (model) |m| try w.print(" model {s}", .{m});
+    if (model != null and effort != null) try w.writeAll(" and");
+    if (effort) |x| try w.print(" effort {s}", .{x});
+    try w.writeAll(" set for this session only");
+    if (relaunched) try w.writeAll(" (restarted with it; the conversation was resumed)");
+    if (current_model != null or current_effort != null) {
+        try w.writeAll("; in effect:");
+        if (current_model) |m| try w.print(" model {s}", .{m});
+        if (current_effort) |x| try w.print(" effort {s}", .{x});
+    }
+    try res.text(aw.written());
     if (model) |m| try res.fact("model", m);
     if (effort) |x| try res.fact("effort", x);
     if (confirmations.items.len > 0) try res.fact("confirmation", try std.mem.join(arena, "\n", confirmations.items));
     try res.fact("relaunched", relaunched);
-    switch (e.agent.source) {
-        .opencode_api => |*api| {
-            if (api.currentModel()) |m| try res.fact("current_model", try std.fmt.allocPrint(arena, "{s}/{s}", .{ m.provider, m.model }));
-            if (api.currentEffort()) |x| try res.fact("current_effort", x);
-        },
-        .screen => {},
-    }
+    if (current_model) |m| try res.fact("current_model", m);
+    if (current_effort) |x| try res.fact("current_effort", x);
     const blocks = [1]Block{.{ .name = "confirmation", .body = try std.mem.join(arena, "\n", confirmations.items) }};
     return finish(arena, &res, e, try pending(arena, e), .{}, blocks[0..@intFromBool(confirmations.items.len > 0)]);
 }
@@ -773,7 +795,8 @@ fn activityRead(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]co
     try w.print("{s} {s}", .{ e.id, @tagName(st) });
     const last_at = if (act_ms > 0) try isoAt(arena, clock.wallOfMono(act_ms)) else null;
     const idle_s: ?i64 = if (act_ms > 0) @divTrunc(@max(0, clock.nowMs() - act_ms), 1000) else null;
-    if (idle_s) |s| try w.print(", last activity {s} ({d}s ago)", .{ clock.isoTime(last_at orelse ""), s }) else try w.writeAll(", no activity yet");
+    var ago_buf: [48]u8 = undefined;
+    if (act_ms > 0) try w.print(", last activity {s} ({s})", .{ clock.isoTime(last_at orelse ""), clock.ago(&ago_buf, clock.nowMs(), act_ms, .short) }) else try w.writeAll(", no activity yet");
     try w.writeAll(if (tools.items.len == 0) "; no tool calls" else "; tools:");
     for (tools.items) |t| try w.print(" {s} {s},", .{ t.name, t.at orelse "?" });
     try res.text(std.mem.trimEnd(u8, aw.written(), ","));
@@ -904,11 +927,23 @@ pub fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             .gone_reason = if (e.gone_why) |g| g.reasonName() else null,
             .lifetime_fenced = if (e.lifetimeFenced()) null else false,
         };
-        try res.textf("{s} ({s}{s}{s}): {s} on {s} in {s}, up {d}s, active {s} ago, {d} undelivered event(s)", .{
-            out.agent,                                                                                                               out.app,                      if (model != null) ", " else "", model orelse "",
-            out.state,                                                                                                               e.host orelse "this machine", out.cwd,                         @divTrunc(@max(0, wall - e.started_ms), 1000),
-            if (out.last_activity_ms) |x| try std.fmt.allocPrint(arena, "{d}s", .{@divTrunc(@max(0, wall - x), 1000)}) else "never", out.pending_events,
-        });
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        var span_buf: [32]u8 = undefined;
+        var ago_buf: [48]u8 = undefined;
+        try w.print("{s}", .{out.agent});
+        if (e.name) |n| try w.print(" ({s})", .{n});
+        try w.print(" ({s}", .{out.app});
+        if (model) |m| try w.print(", {s}", .{m});
+        if (effort) |x| try w.print(", effort {s}", .{x});
+        try w.print("): {s} on {s} in {s}, up {s}", .{ out.state, e.host orelse "this machine", out.cwd, clock.span(&span_buf, wall - e.started_ms, .short) });
+        if (out.last_activity_ms) |x| try w.print(", active {s}", .{clock.ago(&ago_buf, wall, x, .short)}) else try w.writeAll(", never active");
+        try w.print(", {d} undelivered event(s)", .{out.pending_events});
+        if (out.queued_prompts > 0) try w.print(", {d} queued", .{out.queued_prompts});
+        if (out.gone_reason) |r| try w.print(" (gone: {s})", .{r});
+        if (out.relaunchable) |can| try w.print(", {s}", .{if (can) "relaunchable (agent_attach relaunch: true)" else "not relaunchable"});
+        if (e.agent.interaction()) |p| try w.print(", pending {s}: {s}", .{ @tagName(p.kind), agentwait.clip(events.firstLine(p.title), 80) });
+        try res.text(aw.written());
         if (fr.line) |l| try res.textf("{s}: {s}", .{ out.agent, l });
     }
     try hostsReport(arena, &res, until);
@@ -1025,7 +1060,8 @@ fn listCompact(arena: std.mem.Allocator, until: i64, shown: []const *Entry, hidd
         try w.print(" {s} {s} on {s} in {s}", .{ out.app, out.state, out.host, out.cwd });
         if (out.gone_reason) |r| try w.print(" (gone: {s})", .{r});
         if (out.relaunchable) |can| try w.print(", {s}", .{if (can) "relaunchable (agent_attach relaunch: true)" else "not relaunchable"});
-        if (out.idle_s) |x| try w.print(", idle {d}s", .{x});
+        var idle_buf: [32]u8 = undefined;
+        if (act_ms > 0) try w.print(", idle {s}", .{clock.span(&idle_buf, mono - act_ms, .short)});
         if (out.active_at) |hm| try w.print(" (since {s})", .{hm});
         if (out.queued > 0) try w.print(", {d} queued", .{out.queued});
         if (fr.line) |l| try w.print(", {s}", .{l});
