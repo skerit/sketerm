@@ -797,16 +797,6 @@ pub fn main() !u8 {
         screen.hints_overlay = &.{};
         parser.advance("\x1b[0m\x1b[2J\x1b[H", Emit.cb, @ptrCast(&ec));
 
-        // Stage A: rect high above the baseline (y 250..450 of upm
-        // 1000) at U+F0100 (plane-15 PUA: no system font covers it,
-        // so the post-clear fallback below is honest tofu).
-        const rect_hi = try helpers.rectGlyf(allocator, 0, 250, 1000, 450);
-        defer allocator.free(rect_hi);
-        const apc_hi = try helpers.registerApc(allocator, 0xF0100, "", rect_hi);
-        defer allocator.free(apc_hi);
-        parser.advance(apc_hi, Emit.cb, @ptrCast(&ec));
-        parser.advance("\x1b[1;1H\u{F0100}", Emit.cb, @ptrCast(&ec));
-
         const render = struct {
             fn go(cp_: *CellPass, sc: *Screen, pl: *StylePool, at: *Atlas, fbuf: []u8) !void {
                 // Caller has the offscreen FBO bound; keep it.
@@ -820,8 +810,30 @@ pub fn main() !u8 {
             }
         }.go;
 
+        // Stage C asserts a cleared slot falls back to tofu, which holds
+        // only while no installed font covers the fixture codepoint (Nerd
+        // Fonts cover plane 15 from U+F0001): prove it here, unregistered.
+        parser.advance("\x1b[1;1H\u{10FF00}", Emit.cb, @ptrCast(&ec));
         // The offscreen FBO from the top of main is still what we
         // want to render into (id in `fbo`).
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+        try render(&cell_pass, screen, &pool, atlas.?, fb);
+        const pre_stats = helpers.stats(fb, padu, padu, cw, chh);
+        std.debug.print("smoke-cell: glyph-protocol unregistered lit={d}\n", .{pre_stats.count});
+        if (pre_stats.count >= 4) {
+            std.debug.print("smoke-cell: FAIL — an installed font covers fixture U+10FF00; the glyph-protocol stages need an uncovered codepoint\n", .{});
+            return 39;
+        }
+
+        // Stage A: rect high above the baseline (y 250..450 of upm
+        // 1000) at U+10FF00 (plane-16 PUA, uncovered as just proven).
+        const rect_hi = try helpers.rectGlyf(allocator, 0, 250, 1000, 450);
+        defer allocator.free(rect_hi);
+        const apc_hi = try helpers.registerApc(allocator, 0x10FF00, "", rect_hi);
+        defer allocator.free(apc_hi);
+        parser.advance(apc_hi, Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[1;1H\u{10FF00}", Emit.cb, @ptrCast(&ec));
+
         c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
         try render(&cell_pass, screen, &pool, atlas.?, fb);
         const a_stats = helpers.stats(fb, padu, padu, cw, chh);
@@ -838,7 +850,7 @@ pub fn main() !u8 {
         // must move DOWN the screen (also proves the Y-flip is right).
         const rect_lo = try helpers.rectGlyf(allocator, 0, -50, 1000, 150);
         defer allocator.free(rect_lo);
-        const apc_lo = try helpers.registerApc(allocator, 0xF0100, "", rect_lo);
+        const apc_lo = try helpers.registerApc(allocator, 0x10FF00, "", rect_lo);
         defer allocator.free(apc_lo);
         parser.advance(apc_lo, Emit.cb, @ptrCast(&ec));
         c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
@@ -857,8 +869,8 @@ pub fn main() !u8 {
         }
 
         // Stage C: clear the slot; the cell must fall back to tofu
-        // (U+F0100 has no system-font coverage — the cell goes dark).
-        parser.advance("\x1b_25a1;c;cp=F0100\x1b\\", Emit.cb, @ptrCast(&ec));
+        // (U+10FF00 has no system-font coverage — the cell goes dark).
+        parser.advance("\x1b_25a1;c;cp=10FF00\x1b\\", Emit.cb, @ptrCast(&ec));
         c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
         try render(&cell_pass, screen, &pool, atlas.?, fb);
         const c_stats = helpers.stats(fb, padu, padu, cw, chh);
@@ -871,10 +883,10 @@ pub fn main() !u8 {
         // Stage D: width=2 paints across two cells (layout stays 1).
         const rect_wide = try helpers.rectGlyf(allocator, 0, 100, 2000, 500);
         defer allocator.free(rect_wide);
-        const apc_wide = try helpers.registerApc(allocator, 0xF0101, ";width=2", rect_wide);
+        const apc_wide = try helpers.registerApc(allocator, 0x10FF01, ";width=2", rect_wide);
         defer allocator.free(apc_wide);
         parser.advance(apc_wide, Emit.cb, @ptrCast(&ec));
-        parser.advance("\x1b[3;1H\u{F0101}", Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[3;1H\u{10FF01}", Emit.cb, @ptrCast(&ec));
         c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
         try render(&cell_pass, screen, &pool, atlas.?, fb);
         const d_first = helpers.stats(fb, padu, padu + 2 * chh, cw, chh);
@@ -888,7 +900,7 @@ pub fn main() !u8 {
         // Stage E: the GridPass overlay path (a row containing RTL is
         // routed there) must resolve the glossary too. Hebrew aleph +
         // the wide glyph on row 5.
-        parser.advance("\x1b[5;1H\u{05D0} \u{F0101}", Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[5;1H\u{05D0} \u{10FF01}", Emit.cb, @ptrCast(&ec));
         c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
         try render(&cell_pass, screen, &pool, atlas.?, fb);
         try grid_pass.buildVertices(screen, &pool, atlas.?, false, true, &.{});
@@ -978,10 +990,10 @@ pub fn main() !u8 {
             .{ .glyph = 1, .palette = 1 },
         }, &.{ 0xFF0000FF, 0x00FF00FF });
         defer allocator.free(two_layer);
-        const apc_colr = try colr_helpers.registerColrApc(allocator, 0xF0102, two_layer);
+        const apc_colr = try colr_helpers.registerColrApc(allocator, 0x10FF02, two_layer);
         defer allocator.free(apc_colr);
         parser.advance(apc_colr, Emit.cb, @ptrCast(&ec));
-        parser.advance("\x1b[2;1H\u{F0102}", Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[2;1H\u{10FF02}", Emit.cb, @ptrCast(&ec));
         c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
         try render(&cell_pass, screen, &pool, atlas.?, fb);
         const g_x0 = padu;
@@ -1007,10 +1019,10 @@ pub fn main() !u8 {
             .{ .glyph = 0, .palette = gp.PALETTE_FOREGROUND },
         }, &.{});
         defer allocator.free(fg_container);
-        const apc_fg = try colr_helpers.registerColrApc(allocator, 0xF0103, fg_container);
+        const apc_fg = try colr_helpers.registerColrApc(allocator, 0x10FF03, fg_container);
         defer allocator.free(apc_fg);
         parser.advance(apc_fg, Emit.cb, @ptrCast(&ec));
-        parser.advance("\x1b[4;1H\x1b[38;2;255;0;0m\u{F0103}\x1b[4;3H\x1b[38;2;0;0;255m\u{F0103}\x1b[0m", Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[4;1H\x1b[38;2;255;0;0m\u{10FF03}\x1b[4;3H\x1b[38;2;0;0;255m\u{10FF03}\x1b[0m", Emit.cb, @ptrCast(&ec));
         c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
         try render(&cell_pass, screen, &pool, atlas.?, fb);
         const fg_y = padu + 3 * chh + chh / 2;
@@ -1076,7 +1088,7 @@ pub fn main() !u8 {
         const i_root = gpv.V1Node{ .glyph = .{ .glyph_id = 0, .child = &i_lin } };
         const i_container = try gpv.colr1ContainerBytes(allocator, &.{cover}, i_root, &.{ 0xFF0000FF, 0x0000FFFF }, null);
         defer allocator.free(i_container);
-        const apc_i = try v1_helpers.registerV1Apc(allocator, 0xF0104, i_container);
+        const apc_i = try v1_helpers.registerV1Apc(allocator, 0x10FF04, i_container);
         defer allocator.free(apc_i);
 
         // Stage J: radial red centre → blue rim, centred in the cell.
@@ -1094,7 +1106,7 @@ pub fn main() !u8 {
         const j_root = gpv.V1Node{ .glyph = .{ .glyph_id = 0, .child = &j_rad } };
         const j_container = try gpv.colr1ContainerBytes(allocator, &.{cover}, j_root, &.{ 0xFF0000FF, 0x0000FFFF }, null);
         defer allocator.free(j_container);
-        const apc_j = try v1_helpers.registerV1Apc(allocator, 0xF0105, j_container);
+        const apc_j = try v1_helpers.registerV1Apc(allocator, 0x10FF05, j_container);
         defer allocator.free(apc_j);
 
         // Stage K: PaintComposite PLUS of a green source over a red
@@ -1107,7 +1119,7 @@ pub fn main() !u8 {
         const k_root = gpv.V1Node{ .composite = .{ .source = &k_src, .mode = 12, .backdrop = &k_back } };
         const k_container = try gpv.colr1ContainerBytes(allocator, &.{cover}, k_root, &.{ 0xFF0000FF, 0x00FF00FF }, null);
         defer allocator.free(k_container);
-        const apc_k = try v1_helpers.registerV1Apc(allocator, 0xF0106, k_container);
+        const apc_k = try v1_helpers.registerV1Apc(allocator, 0x10FF06, k_container);
         defer allocator.free(apc_k);
 
         // Stage L: the 0xFFFF sentinel DEEP in a v1 graph (glyph →
@@ -1116,7 +1128,7 @@ pub fn main() !u8 {
         const l_root = gpv.V1Node{ .glyph = .{ .glyph_id = 0, .child = &l_solid } };
         const l_container = try gpv.colr1ContainerBytes(allocator, &.{cover}, l_root, &.{}, null);
         defer allocator.free(l_container);
-        const apc_l = try v1_helpers.registerV1Apc(allocator, 0xF0107, l_container);
+        const apc_l = try v1_helpers.registerV1Apc(allocator, 0x10FF07, l_container);
         defer allocator.free(apc_l);
 
         // Stage M: sweep gradient — cairo has no sweep shader, so the
@@ -1130,7 +1142,7 @@ pub fn main() !u8 {
         const m_root = gpv.V1Node{ .glyph = .{ .glyph_id = 0, .child = &m_sweep } };
         const m_container = try gpv.colr1ContainerBytes(allocator, &.{cover}, m_root, &.{ 0xFF0000FF, 0x00FF00FF }, null);
         defer allocator.free(m_container);
-        const apc_m = try v1_helpers.registerV1Apc(allocator, 0xF0108, m_container);
+        const apc_m = try v1_helpers.registerV1Apc(allocator, 0x10FF08, m_container);
         defer allocator.free(apc_m);
 
         // Register everything, lay the five rows out, render once.
@@ -1139,11 +1151,11 @@ pub fn main() !u8 {
         parser.advance(apc_k, Emit.cb, @ptrCast(&ec));
         parser.advance(apc_l, Emit.cb, @ptrCast(&ec));
         parser.advance(apc_m, Emit.cb, @ptrCast(&ec));
-        parser.advance("\x1b[0m\x1b[2J\x1b[H\u{F0104}", Emit.cb, @ptrCast(&ec));
-        parser.advance("\x1b[2;1H\u{F0105}", Emit.cb, @ptrCast(&ec));
-        parser.advance("\x1b[3;1H\u{F0106}", Emit.cb, @ptrCast(&ec));
-        parser.advance("\x1b[4;1H\x1b[38;2;255;0;0m\u{F0107}\x1b[4;3H\x1b[38;2;0;0;255m\u{F0107}\x1b[0m", Emit.cb, @ptrCast(&ec));
-        parser.advance("\x1b[5;1H\u{F0108}", Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[0m\x1b[2J\x1b[H\u{10FF04}", Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[2;1H\u{10FF05}", Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[3;1H\u{10FF06}", Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[4;1H\x1b[38;2;255;0;0m\u{10FF07}\x1b[4;3H\x1b[38;2;0;0;255m\u{10FF07}\x1b[0m", Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[5;1H\u{10FF08}", Emit.cb, @ptrCast(&ec));
         c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
         try render(&cell_pass, screen, &pool, atlas.?, fb);
 
