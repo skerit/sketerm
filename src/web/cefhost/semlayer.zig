@@ -126,6 +126,26 @@ fn postActFor(self: *Host, v: *View, p: *const Pending, ok: u8, msg: []const u8)
     } else self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = ok, .msg = msg });
 }
 
+/// `on <role> "<name>" ` for the element `sid` names; empty when the
+/// tree no longer describes it.
+fn targetPhrase(v: *View, sid: u32, buf: []u8) []const u8 {
+    const d = v.sem.describe(sid) orelse return "";
+    return std.fmt.bufPrint(buf, "on {s} \"{s}\" ", .{ d.role, d.name[0..@min(d.name.len, 96)] }) catch "";
+}
+
+/// Refuse the set-value `p`, naming the action and its target. It takes
+/// no value on purpose: what the caller asked to enter (a password, a
+/// token) never reaches an error message.
+fn postSetValueRefusal(self: *Host, v: *View, p: *const Pending, why: []const u8) void {
+    var target_buf: [140]u8 = undefined;
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "set_value {s}refused: {s}", .{
+        targetPhrase(v, p.sid, &target_buf),
+        why[0..@min(why.len, 340)],
+    }) catch "set_value refused";
+    postActFor(self, v, p, 0, msg);
+}
+
 pub fn takePending(self: *Host, v: *View, req: u32) ?Pending {
     if (req == 0) return null;
     for (v.pending.items, 0..) |p, i| {
@@ -1207,10 +1227,7 @@ pub fn onRect(self: *Host, v: *View, p: *Pending, json: []const u8) void {
     // Echo WHAT the id resolved to, not only where the pointer
     // went: a mis-resolved id is invisible in bare coordinates.
     var target_buf: [140]u8 = undefined;
-    const target: []const u8 = if (v.sem.describe(p.sid)) |d|
-        std.fmt.bufPrint(&target_buf, "on {s} \"{s}\" ", .{ d.role, d.name[0..@min(d.name.len, 96)] }) catch ""
-    else
-        "";
+    const target = targetPhrase(v, p.sid, &target_buf);
     // ...and WHERE: with N identical "Edit" buttons the target alone
     // is the same string for the wrong row and the right one.
     var ctx_buf: [160]u8 = undefined;
@@ -1254,14 +1271,14 @@ pub fn onOptionRect(self: *Host, v: *View, p: *Pending, json: []const u8) void {
     };
     const r = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
     defer r.deinit();
-    var buf: [512]u8 = undefined;
     if (r.value.ok == 0) {
-        const msg = std.fmt.bufPrint(
+        var buf: [400]u8 = undefined;
+        const why = std.fmt.bufPrint(
             &buf,
-            "no option matched \"{s}\" in the opened dropdown; options seen: {s}",
-            .{ p.arg[0..@min(p.arg.len, 96)], r.value.seen[0..@min(r.value.seen.len, 300)] },
-        ) catch "no matching option in the opened dropdown";
-        postActFor(self, v, p, 0, msg);
+            "no option of the opened dropdown matches the requested value; options seen: {s}",
+            .{r.value.seen[0..@min(r.value.seen.len, 300)]},
+        ) catch "no option of the opened dropdown matches the requested value";
+        postSetValueRefusal(self, v, p, why);
         return;
     }
     const picked = self.gpa.dupe(u8, r.value.text) catch return;
@@ -1398,7 +1415,7 @@ pub fn onSetValue(self: *Host, v: *View, p: *Pending, json: []const u8) void {
     const s = std.json.parseFromSlice(S, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
     defer s.deinit();
     if (s.value.ok == 0) {
-        self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 0, .msg = s.value.msg });
+        postSetValueRefusal(self, v, p, s.value.msg);
         return;
     }
     if (s.value.custom != 0) {

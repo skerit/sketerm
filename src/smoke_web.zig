@@ -10903,6 +10903,31 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             std.debug.print("smoke-web: title was \"{s}\"\n", .{cl.titleSlice()});
             fail("stage 16 dropdown: the custom option was never clicked (or the click was not trusted)");
         }
+
+        // A value no option matches is refused naming the action, the
+        // target and the options, never the value itself: it may be a
+        // secret the caller meant for a different field.
+        const secret = "Atlantis-7Q";
+        for ([_]struct { id: u32, target: []const u8, options: []const u8 }{
+            .{ .id = native_id, .target = "set_value on combobox \"Country\" refused: ", .options = "Netherlands" },
+            .{ .id = combo_id, .target = "set_value on combobox ", .options = "Banana" },
+        }) |case| {
+            const seq = cl.act_seq;
+            cl.send(proto.SemAction{
+                .view = view_id,
+                .id = case.id,
+                .action = @intFromEnum(proto.SemAct.set_value),
+                .arg = secret,
+            });
+            if (!cl.waitSeq(&cl.act_seq, seq, 20_000)) fail("stage 16 dropdown: no result for an unmatched value");
+            const msg = cl.act_msg[0..cl.act_msg_len];
+            if (cl.act_ok != 0 or !std.mem.startsWith(u8, msg, case.target) or
+                std.mem.indexOf(u8, msg, case.options) == null or std.mem.indexOf(u8, msg, secret) != null)
+            {
+                std.debug.print("smoke-web: act said \"{s}\"\n", .{msg});
+                fail("stage 16 dropdown: an unmatched value was not refused by target, or the refusal echoed it");
+            }
+        }
     }
     pass("stage 16 dropdowns (native select by text, custom ARIA listbox, both trusted)");
 

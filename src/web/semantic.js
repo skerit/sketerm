@@ -1244,7 +1244,7 @@
         req: req,
         ok: 0,
         typeable: 0,
-        msg: 'no option matches "' + arg + '"; visible options: ' + optionTexts(opts, 12).join(" | ")
+        msg: "no option matches the requested value; visible options: " + optionTexts(opts, 12).join(" | ")
       });
     }
     try {
@@ -1392,7 +1392,10 @@
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
     } catch (e) {
-      return send({ op: "setvalue", req: req, ok: 0, typeable: 0, msg: String(e) });
+      // The name only: an engine's message for a refused assignment can
+      // quote the value, and the value never goes into an error.
+      var why = "assigning the value threw " + (e && e.name ? e.name : "an exception");
+      return send({ op: "setvalue", req: req, ok: 0, typeable: 0, msg: why });
     }
     send({ op: "setvalue", req: req, ok: 1, typeable: 0, msg: "" });
   }
