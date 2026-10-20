@@ -343,18 +343,32 @@
     return "";
   }
 
-  // A password's CURRENT VALUE never leaves the page: the agent-facing
-  // answer is its length, which is all a "did the fill land" check
-  // needs (the old browser_form_state made the same call).
+  // A secret field's CURRENT VALUE never leaves the page: the
+  // agent-facing answer is its length, which is all a "did the fill
+  // land" check needs (the old browser_form_state made the same call).
+  // A field is secret when it is a password input or the page marks it
+  // with one of these autocomplete tokens, so a show-password toggle
+  // that flips type=text keeps it masked.
+  var SECRET_AUTOCOMPLETE = { "current-password": 1, "new-password": 1, "one-time-code": 1, "cc-csc": 1 };
+  function secretField(el) {
+    if (!el || (el.tagName !== "INPUT" && el.tagName !== "TEXTAREA")) return false;
+    if (el.tagName === "INPUT" && (el.getAttribute("type") || "").toLowerCase() === "password") return true;
+    var tokens = (el.getAttribute("autocomplete") || "").toLowerCase().split(/\s+/);
+    for (var i = 0; i < tokens.length; i++) if (SECRET_AUTOCOMPLETE[tokens[i]] === 1) return true;
+    return false;
+  }
+  function secretChars(value) {
+    return Array.from(String(value || "")).length;
+  }
   function valueOf(el) {
     var tag = el.tagName;
+    if (secretField(el)) {
+      var n = secretChars(el.value);
+      return n ? "(" + n + " chars)" : "";
+    }
     if (tag === "INPUT") {
       var t = (el.getAttribute("type") || "text").toLowerCase();
       if (t === "checkbox" || t === "radio") return "";
-      if (t === "password") {
-        var n = String(el.value || "").length;
-        return n ? "(" + n + " chars)" : "";
-      }
       return String(el.value || "").slice(0, VALUE_CLAMP);
     }
     if (tag === "TEXTAREA") return String(el.value || "").slice(0, VALUE_CLAMP);
@@ -1442,7 +1456,12 @@
       try {
         read.dispatchEvent(new Event("change", { bubbles: true }));
       } catch (e) {}
-      send({ op: "ack", req: req, ok: 1, msg: value, note: note });
+      // A secret field answers its length only, the same as a snapshot.
+      if (secretField(read) || secretField(el)) {
+        send({ op: "ack", req: req, ok: 1, msg: "", secret: 1, chars: secretChars(value), note: note });
+      } else {
+        send({ op: "ack", req: req, ok: 1, msg: value, note: note });
+      }
     }
     attempt();
   }

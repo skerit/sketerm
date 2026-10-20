@@ -213,6 +213,7 @@ const csp_header =
     "Content-Security-Policy: script-src 'self' 'unsafe-inline'; object-src 'none'\r\n";
 const input_page =
     "data:text/html,<body><input%20id=i%20autofocus%20" ++
+    "onfocus=%22document.title='focused'%22%20" ++
     "oninput=%22document.title='typed:'+this.value%22></body>";
 /// Opens a popup with NO user interaction behind it — the pop-under
 /// case the GUI's default policy blocks. `window.open` from a load
@@ -467,6 +468,7 @@ const validation_page =
     "data:text/html,<html><body><form>" ++
     "<label%20for=em>Email</label><input%20id=em%20type=email%20required%20value=nope>" ++
     "<label%20for=pw>Password</label><input%20id=pw%20type=password%20value=hunter22>" ++
+    "<label%20for=otp>Code</label><input%20id=otp%20autocomplete=one-time-code>" ++
     "<label%20for=tos>Terms</label><input%20id=tos%20type=checkbox%20checked>" ++
     "<button%20id=dis%20disabled>Submit</button>" ++
     "</form></body></html>";
@@ -3898,7 +3900,10 @@ fn runLifecycleStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8
     policy.max_requests = 500;
     cl.send(policy);
     const allowed = cl.evalWaitView(popup, "fetch(location.href).then(r=>r.status)", true, 15_000);
-    if (std.mem.indexOf(u8, allowed, "\"value\":200") == null) fail("lifecycle: replacing opener policy damaged popup policy");
+    if (std.mem.indexOf(u8, allowed, "\"value\":200") == null) {
+        std.debug.print("smoke-web: the popup's fetch answered {s}\n", .{allowed});
+        fail("lifecycle: replacing opener policy damaged popup policy");
+    }
     const blocked = cl.evalWaitView(popup, "fetch('http://forbidden.invalid/').then(()=> 'bad',()=> 'blocked')", true, 15_000);
     if (std.mem.indexOf(u8, blocked, "blocked") == null) fail("lifecycle: popup lost inherited host restrictions");
     var narrowed = policy;
@@ -9840,6 +9845,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // ── Stage 4: keyboard text entry ──────────────────────────────
     cl.navigate(input_page);
     cl.send(proto.InputFocus{ .view = view_id, .focused = 1 });
+    // Autofocus lands asynchronously after load: keys sent before the
+    // input holds focus go nowhere (seen once under load).
+    if (!cl.waitTitle("focused", 15_000)) {
+        std.debug.print("smoke-web: title was \"{s}\"\n", .{cl.titleSlice()});
+        fail("stage 4 typing: the autofocused input never took focus");
+    }
     cl.typeKey(0x68, "h");
     cl.typeKey(0x69, "i");
     if (!cl.waitTitle("typed:hi", 15_000)) {
@@ -10960,8 +10971,44 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             std.debug.print("smoke-web: password line was: {s}\n", .{pw});
             fail("stage 17 form state: the password length is not reported");
         }
+
+        // set_value into a secret field answers its length, never the
+        // value; a snapshot after it carries the length only as well.
+        // The code field is secret by its autocomplete token alone.
+        for ([_]struct { needle: []const u8, secret: []const u8, said: []const u8 }{
+            .{ .needle = "textbox \"Password\"", .secret = "Zephyr-91x", .said = "set-value ok, secret field, 10 characters set" },
+            .{ .needle = "textbox \"Code\"", .secret = "Quokka-552", .said = "set-value ok, secret field, 10 characters set" },
+        }) |case| {
+            const id = cl.idOfLine(case.needle) orelse fail("stage 17 form state: no id for a secret field");
+            const seq = cl.act_seq;
+            cl.send(proto.SemAction{
+                .view = view_id,
+                .id = id,
+                .action = @intFromEnum(proto.SemAct.set_value),
+                .arg = case.secret,
+            });
+            if (!cl.waitSeq(&cl.act_seq, seq, 20_000)) fail("stage 17 form state: no set_value result for a secret field");
+            const msg = cl.act_msg[0..cl.act_msg_len];
+            if (cl.act_ok != 1 or !std.mem.startsWith(u8, msg, case.said) or std.mem.indexOf(u8, msg, case.secret) != null) {
+                std.debug.print("smoke-web: set_value said \"{s}\"\n", .{msg});
+                fail("stage 17 form state: a secret field's set_value result did not report a length only");
+            }
+        }
+        cl.resetSem();
+        cl.snapshot(1, 1);
+        if (!cl.waitSem("textbox \"Code\"", 20_000)) fail("stage 17 form state: no snapshot after the secret fills");
+        const after = cl.semLog();
+        if (std.mem.indexOf(u8, after, "Zephyr-91x") != null or std.mem.indexOf(u8, after, "Quokka-552") != null) {
+            std.debug.print("smoke-web: snapshot was:\n{s}\n", .{after});
+            fail("stage 17 form state: a snapshot carried a secret field's value");
+        }
+        const code = lineContaining(after, "textbox \"Code\"") orelse fail("stage 17 form state: no code line");
+        if (std.mem.indexOf(u8, code, "(10 chars)") == null) {
+            std.debug.print("smoke-web: code line was: {s}\n", .{code});
+            fail("stage 17 form state: the secret code's length is not reported");
+        }
     }
-    pass("stage 17 form validation state (required/invalid/checked/disabled, masked password)");
+    pass("stage 17 form validation state (required/invalid/checked/disabled, masked secrets, length-only set_value)");
 
     // ── Stage 18: HiDPI — physical buffer, logical input ────────────
     //

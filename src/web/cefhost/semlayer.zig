@@ -998,20 +998,25 @@ pub fn onScriptMessage(self: *Host, v: *View, json: []const u8) void {
     } else if (std.mem.eql(u8, op, "setvalue")) {
         self.onSetValue(v, &p, json);
     } else if (std.mem.eql(u8, op, "ack")) {
-        const Ack = struct { ok: u8 = 0, msg: []const u8 = "", note: []const u8 = "" };
+        const Ack = struct { ok: u8 = 0, msg: []const u8 = "", note: []const u8 = "", secret: u8 = 0, chars: u32 = 0 };
         const a = std.json.parseFromSlice(Ack, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
         defer a.deinit();
         var buf: [512]u8 = undefined;
+        // A secret field's read-back is its length only: the page never
+        // sends its value, and the result never echoes what was typed.
+        var landed_buf: [160]u8 = undefined;
+        const landed: []const u8 = if (a.value.secret != 0)
+            std.fmt.bufPrint(&landed_buf, "secret field, {d} characters set, value not shown", .{a.value.chars}) catch "secret field, value not shown"
+        else
+            std.fmt.bufPrint(&landed_buf, "value=\"{s}\"", .{a.value.msg[0..@min(a.value.msg.len, 128)]}) catch "value not shown";
         const msg = switch (p.kind) {
             .commit => if (a.value.note.len > 0)
-                std.fmt.bufPrint(&buf, "set-value ok, value=\"{s}\" ({s})", .{
-                    a.value.msg[0..@min(a.value.msg.len, 128)],
+                std.fmt.bufPrint(&buf, "set-value ok, {s} ({s})", .{
+                    landed,
                     a.value.note[0..@min(a.value.note.len, 160)],
-                }) catch a.value.msg
+                }) catch "set-value ok"
             else
-                std.fmt.bufPrint(&buf, "set-value ok, value=\"{s}\"", .{
-                    a.value.msg[0..@min(a.value.msg.len, 128)],
-                }) catch a.value.msg,
+                std.fmt.bufPrint(&buf, "set-value ok, {s}", .{landed}) catch "set-value ok",
             .choose_done => std.fmt.bufPrint(
                 &buf,
                 "custom dropdown: clicked option \"{s}\" (trusted); control now \"{s}\"",
