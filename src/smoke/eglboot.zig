@@ -14,9 +14,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 
-const c_egl = @cImport({
-    @cInclude("epoxy/egl.h");
-});
+const c_egl = @import("egl");
 
 /// Which client API the context binds. `gl33_core` exists for
 /// smoke-gl-core, which compiles every shader the way macOS desktop GL

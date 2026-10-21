@@ -57,11 +57,7 @@ fn onImage(_: ?*anyopaque, ev: Screen.ImageEvent) void {
     });
 }
 
-// libc file IO — the Zig 0.16 std.fs/Io API churns; the project
-// reads files through libc everywhere (see config.zig).
-const cstd = @cImport({
-    @cInclude("stdio.h");
-});
+const cstd = @import("c.zig").c;
 
 /// Whole-file read; null (after printing why) when it cannot be read.
 fn readFile(allocator: std.mem.Allocator, path: [:0]const u8) !?[]u8 {

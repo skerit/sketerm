@@ -48,12 +48,7 @@ const structure = @import("structure.zig");
 const FoldRegion = structure.FoldRegion;
 const BracketPair = structure.BracketPair;
 
-/// Plain-C header; safe for the in-process `@cImport` that GTK headers
-/// crash (see CLAUDE.md — the out-of-process TranslateC step exists for
-/// gtk/gdk, not for every C dependency).
-const ts = @cImport({
-    @cInclude("tree_sitter/api.h");
-});
+const ts = @import("tree_sitter");
 
 const languages = @import("languages.zig");
 pub const Grammar = @import("grammars.zig").Grammar;

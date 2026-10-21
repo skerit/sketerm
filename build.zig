@@ -182,6 +182,7 @@ pub fn build(b: *std.Build) void {
     // editor's syntax highlighting. Built once and linked into the
     // GUI-side artifacts only — see `buildTreeSitter`/`addTreeSitter`.
     const tree_sitter = buildTreeSitter(b, target, optimize, use_lld);
+    const egl_mod = buildEglBindings(b, target, optimize);
 
     const bin_deps: BinDeps = .{
         .target = target,
@@ -614,7 +615,7 @@ pub fn build(b: *std.Build) void {
     configureSysDeps(b, smoke_mod, cbindings_mod);
     smoke_mod.addImport("build_options", dev.glib_opts);
     addVideo(b, smoke_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-    smoke_mod.linkSystemLibrary("EGL", .{});
+    addEgl(smoke_mod, egl_mod);
     const smoke = dev.executable(b, "sketerm-smoke-image", smoke_mod);
     const smoke_run = b.addRunArtifact(smoke);
     const smoke_step = b.step("smoke-image", "Headless GL image render check");
@@ -793,7 +794,7 @@ pub fn build(b: *std.Build) void {
     configureSysDeps(b, smoke_cell_mod, cbindings_mod);
     smoke_cell_mod.addImport("build_options", dev.glib_opts);
     addVideo(b, smoke_cell_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-    smoke_cell_mod.linkSystemLibrary("EGL", .{});
+    addEgl(smoke_cell_mod, egl_mod);
     // The shipped CRT shader, embedded so the smoke test compiles
     // and runs the REAL file (data/ is outside the module root).
     smoke_cell_mod.addAnonymousImport("crt_glsl", .{
@@ -831,7 +832,7 @@ pub fn build(b: *std.Build) void {
     configureSysDeps(b, bench_cell_mod, cbindings_mod);
     bench_cell_mod.addImport("build_options", glib_opts_mod);
     addVideo(b, bench_cell_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-    bench_cell_mod.linkSystemLibrary("EGL", .{});
+    addEgl(bench_cell_mod, egl_mod);
     const bench_cell = b.addExecutable(.{
         .name = "sketerm-bench-cell-upload",
         .root_module = bench_cell_mod,
@@ -851,7 +852,7 @@ pub fn build(b: *std.Build) void {
     configureSysDeps(b, smoke_trans_mod, cbindings_mod);
     smoke_trans_mod.addImport("build_options", dev.glib_opts);
     addVideo(b, smoke_trans_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-    smoke_trans_mod.linkSystemLibrary("EGL", .{});
+    addEgl(smoke_trans_mod, egl_mod);
     const smoke_trans = dev.executable(b, "sketerm-smoke-transparency", smoke_trans_mod);
     const smoke_trans_run = b.addRunArtifact(smoke_trans);
     const smoke_trans_step = b.step("smoke-transparency", "Headless GL bg-alpha render check");
@@ -868,7 +869,7 @@ pub fn build(b: *std.Build) void {
     configureSysDeps(b, smoke_editor_mod, cbindings_mod);
     smoke_editor_mod.addImport("build_options", dev.glib_opts);
     addVideo(b, smoke_editor_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-    smoke_editor_mod.linkSystemLibrary("EGL", .{});
+    addEgl(smoke_editor_mod, egl_mod);
     addTreeSitter(b, smoke_editor_mod, tree_sitter);
     const smoke_editor = dev.executable(b, "sketerm-smoke-editor", smoke_editor_mod);
     const smoke_editor_run = b.addRunArtifact(smoke_editor);
@@ -887,7 +888,7 @@ pub fn build(b: *std.Build) void {
     configureSysDeps(b, smoke_core_mod, cbindings_mod);
     smoke_core_mod.addImport("build_options", dev.glib_opts);
     addVideo(b, smoke_core_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
-    smoke_core_mod.linkSystemLibrary("EGL", .{});
+    addEgl(smoke_core_mod, egl_mod);
     smoke_core_mod.addAnonymousImport("crt_glsl", .{
         .root_source_file = b.path("data/shaders/crt.glsl"),
     });
@@ -2156,6 +2157,8 @@ const TreeSitter = struct {
     libs: [1 + ts_grammars.COUNT]*std.Build.Step.Compile,
     /// Unpacked upstream trees, indexed by `ts_grammars.Upstream`.
     trees: [std.enums.values(ts_grammars.Upstream).len]std.Build.LazyPath,
+    /// `tree_sitter/api.h` translated out of process (Zig 0.17 removed `@cImport`).
+    bindings: *std.Build.Module,
 };
 
 /// Downloads one pinned upstream archive and unpacks it into a cached
@@ -2202,6 +2205,13 @@ fn buildTreeSitter(
     use_lld: bool,
 ) TreeSitter {
     var out: TreeSitter = undefined;
+    const api = b.addTranslateC(.{
+        .root_source_file = b.path("vendor/tree-sitter/lib/include/tree_sitter/api.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    out.bindings = api.createModule();
     for (std.enums.values(ts_grammars.Upstream), 0..) |up, i| out.trees[i] = fetchGrammar(b, up);
 
     const rt_mod = b.createModule(.{
@@ -2255,6 +2265,7 @@ fn buildTreeSitter(
 fn addTreeSitter(b: *std.Build, mod: *std.Build.Module, ts: TreeSitter) void {
     mod.addIncludePath(b.path("vendor/tree-sitter/lib/include"));
     for (ts.libs) |lib| mod.linkLibrary(lib);
+    mod.addImport("tree_sitter", ts.bindings);
     // The highlight queries ride along as embedded assets. They live in
     // the fetched trees, outside the source module root, so @embedFile
     // needs an anonymous import (same trick as the CRT shaders in
@@ -2265,6 +2276,28 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module, ts: TreeSitter) void {
             .root_source_file = ts.trees[@intFromEnum(src.upstream)].path(b, src.path),
         });
     }
+}
+
+/// Link EGL and expose epoxy's `<epoxy/egl.h>` as `@import("egl")` for the
+/// headless GL rigs (`src/smoke/eglboot.zig`); Zig 0.17 removed `@cImport`.
+fn addEgl(mod: *std.Build.Module, egl: *std.Build.Module) void {
+    mod.linkSystemLibrary("EGL", .{});
+    mod.addImport("egl", egl);
+}
+
+fn buildEglBindings(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    const tc = b.addTranslateC(.{
+        .root_source_file = b.path("vendor/cimport_egl.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    tc.linkSystemLibrary("epoxy", .{ .use_pkg_config = compat.pkg_config_required });
+    return tc.createModule();
 }
 
 /// The video-tile codec configuration `configureVideo` resolved.
