@@ -198,8 +198,7 @@ pub fn handleSend(d: *Daemon, cl: *Client, payload: []const u8) void {
         defer arena.deinit();
         const m = s.sendMany(arena.allocator(), cl.id, req, clock.wallMs(), &id_buf) catch |e| return cl.queueErrFor(failed.text(e), "peer_send");
         if (m.deferred) return;
-        const first = if (m.results.len > 0) m.results[0] else peermail.RecipientResult{ .to = "", .outcome = .refused };
-        cl.queueJson(.peer_send_reply, s.replyFor(cl.id, .{ .req = req.req, .id = m.id, .outcome = first.outcome, .reason = first.reason, .to_state = first.to_state, .to_polls = first.to_polls, .to_no_mcp = first.to_no_mcp, .results = m.results }));
+        cl.queueJson(.peer_send_reply, s.replyFor(cl.id, peermail.SendReply.list(req.req, m.id, m.results)));
         return;
     }
     const r = s.send(cl.id, req, clock.wallMs(), &id_buf) catch |e| return cl.queueErrFor(failed.text(e), "peer_send");
@@ -212,6 +211,7 @@ pub fn handleSend(d: *Daemon, cl: *Client, payload: []const u8) void {
         .to_state = r.to_state,
         .to_polls = r.to_polls,
         .to_no_mcp = r.to_no_mcp,
+        .duplicate = r.duplicate,
     }));
 }
 

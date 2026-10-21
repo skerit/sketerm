@@ -184,6 +184,19 @@ pub const Flag = enum {
     /// older daemon answers an unknown frame with `.err`); its links are
     /// live until the transport closes, as before.
     peer_link_beat,
+    /// The broker does not send a message again when the same sender sent
+    /// the same text to the same recipient within `peermail.DUP_WINDOW_MS`:
+    /// it answers that send's id and outcome with `duplicate` (in
+    /// `peer_send_reply` and per `results` entry, where `id` names the
+    /// earlier send when it differs from the reply's). Absent = every send
+    /// goes out; `duplicate` never appears.
+    peer_send_dedup,
+    /// When a peer address's live server leaves, the broker moves the live
+    /// server that registered for it first and was refused only because it
+    /// was taken (`name_taken`) onto it: an unsolicited `peer_list` req 0
+    /// with the new `self`, then the address's mail. Absent = such a server
+    /// keeps its anon address until it reconnects.
+    peer_name_handover,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

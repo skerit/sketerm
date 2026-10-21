@@ -367,7 +367,7 @@ fn serviceSub(a: std.mem.Allocator, s: *Sub, now_ms: i64) void {
             // handed out only once the whole line was written.
             if (p.take_slow) if (peer.slowText(arena)) |slow| {
                 sendLine(s, agentwait.encodeEndWith(arena, "presence taken", slow.text) catch return endSub(s, "presence taken"));
-                if (!s.done) peer.slowHanded(arena, slow.seqs);
+                if (!s.done) peer.slowHanded(slow.hand);
                 s.done = true;
                 return;
             };

@@ -361,7 +361,9 @@ pub const NO_MCP_LINE = "no_mcp = its session runs (its hooks report) but its sk
 pub fn sentLine(arena: std.mem.Allocator, id: []const u8, x: peermail.RecipientResult) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
-    try w.print("{s} to {s}: {s}", .{ if (id.len > 0) id else "message", x.to, @tagName(x.outcome) });
+    const own = x.id orelse id;
+    try w.print("{s} to {s}: {s}", .{ if (own.len > 0) own else "message", x.to, @tagName(x.outcome) });
+    if (x.duplicate) try w.writeAll(DUPLICATE_NOTE);
     if (x.reason) |why| try w.print(" ({s}: {s})", .{ @tagName(why), why.describe() });
     if (x.to_no_mcp) {
         try w.writeAll(", it is running with its MCP server down, so this waits until the server is back");
@@ -369,6 +371,9 @@ pub fn sentLine(arena: std.mem.Allocator, id: []const u8, x: peermail.RecipientR
     if (x.to_polls) try w.writeAll("; it polls (nothing is pushed into its session), so this may wait for its next turn");
     return aw.written();
 }
+
+/// What a duplicate's line adds after its outcome.
+const DUPLICATE_NOTE = std.fmt.comptimePrint(" (duplicate: an identical send to it in the last {d} s has this id and outcome; not sent again)", .{@divExact(peermail.DUP_WINDOW_MS, 1000)});
 
 // ── what a received item prints as ──────────────────────────────
 
@@ -422,6 +427,7 @@ const SentLine = struct {
     to_state: ?[]const u8 = null,
     to_polls: ?bool = null,
     to_no_mcp: ?bool = null,
+    duplicate: ?bool = null,
 };
 
 fn jsonLine(arena: std.mem.Allocator, v: anytype) error{OutOfMemory}![]const u8 {
@@ -456,12 +462,12 @@ pub fn itemText(arena: std.mem.Allocator, item: agentpush.PeerItem, json: bool) 
 /// What a send printed: one line per recipient (a `to_list` send answers in
 /// `results`, one id for all).
 fn sentText(arena: std.mem.Allocator, from: []const u8, to: []const u8, r: peermail.SendReply, json: bool) ![]const u8 {
-    const one = [_]peermail.RecipientResult{.{ .to = to, .outcome = r.outcome, .reason = r.reason, .to_state = r.to_state, .to_polls = r.to_polls, .to_no_mcp = r.to_no_mcp }};
+    const one = [_]peermail.RecipientResult{r.single(to)};
     const each: []const peermail.RecipientResult = if (r.results.len > 0) r.results else &one;
     var out: std.ArrayList(u8) = .empty;
     for (each) |x| {
         const line = if (json) try jsonLine(arena, SentLine{
-            .id = r.id,
+            .id = x.id orelse r.id,
             .from = from,
             .to = x.to,
             .outcome = @tagName(x.outcome),
@@ -469,6 +475,7 @@ fn sentText(arena: std.mem.Allocator, from: []const u8, to: []const u8, r: peerm
             .to_state = if (x.to_state) |st| @tagName(st) else null,
             .to_polls = if (x.to_polls) true else null,
             .to_no_mcp = if (x.to_no_mcp) true else null,
+            .duplicate = if (x.duplicate) true else null,
         }) else try std.fmt.allocPrint(arena, "{s}\n", .{try sentLine(arena, r.id, x)});
         try out.appendSlice(arena, line);
     }

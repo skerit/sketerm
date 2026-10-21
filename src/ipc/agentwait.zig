@@ -115,12 +115,16 @@ pub const WireDigest = struct { count: u32, latest: []const u8 };
 /// A pushed wake-up's facts. Every value is a string: Claude Code's
 /// channel `meta` takes nothing else, and its keys must be identifiers.
 /// `agent`, `state` and `seq` are an agent wake's; a peer message
-/// (`agentpush.composePeer`) carries the `from`..`age_s` facts instead.
+/// (`agentpush.composePeer`) carries the `from`..`age_s` facts instead. A
+/// `peer_batch` (`agentpush.composePeers`) carries every item's id in
+/// `message`, comma-separated in push order, and `from`/`from_alias` only
+/// when every item shares the sender; the per-item facts are in the content.
 pub const Meta = struct {
     agent: ?[]const u8 = null,
     name: ?[]const u8 = null,
     /// The kind that decides the wake-up, or `digest`; `peer_message`,
-    /// `peer_expired`, `peer_expired_away` for a peer push.
+    /// `peer_expired`, `peer_expired_away` for a peer push, `peer_batch`
+    /// for several pushed as one (`agentpush.composePeers`).
     kind: []const u8,
     state: ?[]const u8 = null,
     seq: ?[]const u8 = null,

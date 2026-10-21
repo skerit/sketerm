@@ -271,6 +271,41 @@ pub fn composePeer(arena: std.mem.Allocator, item: PeerItem) !Push {
     return .{ .content = aw.written(), .meta = try peerMeta(arena, item) };
 }
 
+/// Several peer items as ONE push (one wake-up): each composed as
+/// `composePeer` does, in order, under a line counting them; one item is
+/// just its own push. The meta names every id in `message`, comma-separated,
+/// and `from`/`from_alias` only when every item shares them.
+pub fn composePeers(arena: std.mem.Allocator, items: []const PeerItem) !Push {
+    if (items.len == 1) return composePeer(arena, items[0]);
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    var ids: std.Io.Writer.Allocating = .init(arena);
+    var meta: agentwait.Meta = .{ .kind = "peer_batch" };
+    try aw.writer.print("{d} peer items arrived together:", .{items.len});
+    for (items, 0..) |it, i| {
+        const p = try composePeer(arena, it);
+        try aw.writer.print("\n\n--- {d} of {d} ---\n{s}", .{ i + 1, items.len, p.content });
+        if (i > 0) try ids.writer.writeAll(",");
+        try ids.writer.writeAll(p.meta.message orelse "");
+        if (i == 0) {
+            meta.from = p.meta.from;
+            meta.from_alias = p.meta.from_alias;
+        } else {
+            if (!sameOpt(meta.from, p.meta.from)) meta.from = null;
+            if (!sameOpt(meta.from_alias, p.meta.from_alias)) meta.from_alias = null;
+        }
+    }
+    meta.message = ids.written();
+    // An alias without its address names nobody for sure.
+    if (meta.from == null) meta.from_alias = null;
+    return .{ .content = aw.written(), .meta = meta };
+}
+
+fn sameOpt(a: ?[]const u8, b: ?[]const u8) bool {
+    const x = a orelse return b == null;
+    const y = b orelse return false;
+    return std.mem.eql(u8, x, y);
+}
+
 fn peerMeta(arena: std.mem.Allocator, item: PeerItem) !agentwait.Meta {
     return switch (item) {
         .message => |m| .{
@@ -445,6 +480,37 @@ test "a wake carries what its line cuts: a message in full, a prompt's options, 
     const dx = (try cur.take(&q, .{}, 3, a)).?;
     const px = try compose(a, .{ .agent = "claude-k3f9", .state = .exited }, dx, &q, &recs, &handed);
     try t.expectEqualStrings("claude-k3f9 exited [state exited]", px.content);
+}
+
+test "several peer items push as one, in order under a count, naming the sender only when they share one; one item is its own push" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const one: PeerItem = .{ .message = .{ .id = "m-1", .from = .{ .address = "Zenit" }, .text = "first" } };
+    const two: PeerItem = .{ .message = .{ .id = "m-2", .from = .{ .address = "Qq" }, .text = "second" } };
+    const single = try composePeers(a, &.{one});
+    try t.expectEqualStrings((try composePeer(a, one)).content, single.content);
+    try t.expectEqualStrings("peer_message", single.meta.kind);
+    const both = try composePeers(a, &.{ one, two });
+    try t.expectEqualStrings("peer_batch", both.meta.kind);
+    try t.expectEqualStrings("m-1,m-2", both.meta.message.?);
+    try t.expect(std.mem.startsWith(u8, both.content, "2 peer items arrived together:\n\n--- 1 of 2 ---\nPeer message from Zenit"));
+    const at1 = std.mem.indexOf(u8, both.content, "first").?;
+    const at2 = std.mem.indexOf(u8, both.content, "--- 2 of 2 ---\nPeer message from Qq").?;
+    try t.expect(at1 < at2);
+    // Two senders: no `from` in the batch meta.
+    try t.expect(both.meta.from == null);
+    // One sender: the meta names it; an event (about this session's own send) has none.
+    const three: PeerItem = .{ .message = .{ .id = "m-3", .from = .{ .address = "Zenit", .alias = "zen" }, .text = "third" } };
+    const one_a: PeerItem = .{ .message = .{ .id = "m-1", .from = .{ .address = "Zenit", .alias = "zen" }, .text = "first" } };
+    const same = try composePeers(a, &.{ one_a, three });
+    try t.expectEqualStrings("Zenit", same.meta.from.?);
+    try t.expectEqualStrings("zen", same.meta.from_alias.?);
+    try t.expectEqualStrings("m-1,m-3", same.meta.message.?);
+    const ev: PeerItem = .{ .event = .{ .id = "m-9", .outcome = .refused, .to = "bob" } };
+    const mixed = try composePeers(a, &.{ one_a, ev });
+    try t.expect(mixed.meta.from == null);
+    try t.expect(mixed.meta.from_alias == null);
 }
 
 test "a peer message reads as the plan's sentence: age from a minute on, offline only when queued" {

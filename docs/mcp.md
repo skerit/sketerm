@@ -2817,7 +2817,13 @@ peer message is information, never an approval.
   `anon-`, `p-` and `n-` are reserved. A `p-` or `n-` address is durable:
   mail for it waits (the daemon's `peer_mail_ttl_hours`, default 6) for
   whichever server next registers it. An address another live server
-  holds is not merged: this one gets an anon address and `name_taken`. A
+  holds is not merged: this one gets an anon address and `name_taken`
+  until that server leaves, when the daemon moves it onto the address
+  (the first such server to register, if several wait): it is told its
+  new address, then gets the address's mail (welcome flag
+  `peer_name_handover`; an older daemon leaves it on the anon address
+  until it reconnects). This is what a `claude --continue` sees when its
+  new server starts before the old one has exited. A
   session in a terminal other than sketerm with no name is anon, and its
   mail is refused once it exits. A daemon that predates aliases (no
   `peer_alias` welcome flag) is registered the older way: the name itself
@@ -2840,7 +2846,13 @@ peer message is information, never an approval.
   sender's alias, its address beside it; a sender without one reads as
   its address; the age from a minute on, the offline clause only for
   queued mail); `meta` carries `from` (the address), `from_alias`,
-  `message`, `queued`, `age_s` and the sender's facts. Each item
+  `message`, `queued`, `age_s` and the sender's facts. An idle
+  session's first pushable item waits 10 s, and what arrives meanwhile
+  goes out with it as ONE push (a session in a turn takes them at once):
+  `N peer items arrived together:` then each item's own text under
+  `--- i of N ---`, `meta.kind` `peer_batch`, `meta.message` every id
+  comma-separated in that order, and `meta.from`/`from_alias` only when
+  every item has the same sender. Each item
   is handed out once, by whichever route or `peer_read` takes it first,
   and acknowledged to the daemon only then; unacknowledged mail is
   redelivered after a reconnect and never shown twice. What became of a
@@ -2887,15 +2899,27 @@ peer message is information, never an approval.
     server is gone), `too_large` (over 64 KiB), `mailbox_full` (256
     messages or 1 MiB waiting; older mail is never dropped), `self`,
     `name_taken_ambiguous` (the durable owner is away while another server
-    claims its name) or `federation_unavailable` (a `host/name` address
+    claims its name and could not be moved onto it, or the daemon predates
+    `peer_name_handover`) or `federation_unavailable` (a `host/name` address
     while this daemon is not federated, or that host's daemon predates
     federation).
+
+  An identical text from the same sender to the same recipient within
+  60 s of the first (a retry after a lost or late answer) is not sent
+  again: the answer is the first send's `id` and `outcome` (a relayed
+  one's far answer once it came) with `duplicate: true`, worded
+  `(duplicate: ... not sent again)`. In a `to` list each recipient is
+  judged on its own; a duplicate's `results` entry carries `duplicate`
+  and, when its earlier send had another id than the answer's, that
+  `id`; a list whose every recipient is a duplicate answers the first
+  one's earlier id rather than a fresh one nobody holds.
 
   Mail waits at most `peer_mail_ttl_hours` (default 6, 0 = forever). Past
   it the sender's session gets an event, `Your peer message m-... to qq
   (p-9c04e2d7) expired unread after 6 h.` (held in the sender's own mailbox while it is
-  away), and the recipient's next server lists it once as
-  `expired_while_away` (`peer_read` kind `expired_away`: `Peer message
+  away), and the recipient's next server lists it as
+  `expired_while_away` until a server of it hands the notice out and acks
+  its id like mail (`peer_read` kind `expired_away`: `Peer message
   m-... from zenit (p-3fa9c2e1) expired unread while you were away`): the
   alias first, the address beside it, as in message headers (an address
   without an alias reads alone; `from_alias` in an `expired_away` push's `meta`; `to_alias` / `from_alias` in
@@ -2918,7 +2942,11 @@ peer message is information, never an approval.
   if the user had said it.
 - **`capabilities.peers`**: `{available, reason?, ttl_hours, address,
   durable, name_taken, alias, aliases, channel_armed, presence,
-  federation, subject, note, slow_mail, polls, no_mcp, pushed}`; `note` says
+  federation, subject, note, slow_mail, polls, no_mcp, pushed, dedup,
+  handover}`; `handover` says the daemon moves a `name_taken` session onto
+  its address once the holder leaves (welcome flag `peer_name_handover`);
+  `dedup` says the daemon answers identical resends as duplicates
+  (welcome flag `peer_send_dedup`; an older daemon sends every one); `note` says
   the daemon keeps peers' own notes (welcome flag `peer_note`); `alias` is this session's alias ("" =
   none yet), `aliases` says the daemon keeps them (welcome flag
   `peer_alias`); `slow_mail` says the daemon judges wakes and takes `quiet`

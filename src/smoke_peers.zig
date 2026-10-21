@@ -23,6 +23,7 @@ const peeraddr = @import("ipc/peeraddr.zig");
 const peermail = @import("mux/peermail.zig");
 const peerwake = @import("mux/peerwake.zig");
 const peerhold = @import("mux/peerhold.zig");
+const mcp_peer = @import("ipc/mcp_peer.zig");
 const muxclient = @import("mux/client.zig");
 const nowMs = @import("util/clock.zig").nowMs;
 const atomicwrite = @import("util/atomicwrite.zig");
@@ -78,6 +79,8 @@ pub fn prepare() void {
     _ = c.setenv("XDG_CONFIG_HOME", cfg.ptr, 1);
     _ = c.setenv(daemon_peers.TTL_ENV, TTL_TEXT, 1);
     _ = c.setenv(peerwake.SILENCE_ENV, SILENCE_TEXT, 1);
+    // Long enough to gather a burst, short enough for the rig's waits.
+    _ = c.setenv(mcp_peer.PUSH_DELAY_ENV, "500", 1);
     prepared = true;
 }
 
@@ -454,6 +457,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
         expectStr(caps, "alias", s.name, "2. capabilities.peers.alias");
         if (!boolOf(caps, "durable", "2.")) fail("2. a named server is not durable");
         if (boolOf(caps, "name_taken", "2.")) fail("2. a free name reads as taken");
+        if (!boolOf(caps, "dedup", "2.")) fail("2. capabilities.peers.dedup is false on a daemon that answers duplicates");
     }
     // 3. each one's peer_list shows both, live, durable, state unknown.
     for ([_]*Mcp{ &alice, &bob }) |m| {
@@ -532,9 +536,15 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
             .unset_env = &UNSET,
             .set_env = stage.env(null),
         });
-        // 12. alice -> bob: the follower prints the composed line once.
+        // 12. alice -> bob twice in a burst: the follower prints ONE wake-up
+        // carrying both, and an identical resend is not sent again.
         const via = send(&alice, arena, "bob", "pushed to the follower", "12. send to followed bob");
         expectStr(via, "outcome", "delivered", "12. outcome");
+        expectStr(send(&alice, arena, "bob", "and a second one", "12. second send"), "outcome", "delivered", "12. second outcome");
+        const again = send(&alice, arena, "bob", "pushed to the follower", "12. identical resend");
+        expectStr(again, "id", str(via, "id", "12."), "12. a resend answers the first send's id");
+        if (!boolOf(again, "duplicate", "12. resend")) fail("12. the resend is not marked a duplicate");
+        if (via.get("duplicate") != null) fail("12. a first send is marked a duplicate");
         const deadline = nowMs() + 10_000;
         var woke: ?std.json.ObjectMap = null;
         while (woke == null) {
@@ -546,8 +556,11 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
             if (ty == .string and std.mem.eql(u8, ty.string, "wake")) woke = v.object;
         }
         const content = str(woke.?, "content", "12.");
+        contains(content, "2 peer items arrived together:", "12. one wake-up for the burst");
         contains(content, "Peer message from alice (", "12. the follower's composed line");
         contains(content, "\n\npushed to the follower", "12. the follower's body");
+        contains(content, "\n\nand a second one", "12. the burst's second message");
+        if (std.mem.indexOf(u8, content, "pushed to the follower").? != std.mem.lastIndexOf(u8, content, "pushed to the follower").?) fail("12. the resend was delivered again");
         // 13. handed out by the follower: peer_read does not repeat it.
         expectNothing(&bob2, arena, "13. bob2 peer_read after the follower");
         follower.terminate();
@@ -592,9 +605,49 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
         again.initialize();
         expectStr(registered(&again, arena, "15c. pane server again"), "address", PANE_ADDR, "15c. the restarted pane address");
         expectStr(readOne(&again, arena, 5_000, "15c. peer_read"), "text", "for whoever runs in that pane", "15c. the waiting mail");
+        // 15d. that server is killed (its exact pid) right after it handed
+        //      the mail out: its ack went with the read, so the next server
+        //      in the pane is not shown it again (a `claude --continue`).
+        const entry = listed(&alice, arena, PANE_ADDR, "15d.") orelse fail("15d. the pane server not listed");
+        const server_pid = (entry.get("pid") orelse fail("15d. no pid")).integer;
+        if (c.kill(@intCast(server_pid), c.SIGKILL) != 0) fail("15d. kill the pane server");
         again.closeStdinWait();
+        awaitOffline(&alice, arena, PANE_ADDR, false, "15d. pane server gone");
+        var third = stage.paneServer();
+        third.initialize();
+        expectStr(registered(&third, arena, "15d. pane server a third time"), "address", PANE_ADDR, "15d. the pane address");
+        expectNothing(&third, arena, "15d. the restarted pane server");
+        // 15e. a `claude --continue` whose new server registers while the
+        //      old one still runs: the new one stands in on an anon address
+        //      (name_taken), takes the pane address over once the old one
+        //      is killed (its exact pid), and mail to the pane's alias
+        //      reaches it.
+        const pane_alias = arena.dupe(u8, str(registered(&third, arena, "15e. third"), "alias", "15e.")) catch fail("oom");
+        if (pane_alias.len == 0) fail("15e. the pane address has no alias");
+        var fourth = stage.paneServer();
+        fourth.initialize();
+        {
+            const second = registered(&fourth, arena, "15e. a second server in the pane");
+            if (!boolOf(second, "name_taken", "15e.")) fail("15e. the second server was not refused the live pane address");
+            if (!boolOf(second, "handover", "15e.")) fail("15e. the broker does not report peer_name_handover");
+        }
+        const holder = listed(&alice, arena, PANE_ADDR, "15e.") orelse fail("15e. the pane server not listed");
+        const holder_pid = (holder.get("pid") orelse fail("15e. no pid")).integer;
+        if (holder_pid != third.pid) fail("15e. the pane address is not held by the third server");
+        if (c.kill(@intCast(holder_pid), c.SIGKILL) != 0) fail("15e. kill the holding pane server");
+        third.closeStdinWait();
+        const handed_at = nowMs();
+        while (true) {
+            const now_caps = registered(&fourth, arena, "15e. after the hand-over");
+            if (std.mem.eql(u8, str(now_caps, "address", "15e."), PANE_ADDR) and !boolOf(now_caps, "name_taken", "15e.")) break;
+            if (nowMs() - handed_at > 10_000) fail("15e. the standing-in server never took the pane address over");
+            _ = c.usleep(50_000);
+        }
+        expectStr(send(&alice, arena, pane_alias, "for the continued session", "15e. send by alias"), "outcome", "delivered", "15e. outcome");
+        expectStr(readOne(&fourth, arena, 5_000, "15e. peer_read"), "text", "for the continued session", "15e. the mail");
+        fourth.closeStdinWait();
     }
-    std.debug.print("smoke: peers: a pane server is p-<origin id>, durable across a restart ok\n", .{});
+    std.debug.print("smoke: peers: a pane server is p-<origin id>, durable across a restart, handed mail not redelivered, a standing-in server takes the address over ok\n", .{});
 
     // -- e. expiry --
     // 16. alice -> carol (away since step 1): queued; past the TTL the
@@ -623,8 +676,14 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
         expectStr(it, "from", namedAddr(arena, "alice"), "17. from");
         contains(str(it, "content", "17."), "expired unread while you were away", "17. wording");
         carol2.closeStdinWait();
+        // 17b. it was acked: a third carol is not told it again.
+        var carol3 = stage.server("carol", null);
+        carol3.initialize();
+        _ = registered(&carol3, arena, "17b. carol a third time");
+        expectNothing(&carol3, arena, "17b. carol3 peer_read");
+        carol3.closeStdinWait();
     }
-    std.debug.print("smoke: peers: TTL expiry reaches the sender and the recipient's next server ok\n", .{});
+    std.debug.print("smoke: peers: TTL expiry reaches the sender and the recipient's next server, once ok\n", .{});
 
     // -- g. the Claude Code channel route --
     // 18. a server under a parent carrying the development-channels
@@ -946,8 +1005,8 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
     // 43. The loop cap: bob already woke dave once (39); the cap's worth
     //     of wakes is delivered, the next one is slow mail, loop_limited.
     {
-        for (1..peerwake.LOOP_WAKES_MAX) |_| expectStr(send(&bob2, arena, "dave", "ping", "43. wake"), "outcome", "delivered", "43. under the cap");
-        const r = send(&bob2, arena, "dave", "ping", "43. past the cap");
+        for (1..peerwake.LOOP_WAKES_MAX) |i| expectStr(send(&bob2, arena, "dave", std.fmt.allocPrint(arena, "ping {d}", .{i}) catch fail("oom"), "43. wake"), "outcome", "delivered", "43. under the cap");
+        const r = send(&bob2, arena, "dave", "ping past the cap", "43. past the cap");
         expectStr(r, "outcome", "queued_slow", "43. outcome");
         expectStr(r, "reason", "loop_limited", "43. reason");
     }

@@ -99,6 +99,14 @@ pub const META_EXT = ".meta.json";
 /// Ids of relayed items recently taken, so a redelivery after a lost
 /// `stored` answer is not taken twice.
 pub const SEEN_RING: usize = 256;
+/// An identical text from one sender to one recipient within this long
+/// (wall ms) is not sent again: the sender gets the first send's id and
+/// outcome marked `duplicate`. It only absorbs a retry after a lost or late
+/// answer (a client waits 10 s), so a short answer repeated for a later
+/// question a minute on still goes out.
+pub const DUP_WINDOW_MS: i64 = 60_000;
+/// Recent local sends remembered for `DUP_WINDOW_MS` (a bound, not a quota).
+pub const DUP_RING: usize = 256;
 /// A sender waits this long (wall ms) for the far broker's answer to a
 /// relayed send before it is told `queued` / `host_unreachable`.
 pub const PENDING_MS: i64 = 5_000;
@@ -380,6 +388,13 @@ pub const RecipientResult = struct {
     to_polls: bool = false,
     /// The recipient has no live server but its session runs (`PeerInfo.no_mcp`).
     to_no_mcp: bool = false,
+    /// An identical send to this recipient within `DUP_WINDOW_MS` already
+    /// went out: nothing was sent, the outcome is that send's (welcome
+    /// `peer_send_dedup`; absent = not a duplicate).
+    duplicate: bool = false,
+    /// Set only when this recipient holds the message under another id
+    /// than the reply's: a duplicate of an earlier send, under its id.
+    id: ?[]const u8 = null,
 };
 
 /// `peer_send_reply` body; `id` is empty when refused. A `to_list` send
@@ -392,7 +407,21 @@ pub const SendReply = struct {
     to_state: ?PeerState = null,
     to_polls: bool = false,
     to_no_mcp: bool = false,
+    /// As `RecipientResult.duplicate`: `id` names the earlier send.
+    duplicate: bool = false,
     results: []const RecipientResult = &.{},
+
+    /// A single send's answer as the one recipient's line.
+    pub fn single(self: SendReply, to: []const u8) RecipientResult {
+        return .{ .to = to, .outcome = self.outcome, .reason = self.reason, .to_state = self.to_state, .to_polls = self.to_polls, .to_no_mcp = self.to_no_mcp, .duplicate = self.duplicate };
+    }
+
+    /// A `to_list` send's answer; the top-level outcome fields repeat the
+    /// first recipient's for a client that reads only those.
+    pub fn list(req: u32, id: []const u8, results: []const RecipientResult) SendReply {
+        const first = if (results.len > 0) results[0] else RecipientResult{ .to = "", .outcome = .refused };
+        return .{ .req = req, .id = id, .outcome = first.outcome, .reason = first.reason, .to_state = first.to_state, .to_polls = first.to_polls, .to_no_mcp = first.to_no_mcp, .duplicate = first.duplicate, .results = results };
+    }
 };
 
 /// `peer_ack` body: ids the server has handed to its client.
@@ -651,8 +680,9 @@ pub const Out = union(enum) {
     relay: Relay,
     /// A persistence or drop notice for the log; `conn` is 0.
     warn: []const u8,
-    /// The live peer on `conn` was given another alias: it is owed its
-    /// own view again (an unsolicited `peer_list` req 0 carrying `self`).
+    /// The live peer on `conn` was given another alias, or took over the
+    /// address it asked for (`promote`): it is owed its own view again (an
+    /// unsolicited `peer_list` req 0 carrying `self`).
     self_changed,
     /// Federation: one `peer_link_beat` for the link `conn`.
     beat,
@@ -814,6 +844,25 @@ const Box = struct {
             self.expired[self.expired_head] = e;
             self.expired_head = (self.expired_head + 1) % EXPIRED_RING;
         }
+    }
+
+    /// Forget the tombstones of these ids (their notice was handed), keeping the rest in order.
+    /// @return how many were forgotten.
+    fn dropExpired(self: *Box, acked: []const []const u8) usize {
+        var kept: [EXPIRED_RING]ExpiredEntry = undefined;
+        var n: usize = 0;
+        for (0..self.expired_len) |k| {
+            const e = self.expired[(self.expired_head + k) % EXPIRED_RING];
+            if (contains(acked, e.id_buf[0..e.id_len])) continue;
+            kept[n] = e;
+            n += 1;
+        }
+        const dropped = self.expired_len - n;
+        if (dropped == 0) return 0;
+        @memcpy(self.expired[0..n], kept[0..n]);
+        self.expired_len = n;
+        self.expired_head = 0;
+        return dropped;
     }
 };
 
@@ -1036,6 +1085,42 @@ const Seen = struct {
     reason: ?RefuseReason = null,
 };
 
+/// A recent local send, keyed by sender, recipient and text (`sentKey`).
+const Sent = struct {
+    key: u64 = 0,
+    /// The recipient alone (`toKey`), so a far answer settles it.
+    to_key: u64 = 0,
+    at_ms: i64 = 0,
+    /// False once a far refusal forgot it (`sentSettle`).
+    live: bool = true,
+    id_buf: [ID_LEN]u8 = undefined,
+    id_len: u8 = 0,
+    /// The send's answer: a relayed send's `queued` until the far answer
+    /// (or the pending deadline) settles it.
+    outcome: PeerOutcome = .delivered,
+    reason: ?RefuseReason = null,
+
+    fn id(self: *const Sent) []const u8 {
+        return self.id_buf[0..self.id_len];
+    }
+
+    /// The first send's answer marked `duplicate`, its id copied into `id_buf`.
+    fn result(self: *const Sent, id_buf: *[ID_LEN]u8) SendResult {
+        @memcpy(id_buf[0..self.id_len], self.id());
+        return .{ .id = id_buf[0..self.id_len], .outcome = self.outcome, .reason = self.reason, .duplicate = true };
+    }
+};
+
+fn sentKey(from: []const u8, to: []const u8, text: []const u8) u64 {
+    var h = std.hash.Wyhash.init(0);
+    h.update(from);
+    h.update(&.{0});
+    h.update(to);
+    h.update(&.{0});
+    h.update(text);
+    return h.final();
+}
+
 pub const Options = struct {
     /// Where durable mailboxes persist; null = memory only.
     dir: ?[]const u8 = null,
@@ -1070,6 +1155,8 @@ pub const SendResult = struct {
     to_state: ?PeerState = null,
     to_polls: bool = false,
     to_no_mcp: bool = false,
+    /// `RecipientResult.duplicate`: nothing was sent, `id` is the earlier send's.
+    duplicate: bool = false,
     /// The answer comes later as `Out.reply` (a relayed send whose link is up).
     deferred: bool = false,
 };
@@ -1103,6 +1190,9 @@ pub const Store = struct {
     seen: [SEEN_RING]Seen = undefined,
     seen_len: usize = 0,
     seen_head: usize = 0,
+    sent: [DUP_RING]Sent = undefined,
+    sent_len: usize = 0,
+    sent_head: usize = 0,
     /// Member: the name the hub knows this host by (its hello's `as`).
     as_name: []u8 = &.{},
     /// A presence snapshot is owed to every live link.
@@ -1194,7 +1284,8 @@ pub const Store = struct {
 
     /// Register (or update) connection `conn`. A durable name another live
     /// connection holds is NOT shared: this one gets a minted anon address
-    /// and `name_taken`. Push its pending mail with `flush` afterwards, once
+    /// and `name_taken`, and takes the name over when its holder leaves
+    /// (`handOver`). Push its pending mail with `flush` afterwards, once
     /// the caller has answered the registration.
     /// AIDEV-NOTE: an empty address re-sent by the same connection (a
     /// presence update, `clientInfo`) keeps the anon address minted first;
@@ -1208,6 +1299,8 @@ pub const Store = struct {
             if (std.mem.eql(u8, p.requested, req.address) and p.asked_durable == req.durable) {
                 try self.updatePeer(p, req, now);
                 if (req.subject) |sj| self.subjectFromRegistration(p.address, sj);
+                // A hand-over that could not happen when the holder left.
+                if (p.name_taken and self.livePeer(p.requested) == null) try self.promote(p, now);
                 if (req.alias) |want| try self.requestAlias(p, want, req.alias_explicit, now);
                 self.presence_dirty = true;
                 return;
@@ -1288,11 +1381,19 @@ pub const Store = struct {
     /// The connection closed. A durable address keeps its mailbox for the
     /// next server; a non-durable one is forgotten, its unread messages
     /// end as `expired`/`not_durable_gone` events to their senders, and
-    /// later sends to it are refused `not_durable_gone`.
+    /// later sends to it are refused `not_durable_gone`. Either way a live
+    /// server refused the address only because this one held it takes it
+    /// over (`handOver`).
     pub fn deregister(self: *Store, conn: u32, now: i64) void {
         const i = self.peerIndex(conn) orelse return;
         const p = self.peers.orderedRemove(i);
         defer self.freePeer(p);
+        self.leave(p, now);
+        self.handOver(p.address, now);
+    }
+
+    /// `p`, already off the roster, leaves its mailbox behind.
+    fn leave(self: *Store, p: *Peer, now: i64) void {
         self.presence_dirty = true;
         self.roster_gen +%= 1;
         const bi = self.boxIndex(p.address) orelse return;
@@ -1318,6 +1419,51 @@ pub const Store = struct {
         };
     }
 
+    /// `address` lost its holder: the live claimant that registered first
+    /// (`name_taken` on it) takes it over, so one address never has two
+    /// candidate servers and a send to it is never ambiguous.
+    fn handOver(self: *Store, address: []const u8, now: i64) void {
+        if (self.livePeer(address) != null) return;
+        for (self.peers.items) |p| if (p.name_taken and std.mem.eql(u8, p.requested, address)) {
+            return self.promote(p, now) catch |e| self.warnf("peermail: {s} could not take over {s} ({s}); it retries with its next registration", .{ p.address, address, @errorName(e) });
+        };
+    }
+
+    /// The claimant `p` gets the address it asked for, as if it registered
+    /// now. Its anon stand-in's mail and note move along, and later mail
+    /// for the stand-in follows the address's alias. It hears of it as
+    /// `self_changed` BEFORE the address's mail is pushed, the order of a
+    /// registration answer, so its kept acks go out first.
+    fn promote(self: *Store, p: *Peer, now: i64) error{OutOfMemory}!void {
+        const durable = p.asked_durable and !peeraddr.isAnonName(p.requested);
+        const owned = try self.allocator.dupe(u8, p.requested);
+        errdefer self.allocator.free(owned);
+        const box = try self.ensureBox(owned, durable);
+        if (box.durable) self.touchFile(box);
+        box.last_seen_ms = now;
+        box.hook_ms = 0;
+        self.goneRemove(owned);
+        const anon = p.address;
+        defer self.allocator.free(anon);
+        p.address = owned;
+        p.name_taken = false;
+        p.durable = box.durable;
+        self.presence_dirty = true;
+        self.roster_gen +%= 1;
+        const stand_in = self.boxOf(anon);
+        if (stand_in) |sb| if (box.note.len == 0 and sb.note.len > 0) {
+            box.note = sb.note;
+            box.note_ms = sb.note_ms;
+            sb.note = &.{};
+            sb.note_ms = 0;
+        };
+        if (box.alias.len == 0 and !peeraddr.isReservedName(p.address)) self.requestAlias(p, p.address, false, now) catch |e|
+            self.warnf("peermail: {s} took over without an alias ({s})", .{ p.address, @errorName(e) });
+        _ = self.emit.call(p.conn, .self_changed);
+        if (stand_in) |sb| self.yieldBox(sb, p.address, box.alias, now);
+        self.flush(p.conn, now);
+    }
+
     /// Push everything in `conn`'s mailbox not yet pushed to `conn`, in order.
     pub fn flush(self: *Store, conn: u32, now: i64) void {
         const p = self.peerOf(conn) orelse return;
@@ -1340,12 +1486,19 @@ pub const Store = struct {
         // Sending is activity: the session is in a turn.
         sender.active_ms = now;
         if (req.text.len > PEER_TEXT_MAX) return refused(.too_large);
-        return self.route(self.msgFrom(sender, req, now, null), .{ .client = .{ .conn = conn, .req = req.req } }, now, id_buf);
+        const resolved = self.resolve(req.to);
+        const key = sentKey(sender.address, resolved, req.text);
+        const to_key = toKey(resolved);
+        if (self.sentFind(key, now)) |d| return d.result(id_buf);
+        const res = try self.route(self.msgFrom(sender, req, now, null), .{ .client = .{ .conn = conn, .req = req.req } }, now, id_buf);
+        self.sentAdd(key, to_key, res, now);
+        return res;
     }
 
     /// What a `to_list` send answers now.
     pub const Many = struct {
         /// Borrowed from the caller's `id_buf`; empty when nothing was sent.
+        /// When every recipient is a duplicate it is the earlier send's id.
         id: []const u8 = "",
         /// One per distinct address, in list order; allocated in the
         /// caller's arena, `to` borrowed from the request.
@@ -1377,28 +1530,50 @@ pub const Store = struct {
         self.next_multi +%= 1;
         const serial = self.next_multi;
         var outstanding: usize = 0;
+        var sent_any = false;
         var scratch: [ID_LEN]u8 = undefined;
         for (tos.items, results, 0..) |to, *r, i| {
+            const resolved = self.resolve(to);
+            const key = sentKey(sender.address, resolved, req.text);
+            const to_key = toKey(resolved);
+            if (self.sentFind(key, now)) |d| {
+                r.* = .{ .to = to, .outcome = d.outcome, .reason = d.reason, .duplicate = true, .id = try arena.dupe(u8, d.id()) };
+                continue;
+            }
             var one = req;
             one.to = to;
             const res = try self.route(self.msgFrom(sender, one, now, id), .{ .multi = .{ .serial = serial, .index = @intCast(i) } }, now, &scratch);
+            self.sentAdd(key, to_key, .{ .id = id, .outcome = res.outcome, .reason = res.reason }, now);
             r.* = .{ .to = to, .outcome = res.outcome, .reason = res.reason, .to_state = res.to_state, .to_polls = res.to_polls, .to_no_mcp = res.to_no_mcp };
+            sent_any = sent_any or res.outcome != .refused;
             outstanding += @intFromBool(res.deferred);
         }
-        if (outstanding == 0) return .{ .id = id, .results = results };
+        // Nothing went out under the new id: answer the earlier send's
+        // rather than one no recipient holds.
+        var reply_id: []const u8 = id;
+        if (!sent_any) for (results) |r| if (r.id) |earlier| {
+            @memcpy(id_buf[0..earlier.len], earlier);
+            reply_id = id_buf[0..earlier.len];
+            break;
+        };
+        for (results) |*r| if (r.id) |x| if (std.mem.eql(u8, x, reply_id)) {
+            r.id = null;
+        };
+        if (outstanding == 0) return .{ .id = reply_id, .results = results };
         const m = try self.allocator.create(Multi);
         m.* = .{ .serial = serial, .conn = conn, .req = req.req, .arena = .init(self.allocator), .results = &.{}, .outstanding = outstanding };
         errdefer freeMulti(self.allocator, m);
-        @memcpy(m.id_buf[0..id.len], id);
-        m.id_len = @intCast(id.len);
+        @memcpy(m.id_buf[0..reply_id.len], reply_id);
+        m.id_len = @intCast(reply_id.len);
         const a = m.arena.allocator();
         m.results = try a.alloc(RecipientResult, results.len);
         for (results, m.results) |r, *o| {
             o.* = r;
             o.to = try a.dupe(u8, r.to);
+            if (r.id) |x| o.id = try a.dupe(u8, x);
         }
         try self.multis.append(self.allocator, m);
-        return .{ .id = id, .results = results, .deferred = true };
+        return .{ .id = reply_id, .results = results, .deferred = true };
     }
 
     fn msgFrom(self: *const Store, sender: *const Peer, req: SendReq, now: i64, id: ?[]const u8) Msg {
@@ -1508,9 +1683,11 @@ pub const Store = struct {
         return .{ .id = id, .outcome = .queued, .reason = .host_unreachable };
     }
 
-    /// `conn` handed these ids to its client: they leave its mailbox.
+    /// `conn` handed these ids to its client: they leave its mailbox, and so
+    /// do the expiry tombstones of these ids (each registration answer
+    /// carries the rest, so a restarted server would be told again).
     /// Unknown ids are ignored (an ack is idempotent).
-    /// @return how many items were removed.
+    /// @return how many items and tombstones were removed.
     pub fn ack(self: *Store, conn: u32, acked: []const []const u8) usize {
         const p = self.peerOf(conn) orelse return 0;
         const box = self.boxOf(p.address) orelse return 0;
@@ -1525,7 +1702,7 @@ pub const Store = struct {
             } else i += 1;
         }
         if (removed > 0) self.compact(box);
-        return removed;
+        return removed + box.dropExpired(acked);
     }
 
     /// Expire every item older than the TTL: a message becomes an
@@ -1931,7 +2108,7 @@ pub const Store = struct {
             if (self.livePeer(box.address)) |p| _ = self.emit.call(p.conn, .self_changed);
         }
         const h = choice.resumes orelse return;
-        if (h.box) |old| return self.yieldBox(old, box.address, now);
+        if (h.box) |old| return self.yieldBox(old, box.address, old.alias, now);
         if (box.subject.len == 0 and h.subject.len > 0) self.subjectFromRegistration(box.address, h.subject);
     }
 
@@ -1939,13 +2116,13 @@ pub const Store = struct {
     /// this side names it): its messages and events go there, by relay when
     /// `to_in` is on another host, and a local `to_in` without a subject
     /// takes `old`'s. `old` is then forgotten, files and all; mail still
-    /// sent to its address follows the alias (`Moved`).
-    fn yieldBox(self: *Store, old: *Box, to_in: []const u8, now: i64) void {
+    /// sent to its address follows the alias `follow` (`Moved`).
+    fn yieldBox(self: *Store, old: *Box, to_in: []const u8, follow: []const u8, now: i64) void {
         var tb: [peeraddr.ADDRESS_MAX]u8 = undefined;
         const n = @min(to_in.len, tb.len);
         @memcpy(tb[0..n], to_in[0..n]);
         const to = tb[0..n];
-        self.movedAdd(old.address, old.alias);
+        self.movedAdd(old.address, follow);
         const local: ?*Box = blk: {
             const a = peeraddr.Address.parse(to) catch break :blk null;
             if (a.host) |h| if (!self.isSelfHost(h)) break :blk null;
@@ -1993,7 +2170,7 @@ pub const Store = struct {
             if (b.isRoute() or b.alias.len == 0 or self.livePeer(b.address) != null) continue;
             const h = self.holderOf(b.alias, b.address) orelse continue;
             if (!h.live) continue;
-            self.yieldBox(b, h.address, now);
+            self.yieldBox(b, h.address, b.alias, now);
             i = 0;
         }
     }
@@ -2454,6 +2631,9 @@ pub const Store = struct {
         var tb: [peeraddr.ADDRESS_MAX]u8 = undefined;
         // A far broker that predates (id, to) keys names no recipient.
         const to: ?[]const u8 = if (rl.to.len > 0) self.inAddr(&tb, r, rl.to) else null;
+        // The far answer settles what a resend is told; a refusal is
+        // forgotten, so a resend of it is a real retry.
+        if (rl.of == .message) self.sentSettle(rl.id, to, rl.outcome, rl.reason);
         const i = r.box.findTo(rl.id, rl.of, to) orelse {
             // A duplicate answer, or one for an item that expired meanwhile.
             if (rl.of == .message) if (self.takePending(rl.id, to)) |p| self.answer(p, ans);
@@ -2591,8 +2771,7 @@ pub const Store = struct {
         if (m.outstanding > 0) return;
         _ = self.multis.orderedRemove(mi);
         defer freeMulti(self.allocator, m);
-        const first = if (m.results.len > 0) m.results[0] else RecipientResult{ .to = "", .outcome = .refused };
-        _ = self.emit.call(m.conn, .{ .reply = self.replyFor(m.conn, .{ .req = m.req, .id = m.id_buf[0..m.id_len], .outcome = first.outcome, .reason = first.reason, .to_state = first.to_state, .to_polls = first.to_polls, .to_no_mcp = first.to_no_mcp, .results = m.results }) });
+        _ = self.emit.call(m.conn, .{ .reply = self.replyFor(m.conn, SendReply.list(m.req, m.id_buf[0..m.id_len], m.results)) });
     }
 
     fn addPending(self: *Store, id: []const u8, to: []const u8, waiter: Waiter, route_conn: u32, now: i64) error{OutOfMemory}!void {
@@ -2638,7 +2817,45 @@ pub const Store = struct {
                 continue;
             }
             _ = self.pending.orderedRemove(i);
+            self.sentSettle(p.id(), p.to(), .queued, .host_unreachable);
             self.answer(p, .{ .outcome = .queued, .reason = .host_unreachable });
+        }
+    }
+
+    /// Remember a local send for `DUP_WINDOW_MS`; a refusal is not
+    /// remembered, so a retry after it goes out.
+    fn sentAdd(self: *Store, key: u64, to_key: u64, res: SendResult, now: i64) void {
+        if (res.outcome == .refused or res.id.len == 0) return;
+        var e = Sent{ .key = key, .to_key = to_key, .at_ms = now, .outcome = res.outcome, .reason = res.reason };
+        const n = @min(res.id.len, ID_LEN);
+        @memcpy(e.id_buf[0..n], res.id[0..n]);
+        e.id_len = @intCast(n);
+        if (self.sent_len < DUP_RING) {
+            self.sent[self.sent_len] = e;
+            self.sent_len += 1;
+        } else {
+            self.sent[self.sent_head] = e;
+            self.sent_head = (self.sent_head + 1) % DUP_RING;
+        }
+    }
+
+    fn sentFind(self: *const Store, key: u64, now: i64) ?*const Sent {
+        for (self.sent[0..self.sent_len]) |*e| {
+            if (e.live and e.key == key and now - e.at_ms < DUP_WINDOW_MS) return e;
+        }
+        return null;
+    }
+
+    /// Settle send `id` to `to` (null: to anyone, from a far broker that
+    /// names no recipient) with its far answer; a refusal forgets it.
+    fn sentSettle(self: *Store, id: []const u8, to: ?[]const u8, outcome: PeerOutcome, reason: ?RefuseReason) void {
+        const key: ?u64 = if (to) |x| toKey(x) else null;
+        for (self.sent[0..self.sent_len]) |*e| {
+            if (!std.mem.eql(u8, e.id(), id)) continue;
+            if (key) |k| if (e.to_key != k) continue;
+            if (outcome == .refused) e.live = false;
+            e.outcome = outcome;
+            e.reason = reason;
         }
     }
 
@@ -3490,18 +3707,22 @@ test "a full mailbox refuses rather than dropping older mail" {
     try s.register(1, reg("a", true), 0);
     try s.register(2, reg("b", true), 0);
     var idb: [ID_LEN]u8 = undefined;
-    for (0..PEER_MAIL_MAX) |_| try t.expect((try sendText(&s, 1, "b", "x", 0, &idb)).outcome == .delivered);
+    var tb: [8]u8 = undefined;
+    for (0..PEER_MAIL_MAX) |i| try t.expect((try sendText(&s, 1, "b", try std.fmt.bufPrint(&tb, "x{d}", .{i}), 0, &idb)).outcome == .delivered);
     try t.expectEqual(@as(?RefuseReason, .mailbox_full), (try sendText(&s, 1, "b", "x", 0, &idb)).reason);
     // Byte bound: a fresh mailbox fills at 1 MiB of text.
     try s.register(3, reg("c", true), 0);
     const chunk = try t.allocator.alloc(u8, PEER_TEXT_MAX);
     defer t.allocator.free(chunk);
     @memset(chunk, 'z');
-    for (0..PEER_MAIL_MAX_BYTES / PEER_TEXT_MAX) |_| try t.expect((try sendText(&s, 1, "c", chunk, 0, &idb)).outcome == .delivered);
+    for (0..PEER_MAIL_MAX_BYTES / PEER_TEXT_MAX) |i| {
+        chunk[0] = @intCast('a' + i);
+        try t.expect((try sendText(&s, 1, "c", chunk, 0, &idb)).outcome == .delivered);
+    }
     try t.expectEqual(@as(?RefuseReason, .mailbox_full), (try sendText(&s, 1, "c", "x", 0, &idb)).reason);
 }
 
-test "a second claimant of a durable name gets an anon address; its owner offline makes sends ambiguous" {
+test "a second claimant of a durable name gets an anon address and takes the name over when its owner leaves" {
     var rec = Rec.init();
     defer rec.deinit();
     var s = try Store.init(t.allocator, .{ .emit = rec.emit() });
@@ -3519,13 +3740,15 @@ test "a second claimant of a durable name gets an anon address; its owner offlin
     // A sender reaches the owner while it is live.
     try s.register(3, reg("Qq", true), 0);
     var idb: [ID_LEN]u8 = undefined;
-    try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 3, "Zenit", "x", 0, &idb)).outcome);
-    // The owner leaves while the claimant lives: nothing is merged.
+    try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 3, "Zenit", "x1", 0, &idb)).outcome);
+    // The owner leaves while the claimant lives: the claimant takes the name.
     s.deregister(1, 10);
-    try t.expectEqual(@as(?RefuseReason, .name_taken_ambiguous), (try sendText(&s, 3, "Zenit", "x", 20, &idb)).reason);
-    // The claimant leaves too: the durable mailbox queues again.
+    try t.expectEqualStrings("Zenit", (try s.selfInfo(arena.allocator(), 2)).?.address);
+    try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 3, "Zenit", "x2", 20, &idb)).outcome);
+    try t.expectEqual(@as(u32, 2), rec.last().conn);
+    // It leaves too: the durable mailbox queues again.
     s.deregister(2, 30);
-    try t.expectEqual(PeerOutcome.queued, (try sendText(&s, 3, "Zenit", "x", 40, &idb)).outcome);
+    try t.expectEqual(PeerOutcome.queued, (try sendText(&s, 3, "Zenit", "x3", 40, &idb)).outcome);
     // An empty address is minted, never durable.
     try s.register(4, .{ .address = "", .durable = true }, 50);
     const anon = (try s.selfInfo(arena.allocator(), 4)).?;
@@ -3533,6 +3756,91 @@ test "a second claimant of a durable name gets an anon address; its owner offlin
     try t.expect(!anon.durable);
     try t.expectError(error.BadAddress, s.register(5, reg("host/x", true), 0));
     try t.expectError(error.BadAddress, s.register(5, reg("..", true), 0));
+}
+
+test "hand-over: the claimant gets the address, its mail after its new view, and the oldest claimant goes first" {
+    var rec = Rec.init();
+    defer rec.deinit();
+    var s = try Store.init(t.allocator, .{ .emit = rec.emit() });
+    defer s.deinit();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var idb: [ID_LEN]u8 = undefined;
+    // 1. A restarted session's new server registers while the old one lives.
+    try s.register(1, reg("p-3fa9c2e1", true), 0);
+    try s.register(3, reg("Qq", true), 0);
+    try s.register(2, reg("p-3fa9c2e1", true), 5);
+    try t.expect((try s.selfInfo(a, 2)).?.name_taken);
+    const r1 = try sendText(&s, 3, "p-3fa9c2e1", "while both live", 6, &idb);
+    try t.expectEqual(@as(u32, 1), rec.last().conn);
+    const id1 = try a.dupe(u8, r1.id);
+    // 2. The old server exits before acking: the new one holds the address,
+    // durable, is told so, and then gets the unacked message under its id.
+    const mark = rec.got.items.len;
+    s.deregister(1, 10);
+    const me = (try s.selfInfo(a, 2)).?;
+    try t.expectEqualStrings("p-3fa9c2e1", me.address);
+    try t.expect(!me.name_taken);
+    try t.expect(me.durable);
+    var seen_self = false;
+    var redelivered = false;
+    for (rec.got.items[mark..]) |g| if (g.conn == 2) switch (g.kind) {
+        .self_changed => seen_self = true,
+        .deliver => {
+            try t.expect(seen_self);
+            try t.expectEqualStrings(id1, g.id);
+            redelivered = true;
+        },
+        else => {},
+    };
+    try t.expect(redelivered);
+    // 3. New mail reaches it, at its address.
+    try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 3, "p-3fa9c2e1", "after", 20, &idb)).outcome);
+    try t.expectEqual(@as(u32, 2), rec.last().conn);
+    // 4. Two claimants wait: the one that registered first takes it.
+    try s.register(4, reg("p-3fa9c2e1", true), 30);
+    try s.register(5, reg("p-3fa9c2e1", true), 31);
+    const stand_in = try a.dupe(u8, (try s.selfInfo(a, 5)).?.address);
+    try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 3, stand_in, "to the stand-in", 32, &idb)).outcome);
+    s.deregister(2, 40);
+    try t.expectEqualStrings("p-3fa9c2e1", (try s.selfInfo(a, 4)).?.address);
+    try t.expect((try s.selfInfo(a, 5)).?.name_taken);
+    try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 3, "p-3fa9c2e1", "to four", 41, &idb)).outcome);
+    try t.expectEqual(@as(u32, 4), rec.last().conn);
+    // 5. The next one takes over with its stand-in's mail moved along.
+    s.deregister(4, 50);
+    try t.expectEqualStrings("p-3fa9c2e1", (try s.selfInfo(a, 5)).?.address);
+    var moved = false;
+    for (rec.got.items) |g| if (g.conn == 5 and g.kind == .deliver and std.mem.eql(u8, g.text, "to the stand-in")) {
+        moved = std.mem.eql(u8, g.to, "p-3fa9c2e1") or moved;
+    };
+    try t.expect(moved);
+}
+
+test "hand-over: a claimant the broker could not promote when the holder left takes over on its next registration" {
+    var fa = std.testing.FailingAllocator.init(t.allocator, .{});
+    var rec = Rec.init();
+    defer rec.deinit();
+    var s = try Store.init(fa.allocator(), .{ .emit = rec.emit() });
+    defer s.deinit();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    var idb: [ID_LEN]u8 = undefined;
+    try s.register(1, reg("Zenit", true), 0);
+    try s.register(2, reg("Zenit", true), 0);
+    try s.register(3, reg("Qq", true), 0);
+    // 1. Out of memory as the holder leaves: no hand-over, and a send to the
+    // name is refused as ambiguous rather than queued past a live claimant.
+    fa.fail_index = fa.alloc_index;
+    s.deregister(1, 10);
+    fa.fail_index = std.math.maxInt(usize);
+    try t.expect((try s.selfInfo(arena.allocator(), 2)).?.name_taken);
+    try t.expectEqual(@as(?RefuseReason, .name_taken_ambiguous), (try sendText(&s, 3, "Zenit", "x", 20, &idb)).reason);
+    // 2. Its next registration (a presence update) takes the name.
+    try s.register(2, reg("Zenit", true), 30);
+    try t.expectEqualStrings("Zenit", (try s.selfInfo(arena.allocator(), 2)).?.address);
+    try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 3, "Zenit", "y", 40, &idb)).outcome);
 }
 
 test "a non-durable peer that leaves: its unread mail becomes events, later sends are refused" {
@@ -3646,6 +3954,69 @@ test "TTL expiry: the recipient keeps a tombstone, an offline sender finds the e
     const before = rec.count(3, .deliver);
     s0.flush(3, 0);
     try t.expectEqual(before + 1, rec.count(3, .deliver));
+}
+
+test "an expiry tombstone its recipient's server acked is not handed to the next server of that address" {
+    var rec = Rec.init();
+    defer rec.deinit();
+    var s = try Store.init(t.allocator, .{ .ttl_ms = 1000, .emit = rec.emit() });
+    defer s.deinit();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try s.register(1, reg("Zenit", true), 0);
+    try s.register(2, reg("Qq", true), 0);
+    s.deregister(2, 0);
+    var idb: [ID_LEN]u8 = undefined;
+    const first = try a.dupe(u8, (try sendText(&s, 1, "Qq", "one", 100, &idb)).id);
+    const second = try a.dupe(u8, (try sendText(&s, 1, "Qq", "two", 200, &idb)).id);
+    s.sweep(1200);
+    // 1. Qq's server comes back: both tombstones ride its registration answer.
+    try s.register(3, reg("Qq", true), 1300);
+    try t.expectEqual(@as(usize, 2), (try s.selfInfo(a, 3)).?.expired_while_away.len);
+    // 2. It hands the first notice and acks it; the second stays, in order.
+    try t.expectEqual(@as(usize, 1), s.ack(3, &.{first}));
+    const left = (try s.selfInfo(a, 3)).?.expired_while_away;
+    try t.expectEqual(@as(usize, 1), left.len);
+    try t.expectEqualStrings(second, left[0].id);
+    // 3. A restarted server (a new connection) is not told the acked one again.
+    s.deregister(3, 1400);
+    try s.register(4, reg("Qq", true), 1500);
+    const now_left = (try s.selfInfo(a, 4)).?.expired_while_away;
+    try t.expectEqual(@as(usize, 1), now_left.len);
+    try t.expectEqualStrings(second, now_left[0].id);
+    try t.expectEqual(@as(usize, 1), s.ack(4, &.{second}));
+    try t.expectEqual(@as(usize, 0), (try s.selfInfo(a, 4)).?.expired_while_away.len);
+}
+
+test "an ack reaches the mailbox its items were pushed from: a claimant under an anon address is pushed none of the owner's" {
+    var rec = Rec.init();
+    defer rec.deinit();
+    var s = try Store.init(t.allocator, .{ .emit = rec.emit() });
+    defer s.deinit();
+    var idb: [ID_LEN]u8 = undefined;
+    try s.register(1, reg("Zenit", true), 0);
+    try s.register(2, reg("Qq", true), 0);
+    const id = try t.allocator.dupe(u8, (try sendText(&s, 1, "Qq", "hello", 100, &idb)).id);
+    defer t.allocator.free(id);
+    // 1. A restarted server registers Qq while the old one still lives:
+    // it gets an anon address and none of Qq's mail, so it can ack none.
+    try s.register(3, reg("Qq", true), 200);
+    s.flush(3, 200);
+    try t.expectEqual(@as(usize, 0), rec.count(3, .deliver));
+    try t.expectEqual(@as(usize, 0), s.ack(3, &.{id}));
+    // 2. The old one leaves without acking: the next server of Qq gets the
+    // message again, and its ack (on the address it was pushed from) holds.
+    s.deregister(2, 300);
+    s.deregister(3, 300);
+    try s.register(4, reg("Qq", true), 400);
+    s.flush(4, 400);
+    try t.expectEqual(@as(usize, 1), rec.count(4, .deliver));
+    try t.expectEqual(@as(usize, 1), s.ack(4, &.{id}));
+    s.deregister(4, 500);
+    try s.register(5, reg("Qq", true), 600);
+    s.flush(5, 600);
+    try t.expectEqual(@as(usize, 0), rec.count(5, .deliver));
 }
 
 /// Whether `s` lists `address` at `now`.
@@ -4381,12 +4752,12 @@ test "wake rules: quiet, a dormant recipient and the loop cap become slow mail; 
     try t.expectEqual(PeerOutcome.queued_slow, d.outcome);
     try t.expectEqual(@as(?RefuseReason, .dormant), d.reason);
     try t.expect(rec.last().quiet);
-    try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 1, "bob", "x", 2000 + 59 * MIN, &idb)).outcome);
+    try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 1, "bob", "x1", 2000 + 59 * MIN, &idb)).outcome);
     try t.expect(!rec.last().quiet);
     // Under 300k he is always woken; working, never dormant.
     bob.facts = small;
     try s.register(2, bob, 2000 + 61 * MIN);
-    try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 1, "bob", "x", 2000 + 61 * MIN, &idb)).outcome);
+    try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 1, "bob", "x2", 2000 + 61 * MIN, &idb)).outcome);
     bob.facts = big;
     bob.state = .working;
     try s.register(2, bob, 2000 + 120 * MIN);
@@ -4407,8 +4778,9 @@ test "wake rules: quiet, a dormant recipient and the loop cap become slow mail; 
     try s.register(3, regSlow("carol"), 0);
     try s.register(4, regSlow("dave"), 0);
     const base: i64 = 1_000_000_000;
-    for (0..peerwake.LOOP_WAKES_MAX) |i| try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 3, "dave", "ping", base + @as(i64, @intCast(i)) * 1000, &idb)).outcome);
-    const lim = try sendText(&s, 3, "dave", "ping", base + 7000, &idb);
+    var pb: [8]u8 = undefined;
+    for (0..peerwake.LOOP_WAKES_MAX) |i| try t.expectEqual(PeerOutcome.delivered, (try sendText(&s, 3, "dave", try std.fmt.bufPrint(&pb, "ping {d}", .{i}), base + @as(i64, @intCast(i)) * 1000, &idb)).outcome);
+    const lim = try sendText(&s, 3, "dave", "ping again", base + 7000, &idb);
     try t.expectEqual(PeerOutcome.queued_slow, lim.outcome);
     try t.expectEqual(@as(?RefuseReason, .loop_limited), lim.reason);
     // 5. A client that predates slow mail reads delivered, never a word it
@@ -4475,6 +4847,122 @@ test "to_list: one id, one outcome per recipient in list order; duplicates colla
     try t.expectError(error.TooManyRecipients, s.sendMany(a, 1, .{ .to_list = over, .text = "x" }, 4000, &idb));
     for (over[PEER_TO_MAX..]) |*o| o.* = "p0";
     try t.expectEqual(PEER_TO_MAX, (try s.sendMany(a, 1, .{ .to_list = over, .text = "x" }, 4000, &idb)).results.len);
+}
+
+test "an identical resend within the window is answered as a duplicate with the first send's id and never delivered again" {
+    var rec = Rec.init();
+    defer rec.deinit();
+    var s = try Store.init(t.allocator, .{ .host = "h", .emit = rec.emit() });
+    defer s.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try s.register(1, regSlow("alice"), 0);
+    try s.register(2, regSlow("bob"), 0);
+    try s.register(3, regSlow("carol"), 0);
+    try s.register(4, regSlow("dave"), 0);
+    try t.expectEqual(@as(i64, 60_000), DUP_WINDOW_MS);
+    var idb: [ID_LEN]u8 = undefined;
+    const first = try s.send(1, .{ .to = "bob", .text = "pushed it" }, 1000, &idb);
+    try t.expect(!first.duplicate);
+    const id = try a.dupe(u8, first.id);
+    // 1. The retry of a send whose answer the sender never saw.
+    const again = try s.send(1, .{ .to = "bob", .text = "pushed it" }, 2000, &idb);
+    try t.expectEqualStrings(id, again.id);
+    try t.expectEqual(PeerOutcome.delivered, again.outcome);
+    try t.expect(again.duplicate);
+    try t.expectEqual(@as(usize, 1), rec.count(2, .deliver));
+    // 2. A list send repeating it reaches only the recipient that lacks it;
+    // the duplicate's result names the earlier id, the fresh one none.
+    const m = try s.sendMany(a, 1, .{ .to_list = &.{ "bob", "carol" }, .text = "pushed it" }, 3000, &idb);
+    const list_id = try a.dupe(u8, m.id);
+    try t.expect(!std.mem.eql(u8, id, list_id));
+    try t.expectEqual(PeerOutcome.delivered, m.results[0].outcome);
+    try t.expect(m.results[0].duplicate);
+    try t.expectEqualStrings(id, m.results[0].id.?);
+    try t.expect(!m.results[1].duplicate);
+    try t.expect(m.results[1].id == null);
+    try t.expectEqual(@as(usize, 1), rec.count(2, .deliver));
+    try t.expectEqual(@as(usize, 1), rec.count(3, .deliver));
+    try t.expectEqualStrings(list_id, lastOf(&rec, 3, .deliver).?.id);
+    // 3. The whole list again: nothing goes out, and the answer's id is one
+    // a recipient holds (bob's, the first), never a fresh one.
+    const all = try s.sendMany(a, 1, .{ .to_list = &.{ "bob", "carol" }, .text = "pushed it" }, 3500, &idb);
+    try t.expectEqualStrings(id, all.id);
+    try t.expect(all.results[0].duplicate and all.results[1].duplicate);
+    try t.expect(all.results[0].id == null);
+    try t.expectEqualStrings(list_id, all.results[1].id.?);
+    try t.expectEqual(@as(usize, 1), rec.count(3, .deliver));
+    // A list repeated whole names its own id once, no per-result ids.
+    const cd = try s.sendMany(a, 1, .{ .to_list = &.{ "carol", "dave" }, .text = "both of you" }, 3600, &idb);
+    const cd_id = try a.dupe(u8, cd.id);
+    const cd2 = try s.sendMany(a, 1, .{ .to_list = &.{ "carol", "dave" }, .text = "both of you" }, 3700, &idb);
+    try t.expectEqualStrings(cd_id, cd2.id);
+    for (cd2.results) |r| try t.expect(r.duplicate and r.id == null);
+    try t.expectEqual(@as(usize, 1), rec.count(4, .deliver));
+    // 4. Another text, another sender, or the window passed: sent again.
+    _ = try s.send(1, .{ .to = "bob", .text = "pushed it twice" }, 4000, &idb);
+    _ = try s.send(3, .{ .to = "bob", .text = "pushed it" }, 4000, &idb);
+    try t.expectEqual(@as(usize, 3), rec.count(2, .deliver));
+    const late = try s.send(1, .{ .to = "bob", .text = "pushed it" }, 1000 + DUP_WINDOW_MS, &idb);
+    try t.expect(!std.mem.eql(u8, id, late.id));
+    try t.expect(!late.duplicate);
+    try t.expectEqual(@as(usize, 4), rec.count(2, .deliver));
+}
+
+test "federation: a resend of a relayed send is told the far answer, not the queued it was deferred with" {
+    var net: Net = undefined;
+    try net.init(null);
+    defer net.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try net.hub.register(1, regSlow("Zenit"), 0);
+    try net.mem.register(1, regSlow("alice"), 0);
+    try net.mem.register(2, regSlow("bob"), 0);
+    try net.connect(100);
+    try net.pump(100);
+    var idb: [ID_LEN]u8 = undefined;
+    // 1. A single send: deferred as queued, answered delivered.
+    const r1 = try net.hub.send(1, .{ .req = 7, .to = "box/alice", .text = "relayed" }, 200, &idb);
+    try t.expect(r1.deferred);
+    try t.expectEqual(PeerOutcome.queued, r1.outcome);
+    const id = try a.dupe(u8, r1.id);
+    try net.pump(200);
+    try t.expectEqual(PeerOutcome.delivered, (lastOf(&net.hub_rec, 1, .reply) orelse return error.TestUnexpectedResult).outcome);
+    const again = try net.hub.send(1, .{ .req = 8, .to = "box/alice", .text = "relayed" }, 300, &idb);
+    try t.expect(!again.deferred);
+    try t.expect(again.duplicate);
+    try t.expectEqualStrings(id, again.id);
+    try t.expectEqual(PeerOutcome.delivered, again.outcome);
+    try net.pump(300);
+    try t.expectEqual(@as(usize, 1), net.mem_rec.count(1, .deliver));
+    // 2. A to_list send: each recipient settled by its own far answer.
+    const m = try net.hub.sendMany(a, 1, .{ .req = 9, .to_list = &.{ "box/alice", "box/bob" }, .text = "both" }, 400, &idb);
+    try t.expect(m.deferred);
+    const list_id = try a.dupe(u8, m.id);
+    try net.pump(400);
+    const one = try net.hub.send(1, .{ .to = "box/bob", .text = "both" }, 500, &idb);
+    try t.expect(one.duplicate);
+    try t.expectEqualStrings(list_id, one.id);
+    try t.expectEqual(PeerOutcome.delivered, one.outcome);
+    const all = try net.hub.sendMany(a, 1, .{ .req = 10, .to_list = &.{ "box/alice", "box/bob" }, .text = "both" }, 500, &idb);
+    try t.expect(!all.deferred);
+    try t.expectEqualStrings(list_id, all.id);
+    for (all.results) |r| {
+        try t.expect(r.duplicate and r.id == null);
+        try t.expectEqual(PeerOutcome.delivered, r.outcome);
+    }
+    try net.pump(500);
+    try t.expectEqual(@as(usize, 1), net.mem_rec.count(2, .deliver));
+    // 3. A far host that never answers: a resend is told what the sender was.
+    net.up = false;
+    const lost = try net.hub.send(1, .{ .req = 11, .to = "box/alice", .text = "unanswered" }, 600, &idb);
+    if (lost.deferred) try net.pump(600 + PENDING_MS);
+    const lost2 = try net.hub.send(1, .{ .to = "box/alice", .text = "unanswered" }, 700 + PENDING_MS, &idb);
+    try t.expect(lost2.duplicate);
+    try t.expectEqual(PeerOutcome.queued, lost2.outcome);
+    try t.expectEqual(@as(?RefuseReason, .host_unreachable), lost2.reason);
 }
 
 test "federation: one to_list message to two peers of one far host keeps one id; an older far broker takes only one" {
