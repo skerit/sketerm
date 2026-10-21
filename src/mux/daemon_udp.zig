@@ -62,10 +62,10 @@ pub fn handleUdpTicketReq(self: *Daemon, cl: *Client, payload: []const u8) void 
         return udpTicketErr(cl, "socket path too long");
 
     // The listener must be a binary that answers --udp-listen: the
-    // test rigs host a Daemon in a smoke binary, so SKETERM_MUX_BIN
+    // test rigs host a Daemon in a smoke binary, so the override
     // wins over /proc/self/exe, same rule as findMuxBinary.
     var bin_buf: [4096:0]u8 = undefined;
-    const bin: [*:0]const u8 = if (c.getenv("SKETERM_MUX_BIN")) |b|
+    const bin: [*:0]const u8 = if (@import("selfexec.zig").binOverride()) |b|
         b
     else if (platform.selfExecPathZ(&bin_buf)) |_|
         @ptrCast(&bin_buf)

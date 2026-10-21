@@ -12,6 +12,17 @@ const std = @import("std");
 /// argv[0] and process name of every sketerm-mux image, whatever file it was exec'd from.
 pub const BINARY = "sketerm-mux";
 
+/// The sketerm-mux image to spawn instead of the one beside us: `$SKETERM_MUX_BIN`, else the
+/// dev-profile binary the unit-test roots were built with (`build_options.test_mux_bin`, set
+/// only for them), else null. Test binaries run from .zig-cache, where neither a sibling nor
+/// `$PATH` is the fresh build, and Zig 0.17 can no longer hand them that path as environment.
+pub fn binOverride() ?[*:0]const u8 {
+    if (std.c.getenv("SKETERM_MUX_BIN")) |p| return p;
+    const opts = @import("build_options");
+    if (comptime @hasDecl(opts, "test_mux_bin")) return std.fmt.comptimePrint("{s}", .{opts.test_mux_bin});
+    return null;
+}
+
 /// Daemon-mode flag selecting process isolation (one worker process per session).
 pub const BROKER_FLAG = "--broker";
 

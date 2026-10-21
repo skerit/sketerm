@@ -5,6 +5,10 @@ const std = @import("std");
 /// `src/version.zig`. `dist/PKGBUILD`'s `pkgver()` greps the same line.
 const semver = @import("build.zig.zon").version;
 
+/// Spelled `Optimize.ReleaseFast` etc., never `.ReleaseFast`: Zig 0.17 renamed
+/// the tags to `.fast`/`.safe`/`.debug` and kept only these declarations.
+const Optimize = std.builtin.OptimizeMode;
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
 
@@ -35,9 +39,9 @@ pub fn build(b: *std.Build) void {
         "optimize",
         "release-profile build mode (default ReleaseFast; Debug fails to link through LLD on Arch + gcc 15)",
     );
-    const optimize = optimize_arg orelse .ReleaseFast;
+    const optimize = optimize_arg orelse Optimize.ReleaseFast;
 
-    const strip_default = optimize != .Debug and optimize != .ReleaseSafe;
+    const strip_default = optimize != Optimize.Debug and optimize != Optimize.ReleaseSafe;
     const strip = b.option(bool, "strip", "strip debug info") orelse strip_default;
 
     // LLVM spends minutes optimizing the monolithic test roots and the
@@ -127,8 +131,8 @@ pub fn build(b: *std.Build) void {
     // artifact imports it, so a stamped dev profile recompiled every test
     // and smoke unit after each commit. Dev artifacts carry `DEV_STAMP`
     // (no test asserts a real one) unless `-Dstamp=true`.
-    const git_commit = runCapture(b, &.{ "git", "-C", b.build_root.path orelse ".", "describe", "--always", "--dirty" }) orelse "unknown";
-    const git_date = runCapture(b, &.{ "git", "-C", b.build_root.path orelse ".", "log", "-1", "--format=%cd", "--date=format:%Y-%m-%d %H:%M" }) orelse "unknown";
+    const git_commit = runCapture(b, &.{ "git", "-C", compat.rootPath(b), "describe", "--always", "--dirty" }) orelse "unknown";
+    const git_date = runCapture(b, &.{ "git", "-C", compat.rootPath(b), "log", "-1", "--format=%cd", "--date=format:%Y-%m-%d %H:%M" }) orelse "unknown";
     const release_facts: OptionFacts = .{
         .commit = git_commit,
         .commit_date = git_date,
@@ -163,7 +167,7 @@ pub fn build(b: *std.Build) void {
     // take the dev backend and stamp but keep `-Doptimize` as they always
     // have.
     const dev: Profile = .{
-        .optimize = .ReleaseSafe,
+        .optimize = Optimize.ReleaseSafe,
         .strip = false,
         .use_llvm = test_llvm,
         .use_lld = if (test_llvm) use_lld else false,
@@ -213,7 +217,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    compat.passthruArgs(run_cmd);
     const run_step = b.step("run", "Run sketerm");
     run_step.dependOn(&run_cmd.step);
 
@@ -511,7 +515,7 @@ pub fn build(b: *std.Build) void {
     if (have_vtenc) addVtEnc(b, smoke_mcp_mod);
     const smoke_mcp = dev.executable(b, "sketerm-smoke-mcp", smoke_mcp_mod);
     const smoke_mcp_run = b.addRunArtifact(smoke_mcp);
-    dev_bins.drive(b, smoke_mcp_run, &.{ dev_bins.gui, dev_bins.mux });
+    dev_bins.drive(smoke_mcp_run, &.{ dev_bins.gui, dev_bins.mux });
     smoke_mcp_run.setCwd(b.path("."));
     const smoke_mcp_step = b.step("smoke-mcp", "MCP isolation + headless-terminal smoke (headless)");
     smoke_mcp_step.dependOn(&smoke_mcp_run.step);
@@ -549,7 +553,7 @@ pub fn build(b: *std.Build) void {
         .use_lld = use_lld,
     });
     const replay_run = b.addRunArtifact(replay);
-    if (b.args) |args| replay_run.addArgs(args);
+    compat.passthruArgs(replay_run);
     const replay_step = b.step("replay", "Replay a captured PTY byte stream into a Screen dump");
     replay_step.dependOn(&replay_run.step);
 
@@ -557,7 +561,7 @@ pub fn build(b: *std.Build) void {
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench_parser.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = Optimize.ReleaseFast,
         .link_libc = true,
     });
     configureSysDeps(b, bench_mod, cbindings_mod);
@@ -578,7 +582,7 @@ pub fn build(b: *std.Build) void {
     const bench_ed_mod = b.createModule(.{
         .root_source_file = b.path("src/bench_editor.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = Optimize.ReleaseFast,
         .link_libc = true,
     });
     configureCoreDeps(b, bench_ed_mod, core_cbindings_mod);
@@ -590,7 +594,7 @@ pub fn build(b: *std.Build) void {
         .use_lld = use_lld,
     });
     const bench_ed_run = b.addRunArtifact(bench_ed);
-    if (b.args) |args| bench_ed_run.addArgs(args);
+    compat.passthruArgs(bench_ed_run);
     const bench_ed_step = b.step("bench-editor", "Editor rope/document large-file benchmark");
     bench_ed_step.dependOn(&bench_ed_run.step);
 
@@ -630,7 +634,7 @@ pub fn build(b: *std.Build) void {
     const smoke_e2e = dev.executable(b, "sketerm-smoke-e2e", smoke_e2e_mod);
     const smoke_e2e_run = b.addRunArtifact(smoke_e2e);
     // It execs the GUI and daemon.
-    dev_bins.drive(b, smoke_e2e_run, &.{ dev_bins.gui, dev_bins.mux });
+    dev_bins.drive(smoke_e2e_run, &.{ dev_bins.gui, dev_bins.mux });
     smoke_e2e_run.setCwd(b.path("."));
     const smoke_e2e_step = b.step("smoke-e2e", "End-to-end GUI smoke on sketerm's own compositor (headless, no X)");
     smoke_e2e_step.dependOn(&smoke_e2e_run.step);
@@ -671,7 +675,7 @@ pub fn build(b: *std.Build) void {
         wm_run.step.dependOn(&install_exe.step);
         wm_run.step.dependOn(&install_mux.step);
         wm_run.setCwd(b.path("."));
-        if (b.args) |args| wm_run.addArgs(args);
+        compat.passthruArgs(wm_run);
         const wm_step = b.step("measure-web", "Browser latency/sharpness measurement rig (headless display session)");
         wm_step.dependOn(&wm_run.step);
     }
@@ -688,7 +692,7 @@ pub fn build(b: *std.Build) void {
     addVideo(b, smoke_lsp_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     const smoke_lsp = dev.executable(b, "sketerm-smoke-lsp-gui", smoke_lsp_mod);
     const smoke_lsp_run = b.addRunArtifact(smoke_lsp);
-    dev_bins.drive(b, smoke_lsp_run, &.{ dev_bins.gui, dev_bins.mux, dev_bins.lsp_stub });
+    dev_bins.drive(smoke_lsp_run, &.{ dev_bins.gui, dev_bins.mux, dev_bins.lsp_stub });
     smoke_lsp_run.setCwd(b.path("."));
     const smoke_lsp_step = b.step("smoke-lsp-gui", "Drive the real editor GUI against a real language server (headless, no X)");
     smoke_lsp_step.dependOn(&smoke_lsp_run.step);
@@ -703,7 +707,7 @@ pub fn build(b: *std.Build) void {
     addVideo(b, smoke_agents_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     const smoke_agents = dev.executable(b, "sketerm-smoke-agents-gui", smoke_agents_mod);
     const smoke_agents_run = b.addRunArtifact(smoke_agents);
-    dev_bins.drive(b, smoke_agents_run, &.{ dev_bins.gui, dev_bins.mux });
+    dev_bins.drive(smoke_agents_run, &.{ dev_bins.gui, dev_bins.mux });
     smoke_agents_run.setCwd(b.path("."));
     const smoke_agents_step = b.step("smoke-agents-gui", "Sub-agent titlebar chip, tab badge and popover on the real GUI, once per colour theme (headless, no X)");
     smoke_agents_step.dependOn(&smoke_agents_run.step);
@@ -723,7 +727,7 @@ pub fn build(b: *std.Build) void {
         addVideo(b, smoke_atspi_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
         const smoke_atspi = dev.executable(b, "sketerm-smoke-atspi", smoke_atspi_mod);
         const smoke_atspi_run = b.addRunArtifact(smoke_atspi);
-        dev_bins.drive(b, smoke_atspi_run, &.{ dev_bins.gui, dev_bins.mux });
+        dev_bins.drive(smoke_atspi_run, &.{ dev_bins.gui, dev_bins.mux });
         smoke_atspi_run.setCwd(b.path("."));
         const smoke_atspi_step = b.step("smoke-atspi", "Terminal-pane AT-SPI accessibility smoke on a private a11y bus (headless, no X)");
         smoke_atspi_step.dependOn(&smoke_atspi_run.step);
@@ -870,7 +874,7 @@ pub fn build(b: *std.Build) void {
     const smoke_editor_run = b.addRunArtifact(smoke_editor);
     // The LSP stage spawns the stub server by path; building it first
     // is what makes `zig build smoke-editor` self-contained.
-    dev_bins.drive(b, smoke_editor_run, &.{dev_bins.lsp_stub});
+    dev_bins.drive(smoke_editor_run, &.{dev_bins.lsp_stub});
     const smoke_editor_step = b.step("smoke-editor", "Headless editor text pipeline render check");
     smoke_editor_step.dependOn(&smoke_editor_run.step);
     }
@@ -900,7 +904,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     configureSysDeps(b, tests_mod, cbindings_mod);
-    tests_mod.addImport("build_options", dev.glib_opts);
+    tests_mod.addImport("build_options", testOptionsModule(b, true, dev_facts, dev_bins));
     addVideo(b, tests_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, tests_mod);
     // Link the NSAccessibility shim so `zig build test` compiles AND
@@ -921,7 +925,7 @@ pub fn build(b: *std.Build) void {
         .use_lld = dev.use_lld,
     });
     const run_tests = b.addRunArtifact(tests);
-    unitTestDaemon(b, run_tests, dev_bins);
+    unitTestDaemon(run_tests, dev_bins);
     const test_roots = b.addSystemCommand(&.{ "bash" });
     test_roots.addFileArg(b.path("dist/test-test-roots.sh"));
     test_roots.has_side_effects = true;
@@ -982,7 +986,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     configureCoreDeps(b, coretests_mod, core_cbindings_mod);
-    coretests_mod.addImport("build_options", dev.noglib_opts);
+    coretests_mod.addImport("build_options", testOptionsModule(b, false, dev_facts, dev_bins));
     addVideo(b, coretests_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, coretests_mod);
     if (have_vtenc) addVtEnc(b, coretests_mod);
@@ -1004,7 +1008,7 @@ pub fn build(b: *std.Build) void {
     core_test_step.dependOn(&lint_errdefer.step);
     core_test_step.dependOn(&env_removal.step);
     const run_coretests = b.addRunArtifact(coretests);
-    unitTestDaemon(b, run_coretests, dev_bins);
+    unitTestDaemon(run_coretests, dev_bins);
     core_test_step.dependOn(&run_coretests.step);
 
     // Optional CEF browser helper — `zig build fetch-cef` / `zig build
@@ -1057,18 +1061,19 @@ const DevBins = struct {
     lsp_stub: *std.Build.Step,
 
     /// Name `dir` on `run`'s argv (`--bin-dir`) and install `needs` first.
-    fn drive(d: DevBins, b: *std.Build, run: *std.Build.Step.Run, needs: []const *std.Build.Step) void {
+    fn drive(d: DevBins, run: *std.Build.Step.Run, needs: []const *std.Build.Step) void {
         for (needs) |s| run.step.dependOn(s);
-        run.addArgs(&.{ "--bin-dir", b.getInstallPath(d.dir, "") });
+        run.addArg("--bin-dir");
+        compat.addInstalledDirArg(run, d.dir);
     }
 };
 
-/// A unit-test run autostarts THIS tree's daemon (`SKETERM_MUX_BIN`), never
-/// whatever `sketerm-mux` is on PATH: an installed one predates the
-/// tree under test and once read the user's config as a peer hub.
-fn unitTestDaemon(b: *std.Build, run: *std.Build.Step.Run, d: DevBins) void {
+/// A unit-test run autostarts THIS tree's daemon (`build_options.test_mux_bin`,
+/// see `testOptionsModule`), never whatever `sketerm-mux` is on PATH: an
+/// installed one predates the tree under test and once read the user's
+/// config as a peer hub.
+fn unitTestDaemon(run: *std.Build.Step.Run, d: DevBins) void {
     run.step.dependOn(d.mux);
-    run.setEnvironmentVariable("SKETERM_MUX_BIN", b.getInstallPath(d.dir, "sketerm-mux"));
 }
 
 /// The commit and commit date dev-profile artifacts carry instead of git's.
@@ -1092,6 +1097,20 @@ const OptionFacts = struct {
 /// and every noglib artifact records GIF and says so in capabilities.
 fn optionsModule(b: *std.Build, glib: bool, f: OptionFacts) *std.Build.Module {
     const o = b.addOptions();
+    addFactOptions(o, glib, f);
+    return o.createModule();
+}
+
+/// `optionsModule` plus `test_mux_bin`: the dev `sketerm-mux` installed into
+/// `d.dir`, which `selfexec.binOverride` spawns from the unit-test binaries.
+fn testOptionsModule(b: *std.Build, glib: bool, f: OptionFacts, d: DevBins) *std.Build.Module {
+    const o = b.addOptions();
+    addFactOptions(o, glib, f);
+    compat.addInstalledPathOption(o, "test_mux_bin", d.dir, "sketerm-mux");
+    return o.createModule();
+}
+
+fn addFactOptions(o: *std.Build.Step.Options, glib: bool, f: OptionFacts) void {
     o.addOption(bool, "glib", glib);
     o.addOption([]const u8, "version", semver);
     o.addOption([]const u8, "commit", f.commit);
@@ -1103,7 +1122,6 @@ fn optionsModule(b: *std.Build, glib: bool, f: OptionFacts) *std.Build.Module {
     o.addOption(bool, "audio_opus", f.audio_opus);
     o.addOption(bool, "dmabuf_import", f.dmabuf_import);
     o.addOption(bool, "webm_rec", glib);
-    return o.createModule();
 }
 
 /// What the GUI, sketerm-mux and sketerm-mcp are built from in either profile.
@@ -1251,7 +1269,7 @@ fn addCef(
     else if (b.graph.environ_map.get("HOME")) |home|
         b.fmt("{s}/.cache/sketerm/cef/{s}", .{ home, CEF_VERSION })
     else
-        b.fmt("{s}/.zig-cache/cef/{s}", .{ b.build_root.path orelse ".", CEF_VERSION });
+        b.fmt("{s}/.zig-cache/cef/{s}", .{ compat.rootPath(b), CEF_VERSION });
     const root_opt = b.option(
         []const u8,
         "cef-root",
@@ -1377,7 +1395,7 @@ fn addCef(
     else if (b.graph.environ_map.get("HOME")) |home|
         b.fmt("{s}/.cache/sketerm/webext-fixtures", .{home})
     else
-        b.fmt("{s}/.zig-cache/webext-fixtures", .{b.build_root.path orelse "."});
+        b.fmt("{s}/.zig-cache/webext-fixtures", .{compat.rootPath(b)});
     const ubo_xpi = b.fmt("{s}/ublock_origin-{s}.xpi", .{ ubo_dir, UBO_VERSION });
     const fetch_ext = b.addSystemCommand(&.{
         "sh", "-c",
@@ -1698,14 +1716,14 @@ fn addCef(
     if (smoke_untrusted_step) |step| {
         const smoke = b.addSystemCommand(&.{"bash"});
         smoke.addFileArg(b.path("dist/test-web-untrusted-netns.sh"));
-        dev_bins.drive(b, smoke, &.{ dev_bins.mcp, dev_bins.mux });
+        dev_bins.drive(smoke, &.{ dev_bins.mcp, dev_bins.mux });
         smoke.addArg("--helper");
         smoke.addArtifactArg(web_exe);
         smoke.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
         smoke.has_side_effects = true;
         const acks = b.addSystemCommand(&.{ "python3", "-B" });
         acks.addFileArg(b.path("dist/test-web-untrusted-acks.py"));
-        dev_bins.drive(b, acks, &.{ dev_bins.mcp, dev_bins.mux });
+        dev_bins.drive(acks, &.{ dev_bins.mcp, dev_bins.mux });
         acks.addArg("--helper");
         acks.addArtifactArg(web_exe);
         acks.has_side_effects = true;
@@ -1725,7 +1743,7 @@ fn addCef(
     // bundle is built FROM, not as something to run.
     const mac_bundle = b.addSystemCommand(&.{"dist/macos-bundle.sh"});
     if (is_mac_cef) {
-        mac_bundle.addArg(b.getInstallPath(.prefix, ""));
+        compat.addInstalledDirArg(mac_bundle, .prefix);
         mac_bundle.addArtifactArg(web_exe);
         mac_bundle.addArg(release_dir);
         mac_bundle.has_side_effects = true;
@@ -1750,7 +1768,7 @@ fn addCef(
         // The loose executable cannot run on macOS (no bundle, so no
         // icudtl.dat and no helper for children) — the rig has to drive
         // the assembled .app, and therefore has to wait for it.
-        smoke_web_run.addArg(b.getInstallPath(.prefix, "sketerm-webengine.app/Contents/MacOS/sketerm-webengine"));
+        smoke_web_run.addFileArg(compat.installedPath(b, .prefix, "sketerm-webengine.app/Contents/MacOS/sketerm-webengine"));
         smoke_web_run.step.dependOn(&mac_bundle.step);
     } else smoke_web_run.addArtifactArg(web_exe);
     // The remote-helper stage spawns a private sketerm-mux and asks IT
@@ -1772,7 +1790,7 @@ fn addCef(
     // and the stage stays a clean SKIP.
     smoke_mcp_run.addArg("--web-bin");
     if (is_mac_cef) {
-        smoke_mcp_run.addArg(b.getInstallPath(.prefix, "sketerm-webengine.app/Contents/MacOS/sketerm-webengine"));
+        smoke_mcp_run.addFileArg(compat.installedPath(b, .prefix, "sketerm-webengine.app/Contents/MacOS/sketerm-webengine"));
         smoke_mcp_run.step.dependOn(&mac_bundle.step);
     } else smoke_mcp_run.addArtifactArg(web_exe);
 
@@ -1815,17 +1833,85 @@ fn addCef(
 /// source. ELF hid the bug: GNU ld coalesces DT_NEEDED.
 const gui_pkg = "sketerm-gui";
 
+/// What GUI artifacts ask pkg-config for: `gui_pkg` itself, unless
+/// `registerGuiPkgConfigPath` found the maker cannot see it.
+var gui_pkgs: []const []const u8 = &.{gui_pkg};
+
 /// Make `vendor/pkgconfig/` visible to the pkg-config invocations Zig
 /// runs for `gui_pkg`, without disturbing a PKG_CONFIG_PATH the caller
 /// set. Only the search path is touched here — no package is resolved,
 /// so a GTK-less host can still build the daemon (`dist/test-mux-build.sh`).
+///
+/// Zig 0.17 runs pkg-config in its separate maker process, with the
+/// environment `zig build` was started with; nothing build.zig puts in
+/// its own environment reaches it. There `gui_pkg` resolves only when
+/// the caller exported the directory, and otherwise `gui_pkgs` becomes
+/// its `Requires:` roster, linked package by package. That is the
+/// duplicate-`-l` link the virtual package exists to avoid, harmless on
+/// ELF but fatal under dyld, so on macOS the GUI steps then fail with
+/// the export to run instead (`guiPkgConfigGate`).
 fn registerGuiPkgConfigPath(b: *std.Build) void {
-    const dir = b.pathFromRoot("vendor/pkgconfig");
-    const merged = if (b.graph.environ_map.get("PKG_CONFIG_PATH")) |prev|
-        b.fmt("{s}:{s}", .{ dir, prev })
-    else
-        dir;
+    const dir = b.pathResolve(&.{ compat.rootPath(b), "vendor/pkgconfig" });
+    const prev = b.graph.environ_map.get("PKG_CONFIG_PATH");
+    if (compat.separate_maker) {
+        if (prev) |p| {
+            var it = std.mem.tokenizeScalar(u8, p, ':');
+            while (it.next()) |entry| if (std.mem.eql(u8, b.pathResolve(&.{entry}), dir)) return;
+        }
+        gui_pkgs = guiRoster(b);
+        return;
+    }
+    const merged = if (prev) |p| b.fmt("{s}:{s}", .{ dir, p }) else dir;
     b.graph.environ_map.put("PKG_CONFIG_PATH", merged) catch @panic("OOM");
+}
+
+/// The `Requires:` packages of `vendor/pkgconfig/sketerm-gui.pc`, so the
+/// .pc file stays the one roster even when it cannot be linked by name.
+fn guiRoster(b: *std.Build) []const []const u8 {
+    const sub = "vendor/pkgconfig/" ++ gui_pkg ++ ".pc";
+    const text = compat.readRootFile(b, sub);
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const key = "Requires:";
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        var names: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.tokenizeAny(u8, line[key.len..], " \t,\r");
+        while (it.next()) |n| {
+            // `pkg >= 1.2`: the operator and version are not package names.
+            if (std.mem.indexOfAny(u8, n[0..1], "<>=!") != null) {
+                _ = it.next();
+                continue;
+            }
+            names.append(b.allocator, n) catch @panic("OOM");
+        }
+        return names.items;
+    }
+    std.debug.panic("{s} has no Requires: line", .{sub});
+}
+
+/// What every GUI artifact checks before Zig resolves `gui_pkgs`, or null
+/// on Zig 0.16. On 0.17 those lookups cannot be `.force` (see
+/// `compat.pkg_config_required`), so a missing package would otherwise
+/// degrade to a bare `-l` and a confusing translate or link error; on
+/// macOS with the per-package roster it is a failure naming the export
+/// to run (see `registerGuiPkgConfigPath`).
+fn guiPkgConfigGate(b: *std.Build, target: std.Build.ResolvedTarget) ?*std.Build.Step {
+    if (!compat.separate_maker) return null;
+    if (gui_pkgs.len > 1 and target.result.os.tag == .macos) {
+        const fail = b.addFail(b.fmt(
+            "Zig 0.17 runs pkg-config with zig build's own environment, so it cannot find " ++
+                "vendor/pkgconfig/{s}.pc, and linking its packages one by one makes dyld refuse the GUI " ++
+                "(duplicate LC_LOAD_DYLIB). Run: export PKG_CONFIG_PATH={s}/vendor/pkgconfig${{PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}}",
+            .{ gui_pkg, compat.rootPath(b) },
+        ));
+        return &fail.step;
+    }
+    const pkg_config = b.graph.environ_map.get("PKG_CONFIG") orelse "pkg-config";
+    const check = b.addSystemCommand(&.{ pkg_config, "--print-errors", "--exists" });
+    check.addArgs(gui_pkgs);
+    if (gui_layer_shell) check.addArg("gtk4-layer-shell-0");
+    check.setName("check GUI pkg-config packages");
+    return &check.step;
 }
 
 /// Set up the out-of-process TranslateC step that turns
@@ -1850,14 +1936,15 @@ fn buildCBindings(
     });
     // Generated shim FIRST so it shadows the system gdkversionmacros.h.
     tc.addIncludePath(generateGdkShim(b));
-    tc.linkSystemLibrary(gui_pkg, .{ .use_pkg_config = .force });
+    for (gui_pkgs) |pkg| tc.linkSystemLibrary(pkg, .{ .use_pkg_config = compat.pkg_config_required });
+    if (guiPkgConfigGate(b, target)) |gate| tc.step.dependOn(gate);
     // The macro is what `vendor/cimport_root.h` keys the
     // <gtk4-layer-shell.h> include on, so a `-Dlayer-shell=false` build
     // has no `gtk_layer_*` decls at all and window.zig's `@hasDecl`
     // gate compiles the layer path out.
     if (gui_layer_shell) {
         tc.defineCMacro("SKETERM_LAYER_SHELL", "1");
-        tc.linkSystemLibrary("gtk4-layer-shell-0", .{ .use_pkg_config = .force });
+        tc.linkSystemLibrary("gtk4-layer-shell-0", .{ .use_pkg_config = compat.pkg_config_required });
     }
     tc.addIncludePath(b.path("vendor"));
 
@@ -1920,7 +2007,7 @@ fn addHostTool(b: *std.Build, name: []const u8, root: []const u8) *std.Build.Ste
         .root_module = b.createModule(.{
             .root_source_file = b.path(root),
             .target = host,
-            .optimize = .Debug,
+            .optimize = Optimize.Debug,
         }),
         .use_llvm = !self_hosted,
         .use_lld = if (self_hosted) false else host.result.os.tag == .linux,
@@ -2262,7 +2349,7 @@ fn agentAdaptersSource(b: *std.Build) std.Build.LazyPath {
     if (agent_adapters_src) |p| return p;
     const io = b.graph.io;
     var names: std.ArrayList([]const u8) = .empty;
-    var dir = b.build_root.handle.openDir(io, "data/agents", .{ .iterate = true }) catch @panic("data/agents is missing");
+    var dir = compat.openRootDir(b, io, "data/agents") catch @panic("data/agents is missing");
     defer dir.close(io);
     var it = dir.iterate();
     while (it.next(io) catch @panic("cannot list data/agents")) |e| {
@@ -2361,7 +2448,7 @@ fn configureSysDeps(
     // binary, so a reorder here fails a rig rather than a user.
     if (mod.resolved_target.?.result.os.tag == .linux and gui_layer_shell)
         addPkgConfig(b, mod, "gtk4-layer-shell-0");
-    addPkgConfig(b, mod, gui_pkg);
+    for (gui_pkgs) |pkg| addPkgConfig(b, mod, pkg);
     // Per-window WM_CLASS for remote app windows (wlapp.zig calls
     // XChangeProperty directly — GTK links X11 but doesn't re-export
     // it). Linux-only; the macOS GUI has no X11.
@@ -2396,7 +2483,7 @@ var gui_layer_shell = false;
 /// Resolve a pkg-config package only when a reachable compile step needs it.
 fn addPkgConfig(b: *std.Build, mod: *std.Build.Module, pkg: []const u8) void {
     _ = b;
-    mod.linkSystemLibrary(pkg, .{ .use_pkg_config = .force });
+    mod.linkSystemLibrary(pkg, .{ .use_pkg_config = compat.pkg_config_required });
 }
 
 /// Capture a command's trimmed stdout, or null when the command is
@@ -2422,3 +2509,88 @@ fn addPkgConfigIncludes(b: *std.Build, mod: *std.Build.Module, pkg: []const u8) 
         }
     }
 }
+
+/// The build-API differences between Zig 0.16 and 0.17, kept in one place so
+/// dropping 0.16 is deleting this struct and inlining the 0.17 branches.
+const compat = struct {
+    /// Zig 0.17, told apart by `b.root` (0.16's `b.build_root`, a
+    /// `Cache.Directory`, became that `Cache.Path`).
+    const v017 = @hasField(std.Build, "root");
+
+    /// 0.17 split `zig build` into a configure process running build.zig
+    /// and a maker process running the steps; environment changes made
+    /// here never reach the latter.
+    const separate_maker = v017;
+
+    /// A file under the build root read at configure time; on 0.17 also
+    /// declared as a configure input so the cached configuration follows it.
+    fn readRootFile(b: *std.Build, sub_path: []const u8) []const u8 {
+        const io = b.graph.io;
+        if (comptime v017) {
+            b.dependOnFileContents(b.path(sub_path));
+            const full = b.pathJoin(&.{ b.root.sub_path, sub_path });
+            return b.root.root_dir.handle.readFileAlloc(io, full, b.allocator, .limited(1 << 20)) catch |e|
+                std.debug.panic("cannot read {s}: {t}", .{ sub_path, e });
+        }
+        return b.build_root.handle.readFileAlloc(io, sub_path, b.allocator, .limited(1 << 20)) catch |e|
+            std.debug.panic("cannot read {s}: {t}", .{ sub_path, e });
+    }
+
+    fn rootPath(b: *std.Build) []const u8 {
+        if (comptime v017) return b.root.toString(b.allocator) catch @panic("OOM");
+        return b.build_root.path orelse ".";
+    }
+
+    /// How a required system package is resolved. 0.17's maker fails a
+    /// `.force` lookup on any cflag it does not model (Arch's gtk4.pc
+    /// carries `-mfpmath=sse`), which 0.16 only did under
+    /// `--debug-pkg-config`; `.yes` ignores such flags, and
+    /// `guiPkgConfigGate` restores the missing-package error it drops.
+    const pkg_config_required: @FieldType(std.Build.Module.LinkSystemLibraryOptions, "use_pkg_config") =
+        if (v017) .yes else .force;
+
+    /// A build-root directory listed at configure time; on 0.17 the listing
+    /// is declared as a configure input so the cached configuration follows it.
+    fn openRootDir(b: *std.Build, io: std.Io, sub_path: []const u8) !std.Io.Dir {
+        if (comptime v017) {
+            b.dependOnDirectoryMetadata(b.path(sub_path));
+            return b.root.openDir(io, sub_path, .{ .iterate = true });
+        }
+        return b.build_root.handle.openDir(io, sub_path, .{ .iterate = true });
+    }
+
+    /// Forward `zig build <step> -- args`; 0.17 removed `b.args`, so build
+    /// scripts can no longer see the arguments, only splice them in.
+    fn passthruArgs(run: *std.Build.Step.Run) void {
+        if (comptime @hasDecl(std.Build.Step.Run, "addPassthruArgs")) return run.addPassthruArgs();
+        if (run.step.owner.args) |args| run.addArgs(args);
+    }
+
+    /// Where `sub_path` under `dir` gets installed. 0.17 removed
+    /// `getInstallPath`: the prefix is only known at make time, so the
+    /// path is a `LazyPath` relative to the install prefix.
+    fn installedPath(b: *std.Build, dir: std.Build.InstallDir, sub_path: []const u8) std.Build.LazyPath {
+        if (comptime !v017) return .{ .cwd_relative = b.getInstallPath(dir, sub_path) };
+        const base: @FieldType(@FieldType(std.Build.LazyPath, "relative"), "base"), const dir_sub = switch (dir) {
+            .prefix => .{ .install_prefix, "" },
+            .bin => .{ .install_bin, "" },
+            .lib => .{ .install_lib, "" },
+            .header => .{ .install_include, "" },
+            .custom => |p| .{ .install_prefix, p },
+        };
+        return .{ .relative = .{ .base = base, .sub_path = b.pathJoin(&.{ dir_sub, sub_path }) } };
+    }
+
+    fn addInstalledDirArg(run: *std.Build.Step.Run, dir: std.Build.InstallDir) void {
+        run.addDirectoryArg(installedPath(run.step.owner, dir, ""));
+    }
+
+    /// A `[]const u8` option naming an installed file. Untracked on 0.17,
+    /// so the option (and every module importing it) does not rebuild
+    /// when that file changes; the string itself is stable.
+    fn addInstalledPathOption(o: *std.Build.Step.Options, name: []const u8, dir: std.Build.InstallDir, sub_path: []const u8) void {
+        const b = o.step.owner;
+        if (comptime !v017) return o.addOption([]const u8, name, b.getInstallPath(dir, sub_path));
+        o.addOptionPathUntracked(name, installedPath(b, dir, sub_path));
+    }
+};

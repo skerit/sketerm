@@ -20,18 +20,29 @@ var g_paths: std.EnumArray(Bin, [*:0]const u8) = blk: {
 var g_bufs: std.EnumArray(Bin, [PATH_MAX:0]u8) = undefined;
 
 /// Take `--bin-dir <dir>` from the rig's argv; call once, before any thread or child starts.
+/// A relative dir (the default, or what Zig 0.17's build passes) is anchored at the
+/// current directory here, since rigs hand these paths to children that run elsewhere.
 /// @return false, having said why, when a path under `dir` does not fit.
 pub fn init(argv: []const [*:0]const u8) bool {
+    var dir: []const u8 = DEFAULT_DIR;
     for (argv, 0..) |a, i| {
-        if (i + 1 >= argv.len or !std.mem.eql(u8, std.mem.span(a), "--bin-dir")) continue;
-        const dir = std.mem.span(argv[i + 1]);
-        for (std.enums.values(Bin)) |bin| {
-            const p = std.fmt.bufPrintZ(g_bufs.getPtr(bin), "{s}/{s}", .{ dir, @tagName(bin) }) catch {
-                std.debug.print("smoke rig: --bin-dir {s} is too long a path\n", .{dir});
-                return false;
-            };
-            g_paths.set(bin, p.ptr);
-        }
+        if (i + 1 < argv.len and std.mem.eql(u8, std.mem.span(a), "--bin-dir")) dir = std.mem.span(argv[i + 1]);
+    }
+    var cwd_buf: [PATH_MAX:0]u8 = undefined;
+    const cwd: []const u8 = if (dir.len > 0 and dir[0] == '/') "" else cwd: {
+        const p = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse {
+            std.debug.print("smoke rig: cannot resolve --bin-dir {s}: no current directory\n", .{dir});
+            return false;
+        };
+        break :cwd std.mem.sliceTo(p, 0);
+    };
+    for (std.enums.values(Bin)) |bin| {
+        const sep = if (cwd.len == 0) "" else "/";
+        const p = std.fmt.bufPrintSentinel(g_bufs.getPtr(bin), "{s}{s}{s}/{s}", .{ cwd, sep, dir, @tagName(bin) }, 0) catch {
+            std.debug.print("smoke rig: --bin-dir {s} is too long a path\n", .{dir});
+            return false;
+        };
+        g_paths.set(bin, p.ptr);
     }
     return true;
 }
@@ -49,4 +60,15 @@ test "bin paths default to the install and follow --bin-dir" {
     try t.expect(init(&argv));
     try t.expectEqualStrings("/x/dev-bin/sketerm", std.mem.span(path(.sketerm)));
     try t.expectEqualStrings("/x/dev-bin/sketerm-lsp-stub", std.mem.span(path(.@"sketerm-lsp-stub")));
+}
+
+test "a relative --bin-dir is anchored at the current directory" {
+    const t = std.testing;
+    const saved = g_paths;
+    defer g_paths = saved;
+    const argv = [_][*:0]const u8{ "rig", "--bin-dir", "./zig-out/dev-bin" };
+    try t.expect(init(&argv));
+    const p = std.mem.span(path(.@"sketerm-mux"));
+    try t.expect(p[0] == '/');
+    try t.expect(std.mem.endsWith(u8, p, "/./zig-out/dev-bin/sketerm-mux"));
 }

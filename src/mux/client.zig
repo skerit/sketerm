@@ -212,9 +212,9 @@ fn reapBootstrapChild(pid: c.pid_t) void {
 /// first (works for `zig build run` trees), then bare name ($PATH).
 pub fn findMuxBinary(buf: *[4096:0]u8) [*:0]const u8 {
     const platform = @import("../util/platform.zig");
-    // $SKETERM_MUX_BIN pins the binary outright — test rigs run from
-    // zig-cache where neither the sibling nor $PATH is the fresh build.
-    if (c.getenv("SKETERM_MUX_BIN")) |p| return p;
+    // An override (test rigs run from zig-cache, where neither the
+    // sibling nor $PATH is the fresh build) pins the binary outright.
+    if (selfexec.binOverride()) |p| return p;
     if (platform.exePathZ(buf)) |exe_path| {
         if (std.mem.lastIndexOfScalar(u8, exe_path, '/')) |slash| {
             const dir_len = slash + 1;
