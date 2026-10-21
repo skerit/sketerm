@@ -249,8 +249,8 @@ pub const AttrPair = struct { name: [:0]const u8, value: [:0]const u8 };
 
 /// Every attribute of `a` as GTK names it, colours as `r,g,b`.
 pub fn attrPairs(a: TextAttrs, fg_buf: *[16]u8, bg_buf: *[16]u8) [6]AttrPair {
-    const fg = std.fmt.bufPrintZ(fg_buf, "{d},{d},{d}", .{ a.fg[0], a.fg[1], a.fg[2] }) catch "0,0,0";
-    const bg = std.fmt.bufPrintZ(bg_buf, "{d},{d},{d}", .{ a.bg[0], a.bg[1], a.bg[2] }) catch "0,0,0";
+    const fg = std.fmt.bufPrintSentinel(fg_buf, "{d},{d},{d}", .{ a.fg[0], a.fg[1], a.fg[2] }, 0) catch "0,0,0";
+    const bg = std.fmt.bufPrintSentinel(bg_buf, "{d},{d},{d}", .{ a.bg[0], a.bg[1], a.bg[2] }, 0) catch "0,0,0";
     return .{
         .{ .name = "weight", .value = if (a.bold) "700" else "400" },
         .{ .name = "style", .value = if (a.italic) "italic" else "normal" },

@@ -139,7 +139,7 @@ fn writeAll(allocator: std.mem.Allocator, path: [:0]const u8, bytes: []const u8)
 fn indexPath(allocator: std.mem.Allocator) ?[:0]u8 {
     const p = xdg.statePath(allocator, FILE) catch return null;
     defer allocator.free(p);
-    return allocator.dupeZ(u8, p) catch null;
+    return allocator.dupeSentinel(u8, p, 0) catch null;
 }
 
 /// Record `tags` for `path` (after a successful tag_set). Best effort:

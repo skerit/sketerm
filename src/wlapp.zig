@@ -1473,7 +1473,7 @@ pub const AppHost = struct {
             return;
         };
         var buf: [256:0]u8 = undefined;
-        const z = std.fmt.bufPrintZ(&buf, "{s}", .{title}) catch return;
+        const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{title}, 0) catch return;
         c.gtk_window_set_title(win.window, z.ptr);
     }
 
@@ -1612,7 +1612,7 @@ pub const AppHost = struct {
         };
         if (self.pending_titles.fetchRemove(surface)) |kv| {
             var tbuf: [256:0]u8 = undefined;
-            if (std.fmt.bufPrintZ(&tbuf, "{s}", .{kv.value})) |z| {
+            if (std.fmt.bufPrintSentinel(&tbuf, "{s}", .{kv.value}, 0)) |z| {
                 c.gtk_window_set_title(window, z.ptr);
             } else |_| {}
             self.allocator.free(kv.value);

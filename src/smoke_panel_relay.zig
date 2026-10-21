@@ -184,7 +184,7 @@ fn patternByte(offset: u64) u8 {
 
 fn proveAttachedAssetRead(allocator: std.mem.Allocator, presenter: *client_mod.Conn) void {
     var path_buf: [160]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-relay-asset-{d}.bin", .{c.getpid()}) catch
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-panel-relay-asset-{d}.bin", .{c.getpid()}, 0) catch
         fail("asset smoke path");
     defer _ = c.unlink(path.ptr);
     const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC, @as(c.mode_t, 0o600));

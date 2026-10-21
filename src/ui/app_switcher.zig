@@ -243,7 +243,7 @@ const Switcher = struct {
         else
             "";
         var out: [768:0]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&out, "{d} playing, {d} application window(s), {d} attached, {d} available{s}{s}{s}{s}", .{
+        const text = std.fmt.bufPrintSentinel(&out, "{d} playing, {d} application window(s), {d} attached, {d} available{s}{s}{s}{s}", .{
             self.playing_apps,
             self.open_windows,
             self.attached_sessions,
@@ -252,7 +252,7 @@ const Switcher = struct {
             stopping,
             failed,
             note,
-        }) catch "Session overview";
+        }, 0) catch "Session overview";
         c.gtk_label_set_text(@ptrCast(self.status), text.ptr);
         c.gtk_widget_set_sensitive(self.refresh_button, @intFromBool(self.pending_ops == 0));
     }
@@ -485,13 +485,13 @@ fn addAudioRow(self: *Switcher, term: *Terminal, pane: ?*Pane, app_session: ?*mu
         "";
     var subtitle_out: [896:0]u8 = undefined;
     const media = if (info.media.len > 0) info.media else "Active playback stream";
-    const subtitle = std.fmt.bufPrintZ(&subtitle_out, "{s}{s} - {s} - session {s}{s}", .{
+    const subtitle = std.fmt.bufPrintSentinel(&subtitle_out, "{s}{s} - {s} - session {s}{s}", .{
         media,
         if (streams > 1) " (multiple streams)" else "",
         hostLabel(term),
         remote.session,
         pid_text,
-    }) catch "Playing through Sketerm";
+    }, 0) catch "Playing through Sketerm";
     const entry = appendRow(self, .audio, displayApplication(info), subtitle, null, if (info.icon.len > 0) info.icon else "audio-x-generic-symbolic", true) orelse return;
     entry.kind = .audio;
     entry.pane = pane;
@@ -515,7 +515,7 @@ fn addApplicationRows(self: *Switcher, term: *Terminal, pane: ?*Pane) usize {
             var subtitle_buf: [640:0]u8 = undefined;
             const app_id = if (info.app_id.len > 0) info.app_id else "application";
             const place = if (info.embedded) "in a pane" else "forwarded window";
-            const subtitle = std.fmt.bufPrintZ(&subtitle_buf, "{s} - {s} - {s} - session {s}", .{ app_id, place, hostLabel(term), remote.session }) catch "Forwarded application";
+            const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "{s} - {s} - {s} - session {s}", .{ app_id, place, hostLabel(term), remote.session }, 0) catch "Forwarded application";
             const entry = appendRow(self, .applications, if (title.len > 0) title else app_id, subtitle, info.paintable, "application-x-executable-symbolic", false) orelse continue;
             entry.kind = .native_window;
             entry.native_host = native.host;
@@ -534,7 +534,7 @@ fn addApplicationRows(self: *Switcher, term: *Terminal, pane: ?*Pane) usize {
         for (infos) |info| {
             const title = std.mem.span(info.title);
             var subtitle_buf: [512:0]u8 = undefined;
-            const subtitle = std.fmt.bufPrintZ(&subtitle_buf, "streamed window - {s} - session {s}", .{ hostLabel(term), remote.session }) catch "Streamed application";
+            const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "streamed window - {s} - session {s}", .{ hostLabel(term), remote.session }, 0) catch "Streamed application";
             const entry = appendRow(self, .applications, if (title.len > 0) title else remote.session, subtitle, info.paintable, "application-x-executable-symbolic", false) orelse continue;
             entry.kind = .streamed_window;
             entry.streamed_host = streamed.host;
@@ -550,7 +550,7 @@ fn addApplicationRows(self: *Switcher, term: *Terminal, pane: ?*Pane) usize {
 fn addHiddenAppRow(self: *Switcher, app_session: *muxtabs.AppSession) void {
     const remote = app_session.terminal.remote orelse return;
     var subtitle_buf: [512:0]u8 = undefined;
-    const subtitle = std.fmt.bufPrintZ(&subtitle_buf, "No window is open - {s} - activate to show its log in a tab", .{hostLabel(app_session.terminal)}) catch "Application session without a window";
+    const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "No window is open - {s} - activate to show its log in a tab", .{hostLabel(app_session.terminal)}, 0) catch "Application session without a window";
     const entry = appendRow(self, .applications, remote.session, subtitle, null, "view-conceal-symbolic", false) orelse return;
     entry.kind = .hidden_app;
     entry.app_session = app_session;
@@ -564,7 +564,7 @@ fn addPaneRow(self: *Switcher, pane: *Pane) void {
     const title = if (term.screen.last_title) |value| value else remote.session;
     var subtitle_buf: [768:0]u8 = undefined;
     const kind = if (remote.is_app) "Application session" else "Shell session";
-    const subtitle = std.fmt.bufPrintZ(&subtitle_buf, "{s} - {s} - {s}", .{ kind, hostLabel(term), remote.session }) catch "Attached mux session";
+    const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "{s} - {s} - {s}", .{ kind, hostLabel(term), remote.session }, 0) catch "Attached mux session";
     const entry = appendRow(self, .attached, title, subtitle, null, std.mem.span((if (remote.is_app) assistants.Kind.app else assistants.Kind.terminal).icon()), false) orelse return;
     entry.kind = .pane;
     entry.pane = pane;
@@ -638,7 +638,7 @@ fn populateAgentsElsewhere(self: *Switcher) void {
             var title_buf: [320]u8 = undefined;
             const title = assistants.rowTitle(&title_buf, a, s);
             var subtitle_buf: [768:0]u8 = undefined;
-            const subtitle = std.fmt.bufPrintZ(&subtitle_buf, "Sub-agent - assistant {s} - session {s} at {s}", .{ a.label(), s.name, host }) catch "Sub-agent session";
+            const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "Sub-agent - assistant {s} - session {s} at {s}", .{ a.label(), s.name, host }, 0) catch "Sub-agent session";
             const entry = appendRow(self, .available, title, subtitle, null, std.mem.span(s.kind.icon()), false) orelse continue;
             entry.kind = .attach;
             setSessionTarget(self, entry, s.name, host, s.origin_id, false);
@@ -664,13 +664,13 @@ fn addFetchedAudioRow(self: *Switcher, daemon: *DaemonState, session: *const mux
     const pid = if (info.pid != 0) std.fmt.bufPrint(&pid_buf, " - PID {d}", .{info.pid}) catch "" else "";
     var subtitle_buf: [1024:0]u8 = undefined;
     const media = if (info.media.len > 0) info.media else "Active playback stream";
-    const subtitle = std.fmt.bufPrintZ(&subtitle_buf, "{s}{s} - {s} - session {s}{s}", .{
+    const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "{s}{s} - {s} - session {s}{s}", .{
         media,
         if (streams > 1) " (multiple streams)" else "",
         daemon.origin,
         session.name,
         pid,
-    }) catch "Playing on an available session";
+    }, 0) catch "Playing on an available session";
     const entry = appendRow(self, .audio, displayApplication(info), subtitle, null, if (info.icon.len > 0) info.icon else "audio-x-generic-symbolic", true) orelse return;
     entry.kind = .attach;
     setSessionTarget(self, entry, session.name, daemon.host, session.origin_id, true);
@@ -685,7 +685,7 @@ fn addAvailableRow(self: *Switcher, daemon: *DaemonState, session: *const mux_cl
     var subtitle_buf: [896:0]u8 = undefined;
     const kind = if (session.app) "Application" else "Shell";
     const cwd = if (session.cwd.len > 0) session.cwd else "working directory unavailable";
-    const subtitle = std.fmt.bufPrintZ(&subtitle_buf, "{s} - {s} - session {s} - {s} - {d} viewer(s)", .{ kind, daemon.origin, session.name, cwd, session.viewerCount() }) catch "Available mux session";
+    const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "{s} - {s} - session {s} - {s} - {d} viewer(s)", .{ kind, daemon.origin, session.name, cwd, session.viewerCount() }, 0) catch "Available mux session";
     const entry = appendRow(self, .available, title, subtitle, null, std.mem.span((if (session.app) assistants.Kind.app else assistants.Kind.terminal).icon()), false) orelse return;
     entry.kind = .attach;
     setSessionTarget(self, entry, session.name, daemon.host, session.origin_id, true);
@@ -715,7 +715,7 @@ fn appendRow(self: *Switcher, section: Section, title: []const u8, subtitle: [:0
         c.gtk_box_append(@ptrCast(body), picture);
     } else {
         var icon_buf: [192:0]u8 = undefined;
-        const icon_z = std.fmt.bufPrintZ(&icon_buf, "{s}", .{icon_name}) catch "application-x-executable-symbolic";
+        const icon_z = std.fmt.bufPrintSentinel(&icon_buf, "{s}", .{icon_name}, 0) catch "application-x-executable-symbolic";
         const icon = c.gtk_image_new_from_icon_name(icon_z.ptr).?;
         c.gtk_image_set_pixel_size(@ptrCast(icon), if (section == .audio) 44 else 40);
         c.gtk_widget_set_size_request(icon, 72, 64);
@@ -726,7 +726,7 @@ fn appendRow(self: *Switcher, section: Section, title: []const u8, subtitle: [:0
     c.gtk_widget_set_hexpand(text, 1);
     c.gtk_widget_set_valign(text, c.GTK_ALIGN_CENTER);
     var title_buf: [512:0]u8 = undefined;
-    const title_z = std.fmt.bufPrintZ(&title_buf, "{s}", .{title}) catch "Application";
+    const title_z = std.fmt.bufPrintSentinel(&title_buf, "{s}", .{title}, 0) catch "Application";
     const title_label = c.gtk_label_new(title_z.ptr).?;
     c.gtk_label_set_xalign(@ptrCast(title_label), 0);
     c.gtk_label_set_ellipsize(@ptrCast(title_label), c.PANGO_ELLIPSIZE_END);
@@ -892,10 +892,10 @@ fn applySearch(self: *Switcher, preferred: ?[]const u8) void {
 fn matchesSearch(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
     const folded_needle = c.g_utf8_casefold(needle.ptr, @intCast(needle.len)) orelse
-        return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+        return std.ascii.findIgnoreCase(haystack, needle) != null;
     defer c.g_free(folded_needle);
     const folded_haystack = c.g_utf8_casefold(haystack.ptr, @intCast(haystack.len)) orelse
-        return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+        return std.ascii.findIgnoreCase(haystack, needle) != null;
     defer c.g_free(folded_haystack);
     return std.mem.indexOf(u8, std.mem.span(@as([*:0]const u8, @ptrCast(folded_haystack))), std.mem.span(@as([*:0]const u8, @ptrCast(folded_needle)))) != null;
 }
@@ -1142,7 +1142,7 @@ fn pruneDaemons(self: *Switcher) void {
             continue;
         }
         var path_buf: [1200:0]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "{s}", .{host["sock:".len..]}) catch {
+        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}", .{host["sock:".len..]}, 0) catch {
             index += 1;
             continue;
         };
@@ -1191,7 +1191,7 @@ fn discoverDaemons(self: *Switcher) void {
     const watcher = self.win.assistants orelse return;
     for (watcher.roster.items) |assistant| {
         var origin_buf: [320:0]u8 = undefined;
-        const origin = std.fmt.bufPrintZ(&origin_buf, "assistant {s}", .{assistant.label()}) catch continue;
+        const origin = std.fmt.bufPrintSentinel(&origin_buf, "assistant {s}", .{assistant.label()}, 0) catch continue;
         addDaemon(self, assistant.host, origin);
     }
 }

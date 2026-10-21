@@ -105,10 +105,11 @@ pub fn onContextMenu(self: *WebFace, ev: proto.EvContextMenu) void {
             while (end > 0 and (short[end] & 0xC0) == 0x80) end -= 1;
             short = short[0..end];
         }
-        const label: [*:0]const u8 = if (std.fmt.bufPrintZ(
+        const label: [*:0]const u8 = if (std.fmt.bufPrintSentinel(
             &lbuf,
             "Search the Web for \"{s}{s}\"",
             .{ short, if (short.len < sel.len) "\u{2026}" else "" },
+            0,
         )) |l| l.ptr else |_| "Search the Web for Selection";
         seln.itemIcon(label, .{ .name = "edit-find-symbolic" }, &onMenuSearchSelection, ctx);
     }
@@ -551,7 +552,7 @@ pub fn showBurgerMenu(self: *WebFace, anchor: *c.GtkWidget) void {
         const current = webroute.Choice.fromKind(self.routeSpec().kind);
         var rbuf: [64]u8 = undefined;
         var sbuf: [webroute.HOST_LABEL_MAX + 8]u8 = undefined;
-        const rlabel = std.fmt.bufPrintZ(&rbuf, "Route: {s}", .{self.routeSpec().shortLabel(&sbuf)}) catch "Route";
+        const rlabel = std.fmt.bufPrintSentinel(&rbuf, "Route: {s}", .{self.routeSpec().shortLabel(&sbuf)}, 0) catch "Route";
         const rm = tabs.submenuIcon(rlabel.ptr, .{ .name = self.routeSpec().kind.icon() });
         self.appendRouteRows(root, rm, current);
     }
@@ -618,7 +619,7 @@ pub fn shellRowLabel(self: *WebFace, buf: []u8) [*:0]const u8 {
         const raw = c.gtk_accelerator_get_label(b.keyval, b.mods) orelse return base;
         defer c.g_free(raw);
         const label = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
-        return (std.fmt.bufPrintZ(buf, "{s} ({s})", .{ base, label }) catch return base).ptr;
+        return (std.fmt.bufPrintSentinel(buf, "{s} ({s})", .{ base, label }, 0) catch return base).ptr;
     }
     return base;
 }

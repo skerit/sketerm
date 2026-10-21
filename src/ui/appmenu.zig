@@ -63,17 +63,17 @@ pub fn showAbout(parent: ?*c.GtkWindow, identity: Identity) void {
     c.adw_about_window_set_developer_name(@ptrCast(about), "Jelle De Loecker");
     c.adw_about_window_set_license_type(@ptrCast(about), c.GTK_LICENSE_GPL_3_0);
     var vz: [192:0]u8 = undefined;
-    const ver = std.fmt.bufPrintZ(&vz, "{s} ({s}, {s})", .{
+    const ver = std.fmt.bufPrintSentinel(&vz, "{s} ({s}, {s})", .{
         version.string,
         build_options.commit,
         build_options.commit_date,
-    }) catch "0";
+    }, 0) catch "0";
     c.adw_about_window_set_version(@ptrCast(about), ver.ptr);
     var cz: [256:0]u8 = undefined;
-    const info = std.fmt.bufPrintZ(&cz, "Commit {s}, built from source dated {s}.", .{
+    const info = std.fmt.bufPrintSentinel(&cz, "Commit {s}, built from source dated {s}.", .{
         build_options.commit,
         build_options.commit_date,
-    }) catch "";
+    }, 0) catch "";
     c.adw_about_window_set_comments(@ptrCast(about), info.ptr);
     if (parent) |p| c.gtk_window_set_transient_for(@ptrCast(about), p);
     c.gtk_window_present(@ptrCast(about));
@@ -186,7 +186,7 @@ pub fn appendHelp(
     const help = m.section();
     help.itemIcon("Keyboard Shortcuts", .{ .name = "preferences-desktop-keyboard-shortcuts-symbolic" }, &onShortcuts, @ptrCast(ctx));
     var zbuf: [64:0]u8 = undefined;
-    const about = std.fmt.bufPrintZ(&zbuf, "About {s}", .{identity.appName()}) catch "About";
+    const about = std.fmt.bufPrintSentinel(&zbuf, "About {s}", .{identity.appName()}, 0) catch "About";
     help.itemIcon(about.ptr, .{ .name = "help-about-symbolic" }, &onAbout, @ptrCast(ctx));
 }
 

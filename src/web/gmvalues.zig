@@ -71,7 +71,7 @@ pub const Values = struct {
     fn path(self: *Values, key: []const u8, suffix: []const u8, buf: []u8) ?[:0]const u8 {
         self.resolve();
         if (self.dir.len == 0) return null;
-        return std.fmt.bufPrintZ(buf, "{s}/{s}{s}", .{ self.dir, key, suffix }) catch null;
+        return std.fmt.bufPrintSentinel(buf, "{s}/{s}{s}", .{ self.dir, key, suffix }, 0) catch null;
     }
 
     fn stamp(self: *Values, e: *Entry) void {

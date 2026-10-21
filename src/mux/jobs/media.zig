@@ -271,7 +271,7 @@ pub fn runMediaMeta(job: *const Job) u8 {
 fn mediaOne(job: *const Job, bufs: *MediaBufs, cache: *MediaCache, full: []const u8, budget: *u64) void {
     const allocator = job.allocator;
     var z: [4096:0]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&z, "{s}", .{full}) catch return emitMediaSkip(job, full, "path too long");
+    const p = std.fmt.bufPrintSentinel(&z, "{s}", .{full}, 0) catch return emitMediaSkip(job, full, "path too long");
     var st: c.struct_stat = undefined;
     if (c.stat(p.ptr, &st) != 0) return emitMediaSkip(job, full, "cannot stat");
     if ((st.st_mode & c.S_IFMT) != c.S_IFREG) return emitMediaSkip(job, full, "not a regular file");

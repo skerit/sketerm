@@ -557,9 +557,9 @@ fn menuExtra(ctx: ?*anyopaque, page: *c.GtkWidget, root: *classicmenu.Root, m: c
     // the ring has something to give back.
     if (view.closed_docs.items.len > 0) {
         var label: [96:0]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&label, "Reopen Closed Tab ({d})", .{
+        const text = std.fmt.bufPrintSentinel(&label, "Reopen Closed Tab ({d})", .{
             view.closed_docs.items.len,
-        }) catch "Reopen Closed Tab";
+        }, 0) catch "Reopen Closed Tab";
         const r = m.section();
         r.itemIcon(text.ptr, .{ .name = "document-open-recent-symbolic" }, &onReopenClosed, ctx);
     }
@@ -614,7 +614,7 @@ fn onCopyFullPath(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
     // The PATH, not the host-qualified spec: what you paste into a
     // shell or another editor.
     const path = paths.parseSpec(spec).path;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return;
+    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0) catch return;
     clipboard.copyToClipboard(@ptrCast(r.view.area), z);
     r.view.setStatusText(z.ptr);
 }
@@ -626,7 +626,7 @@ fn onCopyRelativePath(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
     const path = paths.parseSpec(spec).path;
     const rel = relativeTo(project.root, path) orelse return;
     var buf: [4096:0]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{rel}) catch return;
+    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{rel}, 0) catch return;
     clipboard.copyToClipboard(@ptrCast(r.view.area), z);
     r.view.setStatusText(z.ptr);
 }
@@ -672,9 +672,9 @@ pub fn showStripMenu(view: *EditorView, x: f64, y: f64) void {
     m.itemIcon("Open File…", .{ .name = "document-open-symbolic" }, &onStripOpen, @ptrCast(view));
     if (view.closed_docs.items.len > 0) {
         var label: [96:0]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&label, "Reopen Closed Tab ({d})", .{
+        const text = std.fmt.bufPrintSentinel(&label, "Reopen Closed Tab ({d})", .{
             view.closed_docs.items.len,
-        }) catch "Reopen Closed Tab";
+        }, 0) catch "Reopen Closed Tab";
         m.item(text.ptr, &onReopenClosed, @ptrCast(view));
     }
     _ = root.popupVia(view.tabhost.widget(), view.root_box, x, y);

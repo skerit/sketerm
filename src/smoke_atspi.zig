@@ -125,7 +125,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     // Every mutable path and the daemon itself are private to this smoke.
     var rt_buf: [256]u8 = undefined;
-    const rt = std.fmt.bufPrintZ(&rt_buf, "/tmp/sketerm-a11y-{d}", .{c.getpid()}) catch return fail("runtime path");
+    const rt = std.fmt.bufPrintSentinel(&rt_buf, "/tmp/sketerm-a11y-{d}", .{c.getpid()}, 0) catch return fail("runtime path");
     _ = c.mkdir(rt.ptr, 0o700);
     _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
     _ = c.setenv("XDG_CONFIG_HOME", rt.ptr, 1);
@@ -153,7 +153,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     daemon_pid = mux_pid;
     var mux_sock_buf: [512]u8 = undefined;
-    const mux_sock = std.fmt.bufPrintZ(&mux_sock_buf, "{s}/sketerm/mux.sock", .{rt}) catch return fail("mux socket path");
+    const mux_sock = std.fmt.bufPrintSentinel(&mux_sock_buf, "{s}/sketerm/mux.sock", .{rt}, 0) catch return fail("mux socket path");
     var waited: u32 = 0;
     while (c.access(mux_sock.ptr, c.F_OK) != 0) {
         _ = c.usleep(50_000);
@@ -181,7 +181,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer parsed.deinit();
         const wl = parsed.value.environment.WAYLAND_DISPLAY;
         if (wl.len == 0 or wl[0] != '/') return fail("display create returned no absolute WAYLAND_DISPLAY");
-        _ = std.fmt.bufPrintZ(&wl_z, "{s}", .{wl}) catch return fail("WAYLAND_DISPLAY too long");
+        _ = std.fmt.bufPrintSentinel(&wl_z, "{s}", .{wl}, 0) catch return fail("WAYLAND_DISPLAY too long");
     }
     say("display session up");
 
@@ -953,7 +953,7 @@ fn tabMenuStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:0]con
     var names: [3][]const u8 = undefined;
     var specs: [3][:0]const u8 = undefined;
     for (0..3) |i| {
-        specs[i] = std.fmt.bufPrintZ(&path_buf[i], "{s}/tabmenu-{c}.txt", .{ rt, @as(u8, 'a') + @as(u8, @intCast(i)) }) catch
+        specs[i] = std.fmt.bufPrintSentinel(&path_buf[i], "{s}/tabmenu-{c}.txt", .{ rt, @as(u8, 'a') + @as(u8, @intCast(i)) }, 0) catch
             return "tab menu path";
         names[i] = std.fs.path.basename(std.mem.span(specs[i].ptr));
         const f = c.fopen(specs[i].ptr, "wb") orelse return "creating a tab-menu document failed";
@@ -1100,7 +1100,7 @@ fn browserTabMenuStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: 
     var dirs: [3][:0]const u8 = undefined;
     var names: [3][]const u8 = undefined;
     for (0..3) |i| {
-        dirs[i] = std.fmt.bufPrintZ(&dir_buf[i], "{s}/btab-{c}", .{ rt, @as(u8, 'a') + @as(u8, @intCast(i)) }) catch
+        dirs[i] = std.fmt.bufPrintSentinel(&dir_buf[i], "{s}/btab-{c}", .{ rt, @as(u8, 'a') + @as(u8, @intCast(i)) }, 0) catch
             return "browser tab path";
         names[i] = std.fs.path.basename(std.mem.span(dirs[i].ptr));
         _ = c.mkdir(dirs[i].ptr, 0o755);
@@ -1213,7 +1213,7 @@ fn hasTabNamed(allocator: std.mem.Allocator, name: []const u8) bool {
 /// readable. Returns an error message, or null on pass.
 fn editorStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:0]const u8) ?[]const u8 {
     var path_buf: [512]u8 = undefined;
-    const efile = std.fmt.bufPrintZ(&path_buf, "{s}/a11y-editor.txt", .{rt}) catch return "editor path";
+    const efile = std.fmt.bufPrintSentinel(&path_buf, "{s}/a11y-editor.txt", .{rt}, 0) catch return "editor path";
     const base = std.fs.path.basename(std.mem.span(efile.ptr));
 
     var req_buf: [700]u8 = undefined;
@@ -1503,7 +1503,7 @@ fn editorChromeStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:
     _ = app.drainLive(2_000);
     const w_before = (rigwin.mainWindow(app) orelse return "the display session lost its window").w;
     var path_buf: [512]u8 = undefined;
-    const efile = std.fmt.bufPrintZ(&path_buf, "{s}/chrome.zig", .{rt}) catch return "chrome path";
+    const efile = std.fmt.bufPrintSentinel(&path_buf, "{s}/chrome.zig", .{rt}, 0) catch return "chrome path";
     {
         const f = c.fopen(efile.ptr, "wb") orelse return "creating the chrome document failed";
         _ = c.fwrite(CHROME_DOC.ptr, 1, CHROME_DOC.len, f);
@@ -1802,7 +1802,7 @@ fn editorChromeStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:
 /// which is exactly what hid this.
 fn editorTeardownStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:0]const u8) ?[]const u8 {
     var efile_buf: [512]u8 = undefined;
-    const efile = std.fmt.bufPrintZ(&efile_buf, "{s}/atspi-editor-teardown.txt", .{rt}) catch return "teardown editor path";
+    const efile = std.fmt.bufPrintSentinel(&efile_buf, "{s}/atspi-editor-teardown.txt", .{rt}, 0) catch return "teardown editor path";
     var req_buf: [700]u8 = undefined;
     const rq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"new-editor-tab\",\"data\":\"{s}\"}}\n", .{efile}) catch return "fmt";
     const rp = roundtrip(allocator, sock_path, rq) orelse return "teardown new-editor-tab roundtrip";
@@ -1832,7 +1832,7 @@ fn editorTeardownStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: 
     // five area handlers, release the atlas texture under the context)
     // and its own verifier can catch a missed registration.
     var cfile_buf: [512]u8 = undefined;
-    const cfile = std.fmt.bufPrintZ(&cfile_buf, "{s}/atspi-editor-sever.txt", .{rt}) catch return "sever editor path";
+    const cfile = std.fmt.bufPrintSentinel(&cfile_buf, "{s}/atspi-editor-sever.txt", .{rt}, 0) catch return "sever editor path";
     const crq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"new-editor-tab\",\"data\":\"{s}\"}}\n", .{cfile}) catch return "fmt";
     const crp = roundtrip(allocator, sock_path, crq) orelse return "sever new-editor-tab roundtrip";
     defer allocator.free(crp);

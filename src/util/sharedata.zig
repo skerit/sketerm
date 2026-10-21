@@ -13,10 +13,10 @@ pub fn find(buf: *[4096]u8, rel: []const u8) ?[:0]const u8 {
     if (platform.exePath(&exe_buf)) |exe_path| {
         const exe_dir = std.fs.path.dirname(exe_path) orelse "/usr/bin";
         for ([_][]const u8{ "/../share/sketerm/", "/../../data/" }) |infix| {
-            const cand = std.fmt.bufPrintZ(buf, "{s}{s}{s}", .{ exe_dir, infix, rel }) catch continue;
+            const cand = std.fmt.bufPrintSentinel(buf, "{s}{s}{s}", .{ exe_dir, infix, rel }, 0) catch continue;
             if (c.access(cand.ptr, c.R_OK) == 0) return cand;
         }
     }
-    const sys = std.fmt.bufPrintZ(buf, "/usr/share/sketerm/{s}", .{rel}) catch return null;
+    const sys = std.fmt.bufPrintSentinel(buf, "/usr/share/sketerm/{s}", .{rel}, 0) catch return null;
     return if (c.access(sys.ptr, c.R_OK) == 0) sys else null;
 }

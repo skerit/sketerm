@@ -67,9 +67,9 @@ pub fn onTermSessionRenamed(ctx: ?*anyopaque, pane: *Pane, name: []const u8) voi
     const remote = pane.terminal.remote orelse return;
     var title_buf: [160:0]u8 = undefined;
     const title_z = if (remote.host) |h|
-        std.fmt.bufPrintZ(&title_buf, "⌁ {s} @ {s}", .{ name, h }) catch return
+        std.fmt.bufPrintSentinel(&title_buf, "⌁ {s} @ {s}", .{ name, h }, 0) catch return
     else
-        std.fmt.bufPrintZ(&title_buf, "⌁ {s}", .{name}) catch return;
+        std.fmt.bufPrintSentinel(&title_buf, "⌁ {s}", .{name}, 0) catch return;
     c.adw_tab_page_set_title(page, title_z.ptr);
     c.adw_tab_page_set_tooltip(page, title_z.ptr);
 }
@@ -183,20 +183,20 @@ pub fn onTermCmdStatus(ctx: ?*anyopaque, pane: *Pane, running: bool, exit: i32, 
     if (app == null) return;
     var title_buf: [64]u8 = undefined;
     const title_z = if (exit == 0)
-        std.fmt.bufPrintZ(&title_buf, "Command finished", .{}) catch return
+        std.fmt.bufPrintSentinel(&title_buf, "Command finished", .{}, 0) catch return
     else
-        std.fmt.bufPrintZ(&title_buf, "Command failed (exit {d})", .{exit}) catch return;
+        std.fmt.bufPrintSentinel(&title_buf, "Command failed (exit {d})", .{exit}, 0) catch return;
     const notif = c.g_notification_new(title_z.ptr);
     if (notif == null) return;
     defer c.g_object_unref(notif);
     const tab_title = c.adw_tab_page_get_title(page);
     const secs = @divTrunc(duration_ms, 1000);
     var body_buf: [256]u8 = undefined;
-    if (std.fmt.bufPrintZ(&body_buf, "{s} ({d}m {d}s)", .{
+    if (std.fmt.bufPrintSentinel(&body_buf, "{s} ({d}m {d}s)", .{
         if (tab_title != null) std.mem.span(tab_title) else "sketerm",
         @divTrunc(secs, 60),
         @mod(secs, 60),
-    })) |body_z| {
+    }, 0)) |body_z| {
         c.g_notification_set_body(notif, body_z.ptr);
     } else |_| {}
     if (exit != 0) c.g_notification_set_priority(notif, c.G_NOTIFICATION_PRIORITY_HIGH);
@@ -427,7 +427,7 @@ pub fn setTabPageTitleFromUtf8(allocator: std.mem.Allocator, page: *c.AdwTabPage
 /// it. Null (untagged) when the app supplied no id.
 pub fn notifyTag(buf: []u8, id: []const u8) ?[*:0]const u8 {
     if (id.len == 0) return null;
-    const z = std.fmt.bufPrintZ(buf, "sketerm-osc99-{s}", .{id}) catch return null;
+    const z = std.fmt.bufPrintSentinel(buf, "sketerm-osc99-{s}", .{id}, 0) catch return null;
     return z.ptr;
 }
 
@@ -477,7 +477,7 @@ pub fn onTermNotification(ctx: ?*anyopaque, pane: *Pane, ev: Screen.Notification
     // decodes them from the serialized GBytesIcon).
     if (ev.icon_name.len > 0) {
         var name_buf: [128]u8 = undefined;
-        if (std.fmt.bufPrintZ(&name_buf, "{s}", .{ev.icon_name})) |name_z| {
+        if (std.fmt.bufPrintSentinel(&name_buf, "{s}", .{ev.icon_name}, 0)) |name_z| {
             const icon = c.g_themed_icon_new(name_z.ptr);
             c.g_notification_set_icon(notif, @ptrCast(icon));
             c.g_object_unref(icon);

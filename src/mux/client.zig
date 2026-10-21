@@ -290,11 +290,11 @@ fn udpMemoPath(buf: []u8, host: []const u8) ?[:0]const u8 {
     const h = std.hash.Wyhash.hash(0, host);
     if (c.getenv("XDG_CACHE_HOME")) |raw| {
         const base = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
-        return std.fmt.bufPrintZ(buf, "{s}/sketerm/mux/udp-down-{x:0>16}", .{ base, h }) catch null;
+        return std.fmt.bufPrintSentinel(buf, "{s}/sketerm/mux/udp-down-{x:0>16}", .{ base, h }, 0) catch null;
     }
     const home_raw = c.getenv("HOME") orelse return null;
     const home = std.mem.span(@as([*:0]const u8, @ptrCast(home_raw)));
-    return std.fmt.bufPrintZ(buf, "{s}/.cache/sketerm/mux/udp-down-{x:0>16}", .{ home, h }) catch null;
+    return std.fmt.bufPrintSentinel(buf, "{s}/.cache/sketerm/mux/udp-down-{x:0>16}", .{ home, h }, 0) catch null;
 }
 
 fn udpMemoDown(host: []const u8) bool {
@@ -312,7 +312,7 @@ fn udpMemoMark(host: []const u8) void {
     // Parent dirs may not exist yet (fresh cache); build them plainly.
     if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| {
         var dir_buf: [4096:0]u8 = undefined;
-        if (std.fmt.bufPrintZ(&dir_buf, "{s}", .{path[0..slash]})) |dir| {
+        if (std.fmt.bufPrintSentinel(&dir_buf, "{s}", .{path[0..slash]}, 0)) |dir| {
             var i: usize = 1;
             while (i <= dir.len) : (i += 1) {
                 if (i == dir.len or dir[i] == '/') {
@@ -548,8 +548,8 @@ pub const Conn = struct {
     pub fn testDaemonXdg(sock_path: []const u8, config_buf: *[4096:0]u8, state_buf: *[4096:0]u8) error{BadPath}!struct { config: [:0]const u8, state: [:0]const u8 } {
         const dir = std.fs.path.dirname(sock_path) orelse return error.BadPath;
         return .{
-            .config = std.fmt.bufPrintZ(config_buf, "{s}/xdg-config", .{dir}) catch return error.BadPath,
-            .state = std.fmt.bufPrintZ(state_buf, "{s}/xdg-state", .{dir}) catch return error.BadPath,
+            .config = std.fmt.bufPrintSentinel(config_buf, "{s}/xdg-config", .{dir}, 0) catch return error.BadPath,
+            .state = std.fmt.bufPrintSentinel(state_buf, "{s}/xdg-state", .{dir}, 0) catch return error.BadPath,
         };
     }
 
@@ -579,7 +579,7 @@ pub const Conn = struct {
         // (no allocation between fork and exec).
         var sock_z_buf: [4096:0]u8 = undefined;
         const sock_z: ?[*:0]const u8 = if (sock_path != null)
-            (std.fmt.bufPrintZ(&sock_z_buf, "{s}", .{path}) catch return error.BadPath).ptr
+            (std.fmt.bufPrintSentinel(&sock_z_buf, "{s}", .{path}, 0) catch return error.BadPath).ptr
         else
             null;
         // Validated here so a bad value costs nothing in the child: the
@@ -967,7 +967,7 @@ pub const Conn = struct {
     /// keeps the literal host, which is the pre-existing behaviour.
     fn resolveSshConfig(spec: []const u8, out: *[256]u8, deadline: i64) ?SshTarget {
         var spec_z_buf: [256:0]u8 = undefined;
-        const spec_z = std.fmt.bufPrintZ(&spec_z_buf, "{s}", .{spec}) catch return null;
+        const spec_z = std.fmt.bufPrintSentinel(&spec_z_buf, "{s}", .{spec}, 0) catch return null;
 
         var pipe_fds: [2]c_int = undefined;
         if (c.pipe(&pipe_fds) != 0) return null;
@@ -1054,9 +1054,9 @@ pub const Conn = struct {
         var command_buf: [4300:0]u8 = undefined;
         const prepared_command: ?[:0]const u8 = if (prepared) |p| blk: {
             if (port_range) |r| {
-                break :blk std.fmt.bufPrintZ(&command_buf, "exec \"{s}\" --udp-listen --udp-port {s}", .{ p.path, r }) catch return error.BadPath;
+                break :blk std.fmt.bufPrintSentinel(&command_buf, "exec \"{s}\" --udp-listen --udp-port {s}", .{ p.path, r }, 0) catch return error.BadPath;
             }
-            break :blk std.fmt.bufPrintZ(&command_buf, "exec \"{s}\" --udp-listen", .{p.path}) catch return error.BadPath;
+            break :blk std.fmt.bufPrintSentinel(&command_buf, "exec \"{s}\" --udp-listen", .{p.path}, 0) catch return error.BadPath;
         } else null;
         // The bootstrap budget starts AFTER deployment: an upload on
         // first contact must not eat the announcement deadline.
@@ -1101,7 +1101,7 @@ pub const Conn = struct {
         // 1. Bootstrap: ssh prints the announcement on a pipe; our
         //    punch line goes out on its stdin.
         var host_z_buf: [256:0]u8 = undefined;
-        const host_z = std.fmt.bufPrintZ(&host_z_buf, "{s}", .{host}) catch return error.BadPath;
+        const host_z = std.fmt.bufPrintSentinel(&host_z_buf, "{s}", .{host}, 0) catch return error.BadPath;
         var pipe_fds: [2]c_int = undefined;
         if (c.pipe(&pipe_fds) != 0) return error.SocketFailed;
         for (pipe_fds) |fd| _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
@@ -1113,7 +1113,7 @@ pub const Conn = struct {
         const ssh_bin = sshroute.sshBinary();
         var range_z_buf: [32:0]u8 = undefined;
         const range_z: ?[:0]const u8 = if (port_range) |r|
-            std.fmt.bufPrintZ(&range_z_buf, "{s}", .{r}) catch return error.BadPath
+            std.fmt.bufPrintSentinel(&range_z_buf, "{s}", .{r}, 0) catch return error.BadPath
         else
             null;
         const ArgvBuf = [sshroute.Args.MAX_OPTIONS + 8:null]?[*:0]const u8;
@@ -1242,11 +1242,11 @@ pub const Conn = struct {
         var mux_bin_buf: [4096:0]u8 = undefined;
         const mux_bin = findMuxBinary(&mux_bin_buf);
         var port_z_buf: [16:0]u8 = undefined;
-        const port_z = std.fmt.bufPrintZ(&port_z_buf, "{s}", .{port}) catch return error.SshTransportFailed;
+        const port_z = std.fmt.bufPrintSentinel(&port_z_buf, "{s}", .{port}, 0) catch return error.SshTransportFailed;
         var key_z_buf: [128:0]u8 = undefined;
-        const key_z = std.fmt.bufPrintZ(&key_z_buf, "{s}", .{keyhex}) catch return error.SshTransportFailed;
+        const key_z = std.fmt.bufPrintSentinel(&key_z_buf, "{s}", .{keyhex}, 0) catch return error.SshTransportFailed;
         var bh_z_buf: [256:0]u8 = undefined;
-        const bh_z = std.fmt.bufPrintZ(&bh_z_buf, "{s}", .{udp_host}) catch return error.BadPath;
+        const bh_z = std.fmt.bufPrintSentinel(&bh_z_buf, "{s}", .{udp_host}, 0) catch return error.BadPath;
 
         // Hand the pre-bound punch socket to the bridge (fd number as
         // a 4th positional arg; the fd survives spawnOverSocketpair's
@@ -1258,7 +1258,7 @@ pub const Conn = struct {
             mux_bin, selfexec.Mode.udp_connect.flag().?.ptr, bh_z.ptr, port_z.ptr, key_z.ptr, null, null,
         };
         if (punch_fd >= 0) {
-            if (std.fmt.bufPrintZ(&fd_z_buf, "{d}", .{punch_fd})) |fz| {
+            if (std.fmt.bufPrintSentinel(&fd_z_buf, "{d}", .{punch_fd}, 0)) |fz| {
                 _ = c.fcntl(punch_fd, c.F_SETFD, @as(c_int, 0));
                 argv2[5] = fz.ptr;
             } else |_| {}
@@ -1419,7 +1419,7 @@ pub const Conn = struct {
 
     fn connectSshOnceUsing(allocator: std.mem.Allocator, plan: *const sshroute.Plan, remote_mux: ?[]const u8, timeout_ms: c_int, master: sshmaster.Policy) !Conn {
         var host_z_buf: [256:0]u8 = undefined;
-        const host_z = std.fmt.bufPrintZ(&host_z_buf, "{s}", .{plan.destination}) catch return error.BadPath;
+        const host_z = std.fmt.bufPrintSentinel(&host_z_buf, "{s}", .{plan.destination}, 0) catch return error.BadPath;
         const ssh_bin = sshroute.sshBinary();
 
         // Connection multiplexing — only with the real ssh (a test rig
@@ -1442,7 +1442,7 @@ pub const Conn = struct {
         n += 1;
         var command_buf: [4300:0]u8 = undefined;
         if (remote_mux) |path| {
-            const command = std.fmt.bufPrintZ(&command_buf, "exec \"{s}\" {s}", .{ path, selfexec.Mode.proxy.flag().? }) catch return error.BadPath;
+            const command = std.fmt.bufPrintSentinel(&command_buf, "exec \"{s}\" {s}", .{ path, selfexec.Mode.proxy.flag().? }, 0) catch return error.BadPath;
             argv_buf[n] = command.ptr;
             n += 1;
         } else {
@@ -1517,7 +1517,7 @@ pub const Conn = struct {
         const command = proxyroute.remoteCommand(allocator, remote_mux orelse selfexec.BINARY, hops[1..], route.instance) catch return error.BadRoute;
         defer allocator.free(command);
         var host_z_buf: [256:0]u8 = undefined;
-        const host_z = std.fmt.bufPrintZ(&host_z_buf, "{s}", .{plan.destination}) catch return error.BadRoute;
+        const host_z = std.fmt.bufPrintSentinel(&host_z_buf, "{s}", .{plan.destination}, 0) catch return error.BadRoute;
         const ssh_bin = sshroute.sshBinary();
         var route_args = plan.args(.{ .multiplex = true }) catch return error.BadRoute;
         if (route_args.multiplexes()) _ = sshmaster.prepare(ssh_bin, &route_args, plan.destination, master);
@@ -1651,7 +1651,7 @@ pub const Conn = struct {
     /// An unlinked, close-on-exec scratch file; -1 when none can be made.
     fn scratchFile() c_int {
         var tmpl: [4096:0]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&tmpl, "{s}/sketerm-route-XXXXXX", .{@import("../util/platform.zig").runtimeDir()}) catch return -1;
+        const path = std.fmt.bufPrintSentinel(&tmpl, "{s}/sketerm-route-XXXXXX", .{@import("../util/platform.zig").runtimeDir()}, 0) catch return -1;
         const fd = c.mkstemp(path.ptr);
         if (fd < 0) return -1;
         _ = c.unlink(path.ptr);
@@ -2460,7 +2460,7 @@ pub fn connectPanelRequester(allocator: std.mem.Allocator, sock_path: []const u8
 test "panel requester connect, hello, and attach share one absolute deadline" {
     const t = std.testing;
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-connect-deadline-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-panel-connect-deadline-{d}.sock", .{c.getpid()}, 0);
     _ = c.unlink(path.ptr);
     defer _ = c.unlink(path.ptr);
     const listener = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
@@ -2503,7 +2503,7 @@ test "a panel connect that lost the stop race is cancelled before it dials" {
     var active: FdCancel = .{};
     active.stop();
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-stopped-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-panel-stopped-{d}.sock", .{c.getpid()}, 0);
     _ = c.unlink(path.ptr);
     defer _ = c.unlink(path.ptr);
     const listener = try panelAttachListener(path);
@@ -2591,7 +2591,7 @@ test "panel-only attach rejects missing empty and truncated immutable origin met
     };
     for (replies, 0..) |reply, i| {
         var path_buf: [256:0]u8 = undefined;
-        const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-metadata-{d}-{d}.sock", .{ c.getpid(), i });
+        const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-panel-metadata-{d}-{d}.sock", .{ c.getpid(), i }, 0);
         _ = c.unlink(path.ptr);
         defer _ = c.unlink(path.ptr);
         const listener = try panelAttachListener(path);
@@ -2613,7 +2613,7 @@ test "panel-only attach rejects missing empty and truncated immutable origin met
 test "panel-only attach reports a valid unexpected origin id as an identity mismatch" {
     const t = std.testing;
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-id-mismatch-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-panel-id-mismatch-{d}.sock", .{c.getpid()}, 0);
     _ = c.unlink(path.ptr);
     defer _ = c.unlink(path.ptr);
     const listener = try panelAttachListener(path);
@@ -2641,7 +2641,7 @@ test "panel-only attach reports a valid unexpected origin id as an identity mism
 test "panel-only attach returns a typed no-such-session error" {
     const t = std.testing;
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-no-session-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-panel-no-session-{d}.sock", .{c.getpid()}, 0);
     _ = c.unlink(path.ptr);
     defer _ = c.unlink(path.ptr);
     const listener = try panelAttachListener(path);
@@ -2701,7 +2701,7 @@ test "panel-only attach preserves an exact maximum-length immutable origin" {
     const t = std.testing;
     const reply = "{\"ok\":true,\"panel_only\":true,\"origin_name\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"origin_id\":\"00000000000000000000000000000001\"}";
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-metadata-max-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-panel-metadata-max-{d}.sock", .{c.getpid()}, 0);
     _ = c.unlink(path.ptr);
     defer _ = c.unlink(path.ptr);
     const listener = try panelAttachListener(path);
@@ -2721,7 +2721,7 @@ test "panel-only attach preserves an exact maximum-length immutable origin" {
 test "local daemon origin is the exact connected listener, never a default guess" {
     const t = std.testing;
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-peer-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-panel-peer-{d}.sock", .{c.getpid()}, 0);
     _ = c.unlink(path.ptr);
     defer _ = c.unlink(path.ptr);
     const listener = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
@@ -2965,7 +2965,7 @@ test "ssh config resolution spawns ssh and reads back the hostname" {
     // Covers the fork/exec/read half that the parser tests cannot:
     // SKETERM_SSH swaps in a fake that answers -G like OpenSSH.
     var path_buf: [128:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-fake-ssh-{d}", .{c.getpid()}) catch unreachable;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-fake-ssh-{d}", .{c.getpid()}, 0) catch unreachable;
     const f = c.fopen(path.ptr, "w") orelse return error.SkipZigTest;
     _ = c.fputs("#!/bin/sh\nif [ \"$1\" = \"-G\" ]; then printf 'user root\\nhostname 10.1.2.3\\nport 2222\\n'; fi\n", f);
     _ = c.fclose(f);
@@ -2988,15 +2988,16 @@ test "UDP bootstrap sends the punch line with the pre-bound port on ssh stdin" {
     // no announcement — connectUdpFor must fail SshTransportFailed
     // AFTER having already written "SKETERM-PUNCH <port>".
     var cap_buf: [128:0]u8 = undefined;
-    const cap = std.fmt.bufPrintZ(&cap_buf, "/tmp/sketerm-punch-cap-{d}", .{c.getpid()}) catch unreachable;
+    const cap = std.fmt.bufPrintSentinel(&cap_buf, "/tmp/sketerm-punch-cap-{d}", .{c.getpid()}, 0) catch unreachable;
     var path_buf: [128:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-fake-ssh-punch-{d}", .{c.getpid()}) catch unreachable;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-fake-ssh-punch-{d}", .{c.getpid()}, 0) catch unreachable;
     const f = c.fopen(path.ptr, "w") orelse return error.SkipZigTest;
     var script_buf: [512:0]u8 = undefined;
-    const script = std.fmt.bufPrintZ(
+    const script = std.fmt.bufPrintSentinel(
         &script_buf,
         "#!/bin/sh\nif [ \"$1\" = \"-G\" ]; then printf 'hostname 127.0.0.1\\n'; exit 0; fi\nIFS= read -r line\nprintf '%s\\n' \"$line\" > {s}\n",
         .{cap},
+        0,
     ) catch unreachable;
     _ = c.fputs(script.ptr, f);
     _ = c.fclose(f);
@@ -3334,7 +3335,7 @@ test "env ticket is host-matched and single-use" {
     var hexbuf: [rudp.KEY_LEN * 2]u8 = undefined;
     const hex = rudp.keyToHex(key, &hexbuf);
     var val_buf: [128:0]u8 = undefined;
-    const val = try std.fmt.bufPrintZ(&val_buf, "boxy 61111 {s}", .{hex});
+    const val = try std.fmt.bufPrintSentinel(&val_buf, "boxy 61111 {s}", .{hex}, 0);
     var saved: EnvSave = .{};
     try saved.override("SKETERM_UDP_TICKET", val.ptr);
     defer saved.restore();

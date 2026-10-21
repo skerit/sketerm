@@ -151,7 +151,7 @@ pub fn copyTextTo(allocator: std.mem.Allocator, clipboard_opt: ?*c.GdkClipboard,
         c.gdk_clipboard_set_text(clipboard, &stack);
         return;
     }
-    const z = allocator.dupeZ(u8, text) catch return;
+    const z = allocator.dupeSentinel(u8, text, 0) catch return;
     defer allocator.free(z);
     c.gdk_clipboard_set_text(clipboard, z.ptr);
 }

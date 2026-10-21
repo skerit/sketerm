@@ -83,9 +83,9 @@ pub fn openUploadDest(cwd: []const u8, base: []const u8, out: *[4096]u8) !struct
     var n: u32 = 0;
     while (n < 1000) : (n += 1) {
         const path = if (n == 0)
-            std.fmt.bufPrintZ(out, "{s}/{s}", .{ cwd, base }) catch return error.NameTooLong
+            std.fmt.bufPrintSentinel(out, "{s}/{s}", .{ cwd, base }, 0) catch return error.NameTooLong
         else
-            std.fmt.bufPrintZ(out, "{s}/{s} ({d}){s}", .{ cwd, stem, n, ext }) catch return error.NameTooLong;
+            std.fmt.bufPrintSentinel(out, "{s}/{s} ({d}){s}", .{ cwd, stem, n, ext }, 0) catch return error.NameTooLong;
         // O_CLOEXEC: an upload fd lives across poll-loop ticks while the
         // daemon forks and execs children (PTY spawns, display keepers).
         const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC, @as(c_uint, 0o644));
@@ -102,7 +102,7 @@ test "an upload lands under its base name and never clobbers an existing file" {
     try t.expectEqualStrings("", uploadBaseName("dir/"));
 
     var dir_buf: [64:0]u8 = undefined;
-    const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/sk-upload-{d}", .{c.getpid()});
+    const dir = try std.fmt.bufPrintSentinel(&dir_buf, "/tmp/sk-upload-{d}", .{c.getpid()}, 0);
     try t.expectEqual(@as(c_int, 0), c.mkdir(dir.ptr, 0o700));
     defer _ = c.rmdir(dir.ptr);
     var out: [4096]u8 = undefined;
@@ -295,7 +295,7 @@ pub fn handleFileGet(self: *Daemon, cl: *Client, payload: []const u8) void {
     // any file they can read is within their existing privilege.
     var abs_buf: [4096]u8 = undefined;
     const abs = blk: {
-        if (req_path[0] == '/') break :blk std.fmt.bufPrintZ(&abs_buf, "{s}", .{req_path}) catch {
+        if (req_path[0] == '/') break :blk std.fmt.bufPrintSentinel(&abs_buf, "{s}", .{req_path}, 0) catch {
             fileReply(cl, xfer, "error", 0, "", "path too long");
             return;
         };
@@ -304,7 +304,7 @@ pub fn handleFileGet(self: *Daemon, cl: *Client, payload: []const u8) void {
             fileReply(cl, xfer, "error", 0, "", "cannot determine session directory");
             return;
         };
-        break :blk std.fmt.bufPrintZ(&abs_buf, "{s}/{s}", .{ cwd, req_path }) catch {
+        break :blk std.fmt.bufPrintSentinel(&abs_buf, "{s}/{s}", .{ cwd, req_path }, 0) catch {
             fileReply(cl, xfer, "error", 0, "", "path too long");
             return;
         };

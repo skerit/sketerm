@@ -61,7 +61,7 @@ pub fn start(
     dispatch: DispatchFn,
 ) !*Server {
     const dir_end = std.mem.lastIndexOfScalar(u8, path, '/') orelse return error.BadPath;
-    const dir_z = try allocator.dupeZ(u8, path[0..dir_end]);
+    const dir_z = try allocator.dupeSentinel(u8, path[0..dir_end], 0);
     defer allocator.free(dir_z);
     if (c.g_mkdir_with_parents(dir_z.ptr, 0o700) != 0) return error.MkdirFailed;
     // Stale socket from a crashed previous run with the same pid.

@@ -4117,12 +4117,12 @@ test "durable mailboxes survive a restart: append, compaction on ack, unreadable
     // A corrupt line and a foreign file do not stop the load.
     {
         var pbuf: [256]u8 = undefined;
-        const p = try std.fmt.bufPrintZ(&pbuf, "{s}/Qq.jsonl", .{td.path()});
+        const p = try std.fmt.bufPrintSentinel(&pbuf, "{s}/Qq.jsonl", .{td.path()}, 0);
         const fd = c.open(p, c.O_WRONLY | c.O_APPEND);
         try t.expect(fd >= 0);
         _ = c.write(fd, "{not json\n", 10);
         _ = c.close(fd);
-        const q = try std.fmt.bufPrintZ(&pbuf, "{s}/bad name.jsonl", .{td.path()});
+        const q = try std.fmt.bufPrintSentinel(&pbuf, "{s}/bad name.jsonl", .{td.path()}, 0);
         _ = c.close(c.open(q, c.O_WRONLY | c.O_CREAT, @as(c_uint, 0o600)));
     }
     var s = try Store.init(t.allocator, .{ .dir = td.path(), .host = "h", .emit = rec.emit() });

@@ -760,14 +760,14 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         const target = activeOrSelf(self);
         var title_buf: [256:0]u8 = undefined;
         const title_z: ?[*:0]const u8 = if (req.title) |t| blk: {
-            const s = std.fmt.bufPrintZ(&title_buf, "{s}", .{t}) catch break :blk null;
+            const s = std.fmt.bufPrintSentinel(&title_buf, "{s}", .{t}, 0) catch break :blk null;
             break :blk s.ptr;
         } else null;
         if (req.cwd) |cwd| {
             var num_buf: [32]u8 = undefined;
             const t: [*:0]const u8 = title_z orelse tdef: {
                 target.tab_counter += 1;
-                const s = std.fmt.bufPrintZ(&num_buf, "Tab {d}", .{target.tab_counter}) catch "shell";
+                const s = std.fmt.bufPrintSentinel(&num_buf, "Tab {d}", .{target.tab_counter}, 0) catch "shell";
                 break :tdef s.ptr;
             };
             try target.addTabWithProfile(t, cwd, null);
@@ -894,7 +894,7 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
     } else if (eql(u8, req.cmd, "set-title")) {
         const text = req.title orelse req.data orelse return ipc_protocol.writeErr(out, allocator, .invalid_request, "set-title requires title");
         var z_buf: [512:0]u8 = undefined;
-        const z = std.fmt.bufPrintZ(&z_buf, "{s}", .{text}) catch return ipc_protocol.writeErr(out, allocator, .invalid_request, "title too long");
+        const z = std.fmt.bufPrintSentinel(&z_buf, "{s}", .{text}, 0) catch return ipc_protocol.writeErr(out, allocator, .invalid_request, "title too long");
         const page = if (req.pane != null or req.session != null) pg: {
             const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
             break :pg winmod.tabPageForPane(ownerWindow(self, pane), pane) orelse return ipc_protocol.writeErr(out, allocator, .unsupported, "pane has no tab");
@@ -1802,7 +1802,7 @@ test "IPC screenshots use private complete replacement" {
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/shot.png", .{base});
     var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    const path_z = try std.fmt.bufPrintSentinel(&path_z_buf, "{s}", .{path}, 0);
     defer _ = c.unlink(path_z.ptr);
 
     try saveScreenshot(path, "png");
@@ -1822,11 +1822,13 @@ test "pane identity rejects reused addresses and survives movement between owner
     pane.id = 101;
     const saved_id = pane.id;
     var panes = [_]*Pane{pane};
-    source.panes = .{ .items = &panes, .capacity = panes.len };
+    source.panes = .initBuffer(&panes);
+    source.panes.items.len = panes.len;
     destination.panes = .empty;
     try std.testing.expect(paneById(source, saved_id) == pane);
     source.panes = .empty;
-    destination.panes = .{ .items = &panes, .capacity = panes.len };
+    destination.panes = .initBuffer(&panes);
+    destination.panes.items.len = panes.len;
     try std.testing.expect(paneById(source, saved_id) == null);
     try std.testing.expect(paneById(destination, saved_id) == pane);
     // The address now belongs to a replacement; an earlier picker still

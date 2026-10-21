@@ -46,7 +46,7 @@ fn runOpenssl(args: []const ?[*:0]const u8) bool {
 
 pub fn writeFile(dir: []const u8, name: []const u8, body: []const u8) bool {
     var path_buf: [512]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ dir, name }) catch return false;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ dir, name }, 0) catch return false;
     const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o644));
     if (fd < 0) return false;
     defer _ = c.close(fd);
@@ -58,9 +58,9 @@ pub fn writeFile(dir: []const u8, name: []const u8, body: []const u8) bool {
 /// answers `dir/x.html`). Write the pages before calling.
 pub fn start(dir: []const u8) ?Server {
     var key_buf: [512]u8 = undefined;
-    const key = std.fmt.bufPrintZ(&key_buf, "{s}/k.pem", .{dir}) catch return null;
+    const key = std.fmt.bufPrintSentinel(&key_buf, "{s}/k.pem", .{dir}, 0) catch return null;
     var crt_buf: [512]u8 = undefined;
-    const crt = std.fmt.bufPrintZ(&crt_buf, "{s}/c.pem", .{dir}) catch return null;
+    const crt = std.fmt.bufPrintSentinel(&crt_buf, "{s}/c.pem", .{dir}, 0) catch return null;
     // `-subj` is not optional: without it `req` prompts for a subject.
     if (!runOpenssl(&[_]?[*:0]const u8{
         "openssl", "req",    "-x509", "-newkey",       "rsa:2048",
@@ -73,7 +73,7 @@ pub fn start(dir: []const u8) ?Server {
     // and the stage skips.
     const port: u16 = @intCast(20000 + @mod(c.getpid(), 20000));
     var port_buf: [16]u8 = undefined;
-    const port_z = std.fmt.bufPrintZ(&port_buf, "{d}", .{port}) catch return null;
+    const port_z = std.fmt.bufPrintSentinel(&port_buf, "{d}", .{port}, 0) catch return null;
 
     const pid = c.fork();
     if (pid < 0) return null;

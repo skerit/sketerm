@@ -316,7 +316,7 @@ test "places save replaces a complete file and loads the replacement" {
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/places.json", .{base});
     var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    const path_z = try std.fmt.bufPrintSentinel(&path_z_buf, "{s}", .{path}, 0);
     defer _ = c.unlink(path_z.ptr);
 
     try saveToPath(t.allocator, path, .{ .sidebar_px = 201 });
@@ -336,7 +336,7 @@ test "places serialization failure preserves the prior valid file" {
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/places.json", .{base});
     var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    const path_z = try std.fmt.bufPrintSentinel(&path_z_buf, "{s}", .{path}, 0);
     defer _ = c.unlink(path_z.ptr);
 
     try saveToPath(t.allocator, path, .{ .sidebar_px = 211 });
@@ -533,7 +533,7 @@ pub fn frecencyRank(list: []const FrecOwned, filter: []const u8, now_ms: i64, ou
     var n: usize = 0;
     for (list, 0..) |e, i| {
         if (n >= out.len) break;
-        if (filter.len > 0 and std.ascii.indexOfIgnoreCase(e.spec, filter) == null) continue;
+        if (filter.len > 0 and std.ascii.findIgnoreCase(e.spec, filter) == null) continue;
         out[n] = i;
         n += 1;
     }

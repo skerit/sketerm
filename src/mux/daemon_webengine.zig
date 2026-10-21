@@ -113,7 +113,7 @@ fn engineSocketLive(sock: []const u8) bool {
 fn removePresenceAt(sock: []const u8) void {
     const dir_end = std.mem.lastIndexOfScalar(u8, sock, '/') orelse return;
     var z: [4096:0]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&z, "{s}/web.json", .{sock[0..dir_end]}) catch return;
+    const p = std.fmt.bufPrintSentinel(&z, "{s}/web.json", .{sock[0..dir_end]}, 0) catch return;
     _ = c.unlink(p.ptr);
 }
 
@@ -160,16 +160,16 @@ pub fn handleWebEngineOpen(self: *Daemon, cl: *Client, r: WebOpReq) void {
 
     // NUL-terminated argv, prepared before the fork.
     var sock_z: [4096:0]u8 = undefined;
-    const sock_arg = std.fmt.bufPrintZ(&sock_z, "{s}", .{sock}) catch
+    const sock_arg = std.fmt.bufPrintSentinel(&sock_z, "{s}", .{sock}, 0) catch
         return webReplyErr(cl, r.req, "engine socket path too long");
     var cache_z: [4096:0]u8 = undefined;
-    const cache_arg = std.fmt.bufPrintZ(&cache_z, "{s}", .{store.root}) catch
+    const cache_arg = std.fmt.bufPrintSentinel(&cache_z, "{s}", .{store.root}, 0) catch
         return webReplyErr(cl, r.req, "engine cache path too long");
     var stream_z: [4096:0]u8 = undefined;
-    const stream_arg = std.fmt.bufPrintZ(&stream_z, "{s}", .{self.sock_path[0..dir_end]}) catch
+    const stream_arg = std.fmt.bufPrintSentinel(&stream_z, "{s}", .{self.sock_path[0..dir_end]}, 0) catch
         return webReplyErr(cl, r.req, "engine stream directory too long");
     var linger_z: [24:0]u8 = undefined;
-    const linger_arg = std.fmt.bufPrintZ(&linger_z, "{d}", .{engineLingerMs()}) catch unreachable;
+    const linger_arg = std.fmt.bufPrintSentinel(&linger_z, "{d}", .{engineLingerMs()}, 0) catch unreachable;
 
     // A stale socket from a crashed engine would make clients connect
     // against nothing; the daemon's single loop serializes this unlink
@@ -243,7 +243,7 @@ pub fn handleWebEngineOpen(self: *Daemon, cl: *Client, r: WebOpReq) void {
 fn writeEnginePresence(self: *Daemon, sock: []const u8, pid: c.pid_t, key: []const u8) void {
     const dir_end = std.mem.lastIndexOfScalar(u8, sock, '/') orelse return;
     var z: [4096:0]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&z, "{s}/web.json", .{sock[0..dir_end]}) catch return;
+    const p = std.fmt.bufPrintSentinel(&z, "{s}/web.json", .{sock[0..dir_end]}, 0) catch return;
     const f = c.fopen(p.ptr, "w") orelse return;
     defer _ = c.fclose(f);
     var line: [640]u8 = undefined;

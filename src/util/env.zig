@@ -30,7 +30,7 @@ pub fn nonEmpty(name: [*:0]const u8) ?[]const u8 {
 /// `nonEmpty` for a name that is not NUL-terminated (null when it is too long).
 pub fn nonEmptyName(name: []const u8) ?[]const u8 {
     var buf: [256]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{name}) catch return null;
+    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{name}, 0) catch return null;
     return nonEmpty(z.ptr);
 }
 

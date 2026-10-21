@@ -710,7 +710,7 @@ const ScopedDir = struct {
         self.saved.restore();
         // Best-effort recursive cleanup of the scratch tree.
         var cmd_buf: [4200]u8 = undefined;
-        const cmd = std.fmt.bufPrintZ(&cmd_buf, "rm -rf '{s}'", .{self.path}) catch {
+        const cmd = std.fmt.bufPrintSentinel(&cmd_buf, "rm -rf '{s}'", .{self.path}, 0) catch {
             self.alloc.free(self.path);
             return;
         };

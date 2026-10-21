@@ -694,7 +694,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // the whole point of `--route tor` is that nothing goes direct.
         if (req.bad_route) |bad| {
             var msg: [512]u8 = undefined;
-            const line = std.fmt.bufPrintZ(&msg, "sketerm web: --route {s}: expected {s}\n", .{ bad, web_app.ROUTE_GRAMMAR }) catch "sketerm web: bad --route\n";
+            const line = std.fmt.bufPrintSentinel(&msg, "sketerm web: --route {s}: expected {s}\n", .{ bad, web_app.ROUTE_GRAMMAR }, 0) catch "sketerm web: bad --route\n";
             _ = c.fputs(line.ptr, platform.stderr());
             req.deinit();
             return 2;
@@ -744,7 +744,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             .editor => editor_app.ID_SUFFIX,
             .web => web_app.ID_SUFFIX,
         };
-        const id = std.fmt.bufPrintZ(&app_id_buf, "{s}{s}", .{ base, suffix }) catch break :blk APP_ID;
+        const id = std.fmt.bufPrintSentinel(&app_id_buf, "{s}{s}", .{ base, suffix }, 0) catch break :blk APP_ID;
         break :blk id.ptr;
     };
 
@@ -986,7 +986,7 @@ fn onCommandLine(app: ?*c.GApplication, cmdline: ?*c.GApplicationCommandLine, _:
         g_app.editor_request = editor_app.collect(g_app.allocator, args, cwd) catch |err| {
             g_app.editor_request = null;
             var message: [192:0]u8 = undefined;
-            const text = std.fmt.bufPrintZ(&message, "sketerm: cannot open Editor documents: {s}\n", .{@errorName(err)}) catch
+            const text = std.fmt.bufPrintSentinel(&message, "sketerm: cannot open Editor documents: {s}\n", .{@errorName(err)}, 0) catch
                 "sketerm: cannot open Editor documents\n";
             c.g_application_command_line_printerr_literal(cmdline, text.ptr);
             return 1;
@@ -1007,7 +1007,7 @@ fn onCommandLine(app: ?*c.GApplication, cmdline: ?*c.GApplicationCommandLine, _:
             // the grammar opens nothing, on the invoker's stderr.
             if (req.bad_route) |bad| {
                 var msg: [512]u8 = undefined;
-                const line = std.fmt.bufPrintZ(&msg, "sketerm web: --route {s}: expected {s}\n", .{ bad, web_app.ROUTE_GRAMMAR }) catch "sketerm web: bad --route\n";
+                const line = std.fmt.bufPrintSentinel(&msg, "sketerm web: --route {s}: expected {s}\n", .{ bad, web_app.ROUTE_GRAMMAR }, 0) catch "sketerm web: bad --route\n";
                 c.g_application_command_line_printerr(cmdline, "%s", line.ptr);
                 req.deinit();
                 return 2;
@@ -1031,7 +1031,7 @@ fn onCommandLine(app: ?*c.GApplication, cmdline: ?*c.GApplicationCommandLine, _:
             if (g_app.viewer_batch) |*old| old.deinit();
             g_app.viewer_batch = null;
             var message: [192:0]u8 = undefined;
-            const text = std.fmt.bufPrintZ(&message, "sketerm: cannot open Viewer resources: {s}\n", .{@errorName(err)}) catch
+            const text = std.fmt.bufPrintSentinel(&message, "sketerm: cannot open Viewer resources: {s}\n", .{@errorName(err)}, 0) catch
                 "sketerm: cannot open Viewer resources\n";
             c.g_application_command_line_printerr_literal(cmdline, text.ptr);
             return 1;

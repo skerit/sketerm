@@ -1417,7 +1417,7 @@ pub const Window = struct {
         var num_buf: [32]u8 = undefined;
         const title = if (title_opt) |t| t else blk: {
             self.tab_counter += 1;
-            const slice = std.fmt.bufPrintZ(&num_buf, "Tab {d}", .{self.tab_counter}) catch "shell";
+            const slice = std.fmt.bufPrintSentinel(&num_buf, "Tab {d}", .{self.tab_counter}, 0) catch "shell";
             break :blk @as([*:0]const u8, slice.ptr);
         };
         // Inherit the focused pane's last-reported cwd (OSC 7) so a
@@ -1555,7 +1555,7 @@ pub const Window = struct {
         var files_buf: [4096:0]u8 = undefined;
         const sibling: ?[*:0]const u8 = blk: {
             const dir_end = std.mem.lastIndexOfScalar(u8, exe, '/') orelse break :blk null;
-            const p = std.fmt.bufPrintZ(&files_buf, "{s}/sketerm-files", .{exe[0..dir_end]}) catch break :blk null;
+            const p = std.fmt.bufPrintSentinel(&files_buf, "{s}/sketerm-files", .{exe[0..dir_end]}, 0) catch break :blk null;
             if (c.access(p.ptr, c.X_OK) != 0) break :blk null;
             break :blk p.ptr;
         };
@@ -1572,7 +1572,7 @@ pub const Window = struct {
             n += 2;
         }
         if (spec) |s| {
-            if (std.fmt.bufPrintZ(&spec_z_buf, "{s}", .{s})) |z| {
+            if (std.fmt.bufPrintSentinel(&spec_z_buf, "{s}", .{s}, 0)) |z| {
                 argv[n] = @constCast(@as([*c]const u8, z.ptr));
             } else |_| {}
         }
@@ -1582,7 +1582,7 @@ pub const Window = struct {
         var envp: [*c][*c]c.gchar = null;
         var ticket_buf: [512:0]u8 = undefined;
         if (ticket) |t| if (ticket_host) |h| {
-            if (std.fmt.bufPrintZ(&ticket_buf, "{s} {d} {s}", .{ h, t.port, t.keyhex() })) |v| {
+            if (std.fmt.bufPrintSentinel(&ticket_buf, "{s} {d} {s}", .{ h, t.port, t.keyhex() }, 0)) |v| {
                 envp = c.g_environ_setenv(c.g_get_environ(), "SKETERM_UDP_TICKET", v.ptr, 1);
             } else |_| {}
         };
@@ -2658,7 +2658,7 @@ pub const Window = struct {
         const entry = c.gtk_entry_new();
         c.gtk_entry_set_placeholder_text(@ptrCast(entry), "What this session works on (empty = clear)");
         if (pane.terminal.peerSubject()) |cur| {
-            if (self.allocator.dupeZ(u8, cur) catch null) |zz| {
+            if (self.allocator.dupeSentinel(u8, cur, 0) catch null) |zz| {
                 defer self.allocator.free(zz);
                 c.gtk_editable_set_text(@ptrCast(entry), zz.ptr);
                 c.gtk_editable_select_region(@ptrCast(entry), 0, -1);
@@ -3010,7 +3010,7 @@ pub const Window = struct {
         if (c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-title-locked") == null) {
             var num_buf: [32]u8 = undefined;
             self.tab_counter += 1;
-            const t = std.fmt.bufPrintZ(&num_buf, "Tab {d}", .{self.tab_counter}) catch "shell";
+            const t = std.fmt.bufPrintSentinel(&num_buf, "Tab {d}", .{self.tab_counter}, 0) catch "shell";
             c.adw_tab_page_set_title(page, t.ptr);
             c.adw_tab_page_set_tooltip(page, t.ptr);
         }
@@ -3026,7 +3026,7 @@ pub const Window = struct {
         std.debug.print("sketerm: forwarded app exited ({d}) without opening a window — holding pane so the log stays visible\n", .{status});
         const page = tabPageForPane(self, pane) orelse return;
         var buf: [96:0]u8 = undefined;
-        const t = std.fmt.bufPrintZ(&buf, "app exited ({d})", .{status}) catch "app exited";
+        const t = std.fmt.bufPrintSentinel(&buf, "app exited ({d})", .{status}, 0) catch "app exited";
         c.adw_tab_page_set_title(page, t.ptr);
         c.adw_tab_page_set_tooltip(page, "The app exited without opening a window here. " ++
             "Single-instance apps hand off to an already-running instance " ++
@@ -3207,7 +3207,7 @@ pub const Window = struct {
         // window keeps its own name when a template renders empty.
         const text = if (base.len > 0) base else self.title_base;
         var buf: [640:0]u8 = undefined;
-        const title = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ text, suffix }) catch return;
+        const title = std.fmt.bufPrintSentinel(&buf, "{s}{s}", .{ text, suffix }, 0) catch return;
         c.gtk_window_set_title(@ptrCast(self.app_window), title.ptr);
     }
 
@@ -3413,10 +3413,11 @@ pub const Window = struct {
 
         const dir = @import("../util/profile.zig").getenv("XDG_RUNTIME_DIR") orelse "/tmp";
         var path_buf: [512]u8 = undefined;
-        const path = std.fmt.bufPrintZ(
+        const path = std.fmt.bufPrintSentinel(
             &path_buf,
             "{s}/sketerm-scrollback-{d}-{d}.txt",
             .{ dir, c.getpid(), @import("../util/profile.zig").milliTimestamp() },
+            0,
         ) catch return;
 
         const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c_uint, 0o600));
@@ -3445,10 +3446,11 @@ pub const Window = struct {
             break :blk if (env.len == 0) "less -R +G" else env;
         };
         var cmd_buf: [1024]u8 = undefined;
-        const cmd = std.fmt.bufPrintZ(
+        const cmd = std.fmt.bufPrintSentinel(
             &cmd_buf,
             "{s} '{s}'; rm -f '{s}'",
             .{ pager, path, path },
+            0,
         ) catch {
             _ = c.unlink(path.ptr);
             return;
@@ -3718,7 +3720,7 @@ const openUploadDialog = winpickers.openUploadDialog;
 /// Float a transient toast over the grid (transfer finished / failed).
 pub fn showToast(self: *Window, text: []const u8) void {
     var buf: [512]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{text}) catch return;
+    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{text}, 0) catch return;
     const toast = c.adw_toast_new(z.ptr);
     c.adw_toast_set_timeout(toast, 4);
     c.adw_toast_overlay_add_toast(self.toast_overlay, toast);
@@ -4063,11 +4065,11 @@ fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gbool
         const dirty = self.editorDirtyTotal();
         if (dirty > 0) {
             var body: [160:0]u8 = undefined;
-            const b = std.fmt.bufPrintZ(&body, "There {s} {d} editor file{s} with unsaved changes. Closing the window discards them.", .{
+            const b = std.fmt.bufPrintSentinel(&body, "There {s} {d} editor file{s} with unsaved changes. Closing the window discards them.", .{
                 if (dirty == 1) @as([]const u8, "is") else @as([]const u8, "are"),
                 dirty,
                 if (dirty == 1) @as([]const u8, "") else @as([]const u8, "s"),
-            }) catch "There are editor files with unsaved changes.";
+            }, 0) catch "There are editor files with unsaved changes.";
             const pending = self.allocator.create(PendingCloseWin) catch {
                 self.beginDestroy();
                 return 0;

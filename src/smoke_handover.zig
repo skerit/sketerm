@@ -229,7 +229,7 @@ fn orphanReapedByFence(allocator: std.mem.Allocator) void {
         if (c.pipe(&fence) != 0) c._exit(10);
         _ = c.fcntl(fence[1], c.F_SETFD, c.FD_CLOEXEC);
         var num: [16:0]u8 = undefined;
-        const s = std.fmt.bufPrintZ(&num, "{d}", .{fence[0]}) catch unreachable;
+        const s = std.fmt.bufPrintSentinel(&num, "{d}", .{fence[0]}, 0) catch unreachable;
         _ = c.setenv(lifetime.ENV, s.ptr, 1);
         var path_buf: [128]u8 = undefined;
         const sock = std.fmt.bufPrint(&path_buf, "/tmp/sketerm-ho-{d}/mux.sock", .{c.getpid()}) catch unreachable;

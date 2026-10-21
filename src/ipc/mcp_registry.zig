@@ -452,9 +452,9 @@ pub fn agentSocketOf(allocator: std.mem.Allocator, parent: c.pid_t) ![]u8 {
 pub fn ensureDir() ![]const u8 {
     const rt = platform.runtimeDir();
     var z: [4096]u8 = undefined;
-    const base = std.fmt.bufPrintZ(&z, "{s}/sketerm", .{rt}) catch return error.PathTooLong;
+    const base = std.fmt.bufPrintSentinel(&z, "{s}/sketerm", .{rt}, 0) catch return error.PathTooLong;
     if (c.mkdir(base.ptr, 0o700) != 0 and std.posix.errno(@as(c_int, -1)) != .EXIST) return error.MkdirFailed;
-    const dir = std.fmt.bufPrintZ(&z, "{s}/sketerm/mcp-servers", .{rt}) catch return error.PathTooLong;
+    const dir = std.fmt.bufPrintSentinel(&z, "{s}/sketerm/mcp-servers", .{rt}, 0) catch return error.PathTooLong;
     if (c.mkdir(dir.ptr, 0o700) != 0 and std.posix.errno(@as(c_int, -1)) != .EXIST) return error.MkdirFailed;
     // The returned span uses process-lifetime storage, not this stack buffer.
     return registryDirStatic();
@@ -507,7 +507,7 @@ fn scanRegistered(allocator: std.mem.Allocator, out: *std.ArrayList(Entry)) !voi
 
 fn scanLegacy(allocator: std.mem.Allocator, out: *std.ArrayList(Entry)) !void {
     var z: [4096]u8 = undefined;
-    const base = std.fmt.bufPrintZ(&z, "{s}/sketerm", .{platform.runtimeDir()}) catch return;
+    const base = std.fmt.bufPrintSentinel(&z, "{s}/sketerm", .{platform.runtimeDir()}, 0) catch return;
     const dp = c.opendir(base.ptr) orelse return;
     defer _ = c.closedir(dp);
     while (c.readdir(dp)) |de| {
@@ -887,7 +887,7 @@ test "an instance key resolves only to a live server's daemon" {
     }
     // A durable instance whose server exited leaves its directory behind.
     var dir_buf: [512]u8 = undefined;
-    _ = c.mkdir(try std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm/mcp-gone", .{scope.path}), 0o700);
+    _ = c.mkdir(try std.fmt.bufPrintSentinel(&dir_buf, "{s}/sketerm/mcp-gone", .{scope.path}, 0), 0o700);
     try std.testing.expectEqual(Lookup.dead, try lookupInstance(allocator, "gone"));
     try std.testing.expectEqual(Lookup.unknown, try lookupInstance(allocator, "never"));
     try std.testing.expectEqual(Lookup.invalid, try lookupInstance(allocator, "../live"));
@@ -899,9 +899,9 @@ test "mcp registry includes a live pre-registry ephemeral instance" {
     var scope = try ScopedRuntime.init(allocator, "legacy");
     defer scope.deinit();
     var z: [4096]u8 = undefined;
-    const base = try std.fmt.bufPrintZ(&z, "{s}/sketerm", .{scope.path});
+    const base = try std.fmt.bufPrintSentinel(&z, "{s}/sketerm", .{scope.path}, 0);
     _ = c.mkdir(base.ptr, 0o700);
-    const legacy_dir = try std.fmt.bufPrintZ(&z, "{s}/sketerm/mcp-tmp-{d}", .{ scope.path, c.getpid() });
+    const legacy_dir = try std.fmt.bufPrintSentinel(&z, "{s}/sketerm/mcp-tmp-{d}", .{ scope.path, c.getpid() }, 0);
     _ = c.mkdir(legacy_dir.ptr, 0o700);
 
     const entries = try list(allocator, true);

@@ -104,7 +104,7 @@ pub const PanelWindow = struct {
         if (self.destroyed) return;
         const doc_title = self.view.title();
         const text = if (doc_title.len > 0)
-            std.fmt.bufPrintZ(&self.title_buf, "{s} - {s}", .{ doc_title, APP_NAME }) catch APP_NAME
+            std.fmt.bufPrintSentinel(&self.title_buf, "{s} - {s}", .{ doc_title, APP_NAME }, 0) catch APP_NAME
         else
             APP_NAME;
         c.gtk_window_set_title(@ptrCast(self.window), text.ptr);

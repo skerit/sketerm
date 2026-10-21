@@ -295,7 +295,7 @@ test "term output files are created private and keep the user's mode" {
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/output.txt", .{base});
     var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    const path_z = try std.fmt.bufPrintSentinel(&path_z_buf, "{s}", .{path}, 0);
     defer _ = c.unlink(path_z.ptr);
 
     try t.expect(writeFileBytes(path, "first"));
@@ -1007,7 +1007,7 @@ fn termClose(arena: std.mem.Allocator, _: std.json.Value, t: *termdrive.Term, _:
 /// Streaming SHA-256 of a local file; null when unreadable.
 pub fn sha256File(path: []const u8) ?[64]u8 {
     var pbuf: [4096]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&pbuf, "{s}", .{path}) catch return null;
+    const path_z = std.fmt.bufPrintSentinel(&pbuf, "{s}", .{path}, 0) catch return null;
     const f = c.fopen(path_z.ptr, "rb") orelse return null;
     defer _ = c.fclose(f);
     var h = std.crypto.hash.sha2.Sha256.init(.{});
@@ -1030,7 +1030,7 @@ pub fn sha256File(path: []const u8) ?[64]u8 {
 
 pub fn fileSize(path: []const u8) ?u64 {
     var pbuf: [4096]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&pbuf, "{s}", .{path}) catch return null;
+    const path_z = std.fmt.bufPrintSentinel(&pbuf, "{s}", .{path}, 0) catch return null;
     var st: c.struct_stat = undefined;
     if (c.stat(path_z.ptr, &st) != 0) return null;
     return @intCast(@max(st.st_size, 0));
@@ -1039,10 +1039,10 @@ pub fn fileSize(path: []const u8) ?u64 {
 /// Local copy with checksum + atomic rename (the host==null transfer path).
 pub fn localCopyAtomic(arena: std.mem.Allocator, src: []const u8, dst: []const u8) !union(enum) { ok: struct { bytes: u64, sha: [64]u8 }, err: []const u8 } {
     var sbuf: [4096]u8 = undefined;
-    const src_z = std.fmt.bufPrintZ(&sbuf, "{s}", .{src}) catch return .{ .err = "path too long" };
+    const src_z = std.fmt.bufPrintSentinel(&sbuf, "{s}", .{src}, 0) catch return .{ .err = "path too long" };
     const part = try std.fmt.allocPrint(arena, "{s}.sketerm-part", .{dst});
     var dbuf: [4096]u8 = undefined;
-    const part_z = std.fmt.bufPrintZ(&dbuf, "{s}", .{part}) catch return .{ .err = "path too long" };
+    const part_z = std.fmt.bufPrintSentinel(&dbuf, "{s}", .{part}, 0) catch return .{ .err = "path too long" };
     const in = c.fopen(src_z.ptr, "rb") orelse return .{ .err = "cannot read the source file" };
     defer _ = c.fclose(in);
     const out = c.fopen(part_z.ptr, "wb") orelse return .{ .err = "cannot write the destination (parent dir missing or not writable?)" };
@@ -1070,7 +1070,7 @@ pub fn localCopyAtomic(arena: std.mem.Allocator, src: []const u8, dst: []const u
         return .{ .err = "checksum mismatch after local copy" };
     }
     var fbuf: [4096]u8 = undefined;
-    const dst_z = std.fmt.bufPrintZ(&fbuf, "{s}", .{dst}) catch return .{ .err = "path too long" };
+    const dst_z = std.fmt.bufPrintSentinel(&fbuf, "{s}", .{dst}, 0) catch return .{ .err = "path too long" };
     if (c.rename(part_z.ptr, dst_z.ptr) != 0) {
         _ = c.unlink(part_z.ptr);
         return .{ .err = "atomic rename to the destination failed" };
@@ -1532,15 +1532,15 @@ pub fn scpTool(arena: std.mem.Allocator, upload: bool, args: std.json.Value) ![]
                 return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "remote sha256sum gave no hash — cannot verify (partial kept at {s}):\n{s}", .{ part, r.output }));
             if (!std.mem.eql(u8, remote_sha, &part_sha)) {
                 var pbuf: [4096]u8 = undefined;
-                if (std.fmt.bufPrintZ(&pbuf, "{s}", .{part})) |pz| _ = c.unlink(pz.ptr) else |_| {}
+                if (std.fmt.bufPrintSentinel(&pbuf, "{s}", .{part}, 0)) |pz| _ = c.unlink(pz.ptr) else |_| {}
                 return mcp.errRes(arena, .io_failed, "checksum mismatch — corrupt download discarded");
             }
         },
     }
     var pbuf: [4096]u8 = undefined;
     var dbuf: [4096]u8 = undefined;
-    const part_z = std.fmt.bufPrintZ(&pbuf, "{s}", .{part}) catch return mcp.errRes(arena, .invalid_args, "path too long");
-    const local_z = std.fmt.bufPrintZ(&dbuf, "{s}", .{local}) catch return mcp.errRes(arena, .invalid_args, "path too long");
+    const part_z = std.fmt.bufPrintSentinel(&pbuf, "{s}", .{part}, 0) catch return mcp.errRes(arena, .invalid_args, "path too long");
+    const local_z = std.fmt.bufPrintSentinel(&dbuf, "{s}", .{local}, 0) catch return mcp.errRes(arena, .invalid_args, "path too long");
     if (c.rename(part_z.ptr, local_z.ptr) != 0)
         return mcp.errRes(arena, .io_failed, "atomic rename into place failed");
     return xferOk(arena, "download", local, bytes, &part_sha);
@@ -2345,7 +2345,7 @@ test "term_exec result: output_file writes the full output and reports it" {
     const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
     const path = try std.fmt.allocPrint(arena, "{s}/out.txt", .{base});
     var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    const path_z = try std.fmt.bufPrintSentinel(&path_z_buf, "{s}", .{path}, 0);
     defer _ = c.unlink(path_z.ptr);
 
     const out = try execResult(arena, .{
@@ -2606,7 +2606,7 @@ pub fn recDir() ?[]const u8 {
     // when the CDP set was deleted — without it recording is silently
     // off on any fresh state dir.
     var probe: [4096]u8 = undefined;
-    const dir_z = std.fmt.bufPrintZ(&probe, "{s}", .{dir}) catch {
+    const dir_z = std.fmt.bufPrintSentinel(&probe, "{s}", .{dir}, 0) catch {
         a.free(dir);
         return null;
     };
@@ -2840,8 +2840,8 @@ test "localCopyAtomic copies, verifies and renames" {
     const arena = arena_state.allocator();
     var sbuf: [128]u8 = undefined;
     var dbuf: [128]u8 = undefined;
-    const src = try std.fmt.bufPrintZ(&sbuf, "/tmp/sketerm-xfer-src-{d}", .{c.getpid()});
-    const dst = try std.fmt.bufPrintZ(&dbuf, "/tmp/sketerm-xfer-dst-{d}", .{c.getpid()});
+    const src = try std.fmt.bufPrintSentinel(&sbuf, "/tmp/sketerm-xfer-src-{d}", .{c.getpid()}, 0);
+    const dst = try std.fmt.bufPrintSentinel(&dbuf, "/tmp/sketerm-xfer-dst-{d}", .{c.getpid()}, 0);
     const f = c.fopen(src.ptr, "wb") orelse return error.SkipZigTest;
     _ = c.fwrite("hello transfer", 1, 14, f);
     _ = c.fclose(f);
@@ -2992,7 +2992,7 @@ test "text mode: exec, transfer, busy and ssh lines read as people write them" {
 
     // output_file sizes in binary units.
     var pbuf: [96]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&pbuf, "/tmp/sketerm-exec-text-{d}", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&pbuf, "/tmp/sketerm-exec-text-{d}", .{c.getpid()}, 0);
     defer _ = c.unlink(path.ptr);
     var big: [2048]u8 = undefined;
     @memset(&big, 'x');

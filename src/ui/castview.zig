@@ -95,7 +95,7 @@ pub const CastView = struct {
     fn onBoxTitle(user: ?*anyopaque, name: []const u8) void {
         const self = cast.userData(CastView, user);
         var buf: [512:0]u8 = undefined;
-        const t = std.fmt.bufPrintZ(&buf, "{s} - Sketerm Play", .{name}) catch "Sketerm Play";
+        const t = std.fmt.bufPrintSentinel(&buf, "{s} - Sketerm Play", .{name}, 0) catch "Sketerm Play";
         c.gtk_window_set_title(@ptrCast(self.window), t.ptr);
     }
 

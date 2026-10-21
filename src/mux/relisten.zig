@@ -139,7 +139,7 @@ pub fn bindListener(path: []const u8, mode: LockMode) BindError!Bound {
     // both observe the same stale inode and one can unlink the other's new
     // listener between its bind and listen calls.
     var lock_buf: [4096:0]u8 = undefined;
-    const lock_path = std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path}) catch return error.BadPath;
+    const lock_path = std.fmt.bufPrintSentinel(&lock_buf, "{s}.lock", .{path}, 0) catch return error.BadPath;
     const lock_fd = c.open(lock_path.ptr, c.O_CREAT | c.O_RDWR | c.O_CLOEXEC, @as(c_uint, 0o600));
     if (lock_fd < 0) return error.LockFailed;
     defer _ = c.close(lock_fd);
@@ -205,7 +205,7 @@ pub const Record = struct {
 fn recordPath(buf: []u8, pid: c.pid_t, environ: ?[]const u8) ?[:0]u8 {
     var dir_buf: [4096]u8 = undefined;
     const dir = recordDir(&dir_buf, environ) orelse return null;
-    return std.fmt.bufPrintZ(buf, "{s}/{d}.json", .{ dir, pid }) catch null;
+    return std.fmt.bufPrintSentinel(buf, "{s}/{d}.json", .{ dir, pid }, 0) catch null;
 }
 
 fn recordDir(buf: []u8, environ: ?[]const u8) ?[]const u8 {
@@ -360,8 +360,8 @@ pub const Keeper = struct {
         pathz.makeDirs(dir, 0o700) catch return;
         const pid = c.getpid();
         var tmp_buf: [4096:0]u8 = undefined;
-        const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}/.{d}.tmp", .{ dir, pid }) catch return;
-        const final = std.fmt.bufPrintZ(&self.record_path, "{s}/{d}.json", .{ dir, pid }) catch return;
+        const tmp = std.fmt.bufPrintSentinel(&tmp_buf, "{s}/.{d}.tmp", .{ dir, pid }, 0) catch return;
+        const final = std.fmt.bufPrintSentinel(&self.record_path, "{s}/{d}.json", .{ dir, pid }, 0) catch return;
         self.record_path_len = final.len;
         const fd = c.open(tmp.ptr, c.O_CREAT | c.O_TRUNC | c.O_WRONLY | c.O_CLOEXEC, @as(c_uint, 0o600));
         if (fd < 0) return;
@@ -466,7 +466,7 @@ fn sweep(dir: []const u8, self_pid: c.pid_t) void {
         const pid = std.fmt.parseInt(c.pid_t, name[0 .. name.len - ".json".len], 10) catch continue;
         if (pid == self_pid) continue;
         var path_buf: [4096:0]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ dir, name }) catch continue;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ dir, name }, 0) catch continue;
         const fd = c.open(path.ptr, c.O_RDWR | c.O_CLOEXEC);
         if (fd < 0) continue;
         defer _ = c.close(fd);
@@ -531,7 +531,7 @@ test "the prompt gate refuses every orphan that does not hold a current record" 
 
 test "an old or unknown orphan is never signalled; a publishing one is" {
     var root_buf: [64:0]u8 = undefined;
-    const root = try std.fmt.bufPrintZ(&root_buf, "/tmp/sk-relisten-{d}", .{c.getpid()});
+    const root = try std.fmt.bufPrintSentinel(&root_buf, "/tmp/sk-relisten-{d}", .{c.getpid()}, 0);
     defer pathz.removeTree(root);
     var env_buf: [128]u8 = undefined;
     const environ = try std.fmt.bufPrint(&env_buf, "HOME=/nonexistent\x00XDG_STATE_HOME={s}\x00", .{root});
@@ -596,13 +596,13 @@ test "an old or unknown orphan is never signalled; a publishing one is" {
 
 test "a broker re-binds a removed socket path and leaves a live replacement alone" {
     var root_buf: [64:0]u8 = undefined;
-    const root = try std.fmt.bufPrintZ(&root_buf, "/tmp/sk-rebind-{d}", .{c.getpid()});
+    const root = try std.fmt.bufPrintSentinel(&root_buf, "/tmp/sk-rebind-{d}", .{c.getpid()}, 0);
     _ = c.mkdir(root.ptr, 0o700);
     defer pathz.removeTree(root);
     var path_buf: [96]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/rt/sketerm/mux.sock", .{root});
     var rt_buf: [96:0]u8 = undefined;
-    const rt = try std.fmt.bufPrintZ(&rt_buf, "{s}/rt", .{root});
+    const rt = try std.fmt.bufPrintSentinel(&rt_buf, "{s}/rt", .{root}, 0);
     _ = c.mkdir(rt.ptr, 0o700);
 
     const first = try bindListener(path, .wait);

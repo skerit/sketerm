@@ -73,11 +73,11 @@ pub const STARTUP_WAIT_MS: i64 = 1500;
 const STALE_MIN_AGE_S: i64 = 10;
 
 fn dirPath(buf: []u8, broker_sock: []const u8) ?[:0]u8 {
-    return std.fmt.bufPrintZ(buf, "{s}" ++ DIR_SUFFIX, .{broker_sock}) catch null;
+    return std.fmt.bufPrintSentinel(buf, "{s}" ++ DIR_SUFFIX, .{broker_sock}, 0) catch null;
 }
 
 fn listenerPath(buf: []u8, broker_sock: []const u8, origin_id: []const u8) ?[:0]u8 {
-    return std.fmt.bufPrintZ(buf, "{s}" ++ DIR_SUFFIX ++ "/{s}", .{ broker_sock, origin_id }) catch null;
+    return std.fmt.bufPrintSentinel(buf, "{s}" ++ DIR_SUFFIX ++ "/{s}", .{ broker_sock, origin_id }, 0) catch null;
 }
 
 // ── worker side ─────────────────────────────────────────────────────
@@ -132,7 +132,7 @@ pub fn closeListener(self: *Daemon) void {
     self.adopt_path = null;
     defer self.allocator.free(p);
     var z: [512]u8 = undefined;
-    const pz = std.fmt.bufPrintZ(&z, "{s}", .{p}) catch return;
+    const pz = std.fmt.bufPrintSentinel(&z, "{s}", .{p}, 0) catch return;
     if (relisten.pathState(p, .{ .dev = self.adopt_dev, .ino = self.adopt_ino }) == .ours) _ = c.unlink(pz.ptr);
 }
 
@@ -489,7 +489,7 @@ test "a broker adopts an orphaned worker over a fresh control channel" {
     const sock = try std.fmt.bufPrint(&sock_buf, "{s}/mux.sock", .{dir});
     defer {
         var b2: [160]u8 = undefined;
-        const wd = std.fmt.bufPrintZ(&b2, "{s}" ++ DIR_SUFFIX, .{sock}) catch unreachable;
+        const wd = std.fmt.bufPrintSentinel(&b2, "{s}" ++ DIR_SUFFIX, .{sock}, 0) catch unreachable;
         _ = c.rmdir(wd.ptr);
         _ = c.rmdir(dir_ptr);
     }

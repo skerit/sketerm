@@ -537,8 +537,8 @@ pub const WebStore = struct {
             const title = e.value_ptr.title;
             var prefix = false;
             if (q.len > 0) {
-                const in_url = std.ascii.indexOfIgnoreCase(url, q);
-                const in_title = std.ascii.indexOfIgnoreCase(title, q);
+                const in_url = std.ascii.findIgnoreCase(url, q);
+                const in_title = std.ascii.findIgnoreCase(title, q);
                 if (in_url == null and in_title == null) continue;
                 prefix = std.ascii.startsWithIgnoreCase(url, q) or
                     std.ascii.startsWithIgnoreCase(hostPart(url), q);
@@ -1730,7 +1730,7 @@ test "webstore: pre-route container files migrate their host fields" {
     defer td.remove();
     const dir = td.path();
     var pb: [4096]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&pb, "{s}/containers.json", .{dir}) catch return error.SkipZigTest;
+    const path = std.fmt.bufPrintSentinel(&pb, "{s}/containers.json", .{dir}, 0) catch return error.SkipZigTest;
     const legacy =
         \\{"next_id":4,"containers":[
         \\ {"id":1,"name":"Work","jar":"Work","color":0,"egress_host":"gate.example","remote_host":""},

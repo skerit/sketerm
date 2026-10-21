@@ -572,7 +572,7 @@ test "event kinds: always-on and coalescing facts" {
 
 test "outcome ranks are distinct and put an ended agent first" {
     const t = std.testing;
-    var seen = std.StaticBitSet(9).initEmpty();
+    var seen = std.StaticBitSet(9).empty;
     for (std.enums.values(EventKind)) |k| {
         try t.expect(!seen.isSet(k.outcomeRank()));
         seen.set(k.outcomeRank());
@@ -614,7 +614,7 @@ test "attention: every state classified, urgency follows declaration order" {
     for ([_]State{ .starting, .working, .waiting_subagent, .waiting_background, .retrying }) |s|
         try t.expectEqual(Attention.working, s.attention());
     // Every attention is reachable from some state.
-    var seen = std.EnumSet(Attention).initEmpty();
+    var seen = std.EnumSet(Attention).empty;
     for (std.enums.values(State)) |s| seen.insert(s.attention());
     try t.expectEqual(@as(usize, std.enums.values(Attention).len), seen.count());
     try t.expect(Attention.needs_input.moreUrgent(.lost));
@@ -624,7 +624,7 @@ test "attention: every state classified, urgency follows declaration order" {
     try t.expectEqualStrings("disconnected", Attention.lost.label());
     try t.expectEqualStrings("needs input", Attention.needs_input.label());
     // Summary ranks are a permutation.
-    var ranks = std.StaticBitSet(std.enums.values(Attention).len).initEmpty();
+    var ranks = std.StaticBitSet(std.enums.values(Attention).len).empty;
     for (std.enums.values(Attention)) |a| {
         try t.expect(!ranks.isSet(a.summaryRank()));
         ranks.set(a.summaryRank());

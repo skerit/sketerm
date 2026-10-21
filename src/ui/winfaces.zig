@@ -211,10 +211,10 @@ pub fn discardBackgroundWebTabs(self: *Window) void {
         return;
     }
     var buf: [96]u8 = undefined;
-    const msg = std.fmt.bufPrintZ(&buf, "Discarded {d} background web page{s}.", .{
+    const msg = std.fmt.bufPrintSentinel(&buf, "Discarded {d} background web page{s}.", .{
         n,
         if (n == 1) "" else "s",
-    }) catch return;
+    }, 0) catch return;
     showToast(self, msg);
 }
 

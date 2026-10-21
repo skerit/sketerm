@@ -170,7 +170,7 @@ pub fn resolveFamilyStyled(
     var file_ptr: [*c]c.FcChar8 = undefined;
     if (c.FcPatternGetString(match, c.FC_FILE, 0, &file_ptr) != c.FcResultMatch) return null;
     const span = std.mem.span(@as([*:0]const u8, @ptrCast(file_ptr)));
-    return allocator.dupeZ(u8, span) catch null;
+    return allocator.dupeSentinel(u8, span, 0) catch null;
 }
 
 pub const Atlas = struct {

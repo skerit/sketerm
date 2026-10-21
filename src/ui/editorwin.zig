@@ -259,10 +259,11 @@ pub const EditorWindow = struct {
             break :blk if (base.len == 0) s else base;
         } else "Untitled";
         const mark: []const u8 = if (tab.isDirty()) "*" else "";
-        const title = std.fmt.bufPrintZ(
+        const title = std.fmt.bufPrintSentinel(
             &self.title_buf,
             "{s}{s} - {s}",
             .{ mark, name, model.APP_NAME },
+            0,
         ) catch model.APP_NAME;
         c.gtk_window_set_title(@ptrCast(self.window), title.ptr);
     }
@@ -318,9 +319,9 @@ pub const EditorWindow = struct {
 
         var body: [256:0]u8 = undefined;
         const text = if (dirty == 1)
-            std.fmt.bufPrintZ(&body, "One document has unsaved changes.", .{}) catch "Unsaved changes."
+            std.fmt.bufPrintSentinel(&body, "One document has unsaved changes.", .{}, 0) catch "Unsaved changes."
         else
-            std.fmt.bufPrintZ(&body, "{d} documents have unsaved changes.", .{dirty}) catch "Unsaved changes.";
+            std.fmt.bufPrintSentinel(&body, "{d} documents have unsaved changes.", .{dirty}, 0) catch "Unsaved changes.";
         // The ref keeps the window (and the qdata resolving back to
         // `self`) alive until the one-shot callback runs.
         _ = c.g_object_ref(@ptrCast(self.window));

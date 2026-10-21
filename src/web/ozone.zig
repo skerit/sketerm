@@ -148,7 +148,7 @@ pub fn renderNodePresent() bool {
     var i: u16 = 0;
     while (i < 8) : (i += 1) {
         var path: [64]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&path, "/dev/dri/renderD{d}", .{128 + i}) catch return false;
+        const p = std.fmt.bufPrintSentinel(&path, "/dev/dri/renderD{d}", .{128 + i}, 0) catch return false;
         const fd = std.c.open(p.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true });
         if (fd >= 0) {
             _ = std.c.close(fd);

@@ -169,7 +169,7 @@ pub const Canvas = struct {
 
     pub fn setAccessible(self: *Canvas, label: []const u8, detail: ?[]const u8, busy: bool) void {
         var label_buf: [512:0]u8 = undefined;
-        const label_z = std.fmt.bufPrintZ(&label_buf, "{s}", .{label}) catch "Image";
+        const label_z = std.fmt.bufPrintSentinel(&label_buf, "{s}", .{label}, 0) catch "Image";
         c.gtk_accessible_update_property(@ptrCast(self.picture), c.GTK_ACCESSIBLE_PROPERTY_LABEL, label_z.ptr, @as(c_int, -1));
         self.updateAccessibleDescription(detail);
         c.gtk_accessible_update_state(@ptrCast(self.picture), c.GTK_ACCESSIBLE_STATE_BUSY, @as(c.gboolean, @intFromBool(busy)), @as(c_int, -1));
@@ -197,20 +197,20 @@ pub const Canvas = struct {
             @floatFromInt(self.image_height),
         );
         const text = if (semantic.len > 0)
-            std.fmt.bufPrintZ(&buf, "{s}; {d} by {d} pixels; {s}; {d}%", .{
+            std.fmt.bufPrintSentinel(&buf, "{s}; {d} by {d} pixels; {s}; {d}%", .{
                 semantic,
                 self.image_width,
                 self.image_height,
                 mode,
                 @as(u32, @intFromFloat(@round(effective * 100))),
-            }) catch mode
+            }, 0) catch mode
         else
-            std.fmt.bufPrintZ(&buf, "{d} by {d} pixels; {s}; {d}%", .{
+            std.fmt.bufPrintSentinel(&buf, "{d} by {d} pixels; {s}; {d}%", .{
                 self.image_width,
                 self.image_height,
                 mode,
                 @as(u32, @intFromFloat(@round(effective * 100))),
-            }) catch mode;
+            }, 0) catch mode;
         c.gtk_accessible_update_property(@ptrCast(self.picture), c.GTK_ACCESSIBLE_PROPERTY_DESCRIPTION, text.ptr, @as(c_int, -1));
     }
 

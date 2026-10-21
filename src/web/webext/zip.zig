@@ -255,7 +255,7 @@ fn extract(
         else => return error.UnsupportedMethod,
     };
     errdefer gpa.free(out);
-    if (std.hash.crc.Crc32.hash(out) != expected_crc) return error.ChecksumMismatch;
+    if (std.hash.Crc32.hash(out) != expected_crc) return error.ChecksumMismatch;
     return out;
 }
 
@@ -363,7 +363,7 @@ fn buildZip(gpa: std.mem.Allocator, files: []const TestFile) ![]u8 {
 
     for (files) |f| {
         const off: u32 = @intCast(out.items.len);
-        const crc = std.hash.crc.Crc32.hash(f.data);
+        const crc = std.hash.Crc32.hash(f.data);
         var comp_bytes: []u8 = undefined;
         var method: u16 = 0;
         if (f.deflate) {

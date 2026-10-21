@@ -98,7 +98,7 @@ pub fn runSplit(job: *const Job) u8 {
     var part: u32 = 1;
     while (part <= parts) : (part += 1) {
         var pz: [4200:0]u8 = undefined;
-        const pp = std.fmt.bufPrintZ(&pz, "{s}.{d:0>3}", .{ spec.src, part }) catch return job.emitError("path too long");
+        const pp = std.fmt.bufPrintSentinel(&pz, "{s}.{d:0>3}", .{ spec.src, part }, 0) catch return job.emitError("path too long");
         const out = c.open(pp.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC, st.st_mode & 0o777);
         if (out < 0) return job.emitErrno("split part exists or unwritable");
         defer _ = c.close(out);
@@ -149,7 +149,7 @@ pub fn runCombine(job: *const Job) u8 {
     var done: u64 = 0;
     while (part <= 999) : (part += 1) {
         var pz: [4200:0]u8 = undefined;
-        const pp = std.fmt.bufPrintZ(&pz, "{s}.{d:0>3}", .{ base, part }) catch return job.emitError("path too long");
+        const pp = std.fmt.bufPrintSentinel(&pz, "{s}.{d:0>3}", .{ base, part }, 0) catch return job.emitError("path too long");
         const in = c.open(pp.ptr, c.O_RDONLY | c.O_CLOEXEC);
         if (in < 0) {
             if (part == 1) return job.emitError("no .001 part beside the file");

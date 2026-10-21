@@ -240,7 +240,7 @@ pub const Pty = struct {
         // over the user's live pane.
         if (opts.pane_id != 0) {
             var id_buf: [16]u8 = undefined;
-            if (std.fmt.bufPrintZ(&id_buf, "{d}", .{opts.pane_id})) |s| {
+            if (std.fmt.bufPrintSentinel(&id_buf, "{d}", .{opts.pane_id}, 0)) |s| {
                 _ = c.setenv("SKETERM_PANE_ID", s.ptr, 1);
             } else |_| {}
         } else {
@@ -315,7 +315,7 @@ pub const Pty = struct {
                     var buf: [4096]u8 = undefined;
                     const cur = c.getenv("XDG_DATA_DIRS");
                     const cur_s: []const u8 = if (cur) |p| std.mem.span(@as([*:0]const u8, @ptrCast(p))) else "/usr/local/share:/usr/share";
-                    if (std.fmt.bufPrintZ(&buf, "{s}:{s}", .{ std.mem.span(si.shim_dir), cur_s })) |joined| {
+                    if (std.fmt.bufPrintSentinel(&buf, "{s}:{s}", .{ std.mem.span(si.shim_dir), cur_s }, 0)) |joined| {
                         _ = c.setenv("XDG_DATA_DIRS", joined.ptr, 1);
                     } else |_| {}
                 },

@@ -560,9 +560,9 @@ pub fn updateTabLabel(self: *BrowserView, tab: *BTab) void {
     var buf: [160:0]u8 = undefined;
     const name = if (base.len == 0) "/" else base;
     const txt = if (tab.hc.host) |h|
-        std.fmt.bufPrintZ(&buf, "{s}: {s}", .{ h, name }) catch return
+        std.fmt.bufPrintSentinel(&buf, "{s}: {s}", .{ h, name }, 0) catch return
     else
-        std.fmt.bufPrintZ(&buf, "{s}", .{name}) catch return;
+        std.fmt.bufPrintSentinel(&buf, "{s}", .{name}, 0) catch return;
     c.gtk_label_set_text(tab.tab_label, txt.ptr);
 }
 

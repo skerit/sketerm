@@ -27,7 +27,7 @@ fn unsafeArchiveMember(name_in: []const u8) bool {
 /// could escape the selected extraction directory.
 fn archiveMembersSafe(archive: []const u8) bool {
     var az: [4096:0]u8 = undefined;
-    const ap = std.fmt.bufPrintZ(&az, "{s}", .{archive}) catch return false;
+    const ap = std.fmt.bufPrintSentinel(&az, "{s}", .{archive}, 0) catch return false;
     var pipefd: [2]c_int = undefined;
     if (c.pipe(&pipefd) != 0) return false;
     const pid = c.fork();
@@ -86,7 +86,7 @@ pub fn runExtract(job: *const Job) u8 {
     if (c.mkdir(dp, 0o755) != 0 and std.posix.errno(@as(c_int, -1)) != .EXIST)
         return job.emitErrno("mkdir destination");
     var az: [4096:0]u8 = undefined;
-    const ap = std.fmt.bufPrintZ(&az, "{s}", .{spec.src}) catch return job.emitError("archive path too long");
+    const ap = std.fmt.bufPrintSentinel(&az, "{s}", .{spec.src}, 0) catch return job.emitError("archive path too long");
     job.emit(.{ .ev = "progress", .done = @as(u64, 0), .total = @as(u64, 0) });
     const argv = [_:null]?[*:0]const u8{
         "bsdtar", "-xf", ap.ptr, "-C", dp, "--no-same-owner", "--safe-writes", null,
@@ -101,7 +101,7 @@ pub fn runExtract(job: *const Job) u8 {
 pub fn runArchiveList(job: *const Job) u8 {
     const spec = job.spec;
     var az: [4096:0]u8 = undefined;
-    const ap = std.fmt.bufPrintZ(&az, "{s}", .{spec.src}) catch return job.emitError("archive path too long");
+    const ap = std.fmt.bufPrintSentinel(&az, "{s}", .{spec.src}, 0) catch return job.emitError("archive path too long");
     var pipefd: [2]c_int = undefined;
     if (c.pipe(&pipefd) != 0) return job.emitErrno("pipe");
     const pid = c.fork();
@@ -177,11 +177,11 @@ pub fn runArchiveExtractMember(job: *const Job) u8 {
         dir = std.mem.span(@as([*:0]u8, @ptrCast(made)));
     }
     var az: [4096:0]u8 = undefined;
-    const ap = std.fmt.bufPrintZ(&az, "{s}", .{spec.src}) catch return job.emitError("archive path too long");
+    const ap = std.fmt.bufPrintSentinel(&az, "{s}", .{spec.src}, 0) catch return job.emitError("archive path too long");
     var dz2: [4096:0]u8 = undefined;
-    const dp2 = std.fmt.bufPrintZ(&dz2, "{s}", .{dir}) catch return job.emitError("destination too long");
+    const dp2 = std.fmt.bufPrintSentinel(&dz2, "{s}", .{dir}, 0) catch return job.emitError("destination too long");
     var mz: [4096:0]u8 = undefined;
-    const mp = std.fmt.bufPrintZ(&mz, "{s}", .{member}) catch return job.emitError("member too long");
+    const mp = std.fmt.bufPrintSentinel(&mz, "{s}", .{member}, 0) catch return job.emitError("member too long");
     const argv = [_:null]?[*:0]const u8{
         "bsdtar", "-xf", ap.ptr, "-C", dp2.ptr, "--no-same-owner", "--safe-writes", mp.ptr, null,
     };
@@ -204,9 +204,9 @@ pub fn runArchiveCreate(job: *const Job) u8 {
     var pz: [4096:0]u8 = undefined;
     var bz: [4096:0]u8 = undefined;
     var dz: [4096:0]u8 = undefined;
-    const pp = std.fmt.bufPrintZ(&pz, "{s}", .{parent}) catch return job.emitError("source path too long");
-    const bp = std.fmt.bufPrintZ(&bz, "{s}", .{base}) catch return job.emitError("source path too long");
-    const dp = std.fmt.bufPrintZ(&dz, "{s}", .{spec.dst}) catch return job.emitError("archive path too long");
+    const pp = std.fmt.bufPrintSentinel(&pz, "{s}", .{parent}, 0) catch return job.emitError("source path too long");
+    const bp = std.fmt.bufPrintSentinel(&bz, "{s}", .{base}, 0) catch return job.emitError("source path too long");
+    const dp = std.fmt.bufPrintSentinel(&dz, "{s}", .{spec.dst}, 0) catch return job.emitError("archive path too long");
     job.emit(.{ .ev = "progress", .done = @as(u64, 0), .total = @as(u64, 0) });
     const argv = [_:null]?[*:0]const u8{ "bsdtar", "-caf", dp.ptr, "-C", pp.ptr, bp.ptr, null };
     if (!runArgv(&argv)) return job.emitError("archive creation failed (bsdtar required or format unsupported)");

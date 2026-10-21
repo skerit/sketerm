@@ -485,9 +485,9 @@ fn runUdpConnect(allocator: std.mem.Allocator, host: []const u8, port_s: []const
     const port = std.fmt.parseInt(u16, port_s, 10) catch return 1;
 
     var host_z: [256:0]u8 = undefined;
-    const hz = std.fmt.bufPrintZ(&host_z, "{s}", .{host}) catch return 1;
+    const hz = std.fmt.bufPrintSentinel(&host_z, "{s}", .{host}, 0) catch return 1;
     var port_z: [8:0]u8 = undefined;
-    const pz = std.fmt.bufPrintZ(&port_z, "{d}", .{port}) catch return 1;
+    const pz = std.fmt.bufPrintSentinel(&port_z, "{d}", .{port}, 0) catch return 1;
 
     var hints: cc.struct_addrinfo = std.mem.zeroes(cc.struct_addrinfo);
     // --udp-listen currently binds IPv4, so do not select an IPv6 AAAA

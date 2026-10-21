@@ -1239,7 +1239,7 @@ fn insertTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry, posit
             c.gtk_widget_set_valign(ov, c.GTK_ALIGN_CENTER);
             c.gtk_overlay_set_child(@ptrCast(ov), icon);
             var gz: [8:0]u8 = undefined;
-            const chip = c.gtk_label_new(std.fmt.bufPrintZ(&gz, "{s}", .{b.text()}) catch "");
+            const chip = c.gtk_label_new(std.fmt.bufPrintSentinel(&gz, "{s}", .{b.text()}, 0) catch "");
             c.gtk_widget_add_css_class(chip, b.css.ptr);
             c.gtk_widget_add_css_class(chip, "sketerm-fb-gitchip");
             c.gtk_widget_set_halign(chip, c.GTK_ALIGN_END);
@@ -1681,20 +1681,20 @@ pub fn fixedCellText(
         .mime => contentTypeCellZ(e, true, buf),
         .extension => copyZ(buf, extensionOf(e.name)),
         .permissions => fmtModeZ(mode_buf, e.mode, e.tdir),
-        .octal => if (std.fmt.bufPrintZ(buf, "{o:0>3}", .{e.mode})) |v| v.ptr else |_| "",
+        .octal => if (std.fmt.bufPrintSentinel(buf, "{o:0>3}", .{e.mode}, 0)) |v| v.ptr else |_| "",
         .owner => if (e.owner.len > 0)
             copyZ(buf, e.owner)
-        else if (std.fmt.bufPrintZ(buf, "{d}", .{e.uid})) |v|
+        else if (std.fmt.bufPrintSentinel(buf, "{d}", .{e.uid}, 0)) |v|
             v.ptr
         else |_|
             "",
         .group => if (e.group.len > 0)
             copyZ(buf, e.group)
-        else if (std.fmt.bufPrintZ(buf, "{d}", .{e.gid})) |v|
+        else if (std.fmt.bufPrintSentinel(buf, "{d}", .{e.gid}, 0)) |v|
             v.ptr
         else |_|
             "",
-        .nlink => if (std.fmt.bufPrintZ(buf, "{d}", .{e.nlink})) |v| v.ptr else |_| "",
+        .nlink => if (std.fmt.bufPrintSentinel(buf, "{d}", .{e.nlink}, 0)) |v| v.ptr else |_| "",
         // A directory has no meaningful byte size; Nemo shows what it
         // holds instead, and so do we when the daemon counted it.
         .size => if (std.mem.eql(u8, e.kind, "dir"))
@@ -1784,7 +1784,7 @@ pub fn activatePath(tab: *BTab, path_in: []const u8, is_dir: bool) void {
 pub fn loadFileColors(self: *BrowserView) void {
     var pbuf: [4096:0]u8 = undefined;
     const cfg = c.g_get_user_config_dir();
-    const path = std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/filecolors.conf", .{cfg}) catch return;
+    const path = std.fmt.bufPrintSentinel(&pbuf, "{s}/sketerm/filecolors.conf", .{cfg}, 0) catch return;
     const f = c.fopen(path.ptr, "rb") orelse return;
     defer _ = c.fclose(f);
     var content: [16 * 1024]u8 = undefined;

@@ -510,7 +510,7 @@ pub fn runQuery(self: *BrowserView, tab: *BTab, text: []const u8, q: query.Query
     if (rtab.virtual_spec.len > 0) self.allocator.free(rtab.virtual_spec);
     rtab.virtual_spec = self.allocator.dupe(u8, text) catch &.{};
     var lbl: [200:0]u8 = undefined;
-    const ltxt = std.fmt.bufPrintZ(&lbl, "{s}: {s}", .{ q.kindLabel(), text }) catch "query";
+    const ltxt = std.fmt.bufPrintSentinel(&lbl, "{s}: {s}", .{ q.kindLabel(), text }, 0) catch "query";
     c.gtk_label_set_text(rtab.tab_label, ltxt.ptr);
     if (!queryStart(self, rtab, root, text, q, .results))
         rtab.root.setLoadError("could not start the query");
@@ -897,7 +897,7 @@ pub fn dupMaybeFinish(self: *BrowserView) void {
         i = end;
     }
     var lbl: [64:0]u8 = undefined;
-    const l = std.fmt.bufPrintZ(&lbl, "duplicates ({d})", .{files}) catch "duplicates";
+    const l = std.fmt.bufPrintSentinel(&lbl, "duplicates ({d})", .{files}, 0) catch "duplicates";
     c.gtk_label_set_text(rtab.tab_label, l.ptr);
     self.setStatusFmt("duplicates: {d} file(s) in {d} confirmed group(s)", .{ files, groups });
     self.renderTab(rtab);

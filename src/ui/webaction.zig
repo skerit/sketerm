@@ -185,9 +185,9 @@ pub const Toolbar = struct {
         _ = a;
         const provider = c.gtk_css_provider_new() orelse return;
         var css: [256:0]u8 = @splat(0);
-        const text = std.fmt.bufPrintZ(&css,
+        const text = std.fmt.bufPrintSentinel(&css,
             \\.sketerm-webext-badge {{ color: rgba({d},{d},{d},{d:.3}); background: rgba({d},{d},{d},{d:.3}); border-radius: 7px; padding: 0 4px; }}
-        , .{ fg[0], fg[1], fg[2], @as(f64, @floatFromInt(fg[3])) / 255.0, bg[0], bg[1], bg[2], @as(f64, @floatFromInt(bg[3])) / 255.0 }) catch {
+        , .{ fg[0], fg[1], fg[2], @as(f64, @floatFromInt(fg[3])) / 255.0, bg[0], bg[1], bg[2], @as(f64, @floatFromInt(bg[3])) / 255.0 }, 0) catch {
             c.g_object_unref(provider);
             return;
         };
@@ -287,7 +287,7 @@ pub const Toolbar = struct {
         const path = webext.assetPath(self.allocator, id, rel) orelse
             return c.gtk_image_new_from_icon_name("application-x-addon-symbolic").?;
         defer self.allocator.free(path);
-        const z = self.allocator.dupeZ(u8, path) catch
+        const z = self.allocator.dupeSentinel(u8, path, 0) catch
             return c.gtk_image_new_from_icon_name("application-x-addon-symbolic").?;
         defer self.allocator.free(z);
         const pixbuf = c.gdk_pixbuf_new_from_file_at_size(z.ptr, 18, 18, null) orelse

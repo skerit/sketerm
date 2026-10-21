@@ -56,7 +56,7 @@ pub fn runRejected(allocator: std.mem.Allocator, sock_path: []const u8) void {
     hello(allocator, &conn);
 
     var marker_buf: [128]u8 = undefined;
-    const marker = std.fmt.bufPrintZ(&marker_buf, "/tmp/sketerm-spawn-limit-{d}", .{c.getpid()}) catch unreachable;
+    const marker = std.fmt.bufPrintSentinel(&marker_buf, "/tmp/sketerm-spawn-limit-{d}", .{c.getpid()}, 0) catch unreachable;
     _ = c.unlink(marker.ptr);
     defer _ = c.unlink(marker.ptr);
     var command_buf: [256]u8 = undefined;

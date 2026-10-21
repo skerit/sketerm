@@ -77,7 +77,7 @@ pub const Key = union(enum) {
 };
 
 pub const Chord = struct {
-    mods: Mods = .initEmpty(),
+    mods: Mods = .empty,
     key: Key,
 };
 
@@ -131,7 +131,7 @@ pub fn namedFor(name: []const u8, dialect: Dialect) ?Named {
 
 /// Parse one `mod+key` chord.
 pub fn parse(spec: []const u8, dialect: Dialect) Error!Chord {
-    var mods: Mods = .initEmpty();
+    var mods: Mods = .empty;
     var rest = spec;
     while (std.mem.indexOfScalar(u8, rest, '+')) |plus| {
         if (plus + 1 == rest.len) break; // the key IS '+'

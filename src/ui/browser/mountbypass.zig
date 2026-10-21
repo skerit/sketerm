@@ -290,14 +290,14 @@ fn askHost(self: *BrowserView, probe: *Probe, candidates: []const []const u8) vo
     var labels: [bypass.MAX_CANDIDATES][300:0]u8 = undefined;
     responses[0] = .{ .id = "cancel", .label = "Keep the mount", .is_default = true, .is_close = true };
     for (ask.hosts[0..ask.count], 0..) |h, i| {
-        _ = std.fmt.bufPrintZ(&ids[i], "{d}", .{i}) catch unreachable;
-        _ = std.fmt.bufPrintZ(&labels[i], "{s}", .{h}) catch {
+        _ = std.fmt.bufPrintSentinel(&ids[i], "{d}", .{i}, 0) catch unreachable;
+        _ = std.fmt.bufPrintSentinel(&labels[i], "{s}", .{h}, 0) catch {
             labels[i][0] = 0;
         };
         responses[i + 1] = .{ .id = &ids[i], .label = &labels[i] };
     }
     var head: [300:0]u8 = undefined;
-    const heading = std.fmt.bufPrintZ(&head, "Browse {s} through which host?", .{probe.source}) catch "Browse the mount through which host?";
+    const heading = std.fmt.bufPrintSentinel(&head, "Browse {s} through which host?", .{probe.source}, 0) catch "Browse the mount through which host?";
     const remember = c.gtk_check_button_new_with_label("Remember for this mount");
     ask.remember = remember;
     const root = c.gtk_widget_get_root(self.root_box);

@@ -695,7 +695,7 @@ pub fn syncColumns(self: *BrowserView, tab: *BTab) void {
             }
             for (tab.attr_columns.items, 0..) |name, i| {
                 var cb: [64:0]u8 = undefined;
-                const txt: [*:0]const u8 = if (std.fmt.bufPrintZ(&cb, "{s}", .{colkeys.label(name)})) |v| v.ptr else |_| "column";
+                const txt: [*:0]const u8 = if (std.fmt.bufPrintSentinel(&cb, "{s}", .{colkeys.label(name)}, 0)) |v| v.ptr else |_| "column";
                 appendColumn(self, tab, txt, .{ .attr = i });
             }
         }
@@ -1042,10 +1042,10 @@ fn onNameBind(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque
         c.gtk_widget_set_visible(nc.git, 0);
         c.gtk_widget_set_visible(nc.tag, 0);
         var text: [128:0]u8 = undefined;
-        const label: [*:0]const u8 = if (std.fmt.bufPrintZ(&text, "{s}  ({d})", .{
+        const label: [*:0]const u8 = if (std.fmt.bufPrintSentinel(&text, "{s}  ({d})", .{
             d.group_label[0..std.mem.len(@as([*:0]const u8, &d.group_label))],
             d.group_count,
-        })) |v| v.ptr else |_| "group";
+        }, 0)) |v| v.ptr else |_| "group";
         c.gtk_label_set_text(@ptrCast(nc.label), label);
         c.gtk_widget_add_css_class(nc.label, "heading");
         c.gtk_widget_set_margin_start(root, 0);
@@ -1098,9 +1098,9 @@ fn onNameBind(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque
     if (self.fileColorFor(e.name)) |color| {
         const esc = c.g_markup_escape_text(&name_buf, -1);
         var mk: [640:0]u8 = undefined;
-        if (std.fmt.bufPrintZ(&mk, "<span foreground=\"{s}\">{s}</span>", .{
+        if (std.fmt.bufPrintSentinel(&mk, "<span foreground=\"{s}\">{s}</span>", .{
             color, std.mem.span(@as([*:0]const u8, @ptrCast(esc))),
-        })) |m| {
+        }, 0)) |m| {
             c.gtk_label_set_markup(@ptrCast(nc.label), m.ptr);
         } else |_| {
             c.gtk_label_set_text(@ptrCast(nc.label), &name_buf);
@@ -1117,13 +1117,13 @@ fn onNameBind(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque
 
     if (e.tags.len > 0) {
         var tag_z: [128:0]u8 = undefined;
-        const ttxt = std.fmt.bufPrintZ(&tag_z, "[{s}]", .{e.tags}) catch "";
+        const ttxt = std.fmt.bufPrintSentinel(&tag_z, "[{s}]", .{e.tags}, 0) catch "";
         c.gtk_widget_remove_css_class(nc.tag, "dim-label");
         if (std.mem.indexOfAny(u8, e.tags, "<>&\"") == null) {
             var mk: [192:0]u8 = undefined;
-            if (std.fmt.bufPrintZ(&mk, "<span foreground=\"{s}\">[{s}]</span>", .{
+            if (std.fmt.bufPrintSentinel(&mk, "<span foreground=\"{s}\">[{s}]</span>", .{
                 tagColorHex(e.tags), e.tags,
-            })) |m| {
+            }, 0)) |m| {
                 c.gtk_label_set_markup(@ptrCast(nc.tag), m.ptr);
             } else |_| {
                 c.gtk_label_set_text(@ptrCast(nc.tag), ttxt.ptr);
@@ -1157,12 +1157,12 @@ fn applyGitBadge(nc: *const NameCell, badge: ?gitstatus.Badge, tip: []const u8) 
     if (b.dim_name) c.gtk_widget_add_css_class(nc.label, "dim-label");
     if (b.code_len == 0) return c.gtk_widget_set_visible(nc.git, 0);
     var gz: [8:0]u8 = undefined;
-    const gtxt = std.fmt.bufPrintZ(&gz, "{s}", .{b.text()}) catch "";
+    const gtxt = std.fmt.bufPrintSentinel(&gz, "{s}", .{b.text()}, 0) catch "";
     c.gtk_label_set_text(@ptrCast(nc.git), gtxt.ptr);
     c.gtk_widget_add_css_class(nc.git, b.css.ptr);
     if (tip.len > 0) {
         var tz: [576:0]u8 = undefined;
-        if (std.fmt.bufPrintZ(&tz, "{s}", .{tip})) |t|
+        if (std.fmt.bufPrintSentinel(&tz, "{s}", .{tip}, 0)) |t|
             c.gtk_widget_set_tooltip_text(nc.git, t.ptr)
         else |_|
             c.gtk_widget_set_tooltip_text(nc.git, null);
@@ -1725,7 +1725,7 @@ fn appendGroupItem(self: *BrowserView, tab: *BTab, g: grouping.Group, count: usi
         .group_id = g.id,
         .group_count = count,
     };
-    _ = std.fmt.bufPrintZ(&d.group_label, "{s}", .{g.label()}) catch {
+    _ = std.fmt.bufPrintSentinel(&d.group_label, "{s}", .{g.label()}, 0) catch {
         d.group_label[0] = 0;
     };
     const obj = newItem(d) orelse {

@@ -779,7 +779,7 @@ fn tmpDir(buf: []u8) ![]const u8 {
     var rnd: [16]u8 = @splat(0);
     _ = c.getentropy(&rnd, 4);
     const tok = st.mintToken(rnd);
-    const d = try std.fmt.bufPrintZ(buf, "/tmp/skst-{s}", .{tok[0..8]});
+    const d = try std.fmt.bufPrintSentinel(buf, "/tmp/skst-{s}", .{tok[0..8]}, 0);
     if (c.mkdir(d.ptr, 0o700) != 0) return error.MkdirFailed;
     return d;
 }

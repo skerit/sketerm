@@ -349,7 +349,7 @@ pub const SiteInfo = struct {
 
         var buf: [1024]u8 = undefined;
         const shown = if (st.origin.len != 0) st.origin else "No site loaded";
-        const z = std.fmt.bufPrintZ(&buf, "{s}", .{shown}) catch "";
+        const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{shown}, 0) catch "";
         c.gtk_label_set_text(@ptrCast(self.origin_label), z.ptr);
 
         c.gtk_image_set_from_icon_name(@ptrCast(self.tls_icon), st.tls.icon());
@@ -364,7 +364,7 @@ pub const SiteInfo = struct {
         var fz: [webroute.MAX_TEXT]u8 = undefined;
         var hz: [webroute.MAX_TEXT + 1:0]u8 = undefined;
         const route_shown: []const u8 = if (choice == null) st.route.format(&fz) orelse "" else st.route.host;
-        const hb = std.fmt.bufPrintZ(&hz, "{s}", .{route_shown[0..@min(route_shown.len, webroute.MAX_TEXT)]}) catch "";
+        const hb = std.fmt.bufPrintSentinel(&hz, "{s}", .{route_shown[0..@min(route_shown.len, webroute.MAX_TEXT)]}, 0) catch "";
         c.gtk_editable_set_text(@ptrCast(self.route_host), hb.ptr);
         self.route_shows_proxy = choice == null;
         c.gtk_widget_set_sensitive(self.route_host, if (choice != null and choice.?.needsHost()) 1 else 0);
@@ -375,7 +375,7 @@ pub const SiteInfo = struct {
         c.gtk_switch_set_active(@ptrCast(self.block_switch), if (st.blocking) 1 else 0);
         c.gtk_switch_set_state(@ptrCast(self.block_switch), if (st.blocking) 1 else 0);
         self.syncing = false;
-        const detail = std.fmt.bufPrintZ(&buf, "{d} blocked of {d} requests", .{ st.blocked, st.total }) catch "";
+        const detail = std.fmt.bufPrintSentinel(&buf, "{d} blocked of {d} requests", .{ st.blocked, st.total }, 0) catch "";
         c.gtk_label_set_text(@ptrCast(self.block_detail), detail.ptr);
 
         self.fillPerms(st);
@@ -414,7 +414,7 @@ pub const SiteInfo = struct {
         for (st.perms) |p| {
             const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8) orelse continue;
             var buf: [256]u8 = undefined;
-            const label_text = std.fmt.bufPrintZ(&buf, "{s}", .{p.name}) catch continue;
+            const label_text = std.fmt.bufPrintSentinel(&buf, "{s}", .{p.name}, 0) catch continue;
             const name_label = c.gtk_label_new(label_text.ptr).?;
             c.gtk_label_set_xalign(@ptrCast(name_label), 0);
             c.gtk_label_set_ellipsize(@ptrCast(name_label), c.PANGO_ELLIPSIZE_END);
@@ -459,16 +459,16 @@ pub const SiteInfo = struct {
             c.gtk_expander_set_label(@ptrCast(self.cookie_expander), "Cookies");
             return;
         }
-        const title = std.fmt.bufPrintZ(&buf, "Cookies ({d})", .{ev.total}) catch "Cookies";
+        const title = std.fmt.bufPrintSentinel(&buf, "Cookies ({d})", .{ev.total}, 0) catch "Cookies";
         c.gtk_expander_set_label(@ptrCast(self.cookie_expander), title.ptr);
         if (ev.total == 0) {
             c.gtk_label_set_text(@ptrCast(self.cookie_status), "This site has stored no cookies.");
             return;
         }
         const shown = if (ev.entries.len < ev.total)
-            std.fmt.bufPrintZ(&buf, "Showing {d} of {d} cookies.", .{ ev.entries.len, ev.total }) catch ""
+            std.fmt.bufPrintSentinel(&buf, "Showing {d} of {d} cookies.", .{ ev.entries.len, ev.total }, 0) catch ""
         else
-            std.fmt.bufPrintZ(&buf, "{d} cookies stored by this site.", .{ev.total}) catch "";
+            std.fmt.bufPrintSentinel(&buf, "{d} cookies stored by this site.", .{ev.total}, 0) catch "";
         c.gtk_label_set_text(@ptrCast(self.cookie_status), shown.ptr);
         for (ev.entries) |e| self.appendCookieRow(e);
     }
@@ -479,7 +479,7 @@ pub const SiteInfo = struct {
         c.gtk_widget_set_hexpand(text, 1);
 
         var name_buf: [512]u8 = undefined;
-        const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{e.name}) catch return;
+        const name_z = std.fmt.bufPrintSentinel(&name_buf, "{s}", .{e.name}, 0) catch return;
         const name_label = c.gtk_label_new(name_z.ptr).?;
         c.gtk_label_set_xalign(@ptrCast(name_label), 0);
         c.gtk_label_set_ellipsize(@ptrCast(name_label), c.PANGO_ELLIPSIZE_END);
@@ -516,9 +516,9 @@ pub const SiteInfo = struct {
             return;
         }
         const note = if (ev.detail.len != 0)
-            std.fmt.bufPrintZ(&buf, "Cleared ({d} cookies). Note: {s}.", .{ ev.removed, ev.detail }) catch ""
+            std.fmt.bufPrintSentinel(&buf, "Cleared ({d} cookies). Note: {s}.", .{ ev.removed, ev.detail }, 0) catch ""
         else
-            std.fmt.bufPrintZ(&buf, "Cleared {d} cookies.", .{ev.removed}) catch "";
+            std.fmt.bufPrintSentinel(&buf, "Cleared {d} cookies.", .{ev.removed}, 0) catch "";
         c.gtk_label_set_text(@ptrCast(self.cookie_status), note.ptr);
         if (webface.faceByView(self.view)) |face| face.requestCookies();
     }

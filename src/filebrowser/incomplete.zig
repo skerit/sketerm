@@ -120,7 +120,7 @@ test "incomplete-copy save replaces and loads the complete list" {
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/incomplete.json", .{base});
     var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    const path_z = try std.fmt.bufPrintSentinel(&path_z_buf, "{s}", .{path}, 0);
     defer _ = c.unlink(path_z.ptr);
 
     const first = [_]Entry{.{ .src = "/one", .dst = "/target" }};
@@ -149,13 +149,13 @@ test "incomplete-copy save replaces and loads the complete list" {
 test "incomplete: record, match, clear round-trip" {
     const t = std.testing;
     var tmp_buf: [128]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&tmp_buf, "/tmp/sk-incomplete-{d}", .{c.getpid()}) catch unreachable;
+    const dir = std.fmt.bufPrintSentinel(&tmp_buf, "/tmp/sk-incomplete-{d}", .{c.getpid()}, 0) catch unreachable;
     _ = c.mkdir(dir.ptr, 0o700);
     defer {
         var rm_buf: [160]u8 = undefined;
-        const f = std.fmt.bufPrintZ(&rm_buf, "{s}/sketerm/incomplete-copies.json", .{dir}) catch unreachable;
+        const f = std.fmt.bufPrintSentinel(&rm_buf, "{s}/sketerm/incomplete-copies.json", .{dir}, 0) catch unreachable;
         _ = c.unlink(f.ptr);
-        const d = std.fmt.bufPrintZ(&rm_buf, "{s}/sketerm", .{dir}) catch unreachable;
+        const d = std.fmt.bufPrintSentinel(&rm_buf, "{s}/sketerm", .{dir}, 0) catch unreachable;
         _ = c.rmdir(d.ptr);
         _ = c.rmdir(dir.ptr);
     }

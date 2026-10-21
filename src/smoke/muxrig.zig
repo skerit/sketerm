@@ -83,11 +83,11 @@ pub fn forkBroker(comptime rig: []const u8, sock_path: []const u8) c.pid_t {
     if (!lifetime.armed()) fail(rig, "the lifetime fence must be armed before the broker is forked");
     var bin_buf: [4096:0]u8 = undefined;
     const exec_bin: ?[:0]const u8 = if (c.getenv(BROKER_BIN_ENV)) |v|
-        std.fmt.bufPrintZ(&bin_buf, "{s}", .{std.mem.span(@as([*:0]const u8, @ptrCast(v)))}) catch fail(rig, BROKER_BIN_ENV ++ " is too long")
+        std.fmt.bufPrintSentinel(&bin_buf, "{s}", .{std.mem.span(@as([*:0]const u8, @ptrCast(v)))}, 0) catch fail(rig, BROKER_BIN_ENV ++ " is too long")
     else
         null;
     var sock_z_buf: [4096:0]u8 = undefined;
-    const sock_z = std.fmt.bufPrintZ(&sock_z_buf, "{s}", .{sock_path}) catch fail(rig, "socket path too long");
+    const sock_z = std.fmt.bufPrintSentinel(&sock_z_buf, "{s}", .{sock_path}, 0) catch fail(rig, "socket path too long");
 
     const pid = c.fork();
     if (pid < 0) fail(rig, "fork broker");

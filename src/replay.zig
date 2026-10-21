@@ -364,7 +364,7 @@ fn replayAgent(allocator: std.mem.Allocator, adapter_arg: []const u8, path: [:0]
     const loaded = set.get(adapter_arg) orelse blk: {
         // An adapter file under development: `replay --agent ./mine.json rec.cast`.
         if (!std.mem.endsWith(u8, adapter_arg, ".json")) break :blk null;
-        const z = try allocator.dupeZ(u8, adapter_arg);
+        const z = try allocator.dupeSentinel(u8, adapter_arg, 0);
         defer allocator.free(z);
         const json = (try readFile(allocator, z)) orelse return 1;
         defer allocator.free(json);

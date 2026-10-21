@@ -45,21 +45,22 @@ pub fn onCertError(self: *WebFace, ev: proto.EvCertError) void {
 
     var buf: [512]u8 = undefined;
     const named = if (ev.host.len != 0) ev.host else ev.url;
-    const title = std.fmt.bufPrintZ(
+    const title = std.fmt.bufPrintSentinel(
         &buf,
         "sketerm cannot verify that this is {s}. Someone may be impersonating it to steal what you type.",
         .{named},
+        0,
     ) catch "This site's certificate could not be verified.";
     c.gtk_label_set_text(@ptrCast(self.cert_title), title.ptr);
 
     var dbuf: [1024]u8 = undefined;
-    const detail = std.fmt.bufPrintZ(&dbuf, "{s} ({d})\nIssued to: {s}\nIssued by: {s}\nSHA-256: {s}", .{
+    const detail = std.fmt.bufPrintSentinel(&dbuf, "{s} ({d})\nIssued to: {s}\nIssued by: {s}\nSHA-256: {s}", .{
         ev.msg,
         ev.code,
         if (ev.subject.len != 0) ev.subject else "(unknown)",
         if (ev.issuer.len != 0) ev.issuer else "(unknown)",
         if (ev.fingerprint.len != 0) ev.fingerprint else "(unavailable)",
-    }) catch "";
+    }, 0) catch "";
     c.gtk_label_set_text(@ptrCast(self.cert_detail), detail.ptr);
     c.gtk_widget_set_visible(self.cert_box, 1);
 }
@@ -175,10 +176,10 @@ pub fn showPermPrompt(self: *WebFace) void {
     }
     const p = self.perm_queue.items[0];
     var buf: [512]u8 = undefined;
-    const text = std.fmt.bufPrintZ(&buf, "{s} wants to use {s}", .{
+    const text = std.fmt.bufPrintSentinel(&buf, "{s} wants to use {s}", .{
         if (p.origin.len != 0) p.origin else "This page",
         permissionLabel(p.types),
-    }) catch "This page wants a permission";
+    }, 0) catch "This page wants a permission";
     c.gtk_label_set_text(@ptrCast(self.perm_label), text.ptr);
     c.gtk_widget_set_visible(self.perm_bar, 1);
 }

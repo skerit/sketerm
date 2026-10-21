@@ -97,7 +97,7 @@ pub const Hub = struct {
             }
             _ = c.setenv("XDG_RUNTIME_DIR", rt_dir.ptr, 1);
             var abuf: [4096]u8 = undefined;
-            const a = std.fmt.bufPrintZ(&abuf, "--address=unix:path={s}", .{bus_path}) catch c.abort();
+            const a = std.fmt.bufPrintSentinel(&abuf, "--address=unix:path={s}", .{bus_path}, 0) catch c.abort();
             const argv = [_:null]?[*:0]const u8{
                 "dbus-daemon", "--session", "--nofork", "--nopidfile", a.ptr, null,
             };
@@ -261,13 +261,13 @@ pub const Hub = struct {
     /// Removes the private a11y runtime tree without forking after EGL init.
     fn removeA11yTree(dir: []const u8) void {
         var zbuf: [4096]u8 = undefined;
-        const zdir = std.fmt.bufPrintZ(&zbuf, "{s}", .{dir}) catch return;
+        const zdir = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{dir}, 0) catch return;
         if (c.opendir(zdir.ptr)) |dp| {
             while (c.readdir(dp)) |entry| {
                 const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
                 if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
                 var child_buf: [4096]u8 = undefined;
-                const child = std.fmt.bufPrintZ(&child_buf, "{s}/{s}", .{ dir, name }) catch continue;
+                const child = std.fmt.bufPrintSentinel(&child_buf, "{s}/{s}", .{ dir, name }, 0) catch continue;
                 if (c.unlinkat(c.AT_FDCWD, child.ptr, 0) != 0) {
                     removeA11yTree(child);
                     _ = c.unlinkat(c.AT_FDCWD, child.ptr, c.AT_REMOVEDIR);

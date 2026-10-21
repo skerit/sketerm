@@ -103,7 +103,7 @@ fn sessionCount(sock_path: []const u8, allocator: std.mem.Allocator) usize {
 /// parens and may contain spaces, so parse after the last ')'.
 fn ppidOf(pid: c.pid_t) c.pid_t {
     var path_buf: [64]u8 = undefined;
-    const sp = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/stat", .{pid}) catch return -1;
+    const sp = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/stat", .{pid}, 0) catch return -1;
     const fp = c.fopen(sp.ptr, "r") orelse return -1;
     defer _ = c.fclose(fp);
     var buf: [512]u8 = undefined;

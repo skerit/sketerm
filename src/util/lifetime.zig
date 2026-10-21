@@ -40,7 +40,7 @@ pub fn arm() bool {
     _ = c.fcntl(fds[0], c.F_SETFD, @as(c_int, 0));
     _ = c.fcntl(fds[1], c.F_SETFD, c.FD_CLOEXEC);
     var buf: [16:0]u8 = undefined;
-    const s = std.fmt.bufPrintZ(&buf, "{d}", .{fds[0]}) catch unreachable;
+    const s = std.fmt.bufPrintSentinel(&buf, "{d}", .{fds[0]}, 0) catch unreachable;
     if (c.setenv(ENV, s.ptr, 1) != 0) {
         _ = c.close(fds[0]);
         _ = c.close(fds[1]);

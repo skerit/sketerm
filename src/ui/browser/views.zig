@@ -110,7 +110,7 @@ pub fn entryVisible(tab: *BTab, e: Entry) bool {
         if (!vf(pk.ctx, e.name, e.tdir)) return false;
     };
     if (tab.filter.len == 0) return true;
-    return std.ascii.indexOfIgnoreCase(e.name, tab.filter) != null;
+    return std.ascii.findIgnoreCase(e.name, tab.filter) != null;
 }
 
 /// Drop selection-mirror paths this tab HIDES.
@@ -572,7 +572,7 @@ pub fn applyFolderMemory(self: *BrowserView, tab: *BTab) void {
         tab.columns = .initMany(&browser_model.default_columns);
         return;
     }
-    tab.columns = .initEmpty();
+    tab.columns = .empty;
     for (rec.columns) |col| tab.columns.insert(col);
     for (rec.columns, 0..) |col, i| {
         if (i >= rec.col_widths.len) break;
@@ -674,7 +674,7 @@ pub fn onViewModeChosen(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c
 fn updateZoomLabel(self: *BrowserView, tab: *BTab) void {
     const label = self.views.zoom_label orelse return;
     var buf: [64:0]u8 = undefined;
-    const txt = std.fmt.bufPrintZ(&buf, "{d} px icons", .{tab.vs.step().tile_icon_px}) catch return;
+    const txt = std.fmt.bufPrintSentinel(&buf, "{d} px icons", .{tab.vs.step().tile_icon_px}, 0) catch return;
     c.gtk_label_set_text(@ptrCast(@alignCast(label)), txt.ptr);
 }
 
@@ -712,7 +712,7 @@ pub fn onViewMenuClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void
     c.gtk_box_append(@ptrCast(box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
 
     var gbuf: [96:0]u8 = undefined;
-    const gtxt: [*:0]const u8 = if (std.fmt.bufPrintZ(&gbuf, "Group by {s}", .{@tagName(tab.sort_key)})) |v| v.ptr else |_| "Group";
+    const gtxt: [*:0]const u8 = if (std.fmt.bufPrintSentinel(&gbuf, "Group by {s}", .{@tagName(tab.sort_key)}, 0)) |v| v.ptr else |_| "Group";
     const group = c.gtk_check_button_new_with_label(gtxt);
     c.gtk_widget_set_tooltip_text(group, "Collapsible headers over the active sort key (list views)");
     c.gtk_check_button_set_active(@ptrCast(group), @intFromBool(tab.vs.grouped));
@@ -765,9 +765,9 @@ pub fn onViewMenuClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void
     c.gtk_box_append(@ptrCast(box), mem_head);
     menuButton(box, "Forget this folder's view", &onForgetFolder, @ptrCast(self), false);
     var abuf: [96:0]u8 = undefined;
-    const atxt: [*:0]const u8 = if (std.fmt.bufPrintZ(&abuf, "Forget all {d} remembered folders", .{
+    const atxt: [*:0]const u8 = if (std.fmt.bufPrintSentinel(&abuf, "Forget all {d} remembered folders", .{
         memStore(self).count(),
-    })) |v| v.ptr else |_| "Forget all remembered folders";
+    }, 0)) |v| v.ptr else |_| "Forget all remembered folders";
     menuButton(box, atxt, &onForgetAllFolders, @ptrCast(self), true);
 
     c.gtk_popover_set_child(@ptrCast(popover), box);

@@ -254,7 +254,7 @@ test "shader preset save is private and preserves the prior file before install"
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/amber.conf", .{base});
     var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    const path_z = try std.fmt.bufPrintSentinel(&path_z_buf, "{s}", .{path}, 0);
     defer _ = c.unlink(path_z.ptr);
 
     try saveToPath(t.allocator, path, .{

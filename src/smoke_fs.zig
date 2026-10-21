@@ -975,8 +975,8 @@ fn cancelAtInstallElection(ctx: *InstallElectionCancel) void {
                     if (ctx.seed_link_temps) {
                         var legacy_buf: [4096:0]u8 = undefined;
                         var scoped_buf: [4096:0]u8 = undefined;
-                        const legacy = std.fmt.bufPrintZ(&legacy_buf, "{s}" ++ fsjob.LINK_PART_SUFFIX, .{parsed.value.destination_stage}) catch return;
-                        const scoped = std.fmt.bufPrintZ(&scoped_buf, "{s}" ++ fsjob.LINK_PART_SUFFIX ++ "-{d}", .{ parsed.value.destination_stage, ctx.job }) catch return;
+                        const legacy = std.fmt.bufPrintSentinel(&legacy_buf, "{s}" ++ fsjob.LINK_PART_SUFFIX, .{parsed.value.destination_stage}, 0) catch return;
+                        const scoped = std.fmt.bufPrintSentinel(&scoped_buf, "{s}" ++ fsjob.LINK_PART_SUFFIX ++ "-{d}", .{ parsed.value.destination_stage, ctx.job }, 0) catch return;
                         _ = c.symlink("stale-link-temp", legacy.ptr);
                         _ = c.symlink("scoped-link-temp", scoped.ptr);
                     }
@@ -1540,7 +1540,7 @@ fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: [
             var fpi: [4096]u8 = undefined;
             var pic_z: [4096:0]u8 = undefined;
             const pic = std.fmt.bufPrint(&fpi, "{s}/pic.png", .{sdir}) catch unreachable;
-            _ = std.fmt.bufPrintZ(&pic_z, "{s}", .{pic}) catch unreachable;
+            _ = std.fmt.bufPrintSentinel(&pic_z, "{s}", .{pic}, 0) catch unreachable;
             var rgba: [64 * 48 * 4]u8 = undefined;
             for (0..64 * 48) |i| {
                 rgba[i * 4] = @truncate(i * 3);
@@ -1589,7 +1589,7 @@ fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: [
                 }
                 fs.unlink(sidecar) catch failErr("unlink sidecar", fs.lastErr());
                 var side_z: [4096:0]u8 = undefined;
-                _ = std.fmt.bufPrintZ(&side_z, "{s}", .{sidecar}) catch unreachable;
+                _ = std.fmt.bufPrintSentinel(&side_z, "{s}", .{sidecar}, 0) catch unreachable;
                 if (c.access(&side_z, c.F_OK) == 0) fail("sidecar survived its release");
             }
         }
@@ -2954,7 +2954,7 @@ fn crossStage(
 
     // Fake ssh #1: a clean bridge to the source daemon.
     var ssh_ok_buf: [160:0]u8 = undefined;
-    const ssh_ok = std.fmt.bufPrintZ(&ssh_ok_buf, "{s}/fake-ssh", .{dir}) catch unreachable;
+    const ssh_ok = std.fmt.bufPrintSentinel(&ssh_ok_buf, "{s}/fake-ssh", .{dir}, 0) catch unreachable;
     var body_buf: [1024]u8 = undefined;
     writeScript(ssh_ok, std.fmt.bufPrint(&body_buf,
         \\#!/bin/sh
@@ -2970,7 +2970,7 @@ fn crossStage(
     var count_buf: [160]u8 = undefined;
     const count = std.fmt.bufPrint(&count_buf, "{s}/attempts", .{dir}) catch unreachable;
     var ssh_flaky_buf: [160:0]u8 = undefined;
-    const ssh_flaky = std.fmt.bufPrintZ(&ssh_flaky_buf, "{s}/fake-ssh-flaky", .{dir}) catch unreachable;
+    const ssh_flaky = std.fmt.bufPrintSentinel(&ssh_flaky_buf, "{s}/fake-ssh-flaky", .{dir}, 0) catch unreachable;
     var body2_buf: [1024]u8 = undefined;
     writeScript(ssh_flaky, std.fmt.bufPrint(&body2_buf,
         \\#!/bin/sh
@@ -2990,11 +2990,11 @@ fn crossStage(
     // "the local daemon", which resolves under $XDG_RUNTIME_DIR. The
     // job helper inherits it from the daemon that spawns it.
     var rt_buf: [160:0]u8 = undefined;
-    const rt = std.fmt.bufPrintZ(&rt_buf, "{s}", .{dst_runtime}) catch unreachable;
+    const rt = std.fmt.bufPrintSentinel(&rt_buf, "{s}", .{dst_runtime}, 0) catch unreachable;
     const prev_rt = c.getenv("XDG_RUNTIME_DIR");
     var prev_rt_buf: [256:0]u8 = undefined;
     const had_rt = prev_rt != null;
-    if (had_rt) _ = std.fmt.bufPrintZ(&prev_rt_buf, "{s}", .{std.mem.span(prev_rt.?)}) catch unreachable;
+    if (had_rt) _ = std.fmt.bufPrintSentinel(&prev_rt_buf, "{s}", .{std.mem.span(prev_rt.?)}, 0) catch unreachable;
     _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
     defer if (had_rt) {
         _ = c.setenv("XDG_RUNTIME_DIR", &prev_rt_buf, 1);
@@ -3854,7 +3854,7 @@ fn crossStage(
 
     // ── an unreachable source names itself in the failure ──────
     var ssh_dead_buf: [160:0]u8 = undefined;
-    const ssh_dead = std.fmt.bufPrintZ(&ssh_dead_buf, "{s}/fake-ssh-dead", .{dir}) catch unreachable;
+    const ssh_dead = std.fmt.bufPrintSentinel(&ssh_dead_buf, "{s}/fake-ssh-dead", .{dir}, 0) catch unreachable;
     writeScript(ssh_dead,
         \\#!/bin/sh
         \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
@@ -4344,14 +4344,14 @@ fn collectStream(fs: *fsdrive.Fs, job: u64, want_name: []const u8, timeout_ms: i
 /// assertion never is.
 fn haveTool(name: []const u8) bool {
     var cmd: [128:0]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&cmd, "command -v {s} >/dev/null 2>&1", .{name}) catch return false;
+    const z = std.fmt.bufPrintSentinel(&cmd, "command -v {s} >/dev/null 2>&1", .{name}, 0) catch return false;
     const fp = c.popen(z.ptr, "r") orelse return false;
     return c.pclose(fp) == 0;
 }
 
 fn runIn(dir: []const u8, command: []const u8) void {
     var cmd: [1024:0]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&cmd, "cd '{s}' && {s} >/dev/null 2>&1", .{ dir, command }) catch fail("shell cmd too long");
+    const z = std.fmt.bufPrintSentinel(&cmd, "cd '{s}' && {s} >/dev/null 2>&1", .{ dir, command }, 0) catch fail("shell cmd too long");
     const fp = c.popen(z.ptr, "r") orelse fail("popen");
     _ = c.pclose(fp);
 }
@@ -4395,10 +4395,10 @@ fn tagStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
     // A tag written behind the daemon's back: absent from the index,
     // still found by the walk.
     var zb: [4200:0]u8 = undefined;
-    const plain = std.fmt.bufPrintZ(&zb, "{s}/plain.txt", .{dir}) catch unreachable;
+    const plain = std.fmt.bufPrintSentinel(&zb, "{s}/plain.txt", .{dir}, 0) catch unreachable;
     if (!@import("util/platform.zig").lsetxattr(plain, fsserve.TAGS_XATTR, "urgent")) fail("direct xattr set");
     var gz: [4200:0]u8 = undefined;
-    _ = c.unlink((std.fmt.bufPrintZ(&gz, "{s}", .{gone}) catch unreachable).ptr);
+    _ = c.unlink((std.fmt.bufPrintSentinel(&gz, "{s}", .{gone}, 0) catch unreachable).ptr);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -4684,20 +4684,20 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // it at a private directory so a smoke run never touches (or is
     // confused by) the real user cache. Job helpers inherit this.
     var media_cache_buf: [128:0]u8 = undefined;
-    const media_cache = std.fmt.bufPrintZ(&media_cache_buf, "/tmp/sketerm-smoke-fs-media-{d}", .{c.getpid()}) catch unreachable;
+    const media_cache = std.fmt.bufPrintSentinel(&media_cache_buf, "/tmp/sketerm-smoke-fs-media-{d}", .{c.getpid()}, 0) catch unreachable;
     _ = c.setenv("SKETERM_MEDIA_CACHE_DIR", media_cache.ptr, 1);
     registerTmpRoot(media_cache);
     // Image previews install freedesktop thumbnail-cache entries under
     // XDG_CACHE_HOME; keep those out of the real user cache too.
     var thumb_cache_buf: [128:0]u8 = undefined;
-    const thumb_cache = std.fmt.bufPrintZ(&thumb_cache_buf, "/tmp/sketerm-smoke-fs-cache-{d}", .{c.getpid()}) catch unreachable;
+    const thumb_cache = std.fmt.bufPrintSentinel(&thumb_cache_buf, "/tmp/sketerm-smoke-fs-cache-{d}", .{c.getpid()}, 0) catch unreachable;
     _ = c.setenv("XDG_CACHE_HOME", thumb_cache.ptr, 1);
     registerTmpRoot(thumb_cache);
     // Fs-job journals live under the STATE dir now (reboot-durable
     // resume); isolate it or smoke daemons would journal into the real
     // ~/.local/state and adopt each other's records across runs.
     var state_buf: [128:0]u8 = undefined;
-    const state_dir = std.fmt.bufPrintZ(&state_buf, "/tmp/sketerm-smoke-fs-state-{d}", .{c.getpid()}) catch unreachable;
+    const state_dir = std.fmt.bufPrintSentinel(&state_buf, "/tmp/sketerm-smoke-fs-state-{d}", .{c.getpid()}, 0) catch unreachable;
     _ = c.setenv("XDG_STATE_HOME", state_dir.ptr, 1);
     registerTmpRoot(state_dir);
     var gpa_state: std.heap.DebugAllocator(.{ .safety = true }) = .{};

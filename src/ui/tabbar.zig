@@ -1050,7 +1050,7 @@ pub fn loadTheme(self: *TabBar, configured: []const u8) void {
     var path_buf: [1024]u8 = undefined;
     for (bases) |base| {
         if (base.len == 0) continue;
-        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}/gtk-4.0/gtk.css", .{ base, name }) catch continue;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}/gtk-4.0/gtk.css", .{ base, name }, 0) catch continue;
         if (c.access(path.ptr, @as(c_int, 0)) != 0) continue; // F_OK
         const provider = c.gtk_css_provider_new();
         c.gtk_css_provider_load_from_path(provider, path.ptr);

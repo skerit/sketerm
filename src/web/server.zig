@@ -361,7 +361,7 @@ pub const Server = struct {
         // A pre-connected helper has no socket on this host to sit
         // beside: mint a private (0700, mkdtemp) directory instead.
         const base: []const u8 = if (c.getenv("XDG_RUNTIME_DIR")) |r| std.mem.span(r) else "/tmp";
-        const tmpl = std.fmt.bufPrintZ(&self.minted_dir, "{s}/sketerm-ws-XXXXXX", .{std.mem.trimEnd(u8, base, "/")}) catch return "";
+        const tmpl = std.fmt.bufPrintSentinel(&self.minted_dir, "{s}/sketerm-ws-XXXXXX", .{std.mem.trimEnd(u8, base, "/")}, 0) catch return "";
         if (c.mkdtemp(tmpl.ptr) == null) return "";
         self.minted_len = tmpl.len;
         return self.minted_dir[0..self.minted_len];

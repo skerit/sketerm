@@ -799,7 +799,7 @@ fn finishReloadInPlace(view: *EditorView, tab: *ETab, job: *IoJob) void {
 
 fn errorDialog(view: *EditorView, heading: [*:0]const u8, detail: []const u8) void {
     var body: [200:0]u8 = undefined;
-    const b = std.fmt.bufPrintZ(&body, "{s}", .{detail}) catch "unknown error";
+    const b = std.fmt.bufPrintSentinel(&body, "{s}", .{detail}, 0) catch "unknown error";
     _ = confirm.present(view.dialogParent(), .{
         .heading = heading,
         .body = b.ptr,
@@ -1088,10 +1088,10 @@ pub fn bannerText(buf: *[320:0]u8, alert: ev.Alert, from_save: bool, title: []co
     return switch (alert) {
         .none => "",
         .changed => if (from_save)
-            std.fmt.bufPrintZ(buf, "Save refused: \"{s}\" changed on disk since you opened it.", .{title}) catch "The file changed on disk."
+            std.fmt.bufPrintSentinel(buf, "Save refused: \"{s}\" changed on disk since you opened it.", .{title}, 0) catch "The file changed on disk."
         else
-            std.fmt.bufPrintZ(buf, "\"{s}\" changed on disk.", .{title}) catch "The file changed on disk.",
-        .deleted => std.fmt.bufPrintZ(buf, "\"{s}\" no longer exists on disk.", .{title}) catch "The file no longer exists on disk.",
+            std.fmt.bufPrintSentinel(buf, "\"{s}\" changed on disk.", .{title}, 0) catch "The file changed on disk.",
+        .deleted => std.fmt.bufPrintSentinel(buf, "\"{s}\" no longer exists on disk.", .{title}, 0) catch "The file no longer exists on disk.",
     };
 }
 

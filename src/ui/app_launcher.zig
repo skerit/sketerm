@@ -162,7 +162,7 @@ pub fn open(win: *Window, pane: *Pane) void {
 
     var title_buf: [256]u8 = undefined;
     const disp = if (host_str.len > 0) host_str else "this machine";
-    const title = std.fmt.bufPrintZ(&title_buf, "Launch App on {s}", .{disp}) catch "Launch App";
+    const title = std.fmt.bufPrintSentinel(&title_buf, "Launch App on {s}", .{disp}, 0) catch "Launch App";
     c.gtk_window_set_title(@ptrCast(window), title.ptr);
     c.gtk_window_set_default_size(@ptrCast(window), 480, 620);
     c.gtk_window_set_transient_for(@ptrCast(window), @ptrCast(win.app_window));
@@ -308,16 +308,16 @@ fn onApps(ctx: ?*anyopaque, apps: []const Terminal.AppEntry) void {
     for (apps) |app| addRow(self, app);
     var sbuf: [64]u8 = undefined;
     const msg = if (apps.len == 0)
-        std.fmt.bufPrintZ(&sbuf, "No apps found on the host", .{}) catch ""
+        std.fmt.bufPrintSentinel(&sbuf, "No apps found on the host", .{}, 0) catch ""
     else
-        std.fmt.bufPrintZ(&sbuf, "{d} apps — type to filter", .{apps.len}) catch "";
+        std.fmt.bufPrintSentinel(&sbuf, "{d} apps — type to filter", .{apps.len}, 0) catch "";
     c.gtk_label_set_text(@ptrCast(self.status), msg.ptr);
 }
 
 fn addRow(self: *Launcher, app: Terminal.AppEntry) void {
     if (app.name.len == 0 or app.exec.len == 0) return;
     var name_buf: [512]u8 = undefined;
-    const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{app.name}) catch return;
+    const name_z = std.fmt.bufPrintSentinel(&name_buf, "{s}", .{app.name}, 0) catch return;
 
     const row = c.gtk_list_box_row_new();
     const box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 10);
@@ -329,7 +329,7 @@ fn addRow(self: *Launcher, app: Terminal.AppEntry) void {
     // Icon by name (themed); falls back to a generic app icon.
     const icon = if (app.icon.len > 0) blk: {
         var icon_buf: [256]u8 = undefined;
-        const iz = std.fmt.bufPrintZ(&icon_buf, "{s}", .{app.icon}) catch break :blk c.gtk_image_new_from_icon_name("application-x-executable-symbolic");
+        const iz = std.fmt.bufPrintSentinel(&icon_buf, "{s}", .{app.icon}, 0) catch break :blk c.gtk_image_new_from_icon_name("application-x-executable-symbolic");
         break :blk c.gtk_image_new_from_icon_name(iz.ptr);
     } else c.gtk_image_new_from_icon_name("application-x-executable-symbolic");
     c.gtk_image_set_icon_size(@ptrCast(icon), c.GTK_ICON_SIZE_LARGE);
@@ -345,13 +345,13 @@ fn addRow(self: *Launcher, app: Terminal.AppEntry) void {
     // recency rank (as pointer-sized int) for sorting, and the icon
     // for the recents file.
     var exec_buf: [4096]u8 = undefined;
-    if (std.fmt.bufPrintZ(&exec_buf, "{s}", .{app.exec})) |ez| {
+    if (std.fmt.bufPrintSentinel(&exec_buf, "{s}", .{app.exec}, 0)) |ez| {
         c.g_object_set_data_full(@ptrCast(@alignCast(row)), "al-exec", c.g_strdup(ez.ptr), c.g_free);
     } else |_| return;
     c.g_object_set_data_full(@ptrCast(@alignCast(row)), "al-name", c.g_strdup(name_z.ptr), c.g_free);
     if (app.icon.len > 0) {
         var icon_buf2: [256]u8 = undefined;
-        if (std.fmt.bufPrintZ(&icon_buf2, "{s}", .{app.icon})) |iz| {
+        if (std.fmt.bufPrintSentinel(&icon_buf2, "{s}", .{app.icon}, 0)) |iz| {
             c.g_object_set_data_full(@ptrCast(@alignCast(row)), "al-icon", c.g_strdup(iz.ptr), c.g_free);
         } else |_| {}
     }
@@ -463,7 +463,7 @@ test "app launcher recents use private atomic replacement" {
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/recent-apps.json", .{base});
     var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    const path_z = try std.fmt.bufPrintSentinel(&path_z_buf, "{s}", .{path}, 0);
     defer _ = c.unlink(path_z.ptr);
 
     try saveRecentToPath(t.allocator, path, "", "Editor", "editor", "text-editor");

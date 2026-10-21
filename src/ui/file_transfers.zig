@@ -3169,7 +3169,7 @@ pub const Service = struct {
         if (w.monitor != null) return;
         const parent = std.fs.path.dirname(w.cache_path) orelse return;
         var z: [4096:0]u8 = undefined;
-        const pz = std.fmt.bufPrintZ(&z, "{s}", .{parent}) catch return;
+        const pz = std.fmt.bufPrintSentinel(&z, "{s}", .{parent}, 0) catch return;
         const file = c.g_file_new_for_path(pz.ptr);
         defer c.g_object_unref(file);
         w.monitor = c.g_file_monitor_directory(file, c.G_FILE_MONITOR_NONE, null, null);
@@ -3373,7 +3373,7 @@ test "a durable batch materializes deterministic child records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var state_buf: [4096:0]u8 = undefined;
-    const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const state = try std.fmt.bufPrintSentinel(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}, 0);
     var saved_state: EnvSave = .{};
     try saved_state.override("XDG_STATE_HOME", state.ptr);
     defer saved_state.restore();
@@ -3538,7 +3538,7 @@ test "recovered retry waits and repeated transport loss spends one bounded attem
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var state_buf: [4096:0]u8 = undefined;
-    const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const state = try std.fmt.bufPrintSentinel(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}, 0);
     var saved_state: EnvSave = .{};
     try saved_state.override("XDG_STATE_HOME", state.ptr);
     defer saved_state.restore();
@@ -3645,7 +3645,7 @@ test "unresolved cancellation retains both recovery ledgers" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var state_buf: [4096:0]u8 = undefined;
-    const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const state = try std.fmt.bufPrintSentinel(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}, 0);
     var saved_state: EnvSave = .{};
     try saved_state.override("XDG_STATE_HOME", state.ptr);
     defer saved_state.restore();
@@ -3710,7 +3710,7 @@ test "canceling a scheduled daemon retry durably rotates cleanup identity" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var state_buf: [4096:0]u8 = undefined;
-    const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const state = try std.fmt.bufPrintSentinel(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}, 0);
     var saved_state: EnvSave = .{};
     try saved_state.override("XDG_STATE_HOME", state.ptr);
     defer saved_state.restore();
@@ -3836,7 +3836,7 @@ test "a browser copy's record moves through legal phases and is admitted process
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var state_buf: [4096:0]u8 = undefined;
-    const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const state = try std.fmt.bufPrintSentinel(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}, 0);
     var saved_state: EnvSave = .{};
     try saved_state.override("XDG_STATE_HOME", state.ptr);
     defer saved_state.restore();

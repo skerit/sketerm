@@ -263,7 +263,7 @@ pub const Filter = struct {
     /// The kind a stored message is delivered as, or null when not wanted.
     fn classify(self: Filter, text: []const u8) ?vocab.EventKind {
         if (self.match) |m| {
-            if (m.len > 0 and std.ascii.indexOfIgnoreCase(text, m) != null) return .match;
+            if (m.len > 0 and std.ascii.findIgnoreCase(text, m) != null) return .match;
         }
         return if (self.messages) .message else null;
     }

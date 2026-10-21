@@ -411,7 +411,7 @@ fn emitDetails(
 pub fn scan(allocator: std.mem.Allocator, root: []const u8, all_filesystems: bool, sink: Sink) ScanError!Result {
     if (root.len == 0 or root[0] != '/' or root.len > MAX_PATH_BYTES) return error.InvalidRoot;
 
-    const root_path = allocator.dupeZ(u8, root) catch return error.OutOfMemory;
+    const root_path = allocator.dupeSentinel(u8, root, 0) catch return error.OutOfMemory;
     var root_owned = true;
     defer if (root_owned) allocator.free(root_path);
 
@@ -627,9 +627,9 @@ test "retained details keep only the largest bounded records" {
     const t = std.testing;
     var details = TopDetails.init(t.allocator, 2, 64);
     defer details.deinit();
-    try details.take(.{ .path = try t.allocator.dupeZ(u8, "/low"), .kind = .file, .totals = .{ .size = 10 }, .mtime_ms = 0 });
-    try details.take(.{ .path = try t.allocator.dupeZ(u8, "/high"), .kind = .file, .totals = .{ .size = 30 }, .mtime_ms = 0 });
-    try details.take(.{ .path = try t.allocator.dupeZ(u8, "/mid"), .kind = .file, .totals = .{ .size = 20 }, .mtime_ms = 0 });
+    try details.take(.{ .path = try t.allocator.dupeSentinel(u8, "/low", 0), .kind = .file, .totals = .{ .size = 10 }, .mtime_ms = 0 });
+    try details.take(.{ .path = try t.allocator.dupeSentinel(u8, "/high", 0), .kind = .file, .totals = .{ .size = 30 }, .mtime_ms = 0 });
+    try details.take(.{ .path = try t.allocator.dupeSentinel(u8, "/mid", 0), .kind = .file, .totals = .{ .size = 20 }, .mtime_ms = 0 });
     try t.expect(details.dropped);
     try t.expectEqual(@as(usize, 2), details.heap.items.len);
     var total: u64 = 0;
@@ -641,8 +641,8 @@ test "retained detail byte bounds prefer value and ancestor paths on ties" {
     const t = std.testing;
     var details = TopDetails.init(t.allocator, 4, 5);
     defer details.deinit();
-    try details.take(.{ .path = try t.allocator.dupeZ(u8, "/a/b"), .kind = .dir, .totals = .{ .size = 20 }, .mtime_ms = 0 });
-    try details.take(.{ .path = try t.allocator.dupeZ(u8, "/a"), .kind = .dir, .totals = .{ .size = 20 }, .mtime_ms = 0 });
+    try details.take(.{ .path = try t.allocator.dupeSentinel(u8, "/a/b", 0), .kind = .dir, .totals = .{ .size = 20 }, .mtime_ms = 0 });
+    try details.take(.{ .path = try t.allocator.dupeSentinel(u8, "/a", 0), .kind = .dir, .totals = .{ .size = 20 }, .mtime_ms = 0 });
     try t.expect(details.dropped);
     try t.expectEqual(@as(usize, 1), details.heap.items.len);
     try t.expectEqualStrings("/a", details.heap.items[0].path);
@@ -708,7 +708,7 @@ const TestCollector = struct {
 };
 
 fn testPath(buf: []u8, dir: []const u8, name: []const u8) ![:0]u8 {
-    return std.fmt.bufPrintZ(buf, "{s}/{s}", .{ dir, name });
+    return std.fmt.bufPrintSentinel(buf, "{s}/{s}", .{ dir, name }, 0);
 }
 
 test "scanner is postorder, counts nested metadata, deduplicates links, and ignores symlinks" {
@@ -744,7 +744,7 @@ test "scanner is postorder, counts nested metadata, deduplicates links, and igno
     try t.expect(c.symlink("sub", link.ptr) == 0);
 
     var root_z: [64:0]u8 = undefined;
-    const root_path = try std.fmt.bufPrintZ(&root_z, "{s}", .{root});
+    const root_path = try std.fmt.bufPrintSentinel(&root_z, "{s}", .{root}, 0);
     var root_st: c.struct_stat = undefined;
     var sub_st: c.struct_stat = undefined;
     var data_st: c.struct_stat = undefined;

@@ -82,7 +82,7 @@ fn normalizedSpec(allocator: std.mem.Allocator, tab: *BTab, raw: []const u8) ![:
     if (host) |remote| {
         return std.fmt.allocPrintSentinel(allocator, "{s}:{s}", .{ remote, path }, 0);
     }
-    return allocator.dupeZ(u8, path);
+    return allocator.dupeSentinel(u8, path, 0);
 }
 
 pub fn clearOrigin() void {

@@ -59,7 +59,9 @@ fn returnsError(tree: Ast, proto: Ast.full.FnProto) bool {
 
 /// Collect every dead-errdefer site in `source`.
 fn scanSource(gpa: std.mem.Allocator, source: [:0]const u8, out: *std.ArrayList(Site)) !bool {
-    var tree = try Ast.parse(gpa, source, .zig);
+    // Zig 0.17 wrapped the mode in `ParseOptions`.
+    const parse_opts = if (@hasDecl(Ast, "ParseOptions")) Ast.ParseOptions{ .mode = .zig } else Ast.Mode.zig;
+    var tree = try Ast.parse(gpa, source, parse_opts);
     defer tree.deinit(gpa);
     if (tree.errors.len != 0) return false;
 
@@ -127,9 +129,10 @@ const fixtures = [_]Fixture{
     // Comments and strings are not code.
     .{ .src = "fn a() void { // errdefer {}\n }", .expect = 0 },
     .{ .src = "fn a() void { const s = \"errdefer x\"; _ = s; }", .expect = 0 },
-    // Payload form.
+} ++ if (@import("builtin").zig_version.minor < 17) [_]Fixture{
+    // Payload form; Zig 0.17 removed the `errdefer |err|` syntax.
     .{ .src = "fn a() void { errdefer |e| _ = e; }", .expect = 1 },
-};
+} else [_]Fixture{};
 
 fn selfCheck(gpa: std.mem.Allocator) !u8 {
     var bad: u8 = 0;

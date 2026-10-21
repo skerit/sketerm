@@ -79,17 +79,17 @@ pub const Instance = struct {
         self.retry_after_ms = now + 1000;
 
         var display_buf: [16:0]u8 = undefined;
-        const display = std.fmt.bufPrintZ(&display_buf, "{s}", .{self.display_name}) catch return false;
+        const display = std.fmt.bufPrintSentinel(&display_buf, "{s}", .{self.display_name}, 0) catch return false;
         var unix_buf: [16:0]u8 = undefined;
-        const unix_fd = std.fmt.bufPrintZ(&unix_buf, "{d}", .{self.unix_fd}) catch return false;
+        const unix_fd = std.fmt.bufPrintSentinel(&unix_buf, "{d}", .{self.unix_fd}, 0) catch return false;
         var abstract_buf: [16:0]u8 = undefined;
-        const abstract_fd = std.fmt.bufPrintZ(&abstract_buf, "{d}", .{self.abstract_fd}) catch return false;
+        const abstract_fd = std.fmt.bufPrintSentinel(&abstract_buf, "{d}", .{self.abstract_fd}, 0) catch return false;
         var auth_buf: [4096:0]u8 = undefined;
-        const auth = std.fmt.bufPrintZ(&auth_buf, "{s}", .{self.auth_path}) catch return false;
+        const auth = std.fmt.bufPrintSentinel(&auth_buf, "{s}", .{self.auth_path}, 0) catch return false;
         var wl_buf: [4096:0]u8 = undefined;
-        const wl = std.fmt.bufPrintZ(&wl_buf, "{s}", .{self.wayland_display}) catch return false;
+        const wl = std.fmt.bufPrintSentinel(&wl_buf, "{s}", .{self.wayland_display}, 0) catch return false;
         var rt_buf: [4096:0]u8 = undefined;
-        const rt = std.fmt.bufPrintZ(&rt_buf, "{s}", .{self.runtime_dir}) catch return false;
+        const rt = std.fmt.bufPrintSentinel(&rt_buf, "{s}", .{self.runtime_dir}, 0) catch return false;
 
         const owner_pid = c.getpid();
         const pid = c.fork();
@@ -316,7 +316,7 @@ fn acquireDisplayLock(lock_z: [*:0]const u8, socket_path: []const u8) !?c_int {
 /// allocator can never observe an empty lock and misclassify it as stale.
 fn createDisplayLock(lock_z: [*:0]const u8) !?c_int {
     var temp_buf: [4096:0]u8 = undefined;
-    const temp = std.fmt.bufPrintZ(&temp_buf, "{s}.sketerm-{d}-{d}", .{ std.mem.span(lock_z), c.getpid(), nowMs() }) catch
+    const temp = std.fmt.bufPrintSentinel(&temp_buf, "{s}.sketerm-{d}-{d}", .{ std.mem.span(lock_z), c.getpid(), nowMs() }, 0) catch
         return error.BadPath;
     const fd = c.open(temp.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC, @as(c_uint, 0o600));
     if (fd < 0) return error.LockFailed;
@@ -604,7 +604,7 @@ test "xwayland authority record is accepted by xauth layout parser" {
 test "xwayland display locks reclaim dead owners but not live ones" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var lock_buf: [256:0]u8 = undefined;
-    const lock = try std.fmt.bufPrintZ(&lock_buf, "/tmp/sketerm-xlock-test-{d}", .{c.getpid()});
+    const lock = try std.fmt.bufPrintSentinel(&lock_buf, "/tmp/sketerm-xlock-test-{d}", .{c.getpid()}, 0);
     var socket_buf: [256]u8 = undefined;
     const socket = try std.fmt.bufPrint(&socket_buf, "/tmp/sketerm-xlock-sock-test-{d}", .{c.getpid()});
     _ = c.unlink(lock.ptr);

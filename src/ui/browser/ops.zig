@@ -247,7 +247,7 @@ fn exportClipToGdk(board: *clipboard.Board, clip: *c.GdkClipboard) bool {
         if (i > 0) text.append(a, '\n') catch return false;
         text.appendSlice(a, p) catch return false;
         if (!local) continue;
-        const pz = a.dupeZ(u8, p) catch return false;
+        const pz = a.dupeSentinel(u8, p, 0) catch return false;
         defer a.free(pz);
         const uri = c.g_filename_to_uri(pz.ptr, null, null) orelse return false;
         defer c.g_free(uri);
@@ -1310,10 +1310,10 @@ pub const EditorRename = struct {
             c.g_object_unref(m);
         }
         var zb: [4300]u8 = undefined;
-        if (std.fmt.bufPrintZ(&zb, "{s}", .{self.tmp})) |z| {
+        if (std.fmt.bufPrintSentinel(&zb, "{s}", .{self.tmp}, 0)) |z| {
             _ = c.unlink(z.ptr);
         } else |_| {}
-        if (std.fmt.bufPrintZ(&zb, "{s}", .{self.done})) |z| {
+        if (std.fmt.bufPrintSentinel(&zb, "{s}", .{self.done}, 0)) |z| {
             _ = c.unlink(z.ptr);
         } else |_| {}
         for (self.paths.items) |sp| allocator.free(sp);
@@ -1370,7 +1370,7 @@ pub fn onMenuEditorRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
     };
     // Write one basename per line; remember the full paths.
     var zb: [4300:0]u8 = undefined;
-    const tz = std.fmt.bufPrintZ(&zb, "{s}", .{tmp}) catch {
+    const tz = std.fmt.bufPrintSentinel(&zb, "{s}", .{tmp}, 0) catch {
         er.destroy(self.allocator);
         return menuDone(ctx);
     };
@@ -1391,7 +1391,7 @@ pub fn onMenuEditorRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
     _ = c.fclose(f);
 
     var dzb: [4300:0]u8 = undefined;
-    const dz = std.fmt.bufPrintZ(&dzb, "{s}", .{done}) catch {
+    const dz = std.fmt.bufPrintSentinel(&dzb, "{s}", .{done}, 0) catch {
         er.destroy(self.allocator);
         return menuDone(ctx);
     };
@@ -1430,7 +1430,7 @@ pub fn onEditorRenameDone(
         er.destroy(self.allocator);
     }
     var zb: [4300:0]u8 = undefined;
-    const tz = std.fmt.bufPrintZ(&zb, "{s}", .{er.tmp}) catch return;
+    const tz = std.fmt.bufPrintSentinel(&zb, "{s}", .{er.tmp}, 0) catch return;
     const f = c.fopen(tz.ptr, "rb") orelse return;
     var content: [64 * 1024]u8 = undefined;
     const n = c.fread(&content, 1, content.len, f);
@@ -1494,7 +1494,7 @@ pub fn setMountXattr(ctx: *MenuCtx, comptime attr: [:0]const u8, comptime okmsg:
         return menuDone(ctx);
     }
     var z: [4300:0]u8 = undefined;
-    const pz = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return menuDone(ctx);
+    const pz = std.fmt.bufPrintSentinel(&z, "{s}", .{path}, 0) catch return menuDone(ctx);
     if (c.setxattr(pz.ptr, attr.ptr, "1", 1, 0) != 0) {
         self.setStatusFmt("{s} failed (is this really a sketerm mount?)", .{attr});
     } else {
@@ -1690,9 +1690,9 @@ pub fn confirmDeletePathsMode(self: *BrowserView, tab: *BTab, targets: []const [
     var msg: [340:0]u8 = undefined;
     const verb: []const u8 = if (secure) "securely delete" else "permanently delete";
     const txt = if (n == 1)
-        std.fmt.bufPrintZ(&msg, "Are you sure you want to {s} \"{s}\"?", .{ verb, std.fs.path.basename(paths[0]) }) catch "Permanently delete this item?"
+        std.fmt.bufPrintSentinel(&msg, "Are you sure you want to {s} \"{s}\"?", .{ verb, std.fs.path.basename(paths[0]) }, 0) catch "Permanently delete this item?"
     else
-        std.fmt.bufPrintZ(&msg, "Are you sure you want to {s} the {d} selected items?", .{ verb, n }) catch "Permanently delete the selected items?";
+        std.fmt.bufPrintSentinel(&msg, "Are you sure you want to {s} the {d} selected items?", .{ verb, n }, 0) catch "Permanently delete the selected items?";
     req.* = .{
         .allocator = a,
         .view = self,
@@ -2547,7 +2547,7 @@ pub fn startArchiveBrowse(self: *BrowserView, tab: *BTab, archive: []const u8) v
     rtab.root.view_id = 0;
     rtab.root.archive = self.allocator.dupe(u8, archive) catch &.{};
     var lbl: [96:0]u8 = undefined;
-    const l = std.fmt.bufPrintZ(&lbl, "{s}", .{std.fs.path.basename(archive)}) catch "archive";
+    const l = std.fmt.bufPrintSentinel(&lbl, "{s}", .{std.fs.path.basename(archive)}, 0) catch "archive";
     c.gtk_label_set_text(rtab.tab_label, l.ptr);
     self.arch_tab = rtab;
     self.startDaemonJobKind(rtab.hc, "archive_list", archive, "", "", "list archive", .{ .kind = .archive_list });

@@ -1671,7 +1671,7 @@ fn onConnectionStateEvent(ctx: ?*anyopaque, state: Terminal.ConnectionState, ret
     switch (state) {
         .lost, .reconnecting => c.gtk_button_set_label(@ptrCast(self.connection_banner.?), "Connection lost. Reconnecting..."),
         .retry_wait => {
-            const text = std.fmt.bufPrintZ(&buf, "Reconnect failed. Retrying in {d}s. Click to retry now.", .{retry_seconds}) catch {
+            const text = std.fmt.bufPrintSentinel(&buf, "Reconnect failed. Retrying in {d}s. Click to retry now.", .{retry_seconds}, 0) catch {
                 c.gtk_button_set_label(@ptrCast(self.connection_banner.?), "Reconnect failed. Click to retry now.");
                 c.gtk_widget_set_visible(self.connection_banner.?, 1);
                 return;
@@ -1976,9 +1976,9 @@ fn rebuildTitlebarApps(self: *Pane) void {
                     if (info.embedded) continue;
                     const title = std.mem.span(info.title);
                     var buf: [96:0]u8 = undefined;
-                    const label = std.fmt.bufPrintZ(&buf, "{s}", .{
+                    const label = std.fmt.bufPrintSentinel(&buf, "{s}", .{
                         if (title.len > 0) title else if (info.app_id.len > 0) info.app_id else "App",
-                    }) catch "App";
+                    }, 0) catch "App";
                     const btn = c.gtk_button_new_with_label(label.ptr);
                     c.gtk_widget_add_css_class(btn, "flat");
                     c.gtk_widget_add_css_class(btn, "sketerm-titlebar-btn");
@@ -2024,7 +2024,7 @@ fn updateControlChip(self: *Pane) bool {
         var wbuf: [192]u8 = undefined;
         if (@import("webwatch.zig").chipText(g, &wbuf)) |ct| {
             var z: [200:0]u8 = undefined;
-            const tz = std.fmt.bufPrintZ(&z, "{s}", .{ct.text}) catch "View only";
+            const tz = std.fmt.bufPrintSentinel(&z, "{s}", .{ct.text}, 0) catch "View only";
             if (self.titlebar.chip_label) |lbl| c.gtk_label_set_text(lbl, tz.ptr);
             c.gtk_widget_set_tooltip_text(chip, "This browser shows an assistant's pages");
             if (self.titlebar.take_btn) |btn| c.gtk_widget_set_visible(btn, @intFromBool(ct.view_only));
@@ -2046,22 +2046,22 @@ fn updateControlChip(self: *Pane) bool {
     // this GUI is holding the keys back.
     const unenforced = watching and !term.viewOnlyEnforced();
     const text = if (unenforced)
-        std.fmt.bufPrintZ(&buf, "View only - not enforced by this daemon", .{}) catch "View only"
+        std.fmt.bufPrintSentinel(&buf, "View only - not enforced by this daemon", .{}, 0) catch "View only"
     else if (view_only)
         (if (holder.len > 0)
-            std.fmt.bufPrintZ(&buf, "View only - {s} controls", .{holder}) catch "View only"
+            std.fmt.bufPrintSentinel(&buf, "View only - {s} controls", .{holder}, 0) catch "View only"
         else
-            std.fmt.bufPrintZ(&buf, "View only", .{}) catch "View only")
+            std.fmt.bufPrintSentinel(&buf, "View only", .{}, 0) catch "View only")
     else
-        std.fmt.bufPrintZ(&buf, "AI attached", .{}) catch "AI attached";
+        std.fmt.bufPrintSentinel(&buf, "AI attached", .{}, 0) catch "AI attached";
     if (self.titlebar.chip_label) |lbl| c.gtk_label_set_text(lbl, text.ptr);
     var tip: [256:0]u8 = undefined;
     const tip_z = if (unenforced)
-        std.fmt.bufPrintZ(&tip, "Watching: this window sends no input, but the daemon serving this session is too old to refuse it. {d} viewer(s) attached. Take control to type.", .{term.peer_viewers}) catch null
+        std.fmt.bufPrintSentinel(&tip, "Watching: this window sends no input, but the daemon serving this session is too old to refuse it. {d} viewer(s) attached. Take control to type.", .{term.peer_viewers}, 0) catch null
     else if (watching)
-        std.fmt.bufPrintZ(&tip, "Watching: the daemon drops this window's input and resize. {d} viewer(s) attached. Take control to type.", .{term.peer_viewers}) catch null
+        std.fmt.bufPrintSentinel(&tip, "Watching: the daemon drops this window's input and resize. {d} viewer(s) attached. Take control to type.", .{term.peer_viewers}, 0) catch null
     else
-        std.fmt.bufPrintZ(&tip, "{d} viewer(s) attached to this session", .{term.peer_viewers}) catch null;
+        std.fmt.bufPrintSentinel(&tip, "{d} viewer(s) attached to this session", .{term.peer_viewers}, 0) catch null;
     c.gtk_widget_set_tooltip_text(chip, if (tip_z) |t| t.ptr else null);
     if (self.titlebar.take_btn) |btn| c.gtk_widget_set_visible(btn, @intFromBool(view_only));
     c.gtk_widget_set_visible(chip, 1);

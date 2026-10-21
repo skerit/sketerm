@@ -491,10 +491,11 @@ pub const Sidebar = struct {
             if (@import("webface.zig").containerColor(item.page.container)) |rgb| {
                 const dot = c.gtk_label_new(null);
                 var mk: [96]u8 = undefined;
-                const m = std.fmt.bufPrintZ(
+                const m = std.fmt.bufPrintSentinel(
                     &mk,
                     "<span foreground=\"#{x:0>2}{x:0>2}{x:0>2}\">\u{25CF}</span>",
                     .{ rgb[0], rgb[1], rgb[2] },
+                    0,
                 ) catch "";
                 c.gtk_label_set_markup(@ptrCast(dot), m.ptr);
                 c.gtk_widget_set_valign(dot, c.GTK_ALIGN_CENTER);
@@ -609,7 +610,7 @@ pub const Sidebar = struct {
             .page => |face| {
                 const title = webgroup.Group.pageTitle(face);
                 const sidebar = r.sidebar orelse return;
-                const z = sidebar.allocator.dupeZ(u8, title) catch return;
+                const z = sidebar.allocator.dupeSentinel(u8, title, 0) catch return;
                 defer sidebar.allocator.free(z);
                 c.gtk_label_set_text(@ptrCast(r.label), z.ptr);
             },

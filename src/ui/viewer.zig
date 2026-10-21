@@ -461,7 +461,7 @@ fn fetch(work: *LoadWork) !FetchPayload {
     if (resource.host == null) {
         if (paths.isSketermMount(resource.path)) return error.SketermFusePathNotSupported;
         var path_buf: [4096:0]u8 = undefined;
-        const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{resource.path}) catch return error.PathTooLong;
+        const path_z = std.fmt.bufPrintSentinel(&path_buf, "{s}", .{resource.path}, 0) catch return error.PathTooLong;
         var real_buf: [4096:0]u8 = undefined;
         if (c.realpath(path_z.ptr, &real_buf)) |resolved| {
             if (paths.isSketermMount(std.mem.span(resolved))) return error.SketermFusePathNotSupported;
@@ -642,7 +642,7 @@ fn materializeOpenCopy(work: *LoadWork, bytes: []const u8, result: *LoadResult) 
     const resource = model.Resource.parse(work.spec);
     const cache = c.g_get_user_cache_dir() orelse return error.NoCacheDirectory;
     var dir_buf: [4096:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm/viewer-open", .{std.mem.span(cache)}) catch return error.PathTooLong;
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/sketerm/viewer-open", .{std.mem.span(cache)}, 0) catch return error.PathTooLong;
     if (c.g_mkdir_with_parents(dir.ptr, 0o700) != 0) return error.CacheDirectoryFailed;
     var dir_stat: c.struct_stat = undefined;
     if (c.lstat(dir.ptr, &dir_stat) != 0 or dir_stat.st_uid != c.geteuid() or
@@ -653,12 +653,12 @@ fn materializeOpenCopy(work: *LoadWork, bytes: []const u8, result: *LoadResult) 
     sweepOpenCopies(dir);
     const name = resource.name();
     const safe_name = if (name.len > 0 and name.len < 512) name else "remote-image";
-    const path = std.fmt.bufPrintZ(&result.materialized, "{s}/" ++ OPEN_COPY_PREFIX ++ "{d}-{d}-{s}", .{
+    const path = std.fmt.bufPrintSentinel(&result.materialized, "{s}/" ++ OPEN_COPY_PREFIX ++ "{d}-{d}-{s}", .{
         dir,
         c.getpid(),
         c.g_get_monotonic_time(),
         safe_name,
-    }) catch return error.PathTooLong;
+    }, 0) catch return error.PathTooLong;
     const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC, @as(c.mode_t, 0o600));
     if (fd < 0) return error.OpenCopyFailed;
     var installed = false;
@@ -1256,7 +1256,7 @@ pub const ViewerWindow = struct {
         self.setMetadata(if (paths.isVideoName(resource.name())) "Video" else "Audio");
         self.video_retried = false;
         var buf: [600:0]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&buf, "Opening {s}...", .{resource.name()}) catch "Opening...";
+        const text = std.fmt.bufPrintSentinel(&buf, "Opening {s}...", .{resource.name()}, 0) catch "Opening...";
         c.gtk_label_set_text(self.status, text.ptr);
         self.canvas.setAccessible(resource.name(), "Playing", false);
         self.startVideoStream(resource, self.remotePolicy(resource), 0);
@@ -1276,7 +1276,7 @@ pub const ViewerWindow = struct {
         const stream: *c.GtkMediaStream = blk: {
             if (resource.host == null) {
                 var z: [4096:0]u8 = undefined;
-                const path_z = std.fmt.bufPrintZ(&z, "{s}", .{resource.path}) catch break :blk null;
+                const path_z = std.fmt.bufPrintSentinel(&z, "{s}", .{resource.path}, 0) catch break :blk null;
                 break :blk c.gtk_media_file_new_for_filename(path_z.ptr);
             }
             const remote = remotestream.new(resource.host, resource.path, policy, start_ms) orelse break :blk null;
@@ -1427,9 +1427,9 @@ pub const ViewerWindow = struct {
             .on_state = &onCastState,
         }) catch |err| {
             var buf: [256:0]u8 = undefined;
-            const text = std.fmt.bufPrintZ(&buf, "Unable to play {s}: {s}", .{
+            const text = std.fmt.bufPrintSentinel(&buf, "Unable to play {s}: {s}", .{
                 resource.name(), @errorName(err),
-            }) catch "Unable to play the recording";
+            }, 0) catch "Unable to play the recording";
             c.gtk_label_set_text(self.status, text.ptr);
             return;
         };
@@ -1475,10 +1475,10 @@ pub const ViewerWindow = struct {
             return;
         };
         var title: [512:0]u8 = undefined;
-        const title_z = std.fmt.bufPrintZ(&title, "{s} - {s}", .{ resource.name(), model.APP_NAME }) catch model.APP_NAME;
+        const title_z = std.fmt.bufPrintSentinel(&title, "{s} - {s}", .{ resource.name(), model.APP_NAME }, 0) catch model.APP_NAME;
         c.gtk_window_set_title(@ptrCast(self.window), title_z.ptr);
         var pos: [64:0]u8 = undefined;
-        const pos_z = std.fmt.bufPrintZ(&pos, "{d} of {d}", .{ self.index + 1, self.batch.specs.len }) catch "";
+        const pos_z = std.fmt.bufPrintSentinel(&pos, "{d} of {d}", .{ self.index + 1, self.batch.specs.len }, 0) catch "";
         c.gtk_label_set_text(self.position, pos_z.ptr);
         c.gtk_widget_set_sensitive(self.prev_button, @intFromBool(self.index > 0));
         c.gtk_widget_set_sensitive(self.next_button, @intFromBool(self.index + 1 < self.batch.specs.len));
@@ -1575,12 +1575,12 @@ pub const ViewerWindow = struct {
     fn updateAccessibleState(self: *ViewerWindow) void {
         const resource = self.current() orelse return;
         var detail: [256:0]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&detail, "Item {d} of {d}; rotation {d} degrees{s}", .{
+        const text = std.fmt.bufPrintSentinel(&detail, "Item {d} of {d}; rotation {d} degrees{s}", .{
             self.index + 1,
             self.batch.specs.len,
             self.session.rotationDegrees(),
             if (self.session.animated()) if (self.session.isPlaying()) "; animation playing" else "; animation paused" else "",
-        }) catch "Image loaded";
+        }, 0) catch "Image loaded";
         self.canvas.setAccessible(resource.name(), text, false);
     }
 };
@@ -1807,7 +1807,7 @@ fn onHeadLoaded(self: *ViewerWindow, result: *LoadResult) void {
     if (self.content != .text) return;
     const head = result.head orelse {
         var message: [256:0]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&message, "Unable to load the file: {s}", .{result.messageText()}) catch
+        const text = std.fmt.bufPrintSentinel(&message, "Unable to load the file: {s}", .{result.messageText()}, 0) catch
             "Unable to load the file";
         c.gtk_label_set_text(self.status, text.ptr);
         return;
@@ -1843,16 +1843,16 @@ fn onHeadLoaded(self: *ViewerWindow, result: *LoadResult) void {
     var head_buf: [48:0]u8 = undefined;
     var total_buf: [48:0]u8 = undefined;
     const text = if (result.source_bytes > head.len)
-        std.fmt.bufPrintZ(&status_buf, "{s}  showing first {s} of {s}", .{
+        std.fmt.bufPrintSentinel(&status_buf, "{s}  showing first {s} of {s}", .{
             kind,
             format.fmtSize(&head_buf, head.len),
             format.fmtSize(&total_buf, result.source_bytes),
-        }) catch "File loaded"
+        }, 0) catch "File loaded"
     else
-        std.fmt.bufPrintZ(&status_buf, "{s}  {s}", .{
+        std.fmt.bufPrintSentinel(&status_buf, "{s}  {s}", .{
             kind,
             format.fmtSize(&total_buf, result.source_bytes),
-        }) catch "File loaded";
+        }, 0) catch "File loaded";
     c.gtk_label_set_text(self.status, text.ptr);
 }
 
@@ -1875,11 +1875,11 @@ fn onListingLoaded(self: *ViewerWindow, result: *LoadResult, text: []const u8) v
     var status_buf: [256:0]u8 = undefined;
     var total_buf: [48:0]u8 = undefined;
     const status = switch (result.head_kind) {
-        .directory => std.fmt.bufPrintZ(&status_buf, "Folder  {s}", .{result.summaryText()}) catch "Folder",
-        .archive => std.fmt.bufPrintZ(&status_buf, "Archive  {s}  {s}", .{
+        .directory => std.fmt.bufPrintSentinel(&status_buf, "Folder  {s}", .{result.summaryText()}, 0) catch "Folder",
+        .archive => std.fmt.bufPrintSentinel(&status_buf, "Archive  {s}  {s}", .{
             result.summaryText(),
             format.fmtSize(&total_buf, result.source_bytes),
-        }) catch "Archive",
+        }, 0) catch "Archive",
         .bytes => unreachable,
     };
     c.gtk_label_set_text(self.status, status.ptr);
@@ -1899,10 +1899,10 @@ fn onLoaded(user: ?*anyopaque, result: *LoadResult) void {
             };
         }
         var message: [256:0]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&message, "Unable to load {s}: {s}", .{
+        const text = std.fmt.bufPrintSentinel(&message, "Unable to load {s}: {s}", .{
             if (result.variant == .preview) "preview" else "full resolution",
             result.messageText(),
-        }) catch "Unable to load image";
+        }, 0) catch "Unable to load image";
         c.gtk_label_set_text(self.status, text.ptr);
         if (self.current()) |resource| self.canvas.setAccessible(resource.name(), text, false);
         if (result.variant == .original) {
@@ -1928,14 +1928,14 @@ fn onLoaded(user: ?*anyopaque, result: *LoadResult) void {
         .gdk_pixbuf => "GdkPixbuf",
     };
     var size_buf: [48:0]u8 = undefined;
-    const text = std.fmt.bufPrintZ(&status, "{s}  {d} x {d}  {s}  {s}{s}", .{
+    const text = std.fmt.bufPrintSentinel(&status, "{s}  {d} x {d}  {s}  {s}{s}", .{
         if (result.variant == .preview) "Preview" else "Full resolution",
         first.width,
         first.height,
         backend,
         format.fmtSize(&size_buf, result.source_bytes),
         if (image.animated()) "  Animated" else "",
-    }) catch "Image loaded";
+    }, 0) catch "Image loaded";
     c.gtk_label_set_text(self.status, text.ptr);
     const local_kind: LocalPreviewKind = if (result.variant != .preview) .not_local else if (self.current()) |resource|
         localPreviewKind(resource)
@@ -1994,7 +1994,7 @@ fn onOpenCopyLoaded(user: ?*anyopaque, result: *LoadResult) void {
     const self = cast.userData(ViewerWindow, user);
     if (result.materialized_len == 0) {
         var buf: [256:0]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&buf, "Could not prepare the remote image: {s}", .{result.messageText()}) catch
+        const text = std.fmt.bufPrintSentinel(&buf, "Could not prepare the remote image: {s}", .{result.messageText()}, 0) catch
             "Could not prepare the remote image";
         c.gtk_label_set_text(self.status, text.ptr);
         return;
@@ -2017,7 +2017,7 @@ fn onCanvasZoom(user: ?*anyopaque, zoom: f64, mode: model.Viewport.Mode) void {
     if (mode == .fit) return c.gtk_label_set_text(self.zoom_label, "Fit");
     if (mode == .fill) return c.gtk_label_set_text(self.zoom_label, "Fill");
     var buf: [24:0]u8 = undefined;
-    const text = std.fmt.bufPrintZ(&buf, "{d}%", .{@as(u32, @intFromFloat(@round(zoom * 100)))}) catch "";
+    const text = std.fmt.bufPrintSentinel(&buf, "{d}%", .{@as(u32, @intFromFloat(@round(zoom * 100)))}, 0) catch "";
     c.gtk_label_set_text(self.zoom_label, text.ptr);
 }
 
@@ -2142,12 +2142,12 @@ fn onVideoError(stream: *c.GtkMediaStream, _: ?*c.GParamSpec, user: ?*anyopaque)
         const resource = self.current() orelse return;
         const position = self.videoPositionMs();
         self.video_retried = true;
-        const text = std.fmt.bufPrintZ(&buf, "Local playback failed ({s}); transcoding on the host", .{reason}) catch "Local playback failed; transcoding on the host";
+        const text = std.fmt.bufPrintSentinel(&buf, "Local playback failed ({s}); transcoding on the host", .{reason}, 0) catch "Local playback failed; transcoding on the host";
         c.gtk_label_set_text(self.status, text.ptr);
         self.startVideoStream(resource, .transcode, position);
         return;
     }
-    const text = std.fmt.bufPrintZ(&buf, "Playback failed: {s}; showing the poster", .{reason}) catch "Playback failed; showing the poster";
+    const text = std.fmt.bufPrintSentinel(&buf, "Playback failed: {s}; showing the poster", .{reason}, 0) catch "Playback failed; showing the poster";
     self.closeVideo();
     if (self.current()) |resource| self.showPoster(resource);
     c.gtk_label_set_text(self.status, text.ptr);
@@ -2169,13 +2169,13 @@ fn onVideoPrepared(stream: *c.GtkMediaStream, _: ?*c.GParamSpec, user: ?*anyopaq
     const duration_ms: u64 = self.videoDurationMs() orelse 0;
     var route_buf: [96]u8 = undefined;
     var buf: [700:0]u8 = undefined;
-    const text = std.fmt.bufPrintZ(&buf, "{s}  {d}:{d:0>2}{s}{s}", .{
+    const text = std.fmt.bufPrintSentinel(&buf, "{s}  {d}:{d:0>2}{s}{s}", .{
         resource.name(),
         duration_ms / 60_000,
         (duration_ms / 1000) % 60,
         if (c.gtk_media_stream_has_video(stream) != 0) "" else "  audio only",
         self.videoRouteText(&route_buf),
-    }) catch "Playing";
+    }, 0) catch "Playing";
     c.gtk_label_set_text(self.status, text.ptr);
 }
 
@@ -2185,7 +2185,7 @@ fn onCastTitle(user: ?*anyopaque, name: []const u8) void {
     @memcpy(self.cast_title[0..n], name[0..n]);
     self.cast_title_len = n;
     var buf: [600:0]u8 = undefined;
-    const t = std.fmt.bufPrintZ(&buf, "{s} - {s}", .{ name, model.APP_NAME }) catch model.APP_NAME;
+    const t = std.fmt.bufPrintSentinel(&buf, "{s} - {s}", .{ name, model.APP_NAME }, 0) catch model.APP_NAME;
     c.gtk_window_set_title(@ptrCast(self.window), t.ptr);
 }
 
@@ -2202,18 +2202,18 @@ fn onCastState(user: ?*anyopaque, st: Terminal.PlayState) void {
         .playing => "",
     };
     const text = if (st.duration_ms) |d|
-        std.fmt.bufPrintZ(&buf, "{s}  {d}:{d:0>2} / {d}:{d:0>2}{s}", .{
+        std.fmt.bufPrintSentinel(&buf, "{s}  {d}:{d:0>2} / {d}:{d:0>2}{s}", .{
             title,
             st.position_ms / 60_000,
             (st.position_ms / 1000) % 60,
             d / 60_000,
             (d / 1000) % 60,
             suffix,
-        }) catch return
+        }, 0) catch return
     else
-        std.fmt.bufPrintZ(&buf, "{s}  {d}:{d:0>2} / --:--{s}", .{
+        std.fmt.bufPrintSentinel(&buf, "{s}  {d}:{d:0>2} / --:--{s}", .{
             title, st.position_ms / 60_000, (st.position_ms / 1000) % 60, suffix,
-        }) catch return;
+        }, 0) catch return;
     c.gtk_label_set_text(self.status, text.ptr);
 }
 
@@ -2555,7 +2555,7 @@ fn showAppChooserPath(self: *ViewerWindow, path: []const u8, owned_copy: bool) b
     if (owned_copy) {
         const allocator = std.heap.c_allocator;
         const cp = allocator.create(ChooserCopy) catch return false;
-        cp.* = .{ .path = allocator.dupeZ(u8, path) catch {
+        cp.* = .{ .path = allocator.dupeSentinel(u8, path, 0) catch {
             allocator.destroy(cp);
             return false;
         } };
@@ -2648,11 +2648,11 @@ fn revealCurrent(self: *ViewerWindow) void {
     var sibling_buf: [4096:0]u8 = undefined;
     const sibling: ?[:0]const u8 = blk: {
         const slash = std.mem.lastIndexOfScalar(u8, exe, '/') orelse break :blk null;
-        const candidate = std.fmt.bufPrintZ(&sibling_buf, "{s}/sketerm-files", .{exe[0..slash]}) catch break :blk null;
+        const candidate = std.fmt.bufPrintSentinel(&sibling_buf, "{s}/sketerm-files", .{exe[0..slash]}, 0) catch break :blk null;
         if (c.access(candidate.ptr, c.X_OK) != 0) break :blk null;
         break :blk candidate;
     };
-    const parent_z = self.allocator.dupeZ(u8, parent_spec) catch return;
+    const parent_z = self.allocator.dupeSentinel(u8, parent_spec, 0) catch return;
     defer self.allocator.free(parent_z);
     var argv: [6]?[*:0]u8 = @splat(null);
     var at: usize = 0;

@@ -167,12 +167,12 @@ pub fn renameNoReplaceCompat(old_path: [*:0]const u8, new_path: [*:0]const u8) R
 test "renameNoReplaceCompat moves files and directories and refuses an existing target" {
     const t = std.testing;
     var dir_buf: [64]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "/tmp/sk-noreplace-{d}", .{c.getpid()}) catch unreachable;
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "/tmp/sk-noreplace-{d}", .{c.getpid()}, 0) catch unreachable;
     _ = c.mkdir(dir, 0o700);
     defer {
         var p: [96]u8 = undefined;
         for ([_][]const u8{ "b", "c/f", "c", "d", "e" }) |n| {
-            const z = std.fmt.bufPrintZ(&p, "{s}/{s}", .{ dir, n }) catch unreachable;
+            const z = std.fmt.bufPrintSentinel(&p, "{s}/{s}", .{ dir, n }, 0) catch unreachable;
             _ = c.unlink(z);
             _ = c.rmdir(z);
         }
@@ -183,11 +183,11 @@ test "renameNoReplaceCompat moves files and directories and refuses an existing 
     var pc: [96]u8 = undefined;
     var pd: [96]u8 = undefined;
     var pe: [96]u8 = undefined;
-    const a = std.fmt.bufPrintZ(&pa, "{s}/a", .{dir}) catch unreachable;
-    const b = std.fmt.bufPrintZ(&pb, "{s}/b", .{dir}) catch unreachable;
-    const cdir = std.fmt.bufPrintZ(&pc, "{s}/c", .{dir}) catch unreachable;
-    const d = std.fmt.bufPrintZ(&pd, "{s}/d", .{dir}) catch unreachable;
-    const e = std.fmt.bufPrintZ(&pe, "{s}/e", .{dir}) catch unreachable;
+    const a = std.fmt.bufPrintSentinel(&pa, "{s}/a", .{dir}, 0) catch unreachable;
+    const b = std.fmt.bufPrintSentinel(&pb, "{s}/b", .{dir}, 0) catch unreachable;
+    const cdir = std.fmt.bufPrintSentinel(&pc, "{s}/c", .{dir}, 0) catch unreachable;
+    const d = std.fmt.bufPrintSentinel(&pd, "{s}/d", .{dir}, 0) catch unreachable;
+    const e = std.fmt.bufPrintSentinel(&pe, "{s}/e", .{dir}, 0) catch unreachable;
 
     // File: link+unlink path.
     const fd = c.open(a, c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c_uint, 0o600));
@@ -206,7 +206,7 @@ test "renameNoReplaceCompat moves files and directories and refuses an existing 
     // Directory: lstat+rename path, with a file inside surviving.
     try t.expect(c.mkdir(cdir, 0o700) == 0);
     var pf: [96]u8 = undefined;
-    const f = std.fmt.bufPrintZ(&pf, "{s}/f", .{cdir}) catch unreachable;
+    const f = std.fmt.bufPrintSentinel(&pf, "{s}/f", .{cdir}, 0) catch unreachable;
     const ffd = c.open(f, c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c_uint, 0o600));
     try t.expect(ffd >= 0);
     _ = c.close(ffd);
@@ -215,7 +215,7 @@ test "renameNoReplaceCompat moves files and directories and refuses an existing 
     try t.expect(c.lstat(f, &st) == 0);
     try t.expect(renameNoReplaceCompat(cdir, d) == .ok);
     var pg: [96]u8 = undefined;
-    const g = std.fmt.bufPrintZ(&pg, "{s}/f", .{d}) catch unreachable;
+    const g = std.fmt.bufPrintSentinel(&pg, "{s}/f", .{d}, 0) catch unreachable;
     try t.expect(c.lstat(g, &st) == 0);
     _ = c.unlink(g);
 }
@@ -463,12 +463,12 @@ pub fn dlopenAny(names: []const [*:0]const u8) ?*anyopaque {
         var buf: [512]u8 = undefined;
         if (c.getenv("SKETERM_LIB_DIR")) |dir| {
             const d = std.mem.span(@as([*:0]const u8, @ptrCast(dir)));
-            if (std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ std.mem.trimEnd(u8, d, "/"), soname })) |p| {
+            if (std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ std.mem.trimEnd(u8, d, "/"), soname }, 0)) |p| {
                 if (dlopen(p.ptr, RTLD_LAZY)) |h| return h;
             } else |_| {}
         }
         for (dl_prefixes[1..]) |prefix| {
-            const p = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ prefix, soname }) catch continue;
+            const p = std.fmt.bufPrintSentinel(&buf, "{s}{s}", .{ prefix, soname }, 0) catch continue;
             if (dlopen(p.ptr, RTLD_LAZY)) |h| return h;
         }
     }
@@ -546,7 +546,7 @@ pub fn cwdOfPid(pid: c.pid_t, buf: []u8) ?[]const u8 {
         return buf[0..len];
     }
     var path_buf: [64]u8 = undefined;
-    const link = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/cwd", .{pid}) catch return null;
+    const link = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/cwd", .{pid}, 0) catch return null;
     const n = c.readlink(link.ptr, buf.ptr, buf.len);
     if (n <= 0) return null;
     return buf[0..@intCast(n)];
@@ -583,7 +583,7 @@ pub fn foregroundProgram(master_fd: c_int, buf: []u8) ?[]const u8 {
     }
 
     var path_buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/comm", .{pgrp}) catch return null;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/comm", .{pgrp}, 0) catch return null;
     const fd = c.open(path.ptr, c.O_RDONLY | c.O_CLOEXEC);
     if (fd < 0) return null;
     defer _ = c.close(fd);
@@ -724,7 +724,7 @@ test "environBlockValue matches whole keys only" {
 /// Whole `/proc/<pid>/<name>` into `buf`; see `readFileBlock`.
 fn readProcBlock(pid: c.pid_t, name: []const u8, buf: []u8) ?[]u8 {
     var path_buf: [64:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/{s}", .{ pid, name }) catch return null;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/{s}", .{ pid, name }, 0) catch return null;
     return readFileBlock(path, buf);
 }
 
@@ -770,7 +770,7 @@ pub fn argvOfPid(pid: c.pid_t, buf: []u8) ?[]u8 {
 pub fn exeOfPid(pid: c.pid_t, buf: []u8) ?[]const u8 {
     if (!can_inspect_processes or pid <= 0) return null;
     var path_buf: [64:0]u8 = undefined;
-    const link = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/exe", .{pid}) catch return null;
+    const link = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/exe", .{pid}, 0) catch return null;
     const n = c.readlink(link.ptr, buf.ptr, buf.len);
     if (n <= 0 or @as(usize, @intCast(n)) >= buf.len) return null;
     return buf[0..@intCast(n)];
@@ -789,7 +789,7 @@ pub const ProcessInfo = struct {
 pub fn infoOfPid(pid: c.pid_t) ?ProcessInfo {
     if (!can_inspect_processes or pid <= 0) return null;
     var dir_buf: [64:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "/proc/{d}", .{pid}) catch return null;
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "/proc/{d}", .{pid}, 0) catch return null;
     var st: c.struct_stat = undefined;
     if (c.stat(dir.ptr, &st) != 0) return null;
     var stat_buf: [2048]u8 = undefined;
@@ -998,7 +998,7 @@ pub fn anonFileFd(size: usize) c_int {
         fd = memfd_create("sketerm-anon", 1); // MFD_CLOEXEC
     } else {
         var name_buf: [64]u8 = undefined;
-        const name = std.fmt.bufPrintZ(&name_buf, "/sketerm-anon-{d}", .{c.getpid()}) catch return -1;
+        const name = std.fmt.bufPrintSentinel(&name_buf, "/sketerm-anon-{d}", .{c.getpid()}, 0) catch return -1;
         // shm_open is variadic on Darwin — the mode needs a fixed type.
         fd = c.shm_open(name.ptr, c.O_RDWR | c.O_CREAT | c.O_EXCL, @as(c.mode_t, 0o600));
         if (fd >= 0) {
@@ -1146,7 +1146,7 @@ fn linuxRuntimeDir() ?[]const u8 {
         threadlocal var buf: [64:0]u8 = undefined;
     };
     const uid = c.getuid();
-    const path = std.fmt.bufPrintZ(&S.buf, "/run/user/{d}", .{uid}) catch return null;
+    const path = std.fmt.bufPrintSentinel(&S.buf, "/run/user/{d}", .{uid}, 0) catch return null;
     var st: c.struct_stat = undefined;
     if (c.lstat(path.ptr, &st) != 0 or !privateRuntimeDir(st, uid)) return null;
     return path;

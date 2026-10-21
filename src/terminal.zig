@@ -2062,7 +2062,7 @@ pub const Terminal = struct {
         const remote = self.remote orelse return;
         const base = std.fs.path.basename(path);
         var zbuf: [4096]u8 = undefined;
-        const zpath = std.fmt.bufPrintZ(&zbuf, "{s}", .{path}) catch {
+        const zpath = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{path}, 0) catch {
             self.emitUploadFail(base, "path too long");
             return;
         };
@@ -2713,9 +2713,9 @@ pub const Terminal = struct {
         var n: u32 = 0;
         while (n < 1000) : (n += 1) {
             const path = if (n == 0)
-                std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, name }) catch return null
+                std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, name }, 0) catch return null
             else
-                std.fmt.bufPrintZ(&buf, "{s}/{s} ({d}){s}", .{ dir, stem, n, ext }) catch return null;
+                std.fmt.bufPrintSentinel(&buf, "{s}/{s} ({d}){s}", .{ dir, stem, n, ext }, 0) catch return null;
             const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c_uint, 0o644));
             if (fd >= 0) {
                 const owned = self.allocator.dupe(u8, path) catch {

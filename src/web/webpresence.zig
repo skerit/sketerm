@@ -91,14 +91,14 @@ pub fn helperSocketFor(buf: []u8, mux_socket: []const u8, session: []const u8) ?
     const dir = std.fs.path.dirname(mux_socket) orelse return null;
     if (session.len != 0) {
         var dir_z: [MAX_PATH:0]u8 = undefined;
-        const dz = std.fmt.bufPrintZ(&dir_z, "{s}", .{dir}) catch return null;
+        const dz = std.fmt.bufPrintSentinel(&dir_z, "{s}", .{dir}, 0) catch return null;
         if (c.opendir(dz.ptr)) |d| {
             defer _ = c.closedir(d);
             while (c.readdir(d)) |ent| {
                 const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
                 if (!std.mem.startsWith(u8, name, "web") or !std.mem.endsWith(u8, name, ".json")) continue;
                 var path_z: [MAX_PATH:0]u8 = undefined;
-                const pz = std.fmt.bufPrintZ(&path_z, "{s}/{s}", .{ dir, name }) catch continue;
+                const pz = std.fmt.bufPrintSentinel(&path_z, "{s}/{s}", .{ dir, name }, 0) catch continue;
                 if (!presenceNamesSession(pz, session)) continue;
                 return std.fmt.bufPrint(buf, "{s}/{s}.sock", .{ dir, name[0 .. name.len - ".json".len] }) catch null;
             }
@@ -129,7 +129,7 @@ pub fn readMetadata(allocator: std.mem.Allocator, mux_socket: []const u8, sessio
     var socket_buf: [MAX_PATH]u8 = undefined;
     const socket = helperSocketFor(&socket_buf, mux_socket, session) orelse return .{};
     var path_buf: [MAX_PATH:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}.json", .{socket[0 .. socket.len - ".sock".len]}) catch return .{};
+    const path = std.fmt.bufPrintSentinel(&path_buf, "{s}.json", .{socket[0 .. socket.len - ".sock".len]}, 0) catch return .{};
     const f = c.fopen(path.ptr, "r") orelse return .{};
     defer _ = c.fclose(f);
     var bytes: [16384]u8 = undefined;
@@ -178,11 +178,11 @@ test "helperSocketFor falls back to the direct route's web.sock beside the mux s
 
 test "helperSocketFor picks the routed helper whose presence file names the session" {
     var dir_buf: [MAX_PATH:0]u8 = undefined;
-    const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/sk-webpresence-{d}", .{c.getpid()});
+    const dir = try std.fmt.bufPrintSentinel(&dir_buf, "/tmp/sk-webpresence-{d}", .{c.getpid()}, 0);
     _ = c.mkdir(dir.ptr, 0o700);
     defer _ = c.rmdir(dir.ptr);
     var json_buf: [MAX_PATH:0]u8 = undefined;
-    const json = try std.fmt.bufPrintZ(&json_buf, "{s}/web-tor.json", .{dir});
+    const json = try std.fmt.bufPrintSentinel(&json_buf, "{s}/web-tor.json", .{dir}, 0);
     defer _ = c.unlink(json.ptr);
     {
         const f = c.fopen(json.ptr, "w") orelse return error.TestUnexpectedResult;

@@ -248,7 +248,7 @@ pub fn findForHost(allocator: std.mem.Allocator, host: []const u8) Error!Matches
             defer c.g_variant_unref(pv);
             const path = strOf(pv);
             if (path.len == 0) continue;
-            const path_z = allocator.dupeZ(u8, path) catch return Error.OutOfMemory;
+            const path_z = allocator.dupeSentinel(u8, path, 0) catch return Error.OutOfMemory;
             var keep = false;
             defer if (!keep) allocator.free(path_z);
 
@@ -342,7 +342,7 @@ pub fn fetchSecret(allocator: std.mem.Allocator, item_path: [:0]const u8, locked
     const session_v = c.g_variant_get_child_value(opened, 1) orelse return Error.NoSecret;
     defer c.g_variant_unref(session_v);
     const session = strOf(session_v);
-    const session_z = allocator.dupeZ(u8, session) catch return Error.OutOfMemory;
+    const session_z = allocator.dupeSentinel(u8, session, 0) catch return Error.OutOfMemory;
     defer allocator.free(session_z);
     defer _ = call(conn, session_z.ptr, "org.freedesktop.Secret.Session", "Close", null, null);
 

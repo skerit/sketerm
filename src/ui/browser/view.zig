@@ -1353,7 +1353,7 @@ pub const BrowserView = struct {
         tab.show_hidden = state.show_hidden;
         tab.view_mode = state.view;
         if (state.columns.len > 0) {
-            tab.columns = .initEmpty();
+            tab.columns = .empty;
             for (state.columns) |col| tab.columns.insert(col);
         }
         for (state.attr_columns) |name| {

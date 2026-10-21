@@ -311,7 +311,7 @@ pub fn bannerText(buf: *[320:0]u8, entries: []const journal.Entry, now_ms: i64) 
         @memcpy(names[n .. n + name.len], name);
         n += name.len;
     }
-    return std.fmt.bufPrintZ(
+    return std.fmt.bufPrintSentinel(
         buf,
         "{d} unsaved buffer(s) from a previous session ({s}), last changed {s}: {s}",
         .{
@@ -320,6 +320,7 @@ pub fn bannerText(buf: *[320:0]u8, entries: []const journal.Entry, now_ms: i64) 
             agoText(now_ms, if (entries.len > 0) entries[0].header.updated_ms else now_ms),
             names[0..n],
         },
+        0,
     ) catch "Unsaved buffers from a previous session are recoverable.";
 }
 
@@ -377,7 +378,7 @@ pub fn recoverAll(view: *EditorView) void {
     }
     updateBanner(view);
     var buf: [80:0]u8 = undefined;
-    const msg = std.fmt.bufPrintZ(&buf, "Recovered {d} unsaved buffer(s).", .{opened}) catch "Recovered.";
+    const msg = std.fmt.bufPrintSentinel(&buf, "Recovered {d} unsaved buffer(s).", .{opened}, 0) catch "Recovered.";
     view.setStatusText(msg.ptr);
     // Show whether each file moved on since the crash, rather than
     // writing anything back: the ordinary probe compares the recovered
@@ -454,10 +455,11 @@ fn onDiscardClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const view = cast.userData(EditorView, user);
     if (view.recovery.len == 0) return;
     var body: [160:0]u8 = undefined;
-    const b = std.fmt.bufPrintZ(
+    const b = std.fmt.bufPrintSentinel(
         &body,
         "{d} unsaved buffer(s) from a previous session will be deleted. This cannot be undone.",
         .{view.recovery.len},
+        0,
     ) catch "These unsaved buffers will be deleted.";
     const ctx = std.heap.c_allocator.create(ev.DlgCtx) catch return;
     view.fence.ref();

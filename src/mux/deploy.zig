@@ -65,7 +65,7 @@ const Found = struct {
         const target = classify(path) orelse return;
         for (self.slice()) |a| if (a.target == target) return;
         const buf = &self.path_bufs[self.len];
-        const owned = std.fmt.bufPrintZ(buf, "{s}", .{path}) catch return;
+        const owned = std.fmt.bufPrintSentinel(buf, "{s}", .{path}, 0) catch return;
         self.items[self.len] = .{ .path = owned, .target = target };
         self.len += 1;
     }
@@ -115,11 +115,11 @@ fn deployMemoPath(buf: []u8, plan: *const sshroute.Plan, hash: []const u8) ?[:0]
     const tail = hash[0..@min(hash.len, 16)];
     if (c.getenv("XDG_CACHE_HOME")) |raw| {
         const base = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
-        return std.fmt.bufPrintZ(buf, "{s}/sketerm/mux/deployed-{x:0>16}-{s}", .{ base, h, tail }) catch null;
+        return std.fmt.bufPrintSentinel(buf, "{s}/sketerm/mux/deployed-{x:0>16}-{s}", .{ base, h, tail }, 0) catch null;
     }
     const home_raw = c.getenv("HOME") orelse return null;
     const home = std.mem.span(@as([*:0]const u8, @ptrCast(home_raw)));
-    return std.fmt.bufPrintZ(buf, "{s}/.cache/sketerm/mux/deployed-{x:0>16}-{s}", .{ home, h, tail }) catch null;
+    return std.fmt.bufPrintSentinel(buf, "{s}/.cache/sketerm/mux/deployed-{x:0>16}-{s}", .{ home, h, tail }, 0) catch null;
 }
 
 /// Seconds since this route last verified `hash`, or null when it never did.
@@ -152,7 +152,7 @@ fn deployMemoStamp(plan: *const sshroute.Plan, hash: []const u8) void {
     const path = deployMemoPath(&buf, plan, hash) orelse return;
     if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| {
         var dir_buf: [4096:0]u8 = undefined;
-        if (std.fmt.bufPrintZ(&dir_buf, "{s}", .{path[0..slash]})) |dir| {
+        if (std.fmt.bufPrintSentinel(&dir_buf, "{s}", .{path[0..slash]}, 0)) |dir| {
             var i: usize = 1;
             while (i <= dir.len) : (i += 1) {
                 if (i == dir.len or dir[i] == '/') {
@@ -433,7 +433,7 @@ fn sendBytes(fd: c_int, bytes: []const u8, deadline: i64) bool {
 
 fn runSshCommand(_: ?*anyopaque, plan: *const sshroute.Plan, ssh_bin: [*:0]const u8, command: [:0]const u8, input_path: ?[]const u8) u8 {
     var host_buf: [256:0]u8 = undefined;
-    const host_z = std.fmt.bufPrintZ(&host_buf, "{s}", .{plan.destination}) catch return 255;
+    const host_z = std.fmt.bufPrintSentinel(&host_buf, "{s}", .{plan.destination}, 0) catch return 255;
     // OpenSSH 10.5 can detach a new ControlPersist master while this
     // process is still feeding the upload on stdin. The mux channel then
     // stops draining after its window fills, poisoning later proxy dials.
@@ -671,18 +671,19 @@ test "check and upload run through a real sh with the payload on stdin" {
     } else unreachable;
 
     var home_buf: [128:0]u8 = undefined;
-    const home = std.fmt.bufPrintZ(&home_buf, "/tmp/sketerm-deploy-home-{d}", .{c.getpid()}) catch unreachable;
+    const home = std.fmt.bufPrintSentinel(&home_buf, "/tmp/sketerm-deploy-home-{d}", .{c.getpid()}, 0) catch unreachable;
     _ = c.mkdir(home.ptr, 0o700);
     defer @import("../util/pathz.zig").removeTree(home);
     var ssh_buf: [160:0]u8 = undefined;
-    const ssh = std.fmt.bufPrintZ(&ssh_buf, "{s}/fake-ssh", .{home}) catch unreachable;
+    const ssh = std.fmt.bufPrintSentinel(&ssh_buf, "{s}/fake-ssh", .{home}, 0) catch unreachable;
     var script_buf: [320:0]u8 = undefined;
-    const script = std.fmt.bufPrintZ(
+    const script = std.fmt.bufPrintSentinel(
         &script_buf,
         "#!/bin/sh\nHOME={s}; export HOME\n" ++
             "for a in \"$@\"; do case \"$a\" in (ControlMaster=*|ControlPath=*|ControlPersist=*) exit 78;; esac; cmd=\"$a\"; done\n" ++
             "exec sh -c \"$cmd\"\n",
         .{home},
+        0,
     ) catch unreachable;
     {
         const f = c.fopen(ssh.ptr, "w") orelse return error.SkipZigTest;
@@ -708,10 +709,11 @@ test "check and upload run through a real sh with the payload on stdin" {
     first.prepared.deinit();
     try std.testing.expectEqual(@as(usize, 1), first.index);
     var deployed_buf: [256:0]u8 = undefined;
-    const deployed = std.fmt.bufPrintZ(
+    const deployed = std.fmt.bufPrintSentinel(
         &deployed_buf,
         "{s}/.cache/sketerm/mux/sketerm-mux-{s}",
         .{ home, &hash.hex },
+        0,
     ) catch unreachable;
     var st: c.struct_stat = undefined;
     try std.testing.expect(c.stat(deployed.ptr, &st) == 0);
@@ -769,7 +771,7 @@ test "every portable target's remote guard is in the check script" {
 
 test "classify reads the artifact header from disk" {
     var path_buf: [128:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-deploy-classify-{d}", .{c.getpid()}) catch unreachable;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-deploy-classify-{d}", .{c.getpid()}, 0) catch unreachable;
     defer _ = c.unlink(path.ptr);
     var header = @as([32]u8, @splat(0));
     std.mem.writeInt(u32, header[0..4], 0xfeedfacf, .little);

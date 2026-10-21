@@ -107,7 +107,7 @@ pub fn json(comptime T: type, allocator: std.mem.Allocator, path: []const u8, ca
 const t = std.testing;
 
 fn writeTemp(dir: []const u8, name: []const u8, bytes: []const u8, buf: *[4096:0]u8) ![]const u8 {
-    const path = try std.fmt.bufPrintZ(buf, "{s}/{s}", .{ dir, name });
+    const path = try std.fmt.bufPrintSentinel(buf, "{s}/{s}", .{ dir, name }, 0);
     const fp = c.fopen(path.ptr, "wb") orelse return error.SkipZigTest;
     defer _ = c.fclose(fp);
     if (bytes.len > 0) try t.expect(c.fwrite(bytes.ptr, 1, bytes.len, fp) == bytes.len);
@@ -193,7 +193,7 @@ test "userConfig reads under XDG_CONFIG_HOME, refuses over-cap files and a missi
     const td = pathz.TempDir.make("readfile-usercfg") orelse return error.SkipZigTest;
     defer td.remove();
     var dir_buf: [4096:0]u8 = undefined;
-    const dir = try std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm", .{td.path()});
+    const dir = try std.fmt.bufPrintSentinel(&dir_buf, "{s}/sketerm", .{td.path()}, 0);
     try t.expect(c.mkdir(dir.ptr, 0o700) == 0);
     var buf: [4096:0]u8 = undefined;
     _ = try writeTemp(dir, "x.conf", "a = b\n", &buf);

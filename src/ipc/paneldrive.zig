@@ -755,7 +755,7 @@ fn attachMetadataListener(path: [:0]const u8) !c_int {
 test "paneldrive evicts gone cached identity before a session alias is reused" {
     const t = std.testing;
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-reuse-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-panel-reuse-{d}.sock", .{c.getpid()}, 0);
     _ = c.unlink(path.ptr);
     defer _ = c.unlink(path.ptr);
 
@@ -801,7 +801,7 @@ test "paneldrive reports stale inherited identity and never adopts a replacement
     defer saved_id.restore();
 
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-stale-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-panel-stale-{d}.sock", .{c.getpid()}, 0);
     _ = c.unlink(path.ptr);
     defer _ = c.unlink(path.ptr);
     const listener = try attachMetadataListener(path);
@@ -835,7 +835,7 @@ test "paneldrive reports stale inherited identity and never adopts a replacement
 test "paneldrive classifies missing attach identity as malformed and caches nothing" {
     const t = std.testing;
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-malformed-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-panel-malformed-{d}.sock", .{c.getpid()}, 0);
     _ = c.unlink(path.ptr);
     defer _ = c.unlink(path.ptr);
     const listener = try attachMetadataListener(path);

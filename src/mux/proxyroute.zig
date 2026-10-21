@@ -216,7 +216,7 @@ fn execNext(allocator: std.mem.Allocator, args: Args) Outcome {
     n += 1;
     route_args.append(&argv, &n) catch return refuse(.exec_failed, "cannot build the ssh options");
     var host_z: [256:0]u8 = undefined;
-    const hz = std.fmt.bufPrintZ(&host_z, "{s}", .{next}) catch return refuse(.bad_route, "hop too long");
+    const hz = std.fmt.bufPrintSentinel(&host_z, "{s}", .{next}, 0) catch return refuse(.bad_route, "hop too long");
     if (n + 3 > argv.len) return refuse(.exec_failed, "too many ssh options");
     argv[n] = hz.ptr;
     argv[n + 1] = command.ptr;

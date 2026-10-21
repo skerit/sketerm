@@ -89,15 +89,15 @@ pub fn phaseRank(phase: []const u8) u8 {
 }
 
 fn recordPath(buf: []u8, dir: []const u8, id: u64) ![:0]u8 {
-    return std.fmt.bufPrintZ(buf, "{s}/{d}.json", .{ dir, id });
+    return std.fmt.bufPrintSentinel(buf, "{s}/{d}.json", .{ dir, id }, 0);
 }
 
 fn cancelPath(buf: []u8, dir: []const u8, id: u64) ![:0]u8 {
-    return std.fmt.bufPrintZ(buf, "{s}/{d}.cancel", .{ dir, id });
+    return std.fmt.bufPrintSentinel(buf, "{s}/{d}.cancel", .{ dir, id }, 0);
 }
 
 fn controlPath(buf: []u8, dir: []const u8, id: u64) ![:0]u8 {
-    return std.fmt.bufPrintZ(buf, "{s}/{d}.control", .{ dir, id });
+    return std.fmt.bufPrintSentinel(buf, "{s}/{d}.control", .{ dir, id }, 0);
 }
 
 fn syncDir(dir: []const u8) bool {

@@ -142,16 +142,16 @@ pub fn spawn(
     }
     var argv: std.ArrayList(?[*:0]u8) = .empty;
     defer argv.deinit(alloc);
-    const cmd_z = alloc.dupeZ(u8, command) catch return Error.OutOfMemory;
+    const cmd_z = alloc.dupeSentinel(u8, command, 0) catch return Error.OutOfMemory;
     argv_store.append(alloc, cmd_z) catch return Error.OutOfMemory;
     argv.append(alloc, cmd_z.ptr) catch return Error.OutOfMemory;
     for (args) |a| {
-        const z = alloc.dupeZ(u8, a) catch return Error.OutOfMemory;
+        const z = alloc.dupeSentinel(u8, a, 0) catch return Error.OutOfMemory;
         argv_store.append(alloc, z) catch return Error.OutOfMemory;
         argv.append(alloc, z.ptr) catch return Error.OutOfMemory;
     }
     argv.append(alloc, null) catch return Error.OutOfMemory;
-    const cwd_z = alloc.dupeZ(u8, cwd) catch return Error.OutOfMemory;
+    const cwd_z = alloc.dupeSentinel(u8, cwd, 0) catch return Error.OutOfMemory;
     defer alloc.free(cwd_z);
 
     const pid = c.fork();
@@ -230,16 +230,16 @@ pub fn spawnSock(
     }
     var argv: std.ArrayList(?[*:0]u8) = .empty;
     defer argv.deinit(alloc);
-    const cmd_z = alloc.dupeZ(u8, command) catch return Error.OutOfMemory;
+    const cmd_z = alloc.dupeSentinel(u8, command, 0) catch return Error.OutOfMemory;
     argv_store.append(alloc, cmd_z) catch return Error.OutOfMemory;
     argv.append(alloc, cmd_z.ptr) catch return Error.OutOfMemory;
     for (args) |a| {
-        const z = alloc.dupeZ(u8, a) catch return Error.OutOfMemory;
+        const z = alloc.dupeSentinel(u8, a, 0) catch return Error.OutOfMemory;
         argv_store.append(alloc, z) catch return Error.OutOfMemory;
         argv.append(alloc, z.ptr) catch return Error.OutOfMemory;
     }
     argv.append(alloc, null) catch return Error.OutOfMemory;
-    const cwd_z = alloc.dupeZ(u8, cwd) catch return Error.OutOfMemory;
+    const cwd_z = alloc.dupeSentinel(u8, cwd, 0) catch return Error.OutOfMemory;
     defer alloc.free(cwd_z);
     // stderr: a CLOEXEC pipe (the dup2 below clears CLOEXEC on fd 2 only).
     var errp: [2]c_int = .{ -1, -1 };
@@ -279,7 +279,7 @@ pub fn spawnSock(
 /// `servers.ExistsFn` against this host's filesystem: does `<dir>/<name>` exist?
 pub fn rootMarkerExists(_: ?*anyopaque, dir: []const u8, name: []const u8) bool {
     var buf: [4096]u8 = undefined;
-    const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, name }) catch return false;
+    const full = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, name }, 0) catch return false;
     return c.access(full.ptr, c.F_OK) == 0;
 }
 

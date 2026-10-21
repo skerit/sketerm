@@ -267,7 +267,7 @@ fn openForProfile(
     c.gtk_window_set_title(@ptrCast(dialog), "Preferences");
     if (ctx.edit_name.len > 0) {
         var title_buf: [160:0]u8 = undefined;
-        const t = std.fmt.bufPrintZ(&title_buf, "Preferences — profile “{s}”", .{ctx.edit_name}) catch "Preferences";
+        const t = std.fmt.bufPrintSentinel(&title_buf, "Preferences — profile “{s}”", .{ctx.edit_name}, 0) catch "Preferences";
         c.gtk_window_set_title(@ptrCast(dialog), t.ptr);
     }
     c.gtk_window_set_transient_for(@ptrCast(dialog), parent_window);
@@ -527,7 +527,7 @@ fn onCreateProfile(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 fn addDeleteProfileRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     const row = c.adw_action_row_new();
     var title_buf: [160:0]u8 = undefined;
-    const t = std.fmt.bufPrintZ(&title_buf, "Delete profile “{s}”", .{ctx.edit_name}) catch "Delete this profile";
+    const t = std.fmt.bufPrintSentinel(&title_buf, "Delete profile “{s}”", .{ctx.edit_name}, 0) catch "Delete this profile";
     // A profile name is the user's, and `addNewProfileRow` rejects only
     // the section-header characters -- `&` and `<` get through.
     var t_z: [512]u8 = undefined;
@@ -1315,7 +1315,7 @@ fn effectivePalette(ctx: *Ctx, variant: ?ColorScheme) [16][3]u8 {
 fn paletteRow(ctx: *Ctx, idx: usize, variant: ?ColorScheme) ?*c.GtkWidget {
     const row = c.adw_action_row_new();
     var title_buf: [32:0]u8 = undefined;
-    const title = std.fmt.bufPrintZ(&title_buf, "Color {d}", .{idx}) catch "Color";
+    const title = std.fmt.bufPrintSentinel(&title_buf, "Color {d}", .{idx}, 0) catch "Color";
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title.ptr);
 
     const cur = effectivePalette(ctx, variant)[idx];
@@ -1982,10 +1982,10 @@ fn buildLspGroup(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
         c.adw_preferences_group_set_title(@ptrCast(@alignCast(sub)), (markupEscape(&title_z, name) catch MARKUP_TOO_LONG).ptr);
         var desc: [256:0]u8 = undefined;
         const installed = @import("../util/pathz.zig").executableOnPath(srv.command);
-        const d = std.fmt.bufPrintZ(&desc, "{s}  —  {s}", .{
+        const d = std.fmt.bufPrintSentinel(&desc, "{s}  —  {s}", .{
             if (srv.languages.len > 0) srv.languages else "no languages",
             if (installed) "installed" else "not found on PATH",
-        }) catch "";
+        }, 0) catch "";
         var desc_z: [512]u8 = undefined;
         c.adw_preferences_group_set_description(@ptrCast(@alignCast(sub)), (markupEscape(&desc_z, d) catch MARKUP_TOO_LONG).ptr);
         addLspEnableRow(@ptrCast(@alignCast(sub)), ctx, name, srv.enabled);
@@ -2628,12 +2628,12 @@ fn addFontWeightRow(
     var i: usize = 1;
     while (i <= 9) : (i += 1) {
         const w: u16 = @intCast(i * 100);
-        _ = std.fmt.bufPrintZ(&bufs[i], "{d}", .{w}) catch continue;
+        _ = std.fmt.bufPrintSentinel(&bufs[i], "{d}", .{w}, 0) catch continue;
         labels[i] = &bufs[i];
     }
     var count: usize = 10;
     if (extra != 0) {
-        _ = std.fmt.bufPrintZ(&bufs[10], "{d}", .{extra}) catch {};
+        _ = std.fmt.bufPrintSentinel(&bufs[10], "{d}", .{extra}, 0) catch {};
         labels[10] = &bufs[10];
         count = 11;
     }
@@ -2814,10 +2814,10 @@ fn buildSymbolMapGroup(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
         var range_buf: [32]u8 = undefined;
         const range = config_mod.formatCodepointRange(&range_buf, sm.lo, sm.hi);
         var sub_buf: [192:0]u8 = undefined;
-        const sub = std.fmt.bufPrintZ(&sub_buf, "{s}  \xe2\x86\x92  {s}", .{
+        const sub = std.fmt.bufPrintSentinel(&sub_buf, "{s}  \xe2\x86\x92  {s}", .{
             range,
             if (sm.family.len > 0) sm.family else "(no family \xe2\x80\x94 not saved)",
-        }) catch "";
+        }, 0) catch "";
         var sub_z: [512]u8 = undefined;
         c.adw_expander_row_set_subtitle(@ptrCast(@alignCast(exp)), (markupEscape(&sub_z, sub) catch MARKUP_TOO_LONG).ptr);
 
@@ -2948,10 +2948,10 @@ fn buildHintGroup(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
         var title_z: [384]u8 = undefined;
         c.adw_preferences_row_set_title(@ptrCast(@alignCast(exp)), (markupEscape(&title_z, name) catch MARKUP_TOO_LONG).ptr);
         var sub_buf: [256:0]u8 = undefined;
-        const sub = std.fmt.bufPrintZ(&sub_buf, "{s}  \xe2\x86\x92  {s}", .{
+        const sub = std.fmt.bufPrintSentinel(&sub_buf, "{s}  \xe2\x86\x92  {s}", .{
             if (hr.pattern.len > 0) hr.pattern else "(no pattern \xe2\x80\x94 matches nothing)",
             @tagName(hr.action),
-        }) catch "";
+        }, 0) catch "";
         // The subtitle quotes a POSIX extended regex, which is exactly
         // where a user writes `<`, `>` and `&`.
         var sub_z: [512]u8 = undefined;

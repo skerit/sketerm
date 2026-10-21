@@ -134,7 +134,7 @@ pub const Lock = struct {
 
     pub fn acquire(base: []const u8) Error!Lock {
         var path_buf: [MAX_PATH]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "{s}/.registry.lock", .{base}) catch
+        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/.registry.lock", .{base}, 0) catch
             return error.PathTooLong;
         const fd = c.open(path.ptr, c.O_RDWR | c.O_CREAT | c.O_CLOEXEC | c.O_NOFOLLOW, @as(c_uint, 0o600));
         if (fd < 0) return error.LockFailed;
@@ -292,13 +292,13 @@ const TestDir = struct {
 
     fn deinit(self: *TestDir) void {
         var buf: [MAX_PATH]u8 = undefined;
-        const reg = std.fmt.bufPrintZ(&buf, "{s}/registry.json", .{self.path()}) catch return;
+        const reg = std.fmt.bufPrintSentinel(&buf, "{s}/registry.json", .{self.path()}, 0) catch return;
         _ = c.unlink(reg.ptr);
         var lbuf: [MAX_PATH]u8 = undefined;
-        const lock = std.fmt.bufPrintZ(&lbuf, "{s}/.registry.lock", .{self.path()}) catch return;
+        const lock = std.fmt.bufPrintSentinel(&lbuf, "{s}/.registry.lock", .{self.path()}, 0) catch return;
         _ = c.unlink(lock.ptr);
         var dbuf: [MAX_PATH]u8 = undefined;
-        const dir = std.fmt.bufPrintZ(&dbuf, "{s}", .{self.path()}) catch return;
+        const dir = std.fmt.bufPrintSentinel(&dbuf, "{s}", .{self.path()}, 0) catch return;
         _ = c.rmdir(dir.ptr);
     }
 };

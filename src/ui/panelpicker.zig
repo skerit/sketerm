@@ -267,7 +267,7 @@ fn openFor(window: *Window, pane: ?*Pane, target: panelhost.Target) void {
     // Which session's panels these are: several assistants share one
     // sketerm, so "these are mine" has to be visible.
     var head_buf: [160]u8 = undefined;
-    const head = std.fmt.bufPrintZ(&head_buf, "Panels saved for local session {s}", .{session}) catch
+    const head = std.fmt.bufPrintSentinel(&head_buf, "Panels saved for local session {s}", .{session}, 0) catch
         "Panels saved in this session";
 
     const ld = listdialog.build(.{
@@ -356,7 +356,7 @@ fn subtitle(arena: std.mem.Allocator, e: panelstore.Entry, invalid_reason: ?[]co
 
 fn setStatus(ctx: *Ctx, text: []const u8, spinning: bool, is_error: bool) void {
     var buf: [512]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{text}) catch "Saved-panel operation failed";
+    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{text}, 0) catch "Saved-panel operation failed";
     c.gtk_label_set_text(ctx.status_label, z.ptr);
     c.gtk_widget_set_visible(ctx.status_box, if (text.len > 0) 1 else 0);
     c.gtk_widget_set_visible(@ptrCast(@alignCast(ctx.status_spinner)), if (spinning) 1 else 0);
@@ -687,10 +687,11 @@ fn onDeleteClicked(button: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     };
 
     var body_buf: [320]u8 = undefined;
-    const body = std.fmt.bufPrintZ(
+    const body = std.fmt.bufPrintSentinel(
         &body_buf,
         "\"{s}\" will be removed from this session's saved panels. This cannot be undone.",
         .{rctx.name},
+        0,
     ) catch "This saved panel will be removed. This cannot be undone.";
 
     const alert = confirm.present(ctx.window.app_window, .{

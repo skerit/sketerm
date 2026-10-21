@@ -107,7 +107,7 @@ pub fn open(view: *EditorView, replace: bool) void {
             if (tab.doc.rope.sliceAlloc(view.allocator, sel.start(), sel.end())) |t| {
                 defer view.allocator.free(t);
                 if (std.mem.indexOfScalar(u8, t, '\n') == null) {
-                    if (view.allocator.dupeZ(u8, t)) |zz| {
+                    if (view.allocator.dupeSentinel(u8, t, 0)) |zz| {
                         defer view.allocator.free(zz);
                         c.gtk_editable_set_text(@ptrCast(view.find_entry), zz.ptr);
                     } else |_| {}
@@ -165,8 +165,8 @@ pub fn recompute(view: *EditorView, tab: *ETab, select: bool) void {
 fn countText(buf: *[40:0]u8, bad_pattern: bool, needle_len: usize, total: usize, current: ?usize) [:0]const u8 {
     if (bad_pattern) return "Bad pattern";
     if (total == 0) return if (needle_len == 0) "" else "No results";
-    if (current) |i| return std.fmt.bufPrintZ(buf, "{d} of {d}", .{ i + 1, total }) catch "";
-    return std.fmt.bufPrintZ(buf, "{d} matches", .{total}) catch "";
+    if (current) |i| return std.fmt.bufPrintSentinel(buf, "{d} of {d}", .{ i + 1, total }, 0) catch "";
+    return std.fmt.bufPrintSentinel(buf, "{d} matches", .{total}, 0) catch "";
 }
 
 fn updateCount(view: *EditorView, tab: *ETab) void {
@@ -252,7 +252,7 @@ pub fn replaceAll(view: *EditorView) void {
         options(view),
     ) catch return;
     var msg_buf: [64:0]u8 = undefined;
-    const msg = std.fmt.bufPrintZ(&msg_buf, "Replaced {d} occurrence(s).", .{n}) catch "Replaced.";
+    const msg = std.fmt.bufPrintSentinel(&msg_buf, "Replaced {d} occurrence(s).", .{n}, 0) catch "Replaced.";
     view.afterDocEdit(tab);
     view.setStatusText(msg.ptr);
 }

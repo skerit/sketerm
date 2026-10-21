@@ -121,7 +121,7 @@ pub fn decodeManifest(allocator: std.mem.Allocator, bytes: []const u8) !Batch {
 
 /// Return a verified private directory for Viewer handoff manifests.
 pub fn ensureManifestDirectory(out: *[4096:0]u8) ?[:0]const u8 {
-    const dir = std.fmt.bufPrintZ(out, "{s}/sketerm-viewer-batches-{d}", .{ platform.runtimeDir(), c.geteuid() }) catch return null;
+    const dir = std.fmt.bufPrintSentinel(out, "{s}/sketerm-viewer-batches-{d}", .{ platform.runtimeDir(), c.geteuid() }, 0) catch return null;
     const mkdir_rc = c.mkdir(dir.ptr, @as(c.mode_t, 0o700));
     if (mkdir_rc != 0 and std.posix.errno(mkdir_rc) != .EXIST) return null;
     if (mkdir_rc == 0) _ = c.chmod(dir.ptr, @as(c.mode_t, 0o700));

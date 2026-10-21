@@ -544,14 +544,14 @@ fn renderHeader(self: *State) void {
     const errors = if (node) |n| n.errors else if (std.mem.eql(u8, self.current, self.root)) self.result_errors else 0;
     const skipped = if (node) |n| n.skipped else if (std.mem.eql(u8, self.current, self.root)) self.result_skipped else 0;
     const metric_name = if (self.metric == .allocated) "on disk" else "apparent";
-    const text = std.fmt.bufPrintZ(&summary, "{s} {s} in {d} item(s){s}{s}{s}", .{
+    const text = std.fmt.bufPrintSentinel(&summary, "{s} {s} in {d} item(s){s}{s}{s}", .{
         format.fmtSize(&size_buf, total),
         metric_name,
         items,
         if (self.canceling) " - canceling" else if (self.running) " - scanning" else "",
         if (errors > 0) " - unreadable content" else "",
         if (skipped > 0) " - mounted filesystems skipped" else "",
-    }) catch "Disk usage";
+    }, 0) catch "Disk usage";
     c.gtk_label_set_text(self.summary_label, text.ptr);
     if (errors > 0 or skipped > 0 or self.truncated)
         c.gtk_widget_add_css_class(@ptrCast(@alignCast(self.summary_label)), "warning")
@@ -575,18 +575,18 @@ fn renderHeader(self: *State) void {
     } else if (self.running) {
         var progress: [720:0]u8 = undefined;
         const path = self.progress_file[0..self.progress_file_len];
-        const txt = std.fmt.bufPrintZ(&progress, "Scanned {d} item(s){s}{s}", .{
+        const txt = std.fmt.bufPrintSentinel(&progress, "Scanned {d} item(s){s}{s}", .{
             self.progress_items,
             if (path.len > 0) ": " else "",
             path,
-        }) catch "Scanning...";
+        }, 0) catch "Scanning...";
         c.gtk_label_set_text(self.progress_label, txt.ptr);
     } else if (!self.failed and !self.canceled) {
         var complete: [220:0]u8 = undefined;
-        const txt = std.fmt.bufPrintZ(&complete, "Scan complete: {d} item(s){s}", .{
+        const txt = std.fmt.bufPrintSentinel(&complete, "Scan complete: {d} item(s){s}", .{
             self.progress_items -| 1,
             if (self.truncated) "; smaller detail omitted" else "",
-        }) catch "Scan complete";
+        }, 0) catch "Scan complete";
         c.gtk_label_set_text(self.progress_label, txt.ptr);
     }
     if (self.tab.view.currentTab() == self.tab) self.tab.view.setStatus(std.mem.span(c.gtk_label_get_text(self.progress_label)));
@@ -645,7 +645,7 @@ fn appendNodeRow(self: *State, index: usize, total: u64) void {
     c.gtk_label_set_xalign(@ptrCast(size), 1);
     c.gtk_box_append(@ptrCast(box), size);
     var percent_buf: [24:0]u8 = undefined;
-    const percent_text = if (total > 0) std.fmt.bufPrintZ(&percent_buf, "{d:.1}%", .{fraction * 100}) catch "" else "";
+    const percent_text = if (total > 0) std.fmt.bufPrintSentinel(&percent_buf, "{d:.1}%", .{fraction * 100}, 0) catch "" else "";
     const percent = c.gtk_label_new(percent_text.ptr).?;
     c.gtk_widget_set_size_request(percent, 58, -1);
     c.gtk_label_set_xalign(@ptrCast(percent), 1);
@@ -655,7 +655,7 @@ fn appendNodeRow(self: *State, index: usize, total: u64) void {
     if (node.kind == .mount) {
         item_text = "Not scanned";
     } else if (node.kind == .dir) {
-        if (std.fmt.bufPrintZ(&items_buf, "{d}", .{node.items -| 1})) |text|
+        if (std.fmt.bufPrintSentinel(&items_buf, "{d}", .{node.items -| 1}, 0)) |text|
             item_text = text.ptr
         else |_|
             item_text = "";
@@ -681,9 +681,9 @@ fn appendOtherRow(self: *State, value: u64, total: u64, omitted: usize) void {
     c.gtk_box_append(@ptrCast(box), c.gtk_image_new_from_icon_name("view-more-symbolic"));
     var label_buf: [96:0]u8 = undefined;
     const label_text = if (omitted > 0)
-        std.fmt.bufPrintZ(&label_buf, "Other ({d} smaller entries)", .{omitted}) catch "Other"
+        std.fmt.bufPrintSentinel(&label_buf, "Other ({d} smaller entries)", .{omitted}, 0) catch "Other"
     else
-        std.fmt.bufPrintZ(&label_buf, "Other files and folder metadata", .{}) catch "Other";
+        std.fmt.bufPrintSentinel(&label_buf, "Other files and folder metadata", .{}, 0) catch "Other";
     const label = c.gtk_label_new(label_text.ptr).?;
     c.gtk_label_set_xalign(@ptrCast(label), 0);
     c.gtk_widget_set_hexpand(label, 1);
@@ -696,7 +696,7 @@ fn appendOtherRow(self: *State, value: u64, total: u64, omitted: usize) void {
     c.gtk_box_append(@ptrCast(box), size);
     var percent_buf: [24:0]u8 = undefined;
     const fraction = if (total > 0) @as(f64, @floatFromInt(value)) / @as(f64, @floatFromInt(total)) else 0;
-    const pct = std.fmt.bufPrintZ(&percent_buf, "{d:.1}%", .{fraction * 100}) catch "";
+    const pct = std.fmt.bufPrintSentinel(&percent_buf, "{d:.1}%", .{fraction * 100}, 0) catch "";
     const percent = c.gtk_label_new(pct.ptr).?;
     c.gtk_widget_set_size_request(percent, 58, -1);
     c.gtk_label_set_xalign(@ptrCast(percent), 1);
@@ -800,7 +800,7 @@ fn onChartMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaq
             const node = self.model.nodes.items[value];
             var size_buf: [48:0]u8 = undefined;
             var tip: [720:0]u8 = undefined;
-            const text = std.fmt.bufPrintZ(&tip, "{s}\n{s}", .{ node.path, format.fmtSize(&size_buf, node.value(self.metric)) }) catch return;
+            const text = std.fmt.bufPrintSentinel(&tip, "{s}\n{s}", .{ node.path, format.fmtSize(&size_buf, node.value(self.metric)) }, 0) catch return;
             c.gtk_widget_set_tooltip_text(self.chart, text.ptr);
         }
         c.gtk_widget_set_cursor_from_name(self.chart, "pointer");

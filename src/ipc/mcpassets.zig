@@ -168,18 +168,18 @@ test "save/load/list/delete round-trip in an isolated state dir" {
     const dir = std.mem.span(@as([*:0]u8, @ptrCast(dir_z)));
     var zbuf: [4096]u8 = undefined;
     var envbuf: [160]u8 = undefined;
-    const env = try std.fmt.bufPrintZ(&envbuf, "{s}", .{dir});
+    const env = try std.fmt.bufPrintSentinel(&envbuf, "{s}", .{dir}, 0);
     var saved: @import("../util/env.zig").Saved = .{};
     try saved.override("XDG_STATE_HOME", env);
     defer {
         saved.restore();
-        if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm/macros", .{dir})) |macros| {
+        if (std.fmt.bufPrintSentinel(&zbuf, "{s}/sketerm/macros", .{dir}, 0)) |macros| {
             _ = c.rmdir(macros.ptr);
         } else |_| {}
-        if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm/agent-templates", .{dir})) |tpls| {
+        if (std.fmt.bufPrintSentinel(&zbuf, "{s}/sketerm/agent-templates", .{dir}, 0)) |tpls| {
             _ = c.rmdir(tpls.ptr);
         } else |_| {}
-        if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm", .{dir})) |root| {
+        if (std.fmt.bufPrintSentinel(&zbuf, "{s}/sketerm", .{dir}, 0)) |root| {
             _ = c.rmdir(root.ptr);
         } else |_| {}
         _ = c.rmdir(dir_z);
@@ -242,7 +242,7 @@ test "concurrent asset saves install one complete value and clean stages" {
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/macro.json", .{base});
     var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    const path_z = try std.fmt.bufPrintSentinel(&path_z_buf, "{s}", .{path}, 0);
     defer _ = c.unlink(path_z.ptr);
 
     const Ctx = struct {

@@ -882,7 +882,7 @@ fn appendPlaceRow(self: *BrowserView, hbox: *c.GtkWidget, ctx: *PlaceCtx) void {
     const row = c.gtk_list_box_row_new();
     c.gtk_list_box_row_set_child(@ptrCast(row), hbox);
     var tip: [4300:0]u8 = undefined;
-    if (std.fmt.bufPrintZ(&tip, "{s}", .{ctx.spec})) |t| c.gtk_widget_set_tooltip_text(@ptrCast(row), t.ptr) else |_| {}
+    if (std.fmt.bufPrintSentinel(&tip, "{s}", .{ctx.spec}, 0)) |t| c.gtk_widget_set_tooltip_text(@ptrCast(row), t.ptr) else |_| {}
     c.g_object_set_data_full(@ptrCast(row), "sketerm-place", @ptrCast(ctx), @ptrCast(&PlaceCtx.free));
     c.gtk_list_box_append(self.places_list, row);
 }
@@ -899,7 +899,7 @@ fn recentRow(self: *BrowserView, spec: []const u8) void {
         c.gtk_widget_set_margin_end(hbox, 10);
         c.gtk_box_append(@ptrCast(hbox), iconload.newImageIcon(@ptrCast(@alignCast(self.places_list)), "document-open-recent-symbolic", 16));
         var hz: [260:0]u8 = undefined;
-        const host_text = std.fmt.bufPrintZ(&hz, "{s}:", .{host}) catch return;
+        const host_text = std.fmt.bufPrintSentinel(&hz, "{s}:", .{host}, 0) catch return;
         const host_label = c.gtk_label_new(host_text.ptr);
         c.gtk_widget_add_css_class(host_label, "dim-label");
         c.gtk_box_append(@ptrCast(hbox), host_label);
@@ -930,10 +930,10 @@ fn recentRow(self: *BrowserView, spec: []const u8) void {
     const esc_name = c.g_markup_escape_text(&nz, -1) orelse return;
     defer c.g_free(@ptrCast(esc_name));
     var markup: [3072:0]u8 = undefined;
-    const m = std.fmt.bufPrintZ(&markup, "<span alpha=\"55%\">{s}</span>{s}", .{
+    const m = std.fmt.bufPrintSentinel(&markup, "<span alpha=\"55%\">{s}</span>{s}", .{
         std.mem.span(@as([*:0]const u8, @ptrCast(esc_parent))),
         std.mem.span(@as([*:0]const u8, @ptrCast(esc_name))),
-    }) catch return;
+    }, 0) catch return;
     placeRowMarkup(self, "document-open-recent-symbolic", m.ptr, spec);
 }
 
@@ -1859,7 +1859,7 @@ pub fn runSavedSearch(self: *BrowserView, idx: usize) void {
     const content = sq.content;
     self.navigateSpec(tab, spec);
     var pz: [512:0]u8 = undefined;
-    const pat = std.fmt.bufPrintZ(&pz, "{s}", .{text}) catch return;
+    const pat = std.fmt.bufPrintSentinel(&pz, "{s}", .{text}, 0) catch return;
     c.gtk_editable_set_text(@ptrCast(self.search_entry), pat.ptr);
     c.gtk_check_button_set_active(@ptrCast(self.search_content), @intFromBool(content));
     c.gtk_widget_set_visible(self.search_bar, 1);

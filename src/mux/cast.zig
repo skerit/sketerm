@@ -99,7 +99,7 @@ pub const Rec = struct {
         now_ms: i64,
     ) !Rec {
         var z_buf: [4096]u8 = undefined;
-        const z = std.fmt.bufPrintZ(&z_buf, "{s}", .{path}) catch return error.BadPath;
+        const z = std.fmt.bufPrintSentinel(&z_buf, "{s}", .{path}, 0) catch return error.BadPath;
         const f = c.fopen(z.ptr, "w") orelse return error.OpenFailed;
         errdefer _ = c.fclose(f);
 

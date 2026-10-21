@@ -912,7 +912,7 @@ test "agent_templates shows the stored files that do not load in a problems bloc
     const a = rig.arena.allocator();
     var env_buf: [96]u8 = undefined;
     var saved_env: @import("../util/env.zig").Saved = .{};
-    try saved_env.override("XDG_STATE_HOME", try std.fmt.bufPrintZ(&env_buf, "{s}", .{rig.dir.path()}));
+    try saved_env.override("XDG_STATE_HOME", try std.fmt.bufPrintSentinel(&env_buf, "{s}", .{rig.dir.path()}, 0));
     defer saved_env.restore();
     _ = try shaped(a, "agent_template_save", try rig.call(.agent_template_save, "{\"name\":\"good\",\"text\":\"do {task}\"}"));
     try @import("mcpassets.zig").save(a, .agent_template, "broken", "not json");

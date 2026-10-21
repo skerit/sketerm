@@ -505,7 +505,7 @@ pub fn onDamage(self: *WebFace, dmg: proto.FrameDamage) void {
             _ = c.fclose(f);
         }
         var meta_buf: [512]u8 = undefined;
-        if (std.fmt.bufPrintZ(&meta_buf, "{s}.txt", .{path}) catch null) |mp| {
+        if (std.fmt.bufPrintSentinel(&meta_buf, "{s}.txt", .{path}, 0) catch null) |mp| {
             if (c.fopen(mp.ptr, "wb")) |f| {
                 var line: [128]u8 = undefined;
                 const t = std.fmt.bufPrint(&line, "{d} {d} {d}\n", .{ self.buf_w, self.buf_h, self.buf_stride }) catch "";

@@ -84,11 +84,12 @@ pub fn localPathOrRefuse(
     const loc = paths.parseSpec(spec);
     const host = loc.host orelse return loc.path;
     var body: [640:0]u8 = undefined;
-    const b = std.fmt.bufPrintZ(
+    const b = std.fmt.bufPrintSentinel(
         &body,
         "\"{s}\" lives on {s}. " ++ detail,
         .{ loc.path, host },
-    ) catch std.fmt.bufPrintZ(&body, detail, .{}) catch unreachable;
+        0,
+    ) catch std.fmt.bufPrintSentinel(&body, detail, .{}, 0) catch unreachable;
     _ = confirm.present(@ptrCast(@alignCast(parent)), .{
         .heading = "Remote file",
         .body = b.ptr,
@@ -507,8 +508,8 @@ pub const PickerWindow = struct {
     fn contentTypeIsA(mime: []const u8, super: []const u8) bool {
         var a: [256:0]u8 = undefined;
         var b: [256:0]u8 = undefined;
-        const az = std.fmt.bufPrintZ(&a, "{s}", .{mime}) catch return false;
-        const bz = std.fmt.bufPrintZ(&b, "{s}", .{super}) catch return false;
+        const az = std.fmt.bufPrintSentinel(&a, "{s}", .{mime}, 0) catch return false;
+        const bz = std.fmt.bufPrintSentinel(&b, "{s}", .{super}, 0) catch return false;
         return c.g_content_type_is_a(az.ptr, bz.ptr) != 0;
     }
 
@@ -759,13 +760,14 @@ pub const PickerWindow = struct {
         }
         const h = host orelse return false;
         var body: [640:0]u8 = undefined;
-        const b = std.fmt.bufPrintZ(
+        const b = std.fmt.bufPrintSentinel(
             &body,
             "\"{s}\" lives on {s}. The application that opened this dialog reads " ++
                 "and writes files on this machine only, so it cannot use a file on " ++
                 "another host. Copy it here first, then pick the local copy.",
             .{ leaf, h },
-        ) catch std.fmt.bufPrintZ(&body, "The application that opened this dialog can only use files on this machine.", .{}) catch unreachable;
+            0,
+        ) catch std.fmt.bufPrintSentinel(&body, "The application that opened this dialog can only use files on this machine.", .{}, 0) catch unreachable;
         _ = confirm.present(@ptrCast(@alignCast(self.window)), .{
             .heading = "File is on another host",
             .body = b.ptr,
@@ -1015,8 +1017,8 @@ pub const PickerWindow = struct {
         };
         ctx.* = .{ .self = self, .spec = spec, .name = owned_name };
         var body: [600:0]u8 = undefined;
-        const b = std.fmt.bufPrintZ(&body, "\"{s}\" already exists. Replacing it overwrites its contents.", .{name}) catch blk: {
-            break :blk std.fmt.bufPrintZ(&body, "The file already exists. Replacing it overwrites its contents.", .{}) catch unreachable;
+        const b = std.fmt.bufPrintSentinel(&body, "\"{s}\" already exists. Replacing it overwrites its contents.", .{name}, 0) catch blk: {
+            break :blk std.fmt.bufPrintSentinel(&body, "The file already exists. Replacing it overwrites its contents.", .{}, 0) catch unreachable;
         };
         if (confirm.present(@ptrCast(@alignCast(self.window)), .{
             .heading = "Replace file?",

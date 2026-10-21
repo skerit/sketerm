@@ -106,7 +106,7 @@ pub const Client = struct {
     /// helper may lack degrades by construction: a verb it does not
     /// advertise is never posted, and its menu row is insensitive rather
     /// than hidden, so it stays discoverable.
-    caps: proto.Caps = .initEmpty(),
+    caps: proto.Caps = .empty,
     /// The current connection's `hello_ack` has arrived. Container views
     /// wait for it, because whether the helper can keep a container's
     /// identity apart (`contexts-fail-closed`) is only known from it.
@@ -392,7 +392,7 @@ pub const Client = struct {
         }
         // Capabilities belong to the CONNECTION, not to the client: a
         // restart may land on a different helper build.
-        self.caps = .initEmpty();
+        self.caps = .empty;
         self.sync_enabled = false;
         self.hello_done = false;
         self.adopted = false;
@@ -418,7 +418,7 @@ pub const Client = struct {
     fn makeSocketPath(self: *Client) ?[]const u8 {
         const rt = platform.runtimeDir();
         var dir_buf: [96:0]u8 = undefined;
-        const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm", .{rt}) catch return null;
+        const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/sketerm", .{rt}, 0) catch return null;
         _ = c.mkdir(dir.ptr, 0o700);
         var slug_buf: [64]u8 = undefined;
         const slug = self.routeSpec().slug(&slug_buf) orelse return null;
@@ -463,12 +463,12 @@ pub const Client = struct {
         else
             return null;
         var base_buf: [128:0]u8 = undefined;
-        const base = std.fmt.bufPrintZ(&base_buf, "{s}/sketerm", .{state}) catch return null;
+        const base = std.fmt.bufPrintSentinel(&base_buf, "{s}/sketerm", .{state}, 0) catch return null;
         _ = c.mkdir(base.ptr, 0o700);
         var routes_buf: [128:0]u8 = undefined;
-        const routes = std.fmt.bufPrintZ(&routes_buf, "{s}/web-routes", .{base}) catch return null;
+        const routes = std.fmt.bufPrintSentinel(&routes_buf, "{s}/web-routes", .{base}, 0) catch return null;
         _ = c.mkdir(routes.ptr, 0o700);
-        const p = std.fmt.bufPrintZ(&self.cache_dir, "{s}/{s}", .{ routes, slug }) catch return null;
+        const p = std.fmt.bufPrintSentinel(&self.cache_dir, "{s}/{s}", .{ routes, slug }, 0) catch return null;
         _ = c.mkdir(p.ptr, 0o700);
         self.cache_dir_len = p.len;
         return p;
@@ -525,7 +525,7 @@ pub const Client = struct {
     fn adoptRunningHelper(self: *Client) bool {
         const rt = platform.runtimeDir();
         var dir_buf: [96:0]u8 = undefined;
-        const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm", .{rt}) catch return false;
+        const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/sketerm", .{rt}, 0) catch return false;
         var slug_buf: [64]u8 = undefined;
         const slug: ?[]const u8 = if (self.routeSpec().isDirect())
             null

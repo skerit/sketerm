@@ -324,7 +324,7 @@ fn daemonStatsAt(allocator: std.mem.Allocator, socket: []const u8) !DaemonStats 
 
 fn pathExists(path: []const u8) bool {
     var z: [4096]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return false;
+    const path_z = std.fmt.bufPrintSentinel(&z, "{s}", .{path}, 0) catch return false;
     return c.access(path_z.ptr, c.F_OK) == 0;
 }
 

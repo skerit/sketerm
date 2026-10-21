@@ -167,7 +167,7 @@ fn openLegacy(win: *Window, pane: *Pane) void {
 
     var title_buf: [256]u8 = undefined;
     const host = if (pane.terminal.remote) |r| (if (r.host) |h| h else "local") else "remote";
-    const title = std.fmt.bufPrintZ(&title_buf, "Download from {s}", .{host}) catch "Download";
+    const title = std.fmt.bufPrintSentinel(&title_buf, "Download from {s}", .{host}, 0) catch "Download";
     c.gtk_window_set_title(@ptrCast(window), title.ptr);
     c.gtk_window_set_default_size(@ptrCast(window), 560, 600);
     c.gtk_window_set_transient_for(@ptrCast(window), @ptrCast(win.app_window));
@@ -238,7 +238,7 @@ fn onListing(ctx: ?*anyopaque, listing: Terminal.Listing) void {
         // Navigation failed (e.g. permission denied): keep the current
         // view, surface the reason.
         var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(&buf, "Cannot open: {s}", .{listing.err}) catch "Cannot open directory";
+        const msg = std.fmt.bufPrintSentinel(&buf, "Cannot open: {s}", .{listing.err}, 0) catch "Cannot open directory";
         c.gtk_label_set_text(@ptrCast(self.status), msg.ptr);
         return;
     }
@@ -248,7 +248,7 @@ fn onListing(ctx: ?*anyopaque, listing: Terminal.Listing) void {
     self.allocator.free(self.cur_path);
     self.cur_path = newp;
     var addr_buf: [4096]u8 = undefined;
-    if (std.fmt.bufPrintZ(&addr_buf, "{s}", .{listing.path})) |z| {
+    if (std.fmt.bufPrintSentinel(&addr_buf, "{s}", .{listing.path}, 0)) |z| {
         c.gtk_editable_set_text(@ptrCast(self.addr), z.ptr);
     } else |_| {}
 
@@ -257,15 +257,15 @@ fn onListing(ctx: ?*anyopaque, listing: Terminal.Listing) void {
 
     var sbuf: [128]u8 = undefined;
     const status = if (listing.truncated)
-        std.fmt.bufPrintZ(&sbuf, "{d} items (truncated)", .{listing.entries.len}) catch ""
+        std.fmt.bufPrintSentinel(&sbuf, "{d} items (truncated)", .{listing.entries.len}, 0) catch ""
     else
-        std.fmt.bufPrintZ(&sbuf, "{d} items", .{listing.entries.len}) catch "";
+        std.fmt.bufPrintSentinel(&sbuf, "{d} items", .{listing.entries.len}, 0) catch "";
     c.gtk_label_set_text(@ptrCast(self.status), status.ptr);
 }
 
 fn addRow(self: *Browser, e: Terminal.DirEntry) void {
     var name_buf: [1024]u8 = undefined;
-    const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{e.name}) catch return;
+    const name_z = std.fmt.bufPrintSentinel(&name_buf, "{s}", .{e.name}, 0) catch return;
 
     const row = c.gtk_list_box_row_new();
     const box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);

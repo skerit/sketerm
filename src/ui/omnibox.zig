@@ -596,7 +596,7 @@ pub const Omnibox = struct {
     }
 
     fn setLabel(label: *c.GtkWidget, text: []const u8, arena: std.mem.Allocator) void {
-        const z = arena.dupeZ(u8, text) catch return;
+        const z = arena.dupeSentinel(u8, text, 0) catch return;
         c.gtk_label_set_text(@ptrCast(label), z.ptr);
     }
 

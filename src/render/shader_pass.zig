@@ -668,11 +668,11 @@ pub const ShaderPass = struct {
         var path_z: [4096]u8 = undefined;
         const resolved: ?[:0]const u8 = blk: {
             if (path.len > 0 and path[0] == '/') {
-                break :blk std.fmt.bufPrintZ(&path_z, "{s}", .{path}) catch null;
+                break :blk std.fmt.bufPrintSentinel(&path_z, "{s}", .{path}, 0) catch null;
             }
             const dir = if (self.source) |s| s.dir else null;
             if (dir) |d| {
-                break :blk std.fmt.bufPrintZ(&path_z, "{s}/{s}", .{ d, path }) catch null;
+                break :blk std.fmt.bufPrintSentinel(&path_z, "{s}/{s}", .{ d, path }, 0) catch null;
             }
             break :blk null;
         };

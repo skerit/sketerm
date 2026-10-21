@@ -128,7 +128,7 @@ pub const Transaction = struct {
             else => return error.RenameFailed,
         }
         var aside_buf: [MAX_PATH]u8 = undefined;
-        const aside_z = std.fmt.bufPrintZ(&aside_buf, "{s}.swap", .{self.stage}) catch
+        const aside_z = std.fmt.bufPrintSentinel(&aside_buf, "{s}.swap", .{self.stage}, 0) catch
             return error.PathTooLong;
         if (c.rename(dest_z, aside_z) != 0) return error.RenameFailed;
         if (c.rename(stage_z, dest_z) != 0) {

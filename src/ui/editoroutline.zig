@@ -206,9 +206,9 @@ fn rebuildRows(view: *EditorView, tab: *ETab) void {
         var buf: [320:0]u8 = undefined;
         const detail = tab.outline.detail(i);
         const text = if (detail.len > 0)
-            std.fmt.bufPrintZ(&buf, "{s}  {s}", .{ tab.outline.name(i), detail }) catch continue
+            std.fmt.bufPrintSentinel(&buf, "{s}  {s}", .{ tab.outline.name(i), detail }, 0) catch continue
         else
-            std.fmt.bufPrintZ(&buf, "{s}", .{tab.outline.name(i)}) catch continue;
+            std.fmt.bufPrintSentinel(&buf, "{s}", .{tab.outline.name(i)}, 0) catch continue;
         const label = c.gtk_label_new(text.ptr);
         c.gtk_label_set_xalign(@ptrCast(label), 0);
         c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_END);
@@ -228,9 +228,9 @@ fn updateStatus(view: *EditorView, tab: *ETab) void {
         .none => "",
     };
     const z = if (tab.outline.isEmpty())
-        std.fmt.bufPrintZ(&buf, "No symbols.", .{}) catch return
+        std.fmt.bufPrintSentinel(&buf, "No symbols.", .{}, 0) catch return
     else
-        std.fmt.bufPrintZ(&buf, "{d} symbol(s) — {s}", .{ tab.outline.nodes.items.len, src }) catch return;
+        std.fmt.bufPrintSentinel(&buf, "{d} symbol(s) — {s}", .{ tab.outline.nodes.items.len, src }, 0) catch return;
     c.gtk_label_set_text(view.outline_status, z.ptr);
 }
 

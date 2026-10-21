@@ -349,7 +349,7 @@ const TabLabels = struct { title: [:0]const u8, detail: [:0]const u8 };
 /// detail names the window only when there is more than one.
 fn tabLabels(arena: std.mem.Allocator, title: []const u8, many: bool, win_id: u32, index: usize) !TabLabels {
     return .{
-        .title = try arena.dupeZ(u8, if (title.len > 0) title else "Untitled tab"),
+        .title = try arena.dupeSentinel(u8, if (title.len > 0) title else "Untitled tab", 0),
         .detail = if (many)
             try std.fmt.allocPrintSentinel(arena, "Window {d} \u{b7} tab {d}", .{ win_id, index + 1 }, 0)
         else

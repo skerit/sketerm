@@ -3944,8 +3944,8 @@ fn pickNamedMatch(payload: []const u8, role: ?[]const u8, wanted: []const u8, nt
         // Name OR value, which is exactly what `semantic.zig`'s find_text
         // matched on to put the line in this pool; a value match never
         // counts as an exact NAME match on its own.
-        const name_hit = f.name.len > 0 and std.ascii.indexOfIgnoreCase(f.name, wanted) != null;
-        const value_hit = f.value.len > 0 and std.ascii.indexOfIgnoreCase(f.value, wanted) != null;
+        const name_hit = f.name.len > 0 and std.ascii.findIgnoreCase(f.name, wanted) != null;
+        const value_hit = f.value.len > 0 and std.ascii.findIgnoreCase(f.value, wanted) != null;
         if (!name_hit and !value_hit) continue;
         const exact = (f.name.len > 0 and std.ascii.eqlIgnoreCase(f.name, wanted)) or
             (f.value.len > 0 and std.ascii.eqlIgnoreCase(f.value, wanted));
@@ -5647,7 +5647,7 @@ fn profilePersistence(arena: std.mem.Allocator, e: *webdrive.Engine, name: []con
 
 fn pathExists(path: []const u8) bool {
     var buf: [4096]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return true;
+    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0) catch return true;
     const lc = @import("../c.zig").c;
     return lc.access(z.ptr, lc.F_OK) == 0;
 }
@@ -6543,7 +6543,7 @@ pub fn extensionFor(mime: []const u8, kind: []const u8) []const u8 {
         .{ "javascript", ".js" }, .{ "css", ".css" },
     };
     for (pairs) |p| {
-        if (std.ascii.indexOfIgnoreCase(mime, p[0]) != null) return p[1];
+        if (std.ascii.findIgnoreCase(mime, p[0]) != null) return p[1];
     }
     return ".txt";
 }
@@ -9488,7 +9488,7 @@ test "web_eval out_file writes the whole result and keeps it out of the reply" {
 
 fn readBackForTest(path: []const u8, buf: []u8) []const u8 {
     var z: [4096:0]u8 = undefined;
-    const zp = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return "";
+    const zp = std.fmt.bufPrintSentinel(&z, "{s}", .{path}, 0) catch return "";
     const f = @import("../c.zig").c.fopen(zp.ptr, "rb") orelse return "";
     defer _ = @import("../c.zig").c.fclose(f);
     const n = @import("../c.zig").c.fread(buf.ptr, 1, buf.len, f);

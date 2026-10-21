@@ -80,7 +80,7 @@ pub fn dbg(comptime fmt: []const u8, args: anytype) void {
     const on = @import("../util/profile.zig").getenv("SKETERM_LSP_DEBUG") != null;
     if (!on) return;
     var buf: [512]u8 = undefined;
-    const s = std.fmt.bufPrintZ(&buf, "sketerm: lsp: " ++ fmt ++ "\n", args) catch return;
+    const s = std.fmt.bufPrintSentinel(&buf, "sketerm: lsp: " ++ fmt ++ "\n", args, 0) catch return;
     _ = c.fprintf(@import("../util/platform.zig").stderr(), "%s", s.ptr);
 }
 
@@ -1092,7 +1092,7 @@ pub const Manager = struct {
 
     fn reportNoServer(self: *Manager, what: []const u8) void {
         var buf: [160:0]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(&buf, "No language server for {s}.", .{what}) catch "No language server.";
+        const msg = std.fmt.bufPrintSentinel(&buf, "No language server for {s}.", .{what}, 0) catch "No language server.";
         self.view.setStatusText(msg);
     }
 
@@ -1565,7 +1565,7 @@ pub const Manager = struct {
         };
         if (!supported) {
             var buf: [160:0]u8 = undefined;
-            const msg = std.fmt.bufPrintZ(&buf, "Server does not support {s}.", .{what}) catch "Unsupported.";
+            const msg = std.fmt.bufPrintSentinel(&buf, "Server does not support {s}.", .{what}, 0) catch "Unsupported.";
             self.view.setStatusText(msg);
             return;
         }
@@ -2602,7 +2602,7 @@ pub const Manager = struct {
         // `postStatus`, via setStatusText: the sentence has to survive
         // the burst of updateStatus rebuilds a cross-file edit causes,
         // which is exactly what EditorView's sticky note is for.
-        const msg = std.fmt.bufPrintZ(&buf, "{s}", .{w.items}) catch return self.view.setStatusText(verb ++ ".");
+        const msg = std.fmt.bufPrintSentinel(&buf, "{s}", .{w.items}, 0) catch return self.view.setStatusText(verb ++ ".");
         self.view.setStatusText(msg);
     }
 
@@ -2614,16 +2614,18 @@ pub const Manager = struct {
         var buf: [200:0]u8 = undefined;
         const remaining = self.view.deferred.countKind(.lsp_text_edits);
         const msg = if (remaining > 0)
-            std.fmt.bufPrintZ(
+            std.fmt.bufPrintSentinel(
                 &buf,
                 "Edited {d} file(s) so far; {d} still opening.",
                 .{ self.pending_touched, remaining },
+                0,
             ) catch "Edited."
         else
-            std.fmt.bufPrintZ(
+            std.fmt.bufPrintSentinel(
                 &buf,
                 "Edited {d} file(s) — {d} separate undo steps, one per file.",
                 .{ self.pending_touched, self.pending_touched },
+                0,
             ) catch "Edited.";
         self.view.setStatusText(msg);
     }
@@ -3116,7 +3118,7 @@ pub const Manager = struct {
             // The status line gets the message; related lines are the
             // hover's (and Alt+F8's) business.
             const first = txt[0 .. std.mem.indexOfScalar(u8, txt, '\n') orelse txt.len];
-            const msg = std.fmt.bufPrintZ(&buf, "{s}", .{@import("../editor/unicode.zig").clipUtf8(first, buf.len - 1)}) catch return;
+            const msg = std.fmt.bufPrintSentinel(&buf, "{s}", .{@import("../editor/unicode.zig").clipUtf8(first, buf.len - 1)}, 0) catch return;
             self.view.setStatusText(msg);
         }
     }
@@ -3299,7 +3301,7 @@ pub const Manager = struct {
             const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
             const name = c.gtk_label_new(null);
             var nbuf: [256:0]u8 = undefined;
-            const ntext = std.fmt.bufPrintZ(&nbuf, "{s}", .{it.label}) catch "";
+            const ntext = std.fmt.bufPrintSentinel(&nbuf, "{s}", .{it.label}, 0) catch "";
             c.gtk_label_set_text(@ptrCast(name), ntext.ptr);
             c.gtk_label_set_xalign(@ptrCast(name), 0);
             // Ellipsized, or a long symbol would raise the popover's
@@ -3313,7 +3315,7 @@ pub const Manager = struct {
             if (it.detail.len > 0) {
                 const det = c.gtk_label_new(null);
                 var dbuf: [256:0]u8 = undefined;
-                const dtext = std.fmt.bufPrintZ(&dbuf, "{s}", .{it.detail}) catch "";
+                const dtext = std.fmt.bufPrintSentinel(&dbuf, "{s}", .{it.detail}, 0) catch "";
                 c.gtk_label_set_text(@ptrCast(det), dtext.ptr);
                 c.gtk_label_set_xalign(@ptrCast(det), 1);
                 c.gtk_label_set_ellipsize(@ptrCast(det), c.PANGO_ELLIPSIZE_END);
@@ -3350,12 +3352,12 @@ pub const Manager = struct {
             .none => "",
         };
         var full: [512:0]u8 = undefined;
-        const all = std.fmt.bufPrintZ(&full, "{s}  ({d}){s}{s}", .{
+        const all = std.fmt.bufPrintSentinel(&full, "{s}  ({d}){s}{s}", .{
             title,
             self.list.shown.items.len,
             if (self.list.filter.items.len > 0) "  filter: " else "",
             if (self.list.filter.items.len > 0) self.list.filter.items else "",
-        }) catch return;
+        }, 0) catch return;
         c.gtk_label_set_text(hdr, all.ptr);
         // The selected item's documentation, on its own ellipsized
         // single line (see the invariant on ensurePopup: this label
@@ -3367,7 +3369,7 @@ pub const Manager = struct {
         }
         if (self.list.doc_label) |dl| {
             var dbuf: [512:0]u8 = undefined;
-            const dz = std.fmt.bufPrintZ(&dbuf, "{s}", .{docline[0..@min(docline.len, 400)]}) catch return;
+            const dz = std.fmt.bufPrintSentinel(&dbuf, "{s}", .{docline[0..@min(docline.len, 400)]}, 0) catch return;
             c.gtk_label_set_text(dl, if (dz.len > 0) dz.ptr else " ");
         }
     }
@@ -3410,7 +3412,7 @@ pub const Manager = struct {
         if (self.hover.open) {
             if (self.hover.popover) |p| c.gtk_popover_popdown(@ptrCast(p));
         }
-        const z = self.alloc.dupeZ(u8, text[0..@min(text.len, 4000)]) catch return;
+        const z = self.alloc.dupeSentinel(u8, text[0..@min(text.len, 4000)], 0) catch return;
         defer self.alloc.free(z);
         c.gtk_label_set_text(self.hover.label.?, z.ptr);
         if (self.hover.at) |rect| {
@@ -3466,10 +3468,10 @@ pub const Manager = struct {
         if (self.view.widgets_dead) return;
         if (!self.ensureSignature()) return;
         var lbuf: [1024:0]u8 = undefined;
-        const lz = std.fmt.bufPrintZ(&lbuf, "{s}", .{label[0..@min(label.len, 900)]}) catch return;
+        const lz = std.fmt.bufPrintSentinel(&lbuf, "{s}", .{label[0..@min(label.len, 900)]}, 0) catch return;
         c.gtk_label_set_text(self.sig.label.?, if (lz.len > 0) lz.ptr else " ");
         var dbuf: [1024:0]u8 = undefined;
-        const dz = std.fmt.bufPrintZ(&dbuf, "{s}", .{detail[0..@min(detail.len, 900)]}) catch return;
+        const dz = std.fmt.bufPrintSentinel(&dbuf, "{s}", .{detail[0..@min(detail.len, 900)]}, 0) catch return;
         c.gtk_label_set_text(self.sig.doc_label.?, if (dz.len > 0) dz.ptr else " ");
         self.positionAtCaret(self.sig.popover.?);
         if (!self.sig.open) c.gtk_popover_popup(@ptrCast(self.sig.popover.?));

@@ -279,15 +279,15 @@ fn onHits(ctx: ?*anyopaque, ok: bool, payload: []const u8) void {
     const searching = std.mem.span(c.gtk_editable_get_text(@ptrCast(self.search))).len > 0;
     const msg = if (hits.len == 0)
         (if (searching)
-            std.fmt.bufPrintZ(&buf, "No page in history matches that.", .{}) catch ""
+            std.fmt.bufPrintSentinel(&buf, "No page in history matches that.", .{}, 0) catch ""
         else
-            std.fmt.bufPrintZ(&buf, "History is empty.", .{}) catch "")
+            std.fmt.bufPrintSentinel(&buf, "History is empty.", .{}, 0) catch "")
     else
-        std.fmt.bufPrintZ(&buf, "{d} page{s}{s}", .{
+        std.fmt.bufPrintSentinel(&buf, "{d} page{s}{s}", .{
             hits.len,
             if (hits.len == 1) "" else "s",
             if (hits.len == 200) " (best matches)" else "",
-        }) catch "";
+        }, 0) catch "";
     self.setStatus(msg.ptr);
 }
 
@@ -309,9 +309,9 @@ fn onBookmarks(ctx: ?*anyopaque, ok: bool, payload: []const u8) void {
     for (order) |i| addBookmarkRow(self, marks[i], i);
     var buf: [64]u8 = undefined;
     const msg = if (marks.len == 0)
-        std.fmt.bufPrintZ(&buf, "No bookmarks yet — the toolbar star adds one.", .{}) catch ""
+        std.fmt.bufPrintSentinel(&buf, "No bookmarks yet — the toolbar star adds one.", .{}, 0) catch ""
     else
-        std.fmt.bufPrintZ(&buf, "{d} bookmark{s}", .{ marks.len, if (marks.len == 1) "" else "s" }) catch "";
+        std.fmt.bufPrintSentinel(&buf, "{d} bookmark{s}", .{ marks.len, if (marks.len == 1) "" else "s" }, 0) catch "";
     self.setStatus(msg.ptr);
 }
 
@@ -338,7 +338,7 @@ fn clearList(list: *c.GtkWidget) void {
 
 fn setRowStr(row: *c.GtkWidget, key: [*:0]const u8, value: []const u8) void {
     var buf: [4096]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{value}) catch return;
+    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{value}, 0) catch return;
     c.g_object_set_data_full(@ptrCast(@alignCast(row)), key, c.g_strdup(z.ptr), c.g_free);
 }
 
@@ -365,13 +365,13 @@ fn rowShell(row: *c.GtkWidget, title: []const u8, url: []const u8) *c.GtkWidget 
     var buf: [1024]u8 = undefined;
     // A page with no title is listed by its address rather than blank.
     const shown_title = if (title.len > 0) title else url;
-    if (std.fmt.bufPrintZ(&buf, "{s}", .{shown_title})) |z| {
+    if (std.fmt.bufPrintSentinel(&buf, "{s}", .{shown_title}, 0)) |z| {
         const lbl = c.gtk_label_new(z.ptr);
         c.gtk_label_set_xalign(@ptrCast(lbl), 0.0);
         c.gtk_label_set_ellipsize(@ptrCast(lbl), c.PANGO_ELLIPSIZE_END);
         c.gtk_box_append(@ptrCast(text), lbl);
     } else |_| {}
-    if (std.fmt.bufPrintZ(&buf, "{s}", .{url})) |z| {
+    if (std.fmt.bufPrintSentinel(&buf, "{s}", .{url}, 0)) |z| {
         const lbl = c.gtk_label_new(z.ptr);
         c.gtk_label_set_xalign(@ptrCast(lbl), 0.0);
         c.gtk_label_set_ellipsize(@ptrCast(lbl), c.PANGO_ELLIPSIZE_MIDDLE);
@@ -405,9 +405,9 @@ fn addHistoryRow(self: *List, hit: webstore.HistoryHit) void {
     var age: [48]u8 = undefined;
     const when = @import("../util/clock.zig").ago(&age, self.now_ms, hit.last_ms, .long);
     const text = if (hit.visits > 1)
-        std.fmt.bufPrintZ(&meta, "{s} · {d} visits", .{ when, hit.visits }) catch ""
+        std.fmt.bufPrintSentinel(&meta, "{s} · {d} visits", .{ when, hit.visits }, 0) catch ""
     else
-        std.fmt.bufPrintZ(&meta, "{s}", .{when}) catch "";
+        std.fmt.bufPrintSentinel(&meta, "{s}", .{when}, 0) catch "";
     const lbl = c.gtk_label_new(text.ptr);
     c.gtk_widget_add_css_class(lbl, "dim-label");
     c.gtk_widget_add_css_class(lbl, "caption");
@@ -457,7 +457,7 @@ fn folderHeader(row: *c.GtkListBoxRow, before: ?*c.GtkListBoxRow, _: ?*anyopaque
         return;
     }
     var buf: [256]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{if (folder.len > 0) folder else "Other bookmarks"}) catch return;
+    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{if (folder.len > 0) folder else "Other bookmarks"}, 0) catch return;
     const lbl = c.gtk_label_new(z.ptr);
     c.gtk_label_set_xalign(@ptrCast(lbl), 0.0);
     c.gtk_widget_add_css_class(lbl, "dim-label");
@@ -574,7 +574,7 @@ fn onMenuOpenNewTab(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
 fn onMenuCopy(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(RowCtx, user);
     const url = rowStr(ctx.row, KEY_URL);
-    const z = ctx.allocator.dupeZ(u8, url) catch return;
+    const z = ctx.allocator.dupeSentinel(u8, url, 0) catch return;
     defer ctx.allocator.free(z);
     clipboard.copyToClipboard(ctx.list.listbox, z);
 }
@@ -636,7 +636,7 @@ fn promptEdit(ctx: *RowCtx, field: @FieldType(EditCtx, "field")) void {
     const entry = c.gtk_entry_new().?;
     const current = rowStr(ctx.row, if (field == .title) KEY_TITLE else KEY_FOLDER);
     var buf: [1024]u8 = undefined;
-    if (std.fmt.bufPrintZ(&buf, "{s}", .{current})) |z|
+    if (std.fmt.bufPrintSentinel(&buf, "{s}", .{current}, 0)) |z|
         c.gtk_editable_set_text(@ptrCast(entry), z.ptr)
     else |_| {}
     c.gtk_entry_set_placeholder_text(

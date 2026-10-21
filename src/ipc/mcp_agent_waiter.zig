@@ -233,7 +233,7 @@ pub const Waiter = struct {
         var addr: c.struct_sockaddr_un = undefined;
         @import("../mux/sockpath.zig").fillSockaddrUn(&addr, path) catch return a.free(path);
         var zbuf: [4096]u8 = undefined;
-        const pz = std.fmt.bufPrintZ(&zbuf, "{s}", .{path}) catch return a.free(path);
+        const pz = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{path}, 0) catch return a.free(path);
         const fd = platform.socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
         if (fd < 0) return a.free(path);
         _ = c.unlink(pz.ptr);

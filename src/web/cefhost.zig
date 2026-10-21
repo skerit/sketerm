@@ -2748,7 +2748,7 @@ pub const Host = struct {
                 self.gpa.free(owned);
                 return self.post(refuse);
             };
-            entry.staged = self.gpa.dupeZ(u8, staged) catch {
+            entry.staged = self.gpa.dupeSentinel(u8, staged, 0) catch {
                 _ = c.unlink(staged.ptr);
                 self.gpa.free(owned);
                 return self.post(refuse);
@@ -6238,7 +6238,7 @@ fn browserHostInt(b: ?*cef.cef_browser_t, comptime name: []const u8) c_int {
 /// for output a client on another host fetches afterwards (a staged
 /// download or print). Null when nothing could be created.
 pub fn stagingFile(buf: [:0]u8, comptime kind: []const u8) ?[:0]u8 {
-    const path = std.fmt.bufPrintZ(buf, "/tmp/sketerm-" ++ kind ++ "-XXXXXX", .{}) catch return null;
+    const path = std.fmt.bufPrintSentinel(buf, "/tmp/sketerm-" ++ kind ++ "-XXXXXX", .{}, 0) catch return null;
     const fd = c.mkstemp(path.ptr);
     if (fd < 0) return null;
     _ = c.close(fd);
@@ -8588,10 +8588,11 @@ fn macHelperPath(buf: *[4096:0]u8) ?[:0]const u8 {
     const macos_dir = std.fs.path.dirname(exe) orelse return null;
     const contents = std.fs.path.dirname(macos_dir) orelse return null;
     const name = "sketerm-webengine Helper";
-    const p = std.fmt.bufPrintZ(
+    const p = std.fmt.bufPrintSentinel(
         buf,
         "{s}/Frameworks/{s}.app/Contents/MacOS/{s}",
         .{ contents, name, name },
+        0,
     ) catch return null;
     if (c.access(p.ptr, c.X_OK) != 0) return null;
     return p;

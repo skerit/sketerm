@@ -33,7 +33,7 @@ const wallMs = @import("../../util/clock.zig").wallMs;
 /// wildcards matches as a SUBSTRING (what a search box means).
 pub fn nameMatches(pattern: []const u8, name: []const u8) bool {
     if (std.mem.indexOfAny(u8, pattern, "*?") == null)
-        return std.ascii.indexOfIgnoreCase(name, pattern) != null;
+        return std.ascii.findIgnoreCase(name, pattern) != null;
     return globMatch(pattern, name);
 }
 
@@ -214,7 +214,7 @@ pub fn runPanelize(job: *const Job) u8 {
     var cwdz: [4096]u8 = undefined;
     const cwd = pathz.pathZ(&cwdz, spec.src) catch return job.emitError("cwd too long");
     var cmdz: [16 * 1024:0]u8 = undefined;
-    const cmd = std.fmt.bufPrintZ(&cmdz, "{s}", .{spec.pattern}) catch return job.emitError("command too long");
+    const cmd = std.fmt.bufPrintSentinel(&cmdz, "{s}", .{spec.pattern}, 0) catch return job.emitError("command too long");
     var pipefd: [2]c_int = undefined;
     if (c.pipe(&pipefd) != 0) return job.emitErrno("pipe");
     const pid = c.fork();

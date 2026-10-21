@@ -699,11 +699,11 @@ const ManagerLabels = struct {
 };
 
 fn managerLabels(e: *const Ext, title_buf: *[160:0]u8, subtitle_buf: *[256:0]u8) ManagerLabels {
-    const title = std.fmt.bufPrintZ(title_buf, "{s}", .{if (e.name.len != 0) e.name else e.id}) catch "extension";
+    const title = std.fmt.bufPrintSentinel(title_buf, "{s}", .{if (e.name.len != 0) e.name else e.id}, 0) catch "extension";
     const subtitle = if (!e.ok and e.err.len != 0)
-        std.fmt.bufPrintZ(subtitle_buf, "v{s} — error: {s}", .{ e.version, e.err }) catch ""
+        std.fmt.bufPrintSentinel(subtitle_buf, "v{s} — error: {s}", .{ e.version, e.err }, 0) catch ""
     else
-        std.fmt.bufPrintZ(subtitle_buf, "v{s}", .{e.version}) catch "";
+        std.fmt.bufPrintSentinel(subtitle_buf, "v{s}", .{e.version}, 0) catch "";
     return .{ .title = title, .subtitle = subtitle };
 }
 
@@ -1011,7 +1011,7 @@ const AllocationTestDir = struct {
 
 fn writeAllocationFile(path: []const u8, bytes: []const u8) !void {
     var path_buf: [4096:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{path});
+    const path_z = try std.fmt.bufPrintSentinel(&path_buf, "{s}", .{path}, 0);
     const fd = c.open(path_z.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
     if (fd < 0) return error.WriteFailed;
     defer _ = c.close(fd);

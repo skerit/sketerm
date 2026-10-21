@@ -162,7 +162,7 @@ pub fn fsyncParent(path: []const u8) bool {
 /// Whether `path` names a directory, following symlinks; an unstatable or oversize path is not one.
 pub fn isDir(path: []const u8) bool {
     var buf: [4096]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return false;
+    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0) catch return false;
     var st: c.struct_stat = undefined;
     return c.stat(z.ptr, &st) == 0 and (st.st_mode & c.S_IFMT) == c.S_IFDIR;
 }
@@ -176,14 +176,14 @@ pub fn isDir(path: []const u8) bool {
 pub fn findExecutable(buf: []u8, name: []const u8) ?[:0]const u8 {
     if (name.len == 0) return null;
     if (std.mem.indexOfScalar(u8, name, '/') != null) {
-        const z = std.fmt.bufPrintZ(buf, "{s}", .{name}) catch return null;
+        const z = std.fmt.bufPrintSentinel(buf, "{s}", .{name}, 0) catch return null;
         return if (isExecutableFile(z)) z else null;
     }
     const path_env = c.getenv("PATH") orelse return null;
     var it = std.mem.splitScalar(u8, std.mem.span(@as([*:0]const u8, @ptrCast(path_env))), ':');
     while (it.next()) |dir| {
         if (dir.len == 0) continue;
-        const z = std.fmt.bufPrintZ(buf, "{s}/{s}", .{ dir, name }) catch continue;
+        const z = std.fmt.bufPrintSentinel(buf, "{s}/{s}", .{ dir, name }, 0) catch continue;
         if (isExecutableFile(z)) return z;
     }
     return null;
@@ -282,7 +282,7 @@ test "makeDirs rejects files but accepts symlinks to directories" {
     const td = TempDir.make("mkdirs-kind") orelse return error.SkipZigTest;
     defer td.remove();
     var buf: [4096:0]u8 = undefined;
-    const file = try std.fmt.bufPrintZ(&buf, "{s}/file", .{td.path()});
+    const file = try std.fmt.bufPrintSentinel(&buf, "{s}/file", .{td.path()}, 0);
     const fp = c.fopen(file.ptr, "wb") orelse return error.SkipZigTest;
     _ = c.fclose(fp);
     try std.testing.expectError(error.MkdirFailed, makeDirs(file, 0o700));
@@ -290,7 +290,7 @@ test "makeDirs rejects files but accepts symlinks to directories" {
     const nested = try std.fmt.bufPrint(&nested_buf, "{s}/child", .{file});
     try std.testing.expectError(error.MkdirFailed, makeDirs(nested, 0o700));
     var link_buf: [4096:0]u8 = undefined;
-    const link = try std.fmt.bufPrintZ(&link_buf, "{s}/link", .{td.path()});
+    const link = try std.fmt.bufPrintSentinel(&link_buf, "{s}/link", .{td.path()}, 0);
     try std.testing.expect(c.symlink(file.ptr, link.ptr) == 0);
     try std.testing.expectError(error.MkdirFailed, makeDirs(link, 0o700));
     try std.testing.expect(c.unlink(link.ptr) == 0);
@@ -304,7 +304,7 @@ test "removeTree takes a nested tree, a lone file and a missing path in stride" 
     const nested = try std.fmt.bufPrint(&buf, "{s}/a/b/c", .{td.path()});
     try makeDirs(nested, 0o700);
     var fbuf: [4096:0]u8 = undefined;
-    const file = try std.fmt.bufPrintZ(&fbuf, "{s}/a/b/c/f", .{td.path()});
+    const file = try std.fmt.bufPrintSentinel(&fbuf, "{s}/a/b/c/f", .{td.path()}, 0);
     const fp = c.fopen(file.ptr, "wb") orelse return error.SkipZigTest;
     _ = c.fclose(fp);
     var z_buf: [4096]u8 = undefined;
@@ -317,11 +317,11 @@ test "removeTree takes a nested tree, a lone file and a missing path in stride" 
     const keep = TempDir.make("rmtree-keep") orelse return error.SkipZigTest;
     defer keep.remove();
     var kbuf: [4096:0]u8 = undefined;
-    const kept = try std.fmt.bufPrintZ(&kbuf, "{s}/kept", .{keep.path()});
+    const kept = try std.fmt.bufPrintSentinel(&kbuf, "{s}/kept", .{keep.path()}, 0);
     const kf = c.fopen(kept.ptr, "wb") orelse return error.SkipZigTest;
     _ = c.fclose(kf);
     var lbuf: [4096:0]u8 = undefined;
-    const link = try std.fmt.bufPrintZ(&lbuf, "{s}/a/link", .{td.path()});
+    const link = try std.fmt.bufPrintSentinel(&lbuf, "{s}/a/link", .{td.path()}, 0);
     try std.testing.expect(c.symlink(keep.pathZ(), link.ptr) == 0);
     td.remove();
     try std.testing.expect(c.stat(try pathZ(&z_buf, td.path()), &st) != 0);
@@ -334,7 +334,7 @@ test "unlinkPath drops a file and shrugs at a missing one" {
     const td = TempDir.make("unlinkp") orelse return error.SkipZigTest;
     defer td.remove();
     var buf: [4096:0]u8 = undefined;
-    const file = try std.fmt.bufPrintZ(&buf, "{s}/gone", .{td.path()});
+    const file = try std.fmt.bufPrintSentinel(&buf, "{s}/gone", .{td.path()}, 0);
     const fp = c.fopen(file.ptr, "wb") orelse return error.SkipZigTest;
     _ = c.fclose(fp);
     var st: c.struct_stat = undefined;
@@ -373,7 +373,7 @@ test "findExecutable: PATH entries, direct paths, and never a directory" {
     const td = TempDir.make("onpath") orelse return error.SkipZigTest;
     defer td.remove();
     var buf: [4096:0]u8 = undefined;
-    const bin = try std.fmt.bufPrintZ(&buf, "{s}/sketerm-fake-tool", .{td.path()});
+    const bin = try std.fmt.bufPrintSentinel(&buf, "{s}/sketerm-fake-tool", .{td.path()}, 0);
     const fp = c.fopen(bin.ptr, "wb") orelse return error.SkipZigTest;
     _ = c.fclose(fp);
     try std.testing.expect(c.chmod(bin.ptr, 0o755) == 0);
@@ -381,7 +381,7 @@ test "findExecutable: PATH entries, direct paths, and never a directory" {
     // An empty entry and a trailing colon are both skipped, never read
     // as the current directory.
     var path_buf: [4096:0]u8 = undefined;
-    const path_env = try std.fmt.bufPrintZ(&path_buf, "::{s}:", .{td.path()});
+    const path_env = try std.fmt.bufPrintSentinel(&path_buf, "::{s}:", .{td.path()}, 0);
     try std.testing.expect(c.setenv("PATH", path_env.ptr, 1) == 0);
     try std.testing.expect(executableOnPath("sketerm-fake-tool"));
     try std.testing.expect(!executableOnPath("sketerm-no-such-tool"));

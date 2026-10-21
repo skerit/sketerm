@@ -698,7 +698,7 @@ const Scratch = struct {
 
     fn init(self: *Scratch, tag: []const u8) !void {
         self.* = .{};
-        const p = try std.fmt.bufPrintZ(&self.buf, "/tmp/sketerm-panels-{s}-{d}", .{ tag, c.getpid() });
+        const p = try std.fmt.bufPrintSentinel(&self.buf, "/tmp/sketerm-panels-{s}-{d}", .{ tag, c.getpid() }, 0);
         self.len = p.len;
         _ = c.mkdir(@ptrCast(&self.buf), 0o755);
         try self.saved.override("XDG_STATE_HOME", @ptrCast(&self.buf));

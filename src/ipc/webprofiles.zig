@@ -213,7 +213,7 @@ pub const Store = struct {
             error.MkdirFailed => error.Io,
         };
         var lock_buf: [4096:0]u8 = undefined;
-        const lock_path = std.fmt.bufPrintZ(&lock_buf, "{s}/lock", .{root}) catch return error.PathTooLong;
+        const lock_path = std.fmt.bufPrintSentinel(&lock_buf, "{s}/lock", .{root}, 0) catch return error.PathTooLong;
         const fd = c.open(lock_path.ptr, c.O_RDWR | c.O_CREAT | c.O_CLOEXEC, @as(c_uint, 0o600));
         if (fd < 0) return error.Io;
         errdefer _ = c.close(fd);
@@ -327,7 +327,7 @@ pub const Store = struct {
 
     fn jarDirExistsForId(self: *const Store, id: u32) bool {
         var buf: [4096:0]u8 = undefined;
-        const dir_z = std.fmt.bufPrintZ(&buf, "{s}", .{self.root}) catch return false;
+        const dir_z = std.fmt.bufPrintSentinel(&buf, "{s}", .{self.root}, 0) catch return false;
         const dir = c.opendir(dir_z.ptr) orelse return false;
         defer _ = c.closedir(dir);
         while (c.readdir(dir)) |ent| {
@@ -451,7 +451,7 @@ pub const Store = struct {
     pub fn sweepOrphans(self: *Store) void {
         if (self.degraded) return;
         var buf: [4096:0]u8 = undefined;
-        const dir_z = std.fmt.bufPrintZ(&buf, "{s}", .{self.root}) catch return;
+        const dir_z = std.fmt.bufPrintSentinel(&buf, "{s}", .{self.root}, 0) catch return;
         const dir = c.opendir(dir_z.ptr) orelse return;
         // Collect first: unlinking while the DIR stream is open is
         // implementation-defined.
@@ -508,7 +508,7 @@ pub const Store = struct {
             return;
         };
         var z_buf: [4096:0]u8 = undefined;
-        const path_z = std.fmt.bufPrintZ(&z_buf, "{s}", .{path}) catch {
+        const path_z = std.fmt.bufPrintSentinel(&z_buf, "{s}", .{path}, 0) catch {
             self.degraded = true;
             return;
         };
@@ -546,7 +546,7 @@ pub const Store = struct {
         for (self.entries.items) |e| self.gpa.free(e.name);
         self.entries.clearRetainingCapacity();
         var buf: [4096:0]u8 = undefined;
-        const dir_z = std.fmt.bufPrintZ(&buf, "{s}", .{self.root}) catch {
+        const dir_z = std.fmt.bufPrintSentinel(&buf, "{s}", .{self.root}, 0) catch {
             self.degraded = true;
             return;
         };

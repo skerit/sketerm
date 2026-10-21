@@ -192,7 +192,7 @@ pub const Session = struct {
     /// Items at the last save (loaded base items count as saved).
     saved: Counts = .initFill(0),
     /// Sections where a pack cap made the recorder drop an item.
-    capped: std.EnumSet(Section) = .initEmpty(),
+    capped: std.EnumSet(Section) = .empty,
 
     // The reach in progress.
     cur: ?struct {

@@ -140,13 +140,13 @@ test "session metadata prefers explicit viewers and falls back for old daemons" 
 fn fmtIdle(buf: []u8, idle_ms: i64) [:0]const u8 {
     if (idle_ms < 2000) return "active";
     const secs: i64 = @divTrunc(idle_ms, 1000);
-    if (secs < 60) return std.fmt.bufPrintZ(buf, "idle {d}s", .{secs}) catch "idle";
+    if (secs < 60) return std.fmt.bufPrintSentinel(buf, "idle {d}s", .{secs}, 0) catch "idle";
     const mins = @divTrunc(secs, 60);
-    if (mins < 60) return std.fmt.bufPrintZ(buf, "idle {d}m", .{mins}) catch "idle";
+    if (mins < 60) return std.fmt.bufPrintSentinel(buf, "idle {d}m", .{mins}, 0) catch "idle";
     const hours = @divTrunc(mins, 60);
-    if (hours < 24) return std.fmt.bufPrintZ(buf, "idle {d}h{d}m", .{ hours, @mod(mins, 60) }) catch "idle";
+    if (hours < 24) return std.fmt.bufPrintSentinel(buf, "idle {d}h{d}m", .{ hours, @mod(mins, 60) }, 0) catch "idle";
     const days = @divTrunc(hours, 24);
-    return std.fmt.bufPrintZ(buf, "idle {d}d{d}h", .{ days, @mod(hours, 24) }) catch "idle";
+    return std.fmt.bufPrintSentinel(buf, "idle {d}d{d}h", .{ days, @mod(hours, 24) }, 0) catch "idle";
 }
 
 test "fmtIdle: thresholds and coarse buckets" {

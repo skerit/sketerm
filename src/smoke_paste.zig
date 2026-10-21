@@ -112,7 +112,7 @@ const Child = struct { pid: c.pid_t, out_fd: c_int };
 
 fn spawn(wl: []const u8, argv: []const [*:0]const u8) Child {
     var wl_z: [4096:0]u8 = undefined;
-    const wz = std.fmt.bufPrintZ(&wl_z, "{s}", .{wl}) catch fail("wl path too long");
+    const wz = std.fmt.bufPrintSentinel(&wl_z, "{s}", .{wl}, 0) catch fail("wl path too long");
     var pfds: [2]c_int = undefined;
     if (c.pipe(&pfds) != 0) fail("pipe");
     var args: [8:null]?[*:0]const u8 = @splat(null);

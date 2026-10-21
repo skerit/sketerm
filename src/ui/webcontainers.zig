@@ -158,7 +158,7 @@ fn rebuild(self: *Manager) void {
 
         const name = c.gtk_entry_new();
         var nz: [160]u8 = undefined;
-        const nb = std.fmt.bufPrintZ(&nz, "{s}", .{ctn.name[0..@min(ctn.name.len, 128)]}) catch "";
+        const nb = std.fmt.bufPrintSentinel(&nz, "{s}", .{ctn.name[0..@min(ctn.name.len, 128)]}, 0) catch "";
         c.gtk_editable_set_text(@ptrCast(name), nb.ptr);
         c.gtk_widget_set_hexpand(name, 1);
         c.gtk_box_append(@ptrCast(row), name);
@@ -177,13 +177,13 @@ fn rebuild(self: *Manager) void {
         var pz: [webroute.MAX_TEXT + 1]u8 = undefined;
         const route_text: []const u8 = spec.format(&fz) orelse "proxy";
         const placeholder: [*:0]const u8 = if (choice == null) blk: {
-            const z = std.fmt.bufPrintZ(&pz, "{s}", .{route_text}) catch break :blk "proxy";
+            const z = std.fmt.bufPrintSentinel(&pz, "{s}", .{route_text}, 0) catch break :blk "proxy";
             break :blk z.ptr;
         } else "host";
         c.gtk_entry_set_placeholder_text(@ptrCast(host), placeholder);
         const cur_host = spec.host;
         var hz: [160]u8 = undefined;
-        const hb = std.fmt.bufPrintZ(&hz, "{s}", .{cur_host[0..@min(cur_host.len, 128)]}) catch "";
+        const hb = std.fmt.bufPrintSentinel(&hz, "{s}", .{cur_host[0..@min(cur_host.len, 128)]}, 0) catch "";
         c.gtk_editable_set_text(@ptrCast(host), hb.ptr);
         c.gtk_widget_set_sensitive(host, if (choice != null and choice.?.needsHost()) 1 else 0);
         c.gtk_box_append(@ptrCast(row), host);
@@ -218,12 +218,12 @@ fn rebuild(self: *Manager) void {
 
     var buf: [96]u8 = undefined;
     const txt = if (shown == 0)
-        std.fmt.bufPrintZ(&buf, "No containers yet. Name one below to create it.", .{}) catch ""
+        std.fmt.bufPrintSentinel(&buf, "No containers yet. Name one below to create it.", .{}, 0) catch ""
     else
-        std.fmt.bufPrintZ(&buf, "{d} container{s}. Press Enter in a field to apply.", .{
+        std.fmt.bufPrintSentinel(&buf, "{d} container{s}. Press Enter in a field to apply.", .{
             shown,
             if (shown == 1) "" else "s",
-        }) catch "";
+        }, 0) catch "";
     c.gtk_label_set_text(@ptrCast(self.status), txt.ptr);
 }
 

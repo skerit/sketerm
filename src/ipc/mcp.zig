@@ -373,14 +373,14 @@ pub const McpLog = struct {
 
     fn open(allocator: std.mem.Allocator, dir_arg: []const u8) ?McpLog {
         var z: [4096]u8 = undefined;
-        const dir_z = std.fmt.bufPrintZ(&z, "{s}", .{dir_arg}) catch return null;
+        const dir_z = std.fmt.bufPrintSentinel(&z, "{s}", .{dir_arg}, 0) catch return null;
         _ = c.mkdir(dir_z.ptr, 0o700); // parent must exist; fopen below is the real check
         // Each session logs into its own datetime-named subfolder so
         // traces and screenshots of separate runs never interleave.
         var secs: c.time_t = @intCast(@divTrunc(clock.wallMs(), 1000));
         var tm: c.struct_tm = undefined;
         _ = c.localtime_r(&secs, &tm);
-        const sub = std.fmt.bufPrintZ(&z, "{s}/{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}", .{
+        const sub = std.fmt.bufPrintSentinel(&z, "{s}/{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}", .{
             dir_arg,
             @as(u32, @intCast(@as(i64, tm.tm_year) + 1900)),
             @as(u32, @intCast(tm.tm_mon + 1)),
@@ -388,7 +388,7 @@ pub const McpLog = struct {
             @as(u32, @intCast(tm.tm_hour)),
             @as(u32, @intCast(tm.tm_min)),
             @as(u32, @intCast(tm.tm_sec)),
-        }) catch return null;
+        }, 0) catch return null;
         _ = c.mkdir(sub.ptr, 0o700);
         // Absolute, always: the session casts land in this dir, and the
         // daemon that writes them resolves a relative path against ITS
@@ -397,7 +397,7 @@ pub const McpLog = struct {
         const abs = c.realpath(sub.ptr, &abs_buf) orelse return null;
         const dir = allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(abs)))) catch return null;
         var pz: [4096]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&pz, "{s}/mcp-{d}.jsonl", .{ dir, c.getpid() }) catch {
+        const path = std.fmt.bufPrintSentinel(&pz, "{s}/mcp-{d}.jsonl", .{ dir, c.getpid() }, 0) catch {
             allocator.free(dir);
             return null;
         };
@@ -467,7 +467,7 @@ pub const McpLog = struct {
             ext,
         }) catch return;
         var z: [4096]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&z, "{s}/{s}", .{ self.dir, fname }) catch return;
+        const path = std.fmt.bufPrintSentinel(&z, "{s}/{s}", .{ self.dir, fname }, 0) catch return;
         if (c.fopen(path.ptr, "wb")) |f| {
             _ = c.fwrite(png.ptr, 1, png.len, f);
             _ = c.fclose(f);
@@ -531,7 +531,7 @@ const Isolation = struct {
 fn setupIsolation(allocator: std.mem.Allocator, name: ?[]const u8, durable: bool) ?Isolation {
     const rt = platform.runtimeDir();
     var z_buf: [4096]u8 = undefined;
-    const base = std.fmt.bufPrintZ(&z_buf, "{s}/sketerm", .{rt}) catch return null;
+    const base = std.fmt.bufPrintSentinel(&z_buf, "{s}/sketerm", .{rt}, 0) catch return null;
     _ = c.mkdir(base.ptr, 0o700);
     const dir = if (name) |n|
         std.fmt.allocPrint(allocator, "{s}/sketerm/mcp-{s}", .{ rt, n }) catch return null
@@ -539,7 +539,7 @@ fn setupIsolation(allocator: std.mem.Allocator, name: ?[]const u8, durable: bool
         std.fmt.allocPrint(allocator, "{s}/sketerm/mcp-tmp-{d}", .{ rt, c.getpid() }) catch return null;
     // No errdefer: `?Isolation` cannot return an error, so it would
     // never run. Both bail-outs below free `dir` explicitly.
-    const dir_z = std.fmt.bufPrintZ(&z_buf, "{s}", .{dir}) catch {
+    const dir_z = std.fmt.bufPrintSentinel(&z_buf, "{s}", .{dir}, 0) catch {
         allocator.free(dir);
         return null;
     };
@@ -575,7 +575,7 @@ fn shutdownDaemonAt(allocator: std.mem.Allocator, sock: []const u8) void {
 fn sweepStaleEphemeral(allocator: std.mem.Allocator) void {
     const rt = platform.runtimeDir();
     var base_buf: [4096]u8 = undefined;
-    const base = std.fmt.bufPrintZ(&base_buf, "{s}/sketerm", .{rt}) catch return;
+    const base = std.fmt.bufPrintSentinel(&base_buf, "{s}/sketerm", .{rt}, 0) catch return;
     const d = c.opendir(base.ptr) orelse return;
     defer _ = c.closedir(d);
     while (c.readdir(d)) |ent| {
@@ -737,7 +737,7 @@ const OwnedPolicy = struct { spec: []u8, source: []u8 };
 fn mcpProfileRecord(cfg: *const Config, name: []const u8) error{BadPolicy}!*const @import("../config.zig").McpProfile {
     return cfg.mcpProfile(name) orelse {
         var msg_buf: [512]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(&msg_buf, "sketerm mcp: --profile {s}: no [mcp.{s}] section in config.conf\n  add one, e.g.:\n    [mcp.{s}]\n    tools = app, files:ro\n", .{ name, name, name }) catch "sketerm mcp: unknown --profile\n";
+        const msg = std.fmt.bufPrintSentinel(&msg_buf, "sketerm mcp: --profile {s}: no [mcp.{s}] section in config.conf\n  add one, e.g.:\n    [mcp.{s}]\n    tools = app, files:ro\n", .{ name, name, name }, 0) catch "sketerm mcp: unknown --profile\n";
         _ = c.fputs(msg.ptr, platform.stderr());
         return error.BadPolicy;
     };
@@ -786,7 +786,7 @@ fn resolveToolPolicy(allocator: std.mem.Allocator, opts: Opts, cfg: *const Confi
             if (i > 0) gw.writeAll(", ") catch {};
             gw.writeAll(g.name()) catch {};
         }
-        const msg = std.fmt.bufPrintZ(&msg_buf, "sketerm mcp: bad tool policy term '{s}' (from {s})\n  spec: {s}\n  groups: {s}\n  terms: all | all:ro | GROUP | GROUP:ro | TOOL | -GROUP | -TOOL\n", .{ bad, source, spec, gw.buffered() }) catch "sketerm mcp: bad tool policy\n";
+        const msg = std.fmt.bufPrintSentinel(&msg_buf, "sketerm mcp: bad tool policy term '{s}' (from {s})\n  spec: {s}\n  groups: {s}\n  terms: all | all:ro | GROUP | GROUP:ro | TOOL | -GROUP | -TOOL\n", .{ bad, source, spec, gw.buffered() }, 0) catch "sketerm mcp: bad tool policy\n";
         _ = c.fputs(msg.ptr, platform.stderr());
         return error.BadPolicy;
     };
@@ -817,7 +817,7 @@ fn resolveWebGuiGrant(opts: Opts, cfg: *const Config) error{BadPolicy}!mcp_webgu
     const env: ?[]const u8 = if (c.getenv(mcp_webgui.ENV)) |v| std.mem.span(@as([*:0]const u8, @ptrCast(v))) else null;
     return mcp_webgui.resolveGrant(cfg.mcp.web_gui, prof_value, prof_name, env, opts.web_gui) catch {
         var msg_buf: [512]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(&msg_buf, "sketerm mcp: bad {s} value '{s}' (use 1/true/yes/on or 0/false/no/off)\n", .{ mcp_webgui.ENV, env orelse "" }) catch "sketerm mcp: bad SKETERM_MCP_WEB_GUI value\n";
+        const msg = std.fmt.bufPrintSentinel(&msg_buf, "sketerm mcp: bad {s} value '{s}' (use 1/true/yes/on or 0/false/no/off)\n", .{ mcp_webgui.ENV, env orelse "" }, 0) catch "sketerm mcp: bad SKETERM_MCP_WEB_GUI value\n";
         _ = c.fputs(msg.ptr, platform.stderr());
         return error.BadPolicy;
     };
@@ -969,7 +969,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         var probe: c.struct_sockaddr_un = undefined;
         @import("../mux/daemon.zig").fillSockaddrUn(&probe, i.sock) catch {
             var msg_buf: [4224]u8 = undefined;
-            const msg = std.fmt.bufPrintZ(&msg_buf, "sketerm mcp: socket path too long for a Unix socket ({d} chars, limit {d}):\n  {s}\npoint XDG_RUNTIME_DIR at a shorter path\n", .{ i.sock.len, probe.sun_path.len - 1, i.sock }) catch "sketerm mcp: socket path too long for a Unix socket\n";
+            const msg = std.fmt.bufPrintSentinel(&msg_buf, "sketerm mcp: socket path too long for a Unix socket ({d} chars, limit {d}):\n  {s}\npoint XDG_RUNTIME_DIR at a shorter path\n", .{ i.sock.len, probe.sun_path.len - 1, i.sock }, 0) catch "sketerm mcp: socket path too long for a Unix socket\n";
             _ = c.fputs(msg.ptr, platform.stderr());
             return 1;
         };
@@ -2472,13 +2472,13 @@ test "mcp isolation dir: durable is named, ephemeral is pid-based" {
 
     var saved: EnvSave = .{};
     var root_buf: [128]u8 = undefined;
-    const root = try std.fmt.bufPrintZ(&root_buf, "/tmp/sk-mcp-iso-{d}", .{c.getpid()});
+    const root = try std.fmt.bufPrintSentinel(&root_buf, "/tmp/sk-mcp-iso-{d}", .{c.getpid()}, 0);
     _ = c.mkdir(root.ptr, 0o700);
     try saved.override("XDG_RUNTIME_DIR", root.ptr);
     defer {
         saved.restore();
         var cmd: [256]u8 = undefined;
-        if (std.fmt.bufPrintZ(&cmd, "rm -rf -- '{s}'", .{root})) |cz| _ = c.system(cz.ptr) else |_| {}
+        if (std.fmt.bufPrintSentinel(&cmd, "rm -rf -- '{s}'", .{root}, 0)) |cz| _ = c.system(cz.ptr) else |_| {}
     }
 
     // `--durable` alone must land in a dir a later run can find again.
@@ -2528,7 +2528,7 @@ test "mcp log: entries and screenshot files land in the dir" {
     log.close();
 
     var pbuf: [512]u8 = undefined;
-    const jsonl_z = try std.fmt.bufPrintZ(&pbuf, "{s}/mcp-{d}.jsonl", .{ session_dir, c.getpid() });
+    const jsonl_z = try std.fmt.bufPrintSentinel(&pbuf, "{s}/mcp-{d}.jsonl", .{ session_dir, c.getpid() }, 0);
     const f = c.fopen(jsonl_z.ptr, "r") orelse return error.NoLogFile;
     var content: [16384]u8 = undefined;
     const n = c.fread(&content, 1, content.len, f);
@@ -2549,7 +2549,7 @@ test "mcp log: entries and screenshot files land in the dir" {
     }
 
     // The PNG bytes were written out verbatim, into the session dir.
-    const img_z = try std.fmt.bufPrintZ(&pbuf, "{s}/img-{d}-0001.png", .{ session_dir, c.getpid() });
+    const img_z = try std.fmt.bufPrintSentinel(&pbuf, "{s}/img-{d}-0001.png", .{ session_dir, c.getpid() }, 0);
     const imgf = c.fopen(img_z.ptr, "r") orelse return error.NoImageFile;
     var ibuf: [64]u8 = undefined;
     const in = c.fread(&ibuf, 1, ibuf.len, imgf);
@@ -2558,7 +2558,7 @@ test "mcp log: entries and screenshot files land in the dir" {
 
     // A tagged shot gets the "-click" filename suffix.
     var cbuf: [512]u8 = undefined;
-    const click_z = try std.fmt.bufPrintZ(&cbuf, "{s}/img-{d}-0002-click.png", .{ session_dir, c.getpid() });
+    const click_z = try std.fmt.bufPrintSentinel(&cbuf, "{s}/img-{d}-0002-click.png", .{ session_dir, c.getpid() }, 0);
     const clickf = c.fopen(click_z.ptr, "r") orelse return error.NoClickImageFile;
     const cn = c.fread(&ibuf, 1, ibuf.len, clickf);
     _ = c.fclose(clickf);
@@ -2567,11 +2567,11 @@ test "mcp log: entries and screenshot files land in the dir" {
     _ = c.unlink(click_z.ptr);
 
     _ = c.unlink(img_z.ptr);
-    const jsonl_z2 = try std.fmt.bufPrintZ(&pbuf, "{s}/mcp-{d}.jsonl", .{ session_dir, c.getpid() });
+    const jsonl_z2 = try std.fmt.bufPrintSentinel(&pbuf, "{s}/mcp-{d}.jsonl", .{ session_dir, c.getpid() }, 0);
     _ = c.unlink(jsonl_z2.ptr);
-    const sub_z = try std.fmt.bufPrintZ(&pbuf, "{s}", .{session_dir});
+    const sub_z = try std.fmt.bufPrintSentinel(&pbuf, "{s}", .{session_dir}, 0);
     _ = c.rmdir(sub_z.ptr);
-    const dir_z = try std.fmt.bufPrintZ(&pbuf, "{s}", .{dir});
+    const dir_z = try std.fmt.bufPrintSentinel(&pbuf, "{s}", .{dir}, 0);
     _ = c.rmdir(dir_z.ptr);
 }
 

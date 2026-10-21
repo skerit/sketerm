@@ -121,13 +121,13 @@ fn isMounted(path: []const u8) bool {
 
 fn mkdirp(path: []const u8) bool {
     var z: [4096:0]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return false;
+    const p = std.fmt.bufPrintSentinel(&z, "{s}", .{path}, 0) catch return false;
     return c.g_mkdir_with_parents(p.ptr, 0o700) == 0;
 }
 
 fn unmount(point: []const u8) void {
     var z: [4096:0]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&z, "{s}", .{point}) catch return;
+    const p = std.fmt.bufPrintSentinel(&z, "{s}", .{point}, 0) catch return;
     const pid = c.fork();
     if (pid == 0) {
         // Lazy: an application still holding a file must not make the
@@ -151,7 +151,7 @@ fn sweepOrphans() void {
     var base_buf: [4096]u8 = undefined;
     const base = std.fmt.bufPrint(&base_buf, "{s}/sketerm/mnt", .{platform.runtimeDir()}) catch return;
     var bz: [4096:0]u8 = undefined;
-    const bp = std.fmt.bufPrintZ(&bz, "{s}", .{base}) catch return;
+    const bp = std.fmt.bufPrintSentinel(&bz, "{s}", .{base}, 0) catch return;
     const dir = c.opendir(bp.ptr) orelse return;
     defer _ = c.closedir(dir);
     while (c.readdir(dir)) |ent| {
@@ -164,7 +164,7 @@ fn sweepOrphans() void {
         var owner_buf: [4096]u8 = undefined;
         const owner = std.fmt.bufPrint(&owner_buf, "{s}/{s}", .{ base, name }) catch continue;
         var oz: [4096:0]u8 = undefined;
-        const op = std.fmt.bufPrintZ(&oz, "{s}", .{owner}) catch continue;
+        const op = std.fmt.bufPrintSentinel(&oz, "{s}", .{owner}, 0) catch continue;
         const od = c.opendir(op.ptr) orelse {
             _ = c.rmdir(op.ptr);
             continue;
@@ -198,12 +198,12 @@ fn spawn(m: *Mount) bool {
         return false;
     };
     var spec_buf: [4200:0]u8 = undefined;
-    const spec = std.fmt.bufPrintZ(&spec_buf, "{s}:/", .{m.host}) catch {
+    const spec = std.fmt.bufPrintSentinel(&spec_buf, "{s}:/", .{m.host}, 0) catch {
         m.reason = "host name too long";
         return false;
     };
     var point_buf: [4096:0]u8 = undefined;
-    const point = std.fmt.bufPrintZ(&point_buf, "{s}", .{m.point}) catch {
+    const point = std.fmt.bufPrintSentinel(&point_buf, "{s}", .{m.point}, 0) catch {
         m.reason = "mount path too long";
         return false;
     };
@@ -435,7 +435,7 @@ pub fn shutdownAll() void {
     var own_buf: [4096]u8 = undefined;
     if (ownDir(&own_buf)) |own| {
         var z: [4096:0]u8 = undefined;
-        if (std.fmt.bufPrintZ(&z, "{s}", .{own})) |p| {
+        if (std.fmt.bufPrintSentinel(&z, "{s}", .{own}, 0)) |p| {
             _ = c.rmdir(p.ptr);
         } else |_| {}
     }

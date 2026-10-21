@@ -1046,7 +1046,7 @@ fn sessionDropped(name: []const u8) bool {
 fn untrustedParent(runtime: []const u8, buf: []u8) ?[:0]const u8 {
     const uid = c.getuid();
     var st: c.struct_stat = undefined;
-    const rt = std.fmt.bufPrintZ(buf, "{s}", .{runtime}) catch return null;
+    const rt = std.fmt.bufPrintSentinel(buf, "{s}", .{runtime}, 0) catch return null;
     if (c.lstat(rt.ptr, &st) != 0 or (st.st_mode & c.S_IFMT) != c.S_IFDIR) return null;
     if (st.st_uid != uid and st.st_uid != 0) return null;
     if (st.st_mode & 0o022 != 0 and st.st_mode & c.S_ISVTX == 0) return null;
@@ -1056,7 +1056,7 @@ fn untrustedParent(runtime: []const u8, buf: []u8) ?[:0]const u8 {
     };
     var out: [:0]const u8 = rt;
     for (levels, 0..) |level, i| {
-        out = std.fmt.bufPrintZ(buf, "{s}/{s}", .{ runtime, level.suffix }) catch return null;
+        out = std.fmt.bufPrintSentinel(buf, "{s}/{s}", .{ runtime, level.suffix }, 0) catch return null;
         _ = c.mkdir(out.ptr, 0o700);
         if (c.lstat(out.ptr, &st) != 0 or (st.st_mode & c.S_IFMT) != c.S_IFDIR or st.st_uid != uid) return null;
         // Our own untrusted dir is tightened in place; its parent is ours
@@ -1176,7 +1176,7 @@ pub const Engine = struct {
     /// without the second an unknown context resolves through the shared
     /// jar invisibly; a `multi-client` helper that outlives the teardown
     /// grace is serving someone else and is abandoned, never signalled.
-    caps: proto.Caps = .initEmpty(),
+    caps: proto.Caps = .empty,
     /// Why this ROUTED helper serves nothing (`ev_route_refused`), owned;
     /// null while it serves. Cleared with the connection: a fresh helper
     /// tries its route again.
@@ -1318,13 +1318,13 @@ pub const Engine = struct {
     fn routePathZ(self: *const Engine, buf: []u8, ext: []const u8) ?[:0]u8 {
         if (self.untrusted) {
             const dir = self.private_dir orelse return null;
-            return std.fmt.bufPrintZ(buf, "{s}/web{s}", .{ dir, ext }) catch null;
+            return std.fmt.bufPrintSentinel(buf, "{s}/web{s}", .{ dir, ext }, 0) catch null;
         }
         if (self.route_kind == .direct)
-            return std.fmt.bufPrintZ(buf, "{s}/web{s}", .{ self.dir, ext }) catch null;
+            return std.fmt.bufPrintSentinel(buf, "{s}/web{s}", .{ self.dir, ext }, 0) catch null;
         var slug_buf: [64]u8 = undefined;
         const slug = self.routeSpec().slug(&slug_buf) orelse return null;
-        return std.fmt.bufPrintZ(buf, "{s}/web-{s}{s}", .{ self.dir, slug, ext }) catch null;
+        return std.fmt.bufPrintSentinel(buf, "{s}/web-{s}{s}", .{ self.dir, slug, ext }, 0) catch null;
     }
 
     /// Kill and reap the helper; safe to call from a signal-driven
@@ -1667,7 +1667,7 @@ pub const Engine = struct {
             // A daemon restart takes the session's display socket with
             // it; a stale one must not be exported to a fresh helper.
             var z: [4096:0]u8 = undefined;
-            const p = std.fmt.bufPrintZ(&z, "{s}", .{s.created.wl_display}) catch return;
+            const p = std.fmt.bufPrintSentinel(&z, "{s}", .{s.created.wl_display}, 0) catch return;
             if (c.access(p.ptr, c.F_OK) == 0) return;
             self.teardownSession(false);
         }
@@ -1711,13 +1711,13 @@ pub const Engine = struct {
     fn sessionEnv(self: *const Engine) SessionEnv {
         var env = SessionEnv{};
         const s: *const WebSession = if (self.session) |*sp| sp else return env;
-        _ = std.fmt.bufPrintZ(&env.wl, "{s}", .{s.created.wl_display}) catch return env;
+        _ = std.fmt.bufPrintSentinel(&env.wl, "{s}", .{s.created.wl_display}, 0) catch return env;
         if (s.created.runtime_dir.len > 0) {
-            _ = std.fmt.bufPrintZ(&env.rt, "{s}", .{s.created.runtime_dir}) catch return env;
+            _ = std.fmt.bufPrintSentinel(&env.rt, "{s}", .{s.created.runtime_dir}, 0) catch return env;
             env.have_rt = true;
         }
         if (s.created.pulse_server.len > 0) {
-            if (std.fmt.bufPrintZ(&env.pulse, "unix:{s}", .{s.created.pulse_server})) |_| {
+            if (std.fmt.bufPrintSentinel(&env.pulse, "unix:{s}", .{s.created.pulse_server}, 0)) |_| {
                 env.have_pulse = true;
             } else |_| {}
         }
@@ -1824,7 +1824,7 @@ pub const Engine = struct {
         // are safe in the store, so the next open republishes the SAME
         // id and lands in the SAME jar; ephemeral ones are simply gone.
         self.clearContexts();
-        self.caps = .initEmpty();
+        self.caps = .empty;
         self.motion.state = .none;
         // A download in flight died with the helper. Failing it here is
         // what turns a lost helper into an ANSWER for whoever is
@@ -1859,7 +1859,7 @@ pub const Engine = struct {
         }
 
         var dir_z: [4096:0]u8 = undefined;
-        const dz = std.fmt.bufPrintZ(&dir_z, "{s}", .{self.dir}) catch return self.failStart("helper directory path too long");
+        const dz = std.fmt.bufPrintSentinel(&dir_z, "{s}", .{self.dir}, 0) catch return self.failStart("helper directory path too long");
         _ = c.mkdir(dz.ptr, 0o700);
         var sock_z: [108:0]u8 = undefined;
         const sock = self.routePathZ(&sock_z, ".sock") orelse
@@ -1925,7 +1925,7 @@ pub const Engine = struct {
         // sharing a root_cache_path is measured-fatal.
         var cache_z: [4096:0]u8 = undefined;
         if (self.storeRoot()) |root| {
-            _ = std.fmt.bufPrintZ(&cache_z, "{s}", .{root}) catch return self.failStart("helper cache path too long");
+            _ = std.fmt.bufPrintSentinel(&cache_z, "{s}", .{root}, 0) catch return self.failStart("helper cache path too long");
         } else if (self.routePathZ(&cache_z, "-cache") == null) {
             return self.failStart("helper cache path too long");
         }
@@ -2051,7 +2051,7 @@ pub const Engine = struct {
         self.closeLifetime();
         if (self.private_dir) |dir| self.gpa.free(dir);
         self.private_dir = null;
-        self.caps = .initEmpty();
+        self.caps = .empty;
         self.owner = .none;
         if (self.state == .ready) self.state = .idle;
     }
@@ -2153,7 +2153,7 @@ pub const Engine = struct {
         const proxy_url = socksbridge.routeProxy(self.gpa, self.routeSpec(), &self.egress, mux_cli.muxConnect, &proxy_buf) catch
             return self.failStart("could not start this route's egress bridge (the via host's daemon is unreachable, or the loopback listener would not bind); nothing was opened directly instead");
         const proxy: ?[*:0]const u8 = if (proxy_url) |url|
-            (std.fmt.bufPrintZ(&proxy_z, "{s}", .{url}) catch
+            (std.fmt.bufPrintSentinel(&proxy_z, "{s}", .{url}, 0) catch
                 return self.failStart("the route's proxy url is too long")).ptr
         else
             null;
@@ -2169,8 +2169,8 @@ pub const Engine = struct {
             const linux = std.os.linux;
             if (linux.errno(linux.pipe2(&lifetime, .{ .CLOEXEC = true })) != .SUCCESS)
                 return self.failStart("could not create the untrusted supervisor's lifetime fence");
-            _ = std.fmt.bufPrintZ(&lifetime_z, "{d}", .{lifetime[0]}) catch unreachable;
-            _ = std.fmt.bufPrintZ(&root_z, "{s}", .{self.private_dir.?}) catch unreachable;
+            _ = std.fmt.bufPrintSentinel(&lifetime_z, "{d}", .{lifetime[0]}, 0) catch unreachable;
+            _ = std.fmt.bufPrintSentinel(&root_z, "{s}", .{self.private_dir.?}, 0) catch unreachable;
         }
         // Environment and argv are complete before the fork: the child
         // only rearranges descriptors and execs.
@@ -4779,7 +4779,7 @@ test "presence updates and teardown leave broker and adopted owner records intac
     const dir = std.mem.span(c.mkdtemp(&template) orelse return error.SkipZigTest);
     defer _ = c.rmdir(dir.ptr);
     var path_buf: [512:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/web.json", .{dir});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/web.json", .{dir}, 0);
     defer _ = c.unlink(path.ptr);
     const original = "{\"broker_pid\":42,\"helper_pid\":43,\"session\":\"web-owner\",\"label\":\"Owner login\"}";
     try @import("../util/atomicwrite.zig").writeCacheFile(path, original, 0o600);
@@ -7012,7 +7012,7 @@ test "a leftover private root never blocks the next untrusted launch and is neve
     const parent = untrustedParent(pair.stateDir(), &parent_buf) orelse return error.TestUnexpectedResult;
     // A dead supervisor's root, still holding a profile.
     var leftover: [512:0]u8 = undefined;
-    _ = try std.fmt.bufPrintZ(&leftover, "{s}/{s}", .{ parent, "0123456789abcdef" });
+    _ = try std.fmt.bufPrintSentinel(&leftover, "{s}/{s}", .{ parent, "0123456789abcdef" }, 0);
     try std.testing.expectEqual(@as(c_int, 0), c.mkdir(&leftover, 0o700));
     pair.eng.private_dir = try std.testing.allocator.dupe(u8, std.mem.span(@as([*:0]const u8, &leftover)));
     pair.eng.stopUntrusted();
@@ -7062,12 +7062,12 @@ test "untrusted roots live in a private per-user parent" {
     try std.testing.expectEqual(@as(c_int, 0), c.lstat(made.ptr, &st));
     try std.testing.expectEqual(@as(c_uint, 0o700), st.st_mode & 0o7777);
     // A group-writable sketerm level is refused, never repaired.
-    _ = try std.fmt.bufPrintZ(&path, "{s}/sketerm", .{base});
+    _ = try std.fmt.bufPrintSentinel(&path, "{s}/sketerm", .{base}, 0);
     try std.testing.expectEqual(@as(c_int, 0), c.chmod(&path, 0o775));
     try std.testing.expect(untrustedParent(base, &buf) == null);
     try std.testing.expectEqual(@as(c_int, 0), c.chmod(&path, 0o700));
     // A symlink in place of the untrusted dir is refused.
-    _ = try std.fmt.bufPrintZ(&path, "{s}/" ++ UNTRUSTED_PARENT, .{base});
+    _ = try std.fmt.bufPrintSentinel(&path, "{s}/" ++ UNTRUSTED_PARENT, .{base}, 0);
     try std.testing.expectEqual(@as(c_int, 0), c.rmdir(&path));
     try std.testing.expectEqual(@as(c_int, 0), c.symlink("/tmp", &path));
     try std.testing.expect(untrustedParent(base, &buf) == null);

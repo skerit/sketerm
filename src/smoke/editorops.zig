@@ -91,7 +91,7 @@ fn pumpWall(app: *appdrive.App, ms: i64) void {
 
 fn readFile(a: std.mem.Allocator, path: []const u8) ?[]u8 {
     var zbuf: [512]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{path}) catch return null;
+    const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{path}, 0) catch return null;
     const fp = c.fopen(z.ptr, "rb") orelse return null;
     defer _ = c.fclose(fp);
     var buf: [4096]u8 = undefined;

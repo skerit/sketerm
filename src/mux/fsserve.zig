@@ -830,7 +830,7 @@ const KqState = struct {
             _ = c.close(dfd);
             return -1;
         };
-        const owned = alloc.dupeZ(u8, want) catch {
+        const owned = alloc.dupeSentinel(u8, want, 0) catch {
             _ = c.close(dfd);
             alloc.destroy(w);
             return -1;

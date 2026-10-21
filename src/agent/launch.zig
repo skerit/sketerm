@@ -396,7 +396,7 @@ pub const Host = struct {
 
 pub fn isExecutable(path: []const u8) bool {
     var buf: [4096]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return false;
+    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0) catch return false;
     var st: c.struct_stat = undefined;
     if (c.stat(z.ptr, &st) != 0) return false;
     if ((st.st_mode & c.S_IFMT) != c.S_IFREG) return false;
@@ -1079,7 +1079,7 @@ test "the remote probe resolves candidates on the host it runs on, in one script
 
 /// Write `body` to `path` with mode 0755.
 fn writeExec(a: std.mem.Allocator, path: []const u8, body: []const u8) !void {
-    const z = try a.dupeZ(u8, path);
+    const z = try a.dupeSentinel(u8, path, 0);
     const f = c.fopen(z.ptr, "w") orelse return error.SkipZigTest;
     _ = c.fwrite(body.ptr, 1, body.len, f);
     _ = c.fclose(f);
@@ -1431,7 +1431,7 @@ const WEIRD_ENV = [_]EnvVar{
 /// A script that prints its argv, then three variables, NUL-separated.
 fn echoScript(a: std.mem.Allocator, dir: []const u8) ![]const u8 {
     const path = try std.fmt.allocPrint(a, "{s}/echo args", .{dir});
-    const z = try a.dupeZ(u8, path);
+    const z = try a.dupeSentinel(u8, path, 0);
     const f = c.fopen(z.ptr, "w") orelse return error.SkipZigTest;
     const body = "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done\n" ++
         "printf 'KEEP=%s\\0PLAIN=%s\\0DROP=%s\\0' \"${CLAUDE_KEEP-unset}\" \"${PLAIN_SET-unset}\" \"${CLAUDE_DROP-unset}\"\n";

@@ -58,9 +58,9 @@ pub const TabLabel = struct {
         var buf: [170:0]u8 = undefined;
         const t = self.title[0..self.title_len];
         const txt = if (self.dirty)
-            std.fmt.bufPrintZ(&buf, "\u{2022} {s}", .{t}) catch return
+            std.fmt.bufPrintSentinel(&buf, "\u{2022} {s}", .{t}, 0) catch return
         else
-            std.fmt.bufPrintZ(&buf, "{s}", .{t}) catch return;
+            std.fmt.bufPrintSentinel(&buf, "{s}", .{t}, 0) catch return;
         c.gtk_label_set_text(self.label, txt.ptr);
     }
 };

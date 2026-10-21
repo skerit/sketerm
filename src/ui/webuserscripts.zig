@@ -111,7 +111,7 @@ fn onListReply(ctx: ?*anyopaque, ok: bool, payload: []const u8) void {
 
         var name_z: [280]u8 = undefined;
         const shown = if (s.name.len > 0) s.name else "(unnamed script)";
-        const nz = std.fmt.bufPrintZ(&name_z, "{s}", .{shown[0..@min(shown.len, 256)]}) catch "script";
+        const nz = std.fmt.bufPrintSentinel(&name_z, "{s}", .{shown[0..@min(shown.len, 256)]}, 0) catch "script";
         const label = c.gtk_label_new(nz.ptr);
         c.gtk_label_set_xalign(@ptrCast(label), 0.0);
         c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_END);
@@ -137,10 +137,10 @@ fn onListReply(ctx: ?*anyopaque, ok: bool, payload: []const u8) void {
         c.gtk_list_box_append(@ptrCast(self.listbox), row);
     }
     var buf: [64]u8 = undefined;
-    const txt = std.fmt.bufPrintZ(&buf, "{d} userscript{s}", .{
+    const txt = std.fmt.bufPrintSentinel(&buf, "{d} userscript{s}", .{
         scripts.len,
         if (scripts.len == 1) "" else "s",
-    }) catch "";
+    }, 0) catch "";
     c.gtk_label_set_text(@ptrCast(self.status), txt.ptr);
 }
 
@@ -216,7 +216,7 @@ const basename = @import("../util/pathz.zig").baseName;
 
 fn readFileBounded(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
     var z: [4096:0]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return null;
+    const p = std.fmt.bufPrintSentinel(&z, "{s}", .{path}, 0) catch return null;
     const fp = c.fopen(p.ptr, "rb") orelse return null;
     defer _ = c.fclose(fp);
     var list: std.ArrayList(u8) = .empty;
@@ -271,7 +271,7 @@ pub fn openSiteStyle(win: *Window, host: []const u8) void {
     };
 
     var title: [560]u8 = undefined;
-    const tz = std.fmt.bufPrintZ(&title, "Style for {s}", .{self.host}) catch "Site Style";
+    const tz = std.fmt.bufPrintSentinel(&title, "Style for {s}", .{self.host}, 0) catch "Site Style";
     c.gtk_window_set_title(@ptrCast(window), tz.ptr);
     c.gtk_window_set_default_size(@ptrCast(window), 560, 480);
     c.gtk_window_set_transient_for(@ptrCast(window), @ptrCast(win.app_window));

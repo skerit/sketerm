@@ -142,7 +142,7 @@ fn describeAll(res: *mcp.Res, value: Json, key: []const u8, heading: []const u8,
 const Artifacts = struct { report: []const u8, data: []const u8, screenshot: ?[]const u8 = null, outlives_instance: bool = true };
 fn exportEvidence(arena: std.mem.Allocator, dir: []const u8, res: *mcp.Res, png: ?[]const u8) !Artifacts {
     if (dir.len == 0 or dir[0] != '/' or std.mem.indexOfScalar(u8, dir, 0) != null) return error.AbsoluteDirectoryRequired;
-    const z = try arena.dupeZ(u8, dir);
+    const z = try arena.dupeSentinel(u8, dir, 0);
     // Explicit NEW directory only; never overwrite a previous review or follow
     // a pre-existing directory symlink. Parent directory must already exist.
     if (c.mkdir(z.ptr, @as(c.mode_t, 0o700)) != 0) return error.NewDirectoryRequired;

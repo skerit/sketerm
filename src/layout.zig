@@ -481,7 +481,7 @@ test "layout save accepts the load limit and preserves the old file on rejection
     defer _ = c.rmdir(dir);
     const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
     var path_buf: [512:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/layout.json", .{base});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/layout.json", .{base}, 0);
     defer _ = c.unlink(path.ptr);
 
     const command = [_][]const u8{"sh"};

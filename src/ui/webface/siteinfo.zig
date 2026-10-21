@@ -99,7 +99,7 @@ pub fn appendRouteRows(self: *WebFace, root: *classicmenu.Root, menu: classicmen
         root.own(freeRouteRowCtx, rc);
         var lbuf: [64]u8 = undefined;
         const label: [*:0]const u8 = if (choice.needsHost()) blk: {
-            const z = std.fmt.bufPrintZ(&lbuf, "{s}...", .{choice.label()}) catch break :blk choice.label();
+            const z = std.fmt.bufPrintSentinel(&lbuf, "{s}...", .{choice.label()}, 0) catch break :blk choice.label();
             break :blk z.ptr;
         } else choice.label();
         menu.checkEnabled(label, choice == current, !self.attached, &onRouteRow, rc);
@@ -232,21 +232,21 @@ pub fn updateSiteButton(self: *WebFace) void {
     if (have_icon) c.gtk_image_set_from_icon_name(@ptrCast(self.route_icon), route_icon);
     var sz: [webroute.HOST_LABEL_MAX + 16:0]u8 = undefined;
     var sbuf: [webroute.HOST_LABEL_MAX + 8]u8 = undefined;
-    const short = std.fmt.bufPrintZ(&sz, "{s}", .{route.shortLabel(&sbuf)}) catch "Route";
+    const short = std.fmt.bufPrintSentinel(&sz, "{s}", .{route.shortLabel(&sbuf)}, 0) catch "Route";
     c.gtk_label_set_text(@ptrCast(self.route_text), short.ptr);
     var rtip: [webroute.MAX_TEXT + 128]u8 = undefined;
     const rt = if (self.attached)
-        std.fmt.bufPrintZ(&rtip, "Route: this view presents another page's browser and cannot change route.", .{}) catch "Route"
+        std.fmt.bufPrintSentinel(&rtip, "Route: this view presents another page's browser and cannot change route.", .{}, 0) catch "Route"
     else if (desc.len != 0)
-        std.fmt.bufPrintZ(&rtip, "Route: this tab browses {s}. Click to change it.", .{desc}) catch "Route"
+        std.fmt.bufPrintSentinel(&rtip, "Route: this tab browses {s}. Click to change it.", .{desc}, 0) catch "Route"
     else
-        std.fmt.bufPrintZ(&rtip, "Route: direct, this machine's own network. Click to switch to Tor or a server.", .{}) catch "Route";
+        std.fmt.bufPrintSentinel(&rtip, "Route: direct, this machine's own network. Click to switch to Tor or a server.", .{}, 0) catch "Route";
     c.gtk_widget_set_tooltip_text(self.route_btn, rt.ptr);
     var tip: [webroute.MAX_TEXT + 96]u8 = undefined;
     const t = if (desc.len != 0)
-        std.fmt.bufPrintZ(&tip, "Site information, permissions and stored data. This tab browses {s}.", .{desc}) catch "Site information"
+        std.fmt.bufPrintSentinel(&tip, "Site information, permissions and stored data. This tab browses {s}.", .{desc}, 0) catch "Site information"
     else
-        std.fmt.bufPrintZ(&tip, "Site information, permissions and stored data", .{}) catch "Site information";
+        std.fmt.bufPrintSentinel(&tip, "Site information, permissions and stored data", .{}, 0) catch "Site information";
     c.gtk_widget_set_tooltip_text(self.site_btn, t.ptr);
     self.refreshSiteInfo(false);
 }

@@ -191,7 +191,7 @@ fn defaultPath(buf: []u8) ?[]const u8 {
 
 fn openLog(path: []const u8) c_int {
     var z_buf: [4096]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&z_buf, "{s}", .{path}) catch return -1;
+    const z = std.fmt.bufPrintSentinel(&z_buf, "{s}", .{path}, 0) catch return -1;
     mkdirParents(z);
     return c.open(z, c.O_WRONLY | c.O_CREAT | c.O_APPEND | c.O_CLOEXEC, @as(c.mode_t, 0o600));
 }
@@ -242,7 +242,7 @@ test "crashlog: a too-small buffer still reports the signal" {
 
 test "crashlog: the log path resolves under XDG_STATE_HOME and opens" {
     var dir_buf: [256]u8 = undefined;
-    const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/sketerm-crashlog-test-{d}", .{c.getpid()});
+    const dir = try std.fmt.bufPrintSentinel(&dir_buf, "/tmp/sketerm-crashlog-test-{d}", .{c.getpid()}, 0);
     _ = c.mkdir(dir.ptr, 0o700);
     defer @import("pathz.zig").removeTree(dir);
     // Restore the ambient value: later tests in this binary read it too.

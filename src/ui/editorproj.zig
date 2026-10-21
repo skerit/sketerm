@@ -347,10 +347,10 @@ pub fn stepHunk(view: *EditorView, forward: bool) void {
     const lc = tab.doc.rope.offsetToLineCol(target);
     view.gotoLineCol(tab, lc.line + 1, 1);
     var buf: [96:0]u8 = undefined;
-    const msg = std.fmt.bufPrintZ(&buf, "Hunk {d} of {d}.", .{
+    const msg = std.fmt.bufPrintSentinel(&buf, "Hunk {d} of {d}.", .{
         hunkIndexOf(tab, target) + 1,
         tab.git.hunkCount(&tab.doc),
-    }) catch "Hunk.";
+    }, 0) catch "Hunk.";
     view.setStatusText(msg.ptr);
 }
 
@@ -572,7 +572,7 @@ fn searchIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     rebuildResultRows(view);
     if (had_err) {
         var buf: [128:0]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(&buf, "{s}", .{err_copy[0..err_len]}) catch "Search failed.";
+        const msg = std.fmt.bufPrintSentinel(&buf, "{s}", .{err_copy[0..err_len]}, 0) catch "Search failed.";
         setSearchStatusZ(view, msg.ptr);
     } else updateSearchStatus(view);
     return 0;
@@ -702,7 +702,7 @@ pub fn closeSearch(view: *EditorView) void {
 
 fn setSearchStatus(view: *EditorView, text: []const u8) void {
     var buf: [256:0]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{text}) catch return;
+    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{text}, 0) catch return;
     setSearchStatusZ(view, z.ptr);
 }
 
@@ -721,20 +721,20 @@ fn updateSearchStatus(view: *EditorView) void {
         const tab = view.activeTab();
         const proj = if (tab) |t| t.project else null;
         if (proj) |p| {
-            const z = std.fmt.bufPrintZ(&buf, "Project: {s} ({s})", .{ p.label(), p.marker }) catch return;
+            const z = std.fmt.bufPrintSentinel(&buf, "Project: {s} ({s})", .{ p.label(), p.marker }, 0) catch return;
             setSearchStatusZ(view, z.ptr);
         } else setSearchStatus(view, "No project for this file.");
         return;
     }
     const seed = psearch.literalSeed(r.needle, r.opts);
-    const z = std.fmt.bufPrintZ(&buf, "{d} result(s) in {d} file(s) — {d} candidate(s) read{s}{s}{s}", .{
+    const z = std.fmt.bufPrintSentinel(&buf, "{d} result(s) in {d} file(s) — {d} candidate(s) read{s}{s}{s}", .{
         r.hitCount(),
         r.matchedFiles(),
         r.scanned,
         if (r.truncated) ", truncated" else "",
         if (seed.len == 0 and r.opts.regex) ", no literal to pre-filter on" else "",
         if (view.replace_previewed) " — preview ready, press Apply" else "",
-    }) catch return;
+    }, 0) catch return;
     setSearchStatusZ(view, z.ptr);
     c.gtk_widget_set_sensitive(view.search_apply_btn, if (view.replace_previewed) 1 else 0);
 }
@@ -751,11 +751,11 @@ fn rebuildResultRows(view: *EditorView) void {
         const spec = r.fileSpec(@intCast(fi));
         const rel = relativeTo(r.root, spec);
         const head_z = if (f.state == .failed)
-            std.fmt.bufPrintZ(&head, "{s} — {s}", .{ rel, r.note(@intCast(fi)) }) catch continue
+            std.fmt.bufPrintSentinel(&head, "{s} — {s}", .{ rel, r.note(@intCast(fi)) }, 0) catch continue
         else if (view.replace_previewed)
-            std.fmt.bufPrintZ(&head, "{s} ({d}) \u{2014} will be replaced in its buffer", .{ rel, f.hit_count }) catch continue
+            std.fmt.bufPrintSentinel(&head, "{s} ({d}) \u{2014} will be replaced in its buffer", .{ rel, f.hit_count }, 0) catch continue
         else
-            std.fmt.bufPrintZ(&head, "{s} ({d})", .{ rel, f.hit_count }) catch continue;
+            std.fmt.bufPrintSentinel(&head, "{s} ({d})", .{ rel, f.hit_count }, 0) catch continue;
         appendRow(view, head_z.ptr, null, true);
         var h: u32 = 0;
         while (h < f.hit_count) : (h += 1) {
@@ -763,7 +763,7 @@ fn rebuildResultRows(view: *EditorView) void {
             if (hi >= r.hits.items.len) break;
             const hit = r.hits.items[hi];
             var line_buf: [512:0]u8 = undefined;
-            const text = std.fmt.bufPrintZ(&line_buf, "{d}: {s}", .{ hit.line + 1, r.preview(hit) }) catch continue;
+            const text = std.fmt.bufPrintSentinel(&line_buf, "{d}: {s}", .{ hit.line + 1, r.preview(hit) }, 0) catch continue;
             appendRow(view, text.ptr, hi, false);
         }
     }
@@ -977,7 +977,7 @@ pub fn applyDeferredReplace(view: *EditorView, tab: *ETab, payload: []const u8) 
 /// The files that had to be opened first got their replacement.
 pub fn reportDeferredReplace(view: *EditorView, files: usize) void {
     var buf: [160:0]u8 = undefined;
-    const msg = std.fmt.bufPrintZ(&buf, "Replaced in {d} more file(s) as they loaded; review and save.", .{files}) catch "Replaced.";
+    const msg = std.fmt.bufPrintSentinel(&buf, "Replaced in {d} more file(s) as they loaded; review and save.", .{files}, 0) catch "Replaced.";
     view.setStatusText(msg.ptr);
 }
 

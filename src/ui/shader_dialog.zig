@@ -346,7 +346,7 @@ pub fn open(win: *Window) bool {
 }
 
 fn dupZ(allocator: std.mem.Allocator, s: []const u8) ?[:0]u8 {
-    return allocator.dupeZ(u8, s) catch null;
+    return allocator.dupeSentinel(u8, s, 0) catch null;
 }
 
 fn digitsForStep(step: f32) c_int {

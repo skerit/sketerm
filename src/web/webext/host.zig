@@ -40,7 +40,7 @@ pub fn uiLanguage() []const u8 {
     State.done = true;
     for ([_][]const u8{ "LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG" }) |name| {
         var zbuf: [16]u8 = undefined;
-        const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{name}) catch continue;
+        const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{name}, 0) catch continue;
         const raw = c.getenv(z.ptr) orelse continue;
         var s: []const u8 = std.mem.span(raw);
         // LANGUAGE is a colon-separated preference list.
@@ -452,7 +452,7 @@ pub const Host = struct {
 
     fn storagePath(self: *Host, e: *const Extension, name: []const u8, buf: []u8) ?[:0]const u8 {
         if (self.data_dir.len == 0) return null;
-        return std.fmt.bufPrintZ(buf, "{s}/{s}/{s}", .{ self.data_dir, e.id, name }) catch null;
+        return std.fmt.bufPrintSentinel(buf, "{s}/{s}/{s}", .{ self.data_dir, e.id, name }, 0) catch null;
     }
 
     fn storageStamp(self: *Host, e: *const Extension) FileStamp {
@@ -756,7 +756,7 @@ pub const Host = struct {
     fn listLocales(self: *Host, e: *Extension, names: [][]const u8, store: []u8) [][]const u8 {
         _ = self;
         var buf: [4096]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&buf, "{s}/_locales", .{e.dir}) catch return names[0..0];
+        const path = std.fmt.bufPrintSentinel(&buf, "{s}/_locales", .{e.dir}, 0) catch return names[0..0];
         const dir = c.opendir(path.ptr) orelse return names[0..0];
         defer _ = c.closedir(dir);
         var n: usize = 0;
@@ -949,13 +949,13 @@ test "storage.local answers immediately and writes once the window passes" {
     const base = std.mem.span(@as([*:0]u8, @ptrCast(base_z)));
     defer {
         var zbuf: [512:0]u8 = undefined;
-        if (std.fmt.bufPrintZ(&zbuf, "{s}/webext/storage@sketerm.test/storage.json", .{base})) |p| {
+        if (std.fmt.bufPrintSentinel(&zbuf, "{s}/webext/storage@sketerm.test/storage.json", .{base}, 0)) |p| {
             _ = c.unlink(p.ptr);
         } else |_| {}
-        if (std.fmt.bufPrintZ(&zbuf, "{s}/webext/storage@sketerm.test", .{base})) |p| {
+        if (std.fmt.bufPrintSentinel(&zbuf, "{s}/webext/storage@sketerm.test", .{base}, 0)) |p| {
             _ = c.rmdir(p.ptr);
         } else |_| {}
-        if (std.fmt.bufPrintZ(&zbuf, "{s}/webext", .{base})) |p| {
+        if (std.fmt.bufPrintSentinel(&zbuf, "{s}/webext", .{base}, 0)) |p| {
             _ = c.rmdir(p.ptr);
         } else |_| {}
         _ = c.rmdir(base_z);
@@ -974,7 +974,7 @@ test "storage.local answers immediately and writes once the window passes" {
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/storage@sketerm.test/storage.json", .{data_dir});
     var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    const path_z = try std.fmt.bufPrintSentinel(&path_z_buf, "{s}", .{path}, 0);
     var st: c.struct_stat = undefined;
 
     var changed: ?[]u8 = null;
@@ -1009,7 +1009,7 @@ test "storage.local answers immediately and writes once the window passes" {
     // data the extension already saw stored.
     const parent = std.fs.path.dirname(path).?;
     var parent_z_buf: [512:0]u8 = undefined;
-    const parent_z = try std.fmt.bufPrintZ(&parent_z_buf, "{s}", .{parent});
+    const parent_z = try std.fmt.bufPrintSentinel(&parent_z_buf, "{s}", .{parent}, 0);
     changed = null;
     const third = host.dispatchStorage(ext, "set", "[{\"secret\":\"three\"}]", &changed);
     defer t.allocator.free(third);
@@ -1044,14 +1044,14 @@ test "an extension torn down inside the window still writes its store" {
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/webext/flush@sketerm.test/storage.json", .{base});
     var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    const path_z = try std.fmt.bufPrintSentinel(&path_z_buf, "{s}", .{path}, 0);
     defer {
         var zbuf: [512:0]u8 = undefined;
         _ = c.unlink(path_z.ptr);
-        if (std.fmt.bufPrintZ(&zbuf, "{s}/webext/flush@sketerm.test", .{base})) |p| {
+        if (std.fmt.bufPrintSentinel(&zbuf, "{s}/webext/flush@sketerm.test", .{base}, 0)) |p| {
             _ = c.rmdir(p.ptr);
         } else |_| {}
-        if (std.fmt.bufPrintZ(&zbuf, "{s}/webext", .{base})) |p| {
+        if (std.fmt.bufPrintSentinel(&zbuf, "{s}/webext", .{base}, 0)) |p| {
             _ = c.rmdir(p.ptr);
         } else |_| {}
         _ = c.rmdir(base_z);
@@ -1125,11 +1125,11 @@ const AllocationTestDir = struct {
     fn deinit(self: *AllocationTestDir) void {
         var path_buf: [320:0]u8 = undefined;
         for ([_][]const u8{ "old/manifest.json", "new/manifest.json" }) |rel| {
-            const child_path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ self.path(), rel }) catch continue;
+            const child_path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ self.path(), rel }, 0) catch continue;
             _ = c.unlink(child_path.ptr);
         }
         for ([_][]const u8{ "old", "new" }) |rel| {
-            const child_path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ self.path(), rel }) catch continue;
+            const child_path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ self.path(), rel }, 0) catch continue;
             _ = c.rmdir(child_path.ptr);
         }
         _ = c.rmdir(@ptrCast(&self.storage));
@@ -1138,7 +1138,7 @@ const AllocationTestDir = struct {
 
 fn writeAllocationManifest(dir: []const u8, bytes: []const u8) !void {
     var path_buf: [320:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/manifest.json", .{dir});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/manifest.json", .{dir}, 0);
     const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
     if (fd < 0) return error.WriteFailed;
     defer _ = c.close(fd);

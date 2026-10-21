@@ -645,7 +645,7 @@ pub fn saveFsJob(self: *Daemon, job: *FsJob) !void {
 pub fn deleteFsJobJournal(self: *Daemon, id: u64) void {
     const guard = fsjournal.lockControl(self.fs_job_dir, id) catch return;
     var path_buf: [4096:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/{d}.json", .{ self.fs_job_dir, id }) catch {
+    const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{d}.json", .{ self.fs_job_dir, id }, 0) catch {
         guard.release();
         return;
     };

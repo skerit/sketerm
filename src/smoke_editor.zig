@@ -196,7 +196,7 @@ fn regexStage(allocator: std.mem.Allocator) !?u8 {
 /// back with caret and content intact, and a clean close leaves nothing.
 fn journalStage(allocator: std.mem.Allocator) !?u8 {
     var dir_buf: [128]u8 = undefined;
-    const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/sketerm-smoke-journal-{d}", .{c.getpid()});
+    const dir = try std.fmt.bufPrintSentinel(&dir_buf, "/tmp/sketerm-smoke-journal-{d}", .{c.getpid()}, 0);
     _ = c.mkdir(dir.ptr, 0o700);
     const saved = c.getenv("XDG_STATE_HOME");
     _ = c.setenv("XDG_STATE_HOME", dir.ptr, 1);
@@ -207,7 +207,7 @@ fn journalStage(allocator: std.mem.Allocator) !?u8 {
             _ = unsetEnv("XDG_STATE_HOME");
         }
         var cmd: [200]u8 = undefined;
-        if (std.fmt.bufPrintZ(&cmd, "rm -rf '{s}'", .{dir})) |z| {
+        if (std.fmt.bufPrintSentinel(&cmd, "rm -rf '{s}'", .{dir}, 0)) |z| {
             _ = c.system(z.ptr);
         } else |_| {}
     }

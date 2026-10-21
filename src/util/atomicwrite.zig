@@ -42,11 +42,11 @@ var next_stage = std.atomic.Value(u64).init(1);
 /// Name a fresh staging sibling of `path`, unique within this process.
 pub fn stagePath(buf: *StageBuf, path: []const u8) error{NameTooLong}![:0]u8 {
     const serial = next_stage.fetchAdd(1, .monotonic);
-    return std.fmt.bufPrintZ(buf, "{s}" ++ STAGE_INFIX ++ "{d}-{x}", .{
+    return std.fmt.bufPrintSentinel(buf, "{s}" ++ STAGE_INFIX ++ "{d}-{x}", .{
         path,
         c.getpid(),
         serial,
-    }) catch error.NameTooLong;
+    }, 0) catch error.NameTooLong;
 }
 
 /// The final name a staging sibling belongs to, or null when `name` is not one.
@@ -143,10 +143,10 @@ pub fn writeCacheFile(path: []const u8, bytes: []const u8, mode: u32) Error!void
 pub fn deleteFile(path: []const u8) Error!void {
     if (path.len == 0 or path.len >= MAX_PATH) return error.NameTooLong;
     var path_buf: [MAX_PATH:0]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return error.NameTooLong;
+    const path_z = std.fmt.bufPrintSentinel(&path_buf, "{s}", .{path}, 0) catch return error.NameTooLong;
     const parent = std.fs.path.dirname(path) orelse ".";
     var parent_buf: [MAX_PATH:0]u8 = undefined;
-    const parent_z = std.fmt.bufPrintZ(&parent_buf, "{s}", .{parent}) catch return error.NameTooLong;
+    const parent_z = std.fmt.bufPrintSentinel(&parent_buf, "{s}", .{parent}, 0) catch return error.NameTooLong;
     const parent_fd = c.open(parent_z.ptr, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC, @as(c.mode_t, 0));
     if (parent_fd < 0) return syscallError(error.ParentOpenFailed);
     defer _ = c.close(parent_fd);
@@ -230,10 +230,10 @@ fn writeFileWithOps(
     if (path.len == 0 or path.len >= MAX_PATH) return error.NameTooLong;
 
     var dst_buf: [MAX_PATH:0]u8 = undefined;
-    const dst = std.fmt.bufPrintZ(&dst_buf, "{s}", .{path}) catch return error.NameTooLong;
+    const dst = std.fmt.bufPrintSentinel(&dst_buf, "{s}", .{path}, 0) catch return error.NameTooLong;
     const parent = std.fs.path.dirname(path) orelse ".";
     var parent_buf: [MAX_PATH:0]u8 = undefined;
-    const parent_z = std.fmt.bufPrintZ(&parent_buf, "{s}", .{parent}) catch return error.NameTooLong;
+    const parent_z = std.fmt.bufPrintSentinel(&parent_buf, "{s}", .{parent}, 0) catch return error.NameTooLong;
 
     var install_mode: c.mode_t = @intCast(create_mode & 0o777);
     if (mode_policy == .preserve_existing) {
@@ -458,7 +458,7 @@ const TempFile = struct {
         _ = c.mkdtemp(&self.tmpl) orelse return error.SkipZigTest;
         self.base = std.mem.span(@as([*:0]const u8, &self.tmpl));
         self.path = try std.fmt.bufPrint(&self.path_buf, "{s}/" ++ leaf, .{self.base});
-        self.path_z = try std.fmt.bufPrintZ(&self.path_z_buf, "{s}", .{self.path});
+        self.path_z = try std.fmt.bufPrintSentinel(&self.path_z_buf, "{s}", .{self.path}, 0);
     }
 
     fn deinit(self: *@This()) void {
@@ -474,7 +474,7 @@ const TempFile = struct {
 
 fn readTestFile(path: []const u8, buf: []u8) ![]const u8 {
     var path_buf: [MAX_PATH:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{path});
+    const path_z = try std.fmt.bufPrintSentinel(&path_buf, "{s}", .{path}, 0);
     const fd = c.open(path_z.ptr, c.O_RDONLY | c.O_CLOEXEC);
     if (fd < 0) return error.ReadFailed;
     defer _ = c.close(fd);

@@ -1518,7 +1518,7 @@ const UiScratch = struct {
         resetEventCursors();
         try self.saved_state_home.take("XDG_STATE_HOME");
         try self.saved_env.take();
-        const p = try std.fmt.bufPrintZ(&self.buf, "/tmp/sketerm-mcp-ui-{s}-{d}", .{ tag, c.getpid() });
+        const p = try std.fmt.bufPrintSentinel(&self.buf, "/tmp/sketerm-mcp-ui-{s}-{d}", .{ tag, c.getpid() }, 0);
         self.len = p.len;
         _ = c.mkdir(@ptrCast(&self.buf), 0o755);
         _ = c.setenv("XDG_STATE_HOME", @ptrCast(&self.buf), 1);
@@ -1535,7 +1535,7 @@ const UiScratch = struct {
         self.saved_env.restore();
         self.saved_state_home.restore();
         var cmd: [256]u8 = undefined;
-        const z = std.fmt.bufPrintZ(&cmd, "rm -rf {s}", .{self.buf[0..self.len]}) catch return;
+        const z = std.fmt.bufPrintSentinel(&cmd, "rm -rf {s}", .{self.buf[0..self.len]}, 0) catch return;
         _ = c.system(z.ptr);
         self.* = undefined;
     }
@@ -1867,7 +1867,7 @@ test "ui presenter protocol shapes cannot fabricate panel success" {
 /// Create an empty file so ui_show_files' readability check passes.
 fn touchFile(dir: []const u8, name: []const u8) void {
     var buf: [512]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, name }) catch return;
+    const p = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, name }, 0) catch return;
     const f = c.fopen(p.ptr, "wb") orelse return;
     _ = c.fwrite("x", 1, 1, f);
     _ = c.fclose(f);
@@ -2197,7 +2197,7 @@ test "a daemon with no lifetime id falls back to by-session storage" {
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-store-legacy-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-store-legacy-{d}.sock", .{c.getpid()}, 0);
     _ = c.unlink(path.ptr);
     defer _ = c.unlink(path.ptr);
     const listener = try directDropListener(path);
@@ -2426,7 +2426,7 @@ test "relay to explicit direct fallback shares one deadline for ui_wait_event" {
     defer scratch.deinit();
 
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-legacy-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-panel-legacy-{d}.sock", .{c.getpid()}, 0);
     _ = c.unlink(path.ptr);
     defer _ = c.unlink(path.ptr);
     const listener = try directDropListener(path);
@@ -2465,7 +2465,7 @@ test "relay to explicit direct fallback shares one deadline for ui_wait_event" {
 test "direct GUI write and reply loss preserve delivery phase" {
     const t = std.testing;
     var missing_buf: [256:0]u8 = undefined;
-    const missing = try std.fmt.bufPrintZ(&missing_buf, "/tmp/sketerm-direct-missing-{d}.sock", .{c.getpid()});
+    const missing = try std.fmt.bufPrintSentinel(&missing_buf, "/tmp/sketerm-direct-missing-{d}.sock", .{c.getpid()}, 0);
     _ = c.unlink(missing.ptr);
     var unavailable = RealBackend{ .sock_path = missing };
     defer unavailable.client.deinit();
@@ -2487,7 +2487,7 @@ test "direct GUI write and reply loss preserve delivery phase" {
     };
     for (cases) |case| {
         var path_buf: [256:0]u8 = undefined;
-        const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-direct-{s}-{d}.sock", .{ case.suffix, c.getpid() });
+        const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-direct-{s}-{d}.sock", .{ case.suffix, c.getpid() }, 0);
         _ = c.unlink(path.ptr);
         defer _ = c.unlink(path.ptr);
         const listener = try directDropListener(path);
@@ -2538,7 +2538,7 @@ test "expired direct deadlines dispatch neither mutations nor event drains" {
     try t.expectEqual(@as(usize, 0), fake.requests.items.len);
 
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-direct-expired-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-direct-expired-{d}.sock", .{c.getpid()}, 0);
     _ = c.unlink(path.ptr);
     defer _ = c.unlink(path.ptr);
     const listener = try directDropListener(path);

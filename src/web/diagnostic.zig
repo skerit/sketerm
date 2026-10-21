@@ -189,7 +189,7 @@ pub const Capture = struct {
 fn sensitive(line: []const u8) bool {
     const keys = [_][]const u8{ "password", "passwd", "token", "secret", "authorization", "cookie", "credential", "bearer", "private key" };
     for (keys) |key| {
-        if (std.ascii.indexOfIgnoreCase(line, key) != null) return true;
+        if (std.ascii.findIgnoreCase(line, key) != null) return true;
     }
     // URLs can embed userinfo, query credentials, or fragment tokens.
     if (std.mem.indexOf(u8, line, "://") != null and std.mem.indexOfAny(u8, line, "@?#") != null) return true;

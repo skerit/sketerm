@@ -27,7 +27,7 @@ pub const Endpoint = union(enum) {
             if (close <= 1 or close + 2 > text.len or text[close + 1] != ':') return error.InvalidEndpoint;
             const port = parsePort(text[close + 2 ..]) catch return error.InvalidEndpoint;
             var host_z: [c.INET6_ADDRSTRLEN:0]u8 = undefined;
-            const host = std.fmt.bufPrintZ(&host_z, "{s}", .{text[1..close]}) catch return error.InvalidEndpoint;
+            const host = std.fmt.bufPrintSentinel(&host_z, "{s}", .{text[1..close]}, 0) catch return error.InvalidEndpoint;
             var addr: [16]u8 = undefined;
             if (c.inet_pton(c.AF_INET6, host.ptr, &addr) != 1) return error.InvalidEndpoint;
             return .{ .ipv6 = .{ .addr = addr, .port = port } };
@@ -38,7 +38,7 @@ pub const Endpoint = union(enum) {
             return error.InvalidEndpoint;
         const port = parsePort(text[colon + 1 ..]) catch return error.InvalidEndpoint;
         var host_z: [c.INET_ADDRSTRLEN:0]u8 = undefined;
-        const host = std.fmt.bufPrintZ(&host_z, "{s}", .{text[0..colon]}) catch return error.InvalidEndpoint;
+        const host = std.fmt.bufPrintSentinel(&host_z, "{s}", .{text[0..colon]}, 0) catch return error.InvalidEndpoint;
         var addr: [4]u8 = undefined;
         if (c.inet_pton(c.AF_INET, host.ptr, &addr) != 1) return error.InvalidEndpoint;
         return .{ .ipv4 = .{ .addr = addr, .port = port } };

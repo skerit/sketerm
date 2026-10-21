@@ -251,13 +251,13 @@ pub fn rebuildCrumbs(self: *BrowserView, tab: *BTab) void {
         // A rerouted mount says so: the files are the host's own, the
         // path is no longer the mount's.
         const host = if (tab.bypass) |link|
-            std.fmt.bufPrintZ(&host_z, "{s} via sketerm", .{link.host}) catch "via sketerm"
+            std.fmt.bufPrintSentinel(&host_z, "{s} via sketerm", .{link.host}, 0) catch "via sketerm"
         else
-            std.fmt.bufPrintZ(&host_z, "{s}", .{tab.hc.host orelse "This computer"}) catch "Remote host";
+            std.fmt.bufPrintSentinel(&host_z, "{s}", .{tab.hc.host orelse "This computer"}, 0) catch "Remote host";
         c.gtk_label_set_text(@ptrCast(label), host.ptr);
         if (tab.bypass) |link| {
             var tip: [1200:0]u8 = undefined;
-            const text = std.fmt.bufPrintZ(&tip, "{s}, browsed through its own daemon instead of the mount at {s}", .{ link.host, link.mountpoint }) catch host;
+            const text = std.fmt.bufPrintSentinel(&tip, "{s}, browsed through its own daemon instead of the mount at {s}", .{ link.host, link.mountpoint }, 0) catch host;
             c.gtk_widget_set_tooltip_text(label, text.ptr);
         } else c.gtk_widget_set_tooltip_text(label, host.ptr);
     }
@@ -274,7 +274,7 @@ pub fn rebuildCrumbs(self: *BrowserView, tab: *BTab) void {
         const warn = c.gtk_label_new("!");
         c.gtk_widget_add_css_class(warn, "error");
         var tip: [512:0]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&tip, "could not be opened: {s}", .{why}) catch null;
+        const text = std.fmt.bufPrintSentinel(&tip, "could not be opened: {s}", .{why}, 0) catch null;
         c.gtk_widget_set_tooltip_text(warn, if (text) |t| t.ptr else "could not be opened");
         c.gtk_box_append(@ptrCast(box), warn);
     }
@@ -307,7 +307,7 @@ fn appendSegment(self: *BrowserView, box: *c.GtkWidget, seg: crumbs.Segment, tab
     toolbtn.flatten(btn.?);
     if (seg.root and tab.hc.host != null) c.gtk_widget_add_css_class(btn, "accent");
     var tip: [4200:0]u8 = undefined;
-    if (std.fmt.bufPrintZ(&tip, "{s}", .{seg.path})) |t| c.gtk_widget_set_tooltip_text(btn, t.ptr) else |_| {}
+    if (std.fmt.bufPrintSentinel(&tip, "{s}", .{seg.path}, 0)) |t| c.gtk_widget_set_tooltip_text(btn, t.ptr) else |_| {}
     if (PathCtx.create(self, seg.path)) |ctx| {
         _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onCrumbClicked), @ptrCast(ctx), @ptrCast(&PathCtx.freeClosure), c.G_CONNECT_DEFAULT);
     }

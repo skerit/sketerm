@@ -55,15 +55,15 @@ test "a directory listing is bounded and answered on the same frame" {
     const t = std.testing;
     const a = t.allocator;
     var dir_buf: [64:0]u8 = undefined;
-    const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/sk-browse-{d}", .{c.getpid()});
+    const dir = try std.fmt.bufPrintSentinel(&dir_buf, "/tmp/sk-browse-{d}", .{c.getpid()}, 0);
     try t.expectEqual(@as(c_int, 0), c.mkdir(dir.ptr, 0o700));
     defer _ = c.rmdir(dir.ptr);
     var sub_buf: [80:0]u8 = undefined;
-    const sub = try std.fmt.bufPrintZ(&sub_buf, "{s}/sub", .{dir});
+    const sub = try std.fmt.bufPrintSentinel(&sub_buf, "{s}/sub", .{dir}, 0);
     try t.expectEqual(@as(c_int, 0), c.mkdir(sub.ptr, 0o700));
     defer _ = c.rmdir(sub.ptr);
     var file_buf: [80:0]u8 = undefined;
-    const file = try std.fmt.bufPrintZ(&file_buf, "{s}/f.txt", .{dir});
+    const file = try std.fmt.bufPrintSentinel(&file_buf, "{s}/f.txt", .{dir}, 0);
     const fd = c.open(file.ptr, c.O_WRONLY | c.O_CREAT, @as(c_uint, 0o600));
     try t.expect(fd >= 0);
     try t.expectEqual(@as(isize, 3), c.write(fd, "abc", 3));
@@ -126,17 +126,17 @@ pub fn handleFileList(self: *Daemon, cl: *Client, payload: []const u8) void {
                 return;
             };
             if (req_path.len == 0) {
-                break :blk std.fmt.bufPrintZ(&dir_z, "{s}", .{cwd}) catch {
+                break :blk std.fmt.bufPrintSentinel(&dir_z, "{s}", .{cwd}, 0) catch {
                     listingError(cl, xfer, "", "path too long");
                     return;
                 };
             }
-            break :blk std.fmt.bufPrintZ(&dir_z, "{s}/{s}", .{ cwd, req_path }) catch {
+            break :blk std.fmt.bufPrintSentinel(&dir_z, "{s}/{s}", .{ cwd, req_path }, 0) catch {
                 listingError(cl, xfer, "", "path too long");
                 return;
             };
         }
-        break :blk std.fmt.bufPrintZ(&dir_z, "{s}", .{req_path}) catch {
+        break :blk std.fmt.bufPrintSentinel(&dir_z, "{s}", .{req_path}, 0) catch {
             listingError(cl, xfer, "", "path too long");
             return;
         };
@@ -179,7 +179,7 @@ pub fn handleFileList(self: *Daemon, cl: *Client, payload: []const u8) void {
         var size: u64 = 0;
         if (de.*.d_type != c.DT_DIR) {
             var full_z: [4096]u8 = undefined;
-            if (std.fmt.bufPrintZ(&full_z, "{s}/{s}", .{ dirpath, name })) |fp| {
+            if (std.fmt.bufPrintSentinel(&full_z, "{s}/{s}", .{ dirpath, name }, 0)) |fp| {
                 var st: c.struct_stat = undefined;
                 if (c.stat(fp.ptr, &st) == 0) {
                     is_dir = (st.st_mode & c.S_IFMT) == c.S_IFDIR;

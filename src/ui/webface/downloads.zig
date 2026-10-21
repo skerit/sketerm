@@ -452,7 +452,7 @@ pub fn autoAcceptDownload(self: *WebFace, id: u32, name: []const u8, url: []cons
         return;
     }
     var dir_z: [4096:0]u8 = undefined;
-    if (std.fmt.bufPrintZ(&dir_z, "{s}", .{dir})) |z| {
+    if (std.fmt.bufPrintSentinel(&dir_z, "{s}", .{dir}, 0)) |z| {
         _ = c.mkdir(z.ptr, 0o755);
     } else |_| {
         declineDownload(self.view, id);
@@ -525,11 +525,11 @@ pub fn stagingPath(self: *WebFace, buf: []u8, id: u32, name: []const u8) ?[]cons
         break :blk std.fmt.bufPrint(&root_buf, "{s}/.cache", .{std.mem.span(@as([*:0]const u8, @ptrCast(home)))}) catch return null;
     };
     var z: [4096:0]u8 = undefined;
-    const d1 = std.fmt.bufPrintZ(&z, "{s}/sketerm", .{cache}) catch return null;
+    const d1 = std.fmt.bufPrintSentinel(&z, "{s}/sketerm", .{cache}, 0) catch return null;
     _ = c.mkdir(d1.ptr, 0o700);
-    const d2 = std.fmt.bufPrintZ(&z, "{s}/sketerm/webdl", .{cache}) catch return null;
+    const d2 = std.fmt.bufPrintSentinel(&z, "{s}/sketerm/webdl", .{cache}, 0) catch return null;
     _ = c.mkdir(d2.ptr, 0o700);
-    const path = std.fmt.bufPrintZ(buf, "{s}/sketerm/webdl/{d}-XXXXXX", .{ cache, id }) catch return null;
+    const path = std.fmt.bufPrintSentinel(buf, "{s}/sketerm/webdl/{d}-XXXXXX", .{ cache, id }, 0) catch return null;
     const fd = c.mkstemp(path.ptr);
     if (fd < 0) return null;
     _ = c.close(fd);
@@ -598,7 +598,7 @@ pub fn buildDlRow(self: *WebFace, d: *Download) void {
     c.gtk_widget_add_css_class(d.row, "sketerm-web-dlrow");
 
     var name_z: [512:0]u8 = undefined;
-    d.label = c.gtk_label_new(std.fmt.bufPrintZ(&name_z, "{s}", .{d.name}) catch "download");
+    d.label = c.gtk_label_new(std.fmt.bufPrintSentinel(&name_z, "{s}", .{d.name}, 0) catch "download");
     c.gtk_label_set_ellipsize(@ptrCast(d.label), c.PANGO_ELLIPSIZE_MIDDLE);
     c.gtk_label_set_max_width_chars(@ptrCast(d.label), 28);
     c.gtk_label_set_xalign(@ptrCast(d.label), 0);
@@ -660,10 +660,10 @@ pub fn updateDlRow(self: *WebFace, d: *Download) void {
         c.gtk_widget_set_tooltip_text(d.cancel_btn, "Cancel");
     }
     var destination: [4700:0]u8 = undefined;
-    const dest = std.fmt.bufPrintZ(&destination, "Save to {s}:{s}", .{
+    const dest = std.fmt.bufPrintSentinel(&destination, "Save to {s}:{s}", .{
         if (d.remote_host.len == 0) "This computer" else d.remote_host,
         if (d.staged) d.remote_path else d.path,
-    }) catch "Download destination";
+    }, 0) catch "Download destination";
     c.gtk_widget_set_tooltip_text(d.label, dest.ptr);
     const format = @import("../../filebrowser/format.zig");
     var size_buf: [48:0]u8 = undefined;
@@ -675,23 +675,23 @@ pub fn updateDlRow(self: *WebFace, d: *Download) void {
             } else {
                 c.gtk_progress_bar_pulse(@ptrCast(d.bar));
             }
-            const t = std.fmt.bufPrintZ(&text, "{s}", .{format.fmtSize(&size_buf, d.received)}) catch "";
+            const t = std.fmt.bufPrintSentinel(&text, "{s}", .{format.fmtSize(&size_buf, d.received)}, 0) catch "";
             c.gtk_label_set_text(@ptrCast(d.status), t.ptr);
         },
         .uploading => {
             var host_z: [128:0]u8 = undefined;
-            const t = std.fmt.bufPrintZ(&text, "Sending to {s}…", .{
-                std.fmt.bufPrintZ(&host_z, "{s}", .{if (d.remote_host.len == 0) "this computer" else d.remote_host}) catch "host",
-            }) catch "Sending…";
+            const t = std.fmt.bufPrintSentinel(&text, "Sending to {s}…", .{
+                std.fmt.bufPrintSentinel(&host_z, "{s}", .{if (d.remote_host.len == 0) "this computer" else d.remote_host}, 0) catch "host",
+            }, 0) catch "Sending…";
             c.gtk_label_set_text(@ptrCast(d.status), t.ptr);
             if (d.total > 0) c.gtk_progress_bar_set_fraction(@ptrCast(d.bar), @as(f64, @floatFromInt(d.received)) / @as(f64, @floatFromInt(d.total)));
         },
         .done => {
             c.gtk_progress_bar_set_fraction(@ptrCast(d.bar), 1.0);
             const t = if (d.remote_host.len != 0)
-                std.fmt.bufPrintZ(&text, "Sent to {s}", .{d.remote_host}) catch "Sent"
+                std.fmt.bufPrintSentinel(&text, "Sent to {s}", .{d.remote_host}, 0) catch "Sent"
             else
-                std.fmt.bufPrintZ(&text, "Saved — {s}", .{format.fmtSize(&size_buf, d.received)}) catch "Saved";
+                std.fmt.bufPrintSentinel(&text, "Saved — {s}", .{format.fmtSize(&size_buf, d.received)}, 0) catch "Saved";
             c.gtk_label_set_text(@ptrCast(d.status), t.ptr);
             // Open only makes sense for a file on THIS machine.
             c.gtk_widget_set_visible(d.open_btn, if (d.remote_host.len == 0) 1 else 0);
@@ -702,13 +702,13 @@ pub fn updateDlRow(self: *WebFace, d: *Download) void {
         .failed => {
             var fail_z: [160:0]u8 = undefined;
             const failed_text: [*:0]const u8 = if (d.fail_reason.len != 0) blk: {
-                const t = std.fmt.bufPrintZ(&fail_z, "Failed: {s}", .{
+                const t = std.fmt.bufPrintSentinel(&fail_z, "Failed: {s}", .{
                     d.fail_reason[0..@min(d.fail_reason.len, 140)],
-                }) catch break :blk "Failed";
+                }, 0) catch break :blk "Failed";
                 break :blk t.ptr;
             } else "Download interrupted. Retry to start again.";
             c.gtk_label_set_text(@ptrCast(d.status), failed_text);
-            if (self.allocator.dupeZ(u8, d.fail_reason)) |why| {
+            if (self.allocator.dupeSentinel(u8, d.fail_reason, 0)) |why| {
                 defer self.allocator.free(why);
                 c.gtk_widget_set_tooltip_text(d.status, why);
             } else |_| {}
@@ -999,7 +999,7 @@ pub fn onDlOpenClicked(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self = findFaceGlobal(ctx.view) orelse return;
     const d = self.rowDownload(ctx.dl) orelse return;
     if (d.remote_host.len != 0) return;
-    const path = self.allocator.dupeZ(u8, if (d.staged) d.remote_path else d.path) catch return;
+    const path = self.allocator.dupeSentinel(u8, if (d.staged) d.remote_path else d.path, 0) catch return;
     defer self.allocator.free(path);
     if (!openLocalFile(path)) self.toast("Could not open the downloaded file. Check that it still exists and an application is installed for it.");
 }

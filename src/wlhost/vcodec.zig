@@ -71,8 +71,8 @@ var svt_probe: Probe = .unknown;
 fn openVersioned(comptime linux_fmt: []const u8, comptime mac_fmt: []const u8, major: c_int) ?*anyopaque {
     var a: [64]u8 = undefined;
     var b: [64]u8 = undefined;
-    const n1 = std.fmt.bufPrintZ(&a, linux_fmt, .{major}) catch return null;
-    const n2 = std.fmt.bufPrintZ(&b, mac_fmt, .{major}) catch return null;
+    const n1 = std.fmt.bufPrintSentinel(&a, linux_fmt, .{major}, 0) catch return null;
+    const n2 = std.fmt.bufPrintSentinel(&b, mac_fmt, .{major}, 0) catch return null;
     return platform.dlopenAny(&.{ n1.ptr, n2.ptr });
 }
 

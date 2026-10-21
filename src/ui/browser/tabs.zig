@@ -296,9 +296,9 @@ fn menuExtra(ctx: ?*anyopaque, _: *c.GtkWidget, _: *classicmenu.Root, m: classic
     const self = cast.userData(BrowserView, ctx);
     if (self.closed_tabs.closed.items.len == 0) return;
     var label: [96:0]u8 = undefined;
-    const text = std.fmt.bufPrintZ(&label, "Reopen Closed Tab ({d})", .{
+    const text = std.fmt.bufPrintSentinel(&label, "Reopen Closed Tab ({d})", .{
         self.closed_tabs.closed.items.len,
-    }) catch "Reopen Closed Tab";
+    }, 0) catch "Reopen Closed Tab";
     m.itemIcon(text.ptr, .{ .name = "document-open-recent-symbolic" }, &onTabMenuReopen, ctx);
 }
 
@@ -350,9 +350,9 @@ pub fn showStripMenu(self: *BrowserView, x: f64, y: f64) void {
     m.itemIcon("New Tab", .{ .name = "tab-new-symbolic" }, &onStripNewTab, @ptrCast(self));
     if (self.closed_tabs.closed.items.len > 0) {
         var label: [96:0]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&label, "Reopen Closed Tab ({d})", .{
+        const text = std.fmt.bufPrintSentinel(&label, "Reopen Closed Tab ({d})", .{
             self.closed_tabs.closed.items.len,
-        }) catch "Reopen Closed Tab";
+        }, 0) catch "Reopen Closed Tab";
         m.item(text.ptr, &onStripReopen, @ptrCast(self));
     }
     _ = root.popupVia(@ptrCast(@alignCast(self.notebook)), self.root_box, x, y);

@@ -105,7 +105,7 @@ fn clearInheritedOrigin() void {
 
 fn fileExists(path: []const u8) bool {
     var z: [4096]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return false;
+    const p = std.fmt.bufPrintSentinel(&z, "{s}", .{path}, 0) catch return false;
     return c.access(p.ptr, c.F_OK) == 0;
 }
 
@@ -153,14 +153,14 @@ fn doctorOutput(exe: [*:0]const u8, buf: []u8) []const u8 {
 /// Locate `<state>/sketerm/mcp-casts/<any>/<name>` and read it.
 fn findCast(state_dir: []const u8, name: []const u8, buf: []u8) ?[]const u8 {
     var base_buf: [4096]u8 = undefined;
-    const base = std.fmt.bufPrintZ(&base_buf, "{s}/sketerm/mcp-casts", .{state_dir}) catch return null;
+    const base = std.fmt.bufPrintSentinel(&base_buf, "{s}/sketerm/mcp-casts", .{state_dir}, 0) catch return null;
     const d = c.opendir(base.ptr) orelse return null;
     defer _ = c.closedir(d);
     while (c.readdir(d)) |ent| {
         const sub = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
         if (sub.len == 0 or sub[0] == '.') continue;
         var path_buf: [4096]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}/{s}", .{ base, sub, name }) catch continue;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}/{s}", .{ base, sub, name }, 0) catch continue;
         const f = c.fopen(path.ptr, "rb") orelse continue;
         defer _ = c.fclose(f);
         const n = c.fread(buf.ptr, 1, buf.len, f);
@@ -179,7 +179,7 @@ fn daemonUnderRt(allocator: std.mem.Allocator, rt: []const u8) bool {
         const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
         if (name.len == 0 or name[0] < '0' or name[0] > '9') continue;
         var path_buf: [256]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "/proc/{s}/environ", .{name}) catch continue;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{s}/environ", .{name}, 0) catch continue;
         const f = c.fopen(path.ptr, "rb") orelse continue;
         defer _ = c.fclose(f);
         var content: std.ArrayList(u8) = .empty;
@@ -194,7 +194,7 @@ fn daemonUnderRt(allocator: std.mem.Allocator, rt: []const u8) bool {
         if (std.mem.indexOf(u8, content.items, needle) != null) {
             // Confirm it's a sketerm-mux by comm.
             var comm_buf: [256]u8 = undefined;
-            const comm_path = std.fmt.bufPrintZ(&comm_buf, "/proc/{s}/comm", .{name}) catch continue;
+            const comm_path = std.fmt.bufPrintSentinel(&comm_buf, "/proc/{s}/comm", .{name}, 0) catch continue;
             const cf = c.fopen(comm_path.ptr, "rb") orelse continue;
             defer _ = c.fclose(cf);
             var cb: [64]u8 = undefined;
@@ -219,7 +219,7 @@ fn killUnderRt(rt: []const u8, allocator: std.mem.Allocator, sig: c_int) void {
         const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
         if (name.len == 0 or name[0] < '0' or name[0] > '9') continue;
         var path_buf: [256]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "/proc/{s}/environ", .{name}) catch continue;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{s}/environ", .{name}, 0) catch continue;
         const f = c.fopen(path.ptr, "rb") orelse continue;
         defer _ = c.fclose(f);
         var content: std.ArrayList(u8) = .empty;
@@ -510,7 +510,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     // Isolated runtime dir so nothing touches the user's real daemon.
     var rt_buf: [256]u8 = undefined;
-    const rt = std.fmt.bufPrintZ(&rt_buf, "/tmp/sketerm-smoke-mcp-{d}", .{c.getpid()}) catch return 1;
+    const rt = std.fmt.bufPrintSentinel(&rt_buf, "/tmp/sketerm-smoke-mcp-{d}", .{c.getpid()}, 0) catch return 1;
     _ = c.mkdir(rt.ptr, 0o700);
     _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
     // Auto asciicast recordings must land under the isolated state
@@ -521,14 +521,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // hooks and silently breaks the injected OSC 133 marks the
     // command-mode stages assert on. Empty HOME = stock bash.
     var home_buf: [280]u8 = undefined;
-    const home = std.fmt.bufPrintZ(&home_buf, "{s}/home", .{rt}) catch return 1;
+    const home = std.fmt.bufPrintSentinel(&home_buf, "{s}/home", .{rt}, 0) catch return 1;
     _ = c.mkdir(home.ptr, 0o700);
     _ = c.setenv("HOME", home.ptr, 1);
     // `sketerm mcp` reads config.conf on every start (tool policy and
     // the web_gui grant); the developer's real one must not decide a
     // smoke's verdicts.
     var cfg_home_buf: [280]u8 = undefined;
-    const cfg_home = std.fmt.bufPrintZ(&cfg_home_buf, "{s}/config", .{rt}) catch return 1;
+    const cfg_home = std.fmt.bufPrintSentinel(&cfg_home_buf, "{s}/config", .{rt}, 0) catch return 1;
     _ = c.mkdir(cfg_home.ptr, 0o700);
     _ = c.setenv("XDG_CONFIG_HOME", cfg_home.ptr, 1);
     // Later fake agents inherit the first default broker's environment.
@@ -1137,7 +1137,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // ── scp_put (local): checksum + atomic rename ────────────
         var src_buf: [512]u8 = undefined;
         var dst_buf: [512]u8 = undefined;
-        const xsrc = std.fmt.bufPrintZ(&src_buf, "{s}/xfer-src.bin", .{rt}) catch unreachable;
+        const xsrc = std.fmt.bufPrintSentinel(&src_buf, "{s}/xfer-src.bin", .{rt}, 0) catch unreachable;
         const xdst = std.fmt.bufPrint(&dst_buf, "{s}/xfer-dst.bin", .{rt}) catch unreachable;
         const xf = c.fopen(xsrc.ptr, "wb") orelse fail("cannot create transfer source");
         _ = c.fwrite("transfer-payload", 1, 16, xf);
@@ -1443,10 +1443,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // ── Stage 6: isolated MCP relays panels to its origin session ─
     {
         var origin_dir_buf: [320]u8 = undefined;
-        const origin_dir = std.fmt.bufPrintZ(&origin_dir_buf, "{s}/panel-origin", .{rt}) catch return 1;
+        const origin_dir = std.fmt.bufPrintSentinel(&origin_dir_buf, "{s}/panel-origin", .{rt}, 0) catch return 1;
         _ = c.mkdir(origin_dir.ptr, 0o700);
         var origin_sock_buf: [360]u8 = undefined;
-        const origin_sock = std.fmt.bufPrintZ(&origin_sock_buf, "{s}/mux.sock", .{origin_dir}) catch return 1;
+        const origin_sock = std.fmt.bufPrintSentinel(&origin_sock_buf, "{s}/mux.sock", .{origin_dir}, 0) catch return 1;
         var owner = muxclient.Conn.connectLocalAutostartAt(allocator, origin_sock) catch
             fail("could not start origin mux daemon");
         defer owner.deinit();
@@ -1464,7 +1464,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var identity_probe = muxclient.connectPanelRequester(allocator, origin_sock, "panel-origin", 5_000) catch
             fail("could not read panel origin identity");
         defer identity_probe.deinit();
-        const origin_id = allocator.dupeZ(u8, identity_probe.panelOriginId()) catch
+        const origin_id = allocator.dupeSentinel(u8, identity_probe.panelOriginId(), 0) catch
             fail("could not retain panel origin identity");
         defer allocator.free(origin_id);
         if (origin_id.len != 32) fail("panel attach did not expose a valid lifetime origin_id");
@@ -1511,7 +1511,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (fileExists(capability_dir))
             fail("capabilities created the panel store scope directory");
         var cap_dir_z: [4096]u8 = undefined;
-        const cap_dir_path = std.fmt.bufPrintZ(&cap_dir_z, "{s}", .{capability_dir}) catch
+        const cap_dir_path = std.fmt.bufPrintSentinel(&cap_dir_z, "{s}", .{capability_dir}, 0) catch
             fail("capability panel scope path too long");
         // One real save creates the scope on disk and proves the ordinary
         // path; the store is then made read-only under the server's feet.
@@ -1832,7 +1832,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     {
         _ = c.setenv("SKETERM_SESSION", "missing-origin", 1);
         var missing_buf: [320]u8 = undefined;
-        const missing = std.fmt.bufPrintZ(&missing_buf, "{s}/missing-origin.sock", .{rt}) catch return 1;
+        const missing = std.fmt.bufPrintSentinel(&missing_buf, "{s}/missing-origin.sock", .{rt}, 0) catch return 1;
         _ = c.unlink(missing.ptr);
         _ = c.setenv("SKETERM_MUX_SOCKET", missing.ptr, 1);
         var m = Mcp.spawn(allocator, exe, &.{});
@@ -1859,7 +1859,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     {
         var legacy_buf: [320]u8 = undefined;
-        const legacy_sock = std.fmt.bufPrintZ(&legacy_buf, "{s}/legacy-mux.sock", .{rt}) catch return 1;
+        const legacy_sock = std.fmt.bufPrintSentinel(&legacy_buf, "{s}/legacy-mux.sock", .{rt}, 0) catch return 1;
         var legacy = FakeLegacyMux.listen(legacy_sock);
         defer legacy.deinit();
         _ = c.setenv("SKETERM_SESSION", "legacy", 1);
@@ -1891,7 +1891,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // proven pre-delivery. Only the explicitly named GUI may then serve as
         // the requested legacy fallback.
         var gui_buf: [320]u8 = undefined;
-        const gui_sock = std.fmt.bufPrintZ(&gui_buf, "{s}/legacy-gui.sock", .{rt}) catch return 1;
+        const gui_sock = std.fmt.bufPrintSentinel(&gui_buf, "{s}/legacy-gui.sock", .{rt}, 0) catch return 1;
         var gui = FakeGui.listen(gui_sock);
         defer gui.deinit();
         var exact = Mcp.spawn(allocator, exe, &.{ "--socket", gui_sock });
@@ -1937,10 +1937,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // direct GUI socket is the one permitted mixed-version fallback.
     {
         var mixed_dir_buf: [320]u8 = undefined;
-        const mixed_dir = std.fmt.bufPrintZ(&mixed_dir_buf, "{s}/panel-mixed", .{rt}) catch return 1;
+        const mixed_dir = std.fmt.bufPrintSentinel(&mixed_dir_buf, "{s}/panel-mixed", .{rt}, 0) catch return 1;
         _ = c.mkdir(mixed_dir.ptr, 0o700);
         var mixed_sock_buf: [360]u8 = undefined;
-        const mixed_sock = std.fmt.bufPrintZ(&mixed_sock_buf, "{s}/mux.sock", .{mixed_dir}) catch return 1;
+        const mixed_sock = std.fmt.bufPrintSentinel(&mixed_sock_buf, "{s}/mux.sock", .{mixed_dir}, 0) catch return 1;
         var owner = muxclient.Conn.connectLocalAutostartAt(allocator, mixed_sock) catch
             fail("could not start mixed-version mux daemon");
         defer owner.deinit();
@@ -1955,7 +1955,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var legacy_viewer = attachLegacyPanelViewer(allocator, mixed_sock, "mixed-version");
 
         var gui_buf: [320]u8 = undefined;
-        const gui_sock = std.fmt.bufPrintZ(&gui_buf, "{s}/mixed-version-gui.sock", .{rt}) catch return 1;
+        const gui_sock = std.fmt.bufPrintSentinel(&gui_buf, "{s}/mixed-version-gui.sock", .{rt}, 0) catch return 1;
         var gui = FakeGui.listen(gui_sock);
         defer gui.deinit();
         _ = c.setenv("SKETERM_SESSION", "mixed-version", 1);
@@ -2008,10 +2008,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer default_identity.deinit();
 
         var exact_dir_buf: [320]u8 = undefined;
-        const exact_dir = std.fmt.bufPrintZ(&exact_dir_buf, "{s}/panel-exact", .{rt}) catch return 1;
+        const exact_dir = std.fmt.bufPrintSentinel(&exact_dir_buf, "{s}/panel-exact", .{rt}, 0) catch return 1;
         _ = c.mkdir(exact_dir.ptr, 0o700);
         var exact_sock_buf: [360]u8 = undefined;
-        const exact_sock = std.fmt.bufPrintZ(&exact_sock_buf, "{s}/mux.sock", .{exact_dir}) catch return 1;
+        const exact_sock = std.fmt.bufPrintSentinel(&exact_sock_buf, "{s}/mux.sock", .{exact_dir}, 0) catch return 1;
         var exact_owner = muxclient.Conn.connectLocalAutostartAt(allocator, exact_sock) catch fail("exact mux start");
         defer exact_owner.deinit();
         exact_owner.setNonBlocking();
@@ -2100,7 +2100,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // sessionful panel still uses the canonical daemon and cannot mutate a
         // same-named session in whichever GUI happened to be discovered.
         var discovered_buf: [360]u8 = undefined;
-        const discovered_sock = std.fmt.bufPrintZ(&discovered_buf, "{s}/sketerm/77777.sock", .{rt}) catch return 1;
+        const discovered_sock = std.fmt.bufPrintSentinel(&discovered_buf, "{s}/sketerm/77777.sock", .{rt}, 0) catch return 1;
         var discovered_gui = FakeGui.listen(discovered_sock);
         defer discovered_gui.deinit();
         var discovered = Mcp.spawn(allocator, exe, &.{"--shared"});
@@ -2156,13 +2156,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         _ = c.setenv("SKETERM_MCP_TOOLS", "ui", 1);
         defer _ = unsetEnv("SKETERM_MCP_TOOLS");
         var sock_buf: [320]u8 = undefined;
-        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/gui.sock", .{rt}) catch return 1;
+        const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/gui.sock", .{rt}, 0) catch return 1;
         var gui = FakeGui.listen(sock);
         defer gui.deinit();
         // Two real files; a third path deliberately never exists.
         for ([_][]const u8{ "e40.png", "e41.png" }) |nm| {
             var f_buf: [320]u8 = undefined;
-            const p = std.fmt.bufPrintZ(&f_buf, "{s}/{s}", .{ rt, nm }) catch return 1;
+            const p = std.fmt.bufPrintSentinel(&f_buf, "{s}/{s}", .{ rt, nm }, 0) catch return 1;
             const f = c.fopen(p.ptr, "wb") orelse fail("cannot create smoke image file");
             _ = c.fwrite("x", 1, 1, f);
             _ = c.fclose(f);
@@ -2378,12 +2378,12 @@ const FAKE_GUI_ENV = "SKETERM_SMOKE_FAKE_GUI";
 fn fakeGui(rt: []const u8) u8 {
     _ = c.write(1, "FAKE-GUI-STDOUT-LEAK\n", 21);
     var dir_buf: [300]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm", .{rt}) catch return 1;
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/sketerm", .{rt}, 0) catch return 1;
     _ = c.mkdir(dir.ptr, 0o700);
     var sock_buf: [340]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/{d}.sock", .{ dir, c.getpid() }) catch return 1;
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/{d}.sock", .{ dir, c.getpid() }, 0) catch return 1;
     var log_buf: [340]u8 = undefined;
-    const log_path = std.fmt.bufPrintZ(&log_buf, "{s}/fakegui-{d}.log", .{ rt, c.getpid() }) catch return 1;
+    const log_path = std.fmt.bufPrintSentinel(&log_buf, "{s}/fakegui-{d}.log", .{ rt, c.getpid() }, 0) catch return 1;
     const log = c.fopen(log_path.ptr, "w") orelse return 1;
     defer _ = c.fclose(log);
     {
@@ -2393,7 +2393,7 @@ fn fakeGui(rt: []const u8) u8 {
         _ = c.fflush(log);
     }
     var pids_buf: [340]u8 = undefined;
-    const pids_path = std.fmt.bufPrintZ(&pids_buf, "{s}/fakegui.pids", .{rt}) catch return 1;
+    const pids_path = std.fmt.bufPrintSentinel(&pids_buf, "{s}/fakegui.pids", .{rt}, 0) catch return 1;
     if (c.fopen(pids_path.ptr, "a")) |pf| {
         var line: [32]u8 = undefined;
         const s = std.fmt.bufPrint(&line, "{d}\n", .{c.getpid()}) catch return 1;
@@ -2532,7 +2532,7 @@ fn startFakeGui(self_exe: [*:0]const u8, rt: [:0]const u8) c.pid_t {
 /// Read `<rt>/fakegui-<pid>.log` (the fake GUI's request journal).
 fn fakeGuiLog(rt: []const u8, pid: c.pid_t, buf: []u8) []const u8 {
     var p_buf: [340]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&p_buf, "{s}/fakegui-{d}.log", .{ rt, pid }) catch return "";
+    const p = std.fmt.bufPrintSentinel(&p_buf, "{s}/fakegui-{d}.log", .{ rt, pid }, 0) catch return "";
     const f = c.fopen(p.ptr, "rb") orelse return "";
     defer _ = c.fclose(f);
     const n = c.fread(buf.ptr, 1, buf.len, f);
@@ -2542,7 +2542,7 @@ fn fakeGuiLog(rt: []const u8, pid: c.pid_t, buf: []u8) []const u8 {
 /// Pids the fake GUIs appended to `<rt>/fakegui.pids`, newest last.
 fn fakeGuiPids(rt: []const u8, out: []c.pid_t) []const c.pid_t {
     var p_buf: [340]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&p_buf, "{s}/fakegui.pids", .{rt}) catch return out[0..0];
+    const p = std.fmt.bufPrintSentinel(&p_buf, "{s}/fakegui.pids", .{rt}, 0) catch return out[0..0];
     const f = c.fopen(p.ptr, "rb") orelse return out[0..0];
     defer _ = c.fclose(f);
     var buf: [4096]u8 = undefined;
@@ -2563,17 +2563,17 @@ fn stopFakeGui(rt: []const u8, pid: c.pid_t) void {
     _ = c.kill(pid, c.SIGKILL);
     _ = c.waitpid(pid, null, 0);
     var sock_buf: [340]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/sketerm/{d}.sock", .{ rt, pid }) catch return;
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/sketerm/{d}.sock", .{ rt, pid }, 0) catch return;
     _ = c.unlink(sock.ptr);
 }
 
 /// Write `<rt>/config/sketerm/config.conf`.
 fn writeSmokeConfig(rt: []const u8, body: []const u8) void {
     var dir_buf: [340]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/config/sketerm", .{rt}) catch fail("config path");
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/config/sketerm", .{rt}, 0) catch fail("config path");
     _ = c.mkdir(dir.ptr, 0o700);
     var p_buf: [360]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&p_buf, "{s}/config.conf", .{dir}) catch fail("config path");
+    const p = std.fmt.bufPrintSentinel(&p_buf, "{s}/config.conf", .{dir}, 0) catch fail("config path");
     const f = c.fopen(p.ptr, "w") orelse fail("cannot write smoke config.conf");
     _ = c.fwrite(body.ptr, 1, body.len, f);
     _ = c.fclose(f);
@@ -2581,7 +2581,7 @@ fn writeSmokeConfig(rt: []const u8, body: []const u8) void {
 
 fn removeSmokeConfig(rt: []const u8) void {
     var p_buf: [360]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&p_buf, "{s}/config/sketerm/config.conf", .{rt}) catch return;
+    const p = std.fmt.bufPrintSentinel(&p_buf, "{s}/config/sketerm/config.conf", .{rt}, 0) catch return;
     _ = c.unlink(p.ptr);
 }
 
@@ -3099,10 +3099,10 @@ fn webDownloadStage(m: *Mcp, rt: []const u8, port: u16) void {
     const dl_dir = std.fmt.bufPrint(&path_buf, "{s}/home/downloads", .{rt}) catch unreachable;
     {
         var z: [512:0]u8 = undefined;
-        const zp = std.fmt.bufPrintZ(&z, "{s}", .{dl_dir}) catch unreachable;
+        const zp = std.fmt.bufPrintSentinel(&z, "{s}", .{dl_dir}, 0) catch unreachable;
         _ = c.mkdir(zp.ptr, 0o700);
         var cfg_buf: [512:0]u8 = undefined;
-        const cfg = std.fmt.bufPrintZ(&cfg_buf, "{s}/config/user-dirs.dirs", .{rt}) catch unreachable;
+        const cfg = std.fmt.bufPrintSentinel(&cfg_buf, "{s}/config/user-dirs.dirs", .{rt}, 0) catch unreachable;
         const f = c.fopen(cfg.ptr, "wb") orelse fail("cannot write user-dirs.dirs");
         var body_buf: [640]u8 = undefined;
         const body = std.fmt.bufPrint(&body_buf, "XDG_DOWNLOAD_DIR=\"{s}\"\n", .{dl_dir}) catch unreachable;
@@ -3203,7 +3203,7 @@ fn webPrintPdfStage(m: *Mcp, rt: []const u8) void {
         fail("capabilities does not report that the running helper honours css_page_size");
 
     var pdf_buf: [512:0]u8 = undefined;
-    const pdf = std.fmt.bufPrintZ(&pdf_buf, "{s}/home/deck.pdf", .{rt}) catch unreachable;
+    const pdf = std.fmt.bufPrintSentinel(&pdf_buf, "{s}/home/deck.pdf", .{rt}, 0) catch unreachable;
     const printed = m.callTool("web_print_pdf", std.fmt.bufPrint(
         &args_buf,
         "{{\"path\":\"{s}\",\"css_page_size\":true,\"no_margins\":true,\"paper\":\"a4\",\"timeout_ms\":30000}}",
@@ -3327,7 +3327,7 @@ fn webEvalSizeStage(m: *Mcp, rt: []const u8) void {
 /// instead of timing out, and naming that fingerprint loads the page.
 fn certStage(m: *Mcp, rt: []const u8) void {
     var dir_buf: [512]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/tls", .{rt}) catch unreachable;
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/tls", .{rt}, 0) catch unreachable;
     _ = c.mkdir(dir.ptr, 0o700);
     if (!smoke_tls.writeFile(dir, "index.html", "<html><head><title>Bad Cert Page</title></head><body><p>BADCERT-MARKER</p></body></html>"))
         fail("cannot write the tls page");
@@ -3388,7 +3388,7 @@ fn certStage(m: *Mcp, rt: []const u8) void {
 
 fn webReviewStage(m: *Mcp, rt: []const u8) void {
     var path_buf: [512:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/review.html", .{rt}) catch unreachable;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/review.html", .{rt}, 0) catch unreachable;
     const html =
         "<!doctype html><title>Review fixture</title><div role=main id=outer><main id=inner>" ++
         "<pl-button id=wrapper aria-expanded=false aria-controls=menu></pl-button>" ++
@@ -4666,7 +4666,7 @@ fn procRssKib(pid: c.pid_t) u64 {
 
 fn procFds(pid: c.pid_t) usize {
     var path: [64:0]u8 = undefined;
-    const d = c.opendir((std.fmt.bufPrintZ(&path, "/proc/{d}/fd", .{pid}) catch unreachable).ptr) orelse fail("helper fd list");
+    const d = c.opendir((std.fmt.bufPrintSentinel(&path, "/proc/{d}/fd", .{pid}, 0) catch unreachable).ptr) orelse fail("helper fd list");
     defer _ = c.closedir(d);
     var n: usize = 0;
     while (c.readdir(d)) |_| n += 1;
@@ -5354,10 +5354,10 @@ fn webTabsStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8
     const arena = arena_state.allocator();
     // A short idle time, from config like a user would set it.
     var cfg_dir_buf: [300]u8 = undefined;
-    const cfg_dir = std.fmt.bufPrintZ(&cfg_dir_buf, "{s}/config/sketerm", .{rt}) catch unreachable;
+    const cfg_dir = std.fmt.bufPrintSentinel(&cfg_dir_buf, "{s}/config/sketerm", .{rt}, 0) catch unreachable;
     _ = c.mkdir(cfg_dir.ptr, 0o700);
     var cfg_buf: [320]u8 = undefined;
-    const cfg_path = std.fmt.bufPrintZ(&cfg_buf, "{s}/config.conf", .{cfg_dir}) catch unreachable;
+    const cfg_path = std.fmt.bufPrintSentinel(&cfg_buf, "{s}/config.conf", .{cfg_dir}, 0) catch unreachable;
     @import("util/atomicwrite.zig").writeFileExact(cfg_path, "[mcp]\nweb_idle_close_secs = 8\n", 0o600) catch fail("write idle config");
     defer _ = c.unlink(cfg_path.ptr);
 
@@ -5507,7 +5507,7 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     // A local page with a button that mutates a paragraph: enough for
     // snapshot ids, a trusted click, the delta and reader extraction.
     var page_buf: [512]u8 = undefined;
-    const page_path = std.fmt.bufPrintZ(&page_buf, "{s}/web-smoke.html", .{rt}) catch unreachable;
+    const page_path = std.fmt.bufPrintSentinel(&page_buf, "{s}/web-smoke.html", .{rt}, 0) catch unreachable;
     {
         const f = c.fopen(page_path.ptr, "wb") orelse fail("cannot write web smoke page");
         const html =
@@ -5648,7 +5648,7 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     // with a snapshot of an empty page and the caller believed the
     // requested page was blank.
     var slow_buf: [512]u8 = undefined;
-    const slow_path = std.fmt.bufPrintZ(&slow_buf, "{s}/web-slow.html", .{rt}) catch unreachable;
+    const slow_path = std.fmt.bufPrintSentinel(&slow_buf, "{s}/web-slow.html", .{rt}, 0) catch unreachable;
     {
         const f = c.fopen(slow_path.ptr, "wb") orelse fail("cannot write the slow web smoke page");
         const html =
@@ -5920,7 +5920,7 @@ const CapHttp = struct {
             if (r <= 0) break;
             n += @intCast(r);
             const end = std.mem.indexOf(u8, buf[0..n], "\r\n\r\n") orelse continue;
-            const cl_at = std.ascii.indexOfIgnoreCase(buf[0..end], "content-length:") orelse break;
+            const cl_at = std.ascii.findIgnoreCase(buf[0..end], "content-length:") orelse break;
             const line_end = std.mem.indexOfPos(u8, buf[0..end], cl_at, "\r\n") orelse end;
             const want = std.fmt.parseInt(usize, std.mem.trim(u8, buf[cl_at + 15 .. line_end], " "), 10) catch 0;
             if (n >= end + 4 + want) break;
@@ -6116,7 +6116,7 @@ fn webCaptureStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const
 
 fn readFileAlloc(arena: std.mem.Allocator, path: []const u8) ?[]u8 {
     var pbuf: [4096]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&pbuf, "{s}", .{path}) catch return null;
+    const z = std.fmt.bufPrintSentinel(&pbuf, "{s}", .{path}, 0) catch return null;
     const f = c.fopen(z.ptr, "rb") orelse return null;
     defer _ = c.fclose(f);
     var out: std.ArrayList(u8) = .empty;
@@ -6289,7 +6289,7 @@ fn webPolicyStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
 /// Read a small file fully; empty slice when missing/unreadable.
 fn readSmall(path: []const u8, buf: []u8) []const u8 {
     var z: [4096:0]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return "";
+    const p = std.fmt.bufPrintSentinel(&z, "{s}", .{path}, 0) catch return "";
     const f = c.fopen(p.ptr, "rb") orelse return "";
     defer _ = c.fclose(f);
     const n = c.fread(buf.ptr, 1, buf.len, f);
@@ -6666,7 +6666,7 @@ fn scanPrimaryWebengines(allocator: std.mem.Allocator, rt: []const u8, first_pid
         var data: std.ArrayList(u8) = .empty;
         defer data.deinit(allocator);
         {
-            const path = std.fmt.bufPrintZ(&path_buf, "/proc/{s}/cmdline", .{name}) catch continue;
+            const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{s}/cmdline", .{name}, 0) catch continue;
             const f = c.fopen(path.ptr, "rb") orelse continue;
             defer _ = c.fclose(f);
             var tmp: [4096]u8 = undefined;
@@ -6682,7 +6682,7 @@ fn scanPrimaryWebengines(allocator: std.mem.Allocator, rt: []const u8, first_pid
         var env_data: std.ArrayList(u8) = .empty;
         defer env_data.deinit(allocator);
         {
-            const path = std.fmt.bufPrintZ(&path_buf, "/proc/{s}/environ", .{name}) catch continue;
+            const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{s}/environ", .{name}, 0) catch continue;
             const f = c.fopen(path.ptr, "rb") orelse continue;
             defer _ = c.fclose(f);
             var tmp: [4096]u8 = undefined;
@@ -6933,7 +6933,7 @@ fn webSessionFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
     _ = c.setenv("SKETERM_FAKE_WEBENGINE", "1", 1);
     defer _ = unsetEnv("SKETERM_FAKE_WEBENGINE");
     var envout_buf: [512]u8 = undefined;
-    const envout = std.fmt.bufPrintZ(&envout_buf, "{s}/fake-web-env.txt", .{rt}) catch unreachable;
+    const envout = std.fmt.bufPrintSentinel(&envout_buf, "{s}/fake-web-env.txt", .{rt}, 0) catch unreachable;
     _ = c.setenv("SKETERM_FAKE_WEB_ENV", envout.ptr, 1);
     defer _ = unsetEnv("SKETERM_FAKE_WEB_ENV");
     var args_buf: [256]u8 = undefined;
@@ -7107,7 +7107,7 @@ fn webProfileFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
     _ = c.setenv("SKETERM_FAKE_WEB_CONTEXTS", "1", 1);
     defer _ = unsetEnv("SKETERM_FAKE_WEB_CONTEXTS");
     var frames_buf: [512]u8 = undefined;
-    const frames = std.fmt.bufPrintZ(&frames_buf, "{s}/fake-web-frames.txt", .{rt}) catch unreachable;
+    const frames = std.fmt.bufPrintSentinel(&frames_buf, "{s}/fake-web-frames.txt", .{rt}, 0) catch unreachable;
     _ = c.unlink(frames.ptr);
     _ = c.setenv("SKETERM_FAKE_WEB_FRAMES", frames.ptr, 1);
     defer _ = unsetEnv("SKETERM_FAKE_WEB_FRAMES");
@@ -7307,7 +7307,7 @@ fn webPolicyFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []co
     _ = c.setenv("SKETERM_FAKE_WEB_POLICY", "1", 1);
     defer _ = unsetEnv("SKETERM_FAKE_WEB_POLICY");
     var frames_buf: [512]u8 = undefined;
-    const frames = std.fmt.bufPrintZ(&frames_buf, "{s}/fake-web-policy-frames.txt", .{rt}) catch unreachable;
+    const frames = std.fmt.bufPrintSentinel(&frames_buf, "{s}/fake-web-policy-frames.txt", .{rt}, 0) catch unreachable;
     _ = c.unlink(frames.ptr);
     _ = c.setenv("SKETERM_FAKE_WEB_FRAMES", frames.ptr, 1);
     defer _ = unsetEnv("SKETERM_FAKE_WEB_FRAMES");
@@ -7974,7 +7974,7 @@ fn webFetchStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         const zpath = scStr(zip_row, "path", "wf: zip path");
         if (capInt(zip_row, "bytes") != FetchHttp.zip.len) fail("wf: the zip's size");
         var zbuf: [512]u8 = undefined;
-        const zpz = std.fmt.bufPrintZ(&zbuf, "{s}", .{zpath}) catch fail("wf: zip path too long");
+        const zpz = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{zpath}, 0) catch fail("wf: zip path too long");
         if (c.access(zpz.ptr, c.F_OK) != 0) fail("wf: the zip was not saved where the result says");
         expectFact(rows[6].object, "status", "invalid_url", "wf: an ftp url is not invalid_url");
         // A PDF, shown by the engine or offered as a download, comes back as a file.
@@ -8036,7 +8036,7 @@ fn webFetchStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         }
         if (!std.mem.endsWith(u8, scStr(rows[0].object, "path", "wf: md"), ".md")) fail("wf: a page's text is not written as .md");
         var pbuf: [512]u8 = undefined;
-        const pz = std.fmt.bufPrintZ(&pbuf, "{s}", .{scStr(rows[0].object, "path", "wf: md")}) catch unreachable;
+        const pz = std.fmt.bufPrintSentinel(&pbuf, "{s}", .{scStr(rows[0].object, "path", "wf: md")}, 0) catch unreachable;
         var fbuf: [4096]u8 = undefined;
         const f = c.fopen(pz.ptr, "r") orelse fail("wf: the to_dir file cannot be opened");
         const n = c.fread(&fbuf, 1, fbuf.len, f);
@@ -8070,10 +8070,10 @@ fn webFetchStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
 
     // (7) Two concurrent calls under a lowered instance-wide cap.
     var cfg_dir_buf: [300]u8 = undefined;
-    const cfg_dir = std.fmt.bufPrintZ(&cfg_dir_buf, "{s}/config/sketerm", .{rt}) catch unreachable;
+    const cfg_dir = std.fmt.bufPrintSentinel(&cfg_dir_buf, "{s}/config/sketerm", .{rt}, 0) catch unreachable;
     pathz.makeDirs(cfg_dir, 0o700) catch {};
     var cfg_buf: [320]u8 = undefined;
-    const cfg_path = std.fmt.bufPrintZ(&cfg_buf, "{s}/config.conf", .{cfg_dir}) catch unreachable;
+    const cfg_path = std.fmt.bufPrintSentinel(&cfg_buf, "{s}/config.conf", .{cfg_dir}, 0) catch unreachable;
     @import("util/atomicwrite.zig").writeFileExact(cfg_path, "[mcp]\nweb_fetch_max_tabs = 3\n", 0o600) catch fail("wf: write the fetch config");
     defer _ = c.unlink(cfg_path.ptr);
     var m2 = Mcp.spawn(allocator, exe, &.{});
@@ -8759,7 +8759,7 @@ fn fakeSsh(args: []const [*:0]const u8) u8 {
         if (std.mem.eql(u8, host_name, NORSYNC_HOST)) if (c.getenv(NORSYNC_BIN_ENV)) |nb| {
             var pbuf: [8192]u8 = undefined;
             const old_path: [*:0]const u8 = if (c.getenv("PATH")) |p| p else "/usr/bin:/bin";
-            const np = std.fmt.bufPrintZ(&pbuf, "{s}:{s}", .{ std.mem.span(@as([*:0]const u8, @ptrCast(nb))), std.mem.span(old_path) }) catch c._exit(127);
+            const np = std.fmt.bufPrintSentinel(&pbuf, "{s}:{s}", .{ std.mem.span(@as([*:0]const u8, @ptrCast(nb))), std.mem.span(old_path) }, 0) catch c._exit(127);
             _ = c.setenv("PATH", np.ptr, 1);
         };
         _ = c.execv("/bin/sh", @ptrCast(&argv));
@@ -8882,8 +8882,8 @@ fn fakeScp(args: []const [*:0]const u8) u8 {
     if (n != 2) return 1;
     var src_z: [4096]u8 = undefined;
     var dst_z: [4096]u8 = undefined;
-    const src = std.fmt.bufPrintZ(&src_z, "{s}", .{paths[0]}) catch return 1;
-    const dst = std.fmt.bufPrintZ(&dst_z, "{s}", .{paths[1]}) catch return 1;
+    const src = std.fmt.bufPrintSentinel(&src_z, "{s}", .{paths[0]}, 0) catch return 1;
+    const dst = std.fmt.bufPrintSentinel(&dst_z, "{s}", .{paths[1]}, 0) catch return 1;
     const in = c.open(src.ptr, c.O_RDONLY);
     if (in < 0) return 1;
     defer _ = c.close(in);
@@ -8953,19 +8953,19 @@ fn sshToolsStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const
     if (self_n <= 0) fail("readlink /proc/self/exe");
     self_buf[@intCast(self_n)] = 0;
     var bin_buf: [512]u8 = undefined;
-    const bin = std.fmt.bufPrintZ(&bin_buf, "{s}/fakebin", .{rt}) catch fail("fakebin path");
+    const bin = std.fmt.bufPrintSentinel(&bin_buf, "{s}/fakebin", .{rt}, 0) catch fail("fakebin path");
     _ = c.mkdir(bin.ptr, 0o700);
     for ([_][]const u8{ "ssh", "scp" }) |name| {
         var link_buf: [600]u8 = undefined;
-        const link = std.fmt.bufPrintZ(&link_buf, "{s}/{s}", .{ bin, name }) catch fail("fakebin link");
+        const link = std.fmt.bufPrintSentinel(&link_buf, "{s}/{s}", .{ bin, name }, 0) catch fail("fakebin link");
         _ = c.unlink(link.ptr);
         if (c.symlink(@ptrCast(&self_buf), link.ptr) != 0) fail("could not link the fake ssh/scp");
     }
     const old_path: []const u8 = if (c.getenv("PATH")) |p| std.mem.span(@as([*:0]const u8, @ptrCast(p))) else "/usr/bin:/bin";
     var saved_path_buf: [4096]u8 = undefined;
-    const saved_path = std.fmt.bufPrintZ(&saved_path_buf, "{s}", .{old_path}) catch fail("PATH too long");
+    const saved_path = std.fmt.bufPrintSentinel(&saved_path_buf, "{s}", .{old_path}, 0) catch fail("PATH too long");
     var path_buf: [4700]u8 = undefined;
-    const new_path = std.fmt.bufPrintZ(&path_buf, "{s}:{s}", .{ bin, old_path }) catch fail("PATH too long");
+    const new_path = std.fmt.bufPrintSentinel(&path_buf, "{s}:{s}", .{ bin, old_path }, 0) catch fail("PATH too long");
     _ = c.setenv("PATH", new_path.ptr, 1);
     _ = c.setenv(FAKE_SSH_ENV, "1", 1);
     defer {
@@ -8983,7 +8983,7 @@ fn sshToolsStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const
 
     // scp_get: remote file -> staged partial -> sha256 verified -> moved.
     var src_buf: [512]u8 = undefined;
-    const src = std.fmt.bufPrintZ(&src_buf, "{s}/remote-src.txt", .{rt}) catch fail("src path");
+    const src = std.fmt.bufPrintSentinel(&src_buf, "{s}/remote-src.txt", .{rt}, 0) catch fail("src path");
     {
         const f = c.fopen(src.ptr, "w") orelse fail("could not write the remote-side file");
         _ = c.fputs("SCP-GET-PAYLOAD\n", f);
@@ -9033,7 +9033,7 @@ fn sshToolsStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const
 /// waits then run on that live toplevel, and close_app retires it.
 fn appToolsStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) void {
     var png_buf: [512]u8 = undefined;
-    const png = std.fmt.bufPrintZ(&png_buf, "{s}/app-fixture.png", .{rt}) catch fail("fixture path");
+    const png = std.fmt.bufPrintSentinel(&png_buf, "{s}/app-fixture.png", .{rt}, 0) catch fail("fixture path");
     if (!writeSolidPngFile(png, 0x20, 0xc0, 0x40)) fail("could not write the app fixture image");
 
     var m = Mcp.spawn(allocator, exe, &.{});
@@ -9209,7 +9209,7 @@ const FC_SETTINGS_WRITTEN = "settings-written";
 /// `$HOME/.fake-claude/<name>`.
 fn fcPath(buf: []u8, name: []const u8) [:0]const u8 {
     const home = if (c.getenv("HOME")) |h| std.mem.span(@as([*:0]const u8, @ptrCast(h))) else "/tmp";
-    return std.fmt.bufPrintZ(buf, "{s}/" ++ FC_DIR ++ "/{s}", .{ home, name }) catch "/tmp/.fake-claude-overflow";
+    return std.fmt.bufPrintSentinel(buf, "{s}/" ++ FC_DIR ++ "/{s}", .{ home, name }, 0) catch "/tmp/.fake-claude-overflow";
 }
 
 fn fcAppend(name: []const u8, line: []const u8) void {
@@ -9971,7 +9971,7 @@ const Waiter = struct {
         var pipe: [2]c_int = undefined;
         if (c.pipe(&pipe) != 0) fail("waiter pipe");
         var cmd_buf: [8192]u8 = undefined;
-        const cmd_z = std.fmt.bufPrintZ(&cmd_buf, "{s}", .{cmd}) catch fail("waiter command too long");
+        const cmd_z = std.fmt.bufPrintSentinel(&cmd_buf, "{s}", .{cmd}, 0) catch fail("waiter command too long");
         const pid = c.fork();
         if (pid < 0) fail("waiter fork");
         if (pid == 0) {
@@ -10950,7 +10950,7 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         expectFact(recalled, "message", "first prompt was: before the reboot", "relaunch: the conversation was resumed");
         _ = agentCall(&r2, arena, "agent_close", "{\"agent\":\"phoenix\"}", "relaunch: agent_close", false, 15_000);
         var desc_buf: [512]u8 = undefined;
-        const desc = std.fmt.bufPrintZ(&desc_buf, "{s}/sketerm/agents/{s}.json", .{ rt, id }) catch fail("path");
+        const desc = std.fmt.bufPrintSentinel(&desc_buf, "{s}/sketerm/agents/{s}.json", .{ rt, id }, 0) catch fail("path");
         var st: c.struct_stat = undefined;
         if (c.stat(desc.ptr, &st) == 0) fail("relaunch: agent_close left the descriptor in the index");
         r2.closeStdinWait();
@@ -10967,7 +10967,7 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         const id = arena.dupe(u8, scStr(opened, "agent", "resume: agent_open")) catch fail("oom");
         const session = std.fmt.allocPrint(arena, "agent-{s}", .{id}) catch fail("oom");
         var desc_buf: [512]u8 = undefined;
-        const desc = std.fmt.bufPrintZ(&desc_buf, "{s}/sketerm/agents/{s}.json", .{ rt, id }) catch fail("path");
+        const desc = std.fmt.bufPrintSentinel(&desc_buf, "{s}/sketerm/agents/{s}.json", .{ rt, id }, 0) catch fail("path");
         var st: c.struct_stat = undefined;
         if (c.stat(desc.ptr, &st) != 0 or (st.st_mode & 0o777) != 0o600) fail("resume: no 0600 descriptor in the per-user index");
         // The server goes away for good (not a clean exit): the agent runs on.
@@ -11021,7 +11021,7 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         expectFact(opened, "message", "echo: before restart", "durable agent_open: prompt answer");
         d1.closeStdinWait();
         var desc_buf: [512]u8 = undefined;
-        const desc = std.fmt.bufPrintZ(&desc_buf, "{s}/sketerm/agents/{s}.json", .{ rt, scStr(opened, "agent", "durable agent_open") }) catch fail("path");
+        const desc = std.fmt.bufPrintSentinel(&desc_buf, "{s}/sketerm/agents/{s}.json", .{ rt, scStr(opened, "agent", "durable agent_open") }, 0) catch fail("path");
         var st: c.struct_stat = undefined;
         if (c.stat(desc.ptr, &st) != 0) fail("durable: no agent descriptor in the per-user index");
         if ((st.st_mode & 0o777) != 0o600) fail("durable: the agent descriptor is not 0600");
@@ -11225,7 +11225,7 @@ fn expectBrief(arena: std.mem.Allocator, o: std.json.ObjectMap, answer: []const 
 /// Read `/proc/<pid>/<file>` into `out` (bounded); "" when unreadable.
 fn procRead(pid: []const u8, file: []const u8, out: []u8) []const u8 {
     var path_buf: [128]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{s}/{s}", .{ pid, file }) catch return "";
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{s}/{s}", .{ pid, file }, 0) catch return "";
     const f = c.fopen(path.ptr, "rb") orelse return "";
     defer _ = c.fclose(f);
     return out[0..c.fread(out.ptr, 1, out.len, f)];
@@ -11455,14 +11455,14 @@ fn routeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
     {
         const link = std.fmt.allocPrintSentinel(arena, "{s}/claude", .{local_bin}, 0) catch fail("oom");
         _ = c.unlink(link.ptr);
-        if (c.symlink((arena.dupeZ(u8, self_exe) catch fail("oom")).ptr, link.ptr) != 0) fail("route stage: fake claude link");
+        if (c.symlink((arena.dupeSentinel(u8, self_exe, 0) catch fail("oom")).ptr, link.ptr) != 0) fail("route stage: fake claude link");
     }
     const fakebin = std.fmt.allocPrintSentinel(arena, "{s}/fakebin", .{rt}, 0) catch fail("oom");
     _ = c.mkdir(fakebin.ptr, 0o700);
     {
         const link = std.fmt.allocPrintSentinel(arena, "{s}/ssh", .{fakebin}, 0) catch fail("oom");
         _ = c.unlink(link.ptr);
-        if (c.symlink((arena.dupeZ(u8, self_exe) catch fail("oom")).ptr, link.ptr) != 0) fail("route stage: fake ssh link");
+        if (c.symlink((arena.dupeSentinel(u8, self_exe, 0) catch fail("oom")).ptr, link.ptr) != 0) fail("route stage: fake ssh link");
     }
 
     // Three hosts, each its own runtime dir; `sketerm-mux` on each one's
@@ -11477,7 +11477,7 @@ fn routeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         const mux = std.fmt.allocPrintSentinel(arena, "{s}/sketerm-mux", .{bin}, 0) catch fail("oom");
         _ = c.unlink(mux.ptr);
         if (i < 2) {
-            if (c.symlink((arena.dupeZ(u8, mux_abs) catch fail("oom")).ptr, mux.ptr) != 0) fail("route stage: mux link");
+            if (c.symlink((arena.dupeSentinel(u8, mux_abs, 0) catch fail("oom")).ptr, mux.ptr) != 0) fail("route stage: mux link");
         } else {
             // What every sketerm-mux before routes does with a flag it
             // does not know: name it on stderr and exit 2.
@@ -11518,8 +11518,8 @@ fn routeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
     }
 
     const old_path: []const u8 = if (c.getenv("PATH")) |p| std.mem.span(@as([*:0]const u8, @ptrCast(p))) else "/usr/bin:/bin";
-    const saved_path = arena.dupeZ(u8, old_path) catch fail("oom");
-    const saved_rt = arena.dupeZ(u8, std.mem.span(@as([*:0]const u8, @ptrCast(c.getenv("XDG_RUNTIME_DIR").?)))) catch fail("oom");
+    const saved_path = arena.dupeSentinel(u8, old_path, 0) catch fail("oom");
+    const saved_rt = arena.dupeSentinel(u8, std.mem.span(@as([*:0]const u8, @ptrCast(c.getenv("XDG_RUNTIME_DIR").?))), 0) catch fail("oom");
     _ = c.setenv("PATH", (std.fmt.allocPrintSentinel(arena, "{s}:/usr/bin:/bin", .{fakebin}, 0) catch fail("oom")).ptr, 1);
     _ = c.setenv(FAKE_SSH_ENV, "1", 1);
     _ = c.setenv(FAKE_AGENT_ENV, "1", 1);
@@ -11599,7 +11599,7 @@ fn routeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
             if (std.mem.eql(u8, ag.sessions[0], local_session)) {
                 // A local agent lives on hosta's per-user daemon.
                 if (!std.mem.eql(u8, ag.location, "user")) fail("route stage: the report does not place the hosta agent on the per-user daemon");
-                local_route = arena.dupeZ(u8, route) catch fail("oom");
+                local_route = arena.dupeSentinel(u8, route, 0) catch fail("oom");
             }
         }
         say("smoke-mcp: route stage: hosta's daemon reports the assistant, both agents and their locations");
@@ -11698,7 +11698,7 @@ fn cutRemoteLink(down: [:0]const u8, rt_env: []const u8) void {
 }
 
 fn syncWrite(arena: std.mem.Allocator, path: []const u8, body: []const u8, mtime: ?i64) void {
-    const z = arena.dupeZ(u8, path) catch fail("oom");
+    const z = arena.dupeSentinel(u8, path, 0) catch fail("oom");
     const f = c.fopen(z.ptr, "wb") orelse fail("file_sync: cannot write a fixture file");
     _ = c.fwrite(body.ptr, 1, body.len, f);
     _ = c.fclose(f);
@@ -11876,7 +11876,7 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         if (c.symlink((std.fmt.allocPrintSentinel(arena, "{s}", .{self_exe}, 0) catch fail("oom")).ptr, link.ptr) != 0) fail("could not link the fake ssh");
     }
     const old_path: []const u8 = if (c.getenv("PATH")) |p| std.mem.span(@as([*:0]const u8, @ptrCast(p))) else "/usr/bin:/bin";
-    const saved_path = arena.dupeZ(u8, old_path) catch fail("oom");
+    const saved_path = arena.dupeSentinel(u8, old_path, 0) catch fail("oom");
     // A system PATH only: the developer's own ~/.local/bin holds a REAL
     // claude the candidates must never find in this stage.
     _ = c.setenv("PATH", (std.fmt.allocPrintSentinel(arena, "{s}:/usr/bin:/bin", .{bin}, 0) catch fail("oom")).ptr, 1);

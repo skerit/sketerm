@@ -119,7 +119,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     // Isolated everything, like smoke-e2e.
     var rt_buf: [128:0]u8 = undefined;
-    const rt = std.fmt.bufPrintZ(&rt_buf, "/tmp/sk-webm-{d}", .{c.getpid()}) catch return 1;
+    const rt = std.fmt.bufPrintSentinel(&rt_buf, "/tmp/sk-webm-{d}", .{c.getpid()}, 0) catch return 1;
     _ = c.mkdir(rt.ptr, 0o700);
     _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
     _ = c.setenv("XDG_CONFIG_HOME", rt.ptr, 1);
@@ -138,7 +138,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     daemon_pid = mux_pid;
     var sock_buf: [256]u8 = undefined;
-    const mux_sock = std.fmt.bufPrintZ(&sock_buf, "{s}/sketerm/mux.sock", .{rt}) catch return fail("sock path");
+    const mux_sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/sketerm/mux.sock", .{rt}, 0) catch return fail("sock path");
     var waited: u32 = 0;
     while (c.access(mux_sock.ptr, c.F_OK) != 0) {
         _ = c.usleep(50_000);
@@ -159,7 +159,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var wl_z: [4096:0]u8 = undefined;
     const wl = parsed.value.environment.WAYLAND_DISPLAY;
     if (wl.len == 0 or wl[0] != '/') return fail("no WAYLAND_DISPLAY");
-    _ = std.fmt.bufPrintZ(&wl_z, "{s}", .{wl}) catch return fail("WAYLAND_DISPLAY too long");
+    _ = std.fmt.bufPrintSentinel(&wl_z, "{s}", .{wl}, 0) catch return fail("WAYLAND_DISPLAY too long");
 
     drive = appdrive.App.attachExisting(allocator, SESSION, null, mux_sock, null) catch
         return fail("viewer attach failed");
@@ -183,13 +183,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (std.mem.indexOfScalar(u8, kv, '=')) |eq| {
                 var kb: [128:0]u8 = undefined;
                 var vb: [512:0]u8 = undefined;
-                const k = std.fmt.bufPrintZ(&kb, "{s}", .{kv[0..eq]}) catch continue;
-                const v = std.fmt.bufPrintZ(&vb, "{s}", .{kv[eq + 1 ..]}) catch continue;
+                const k = std.fmt.bufPrintSentinel(&kb, "{s}", .{kv[0..eq]}, 0) catch continue;
+                const v = std.fmt.bufPrintSentinel(&vb, "{s}", .{kv[eq + 1 ..]}, 0) catch continue;
                 _ = c.setenv(k.ptr, v.ptr, 1);
             }
         }
         var url_z: [4096:0]u8 = undefined;
-        const uz = std.fmt.bufPrintZ(&url_z, "{s}", .{url}) catch c._exit(126);
+        const uz = std.fmt.bufPrintSentinel(&url_z, "{s}", .{url}, 0) catch c._exit(126);
         // `--url exec:<path>` runs an arbitrary binary as the display
         // client instead of the browser GUI (probe experiments).
         if (std.mem.startsWith(u8, std.mem.span(uz.ptr), "exec:")) {
@@ -224,7 +224,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const win_id: u32 = if (app.windows.items.len > 0) app.windows.items[0].id else return fail("no window for shot");
         const shot = app.screenshotPng(win_id, 100_000, null, 1) catch return fail("screenshot failed");
         var pz: [1024:0]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&pz, "{s}", .{sp}) catch return fail("shot path");
+        const p = std.fmt.bufPrintSentinel(&pz, "{s}", .{sp}, 0) catch return fail("shot path");
         const f = c.fopen(p.ptr, "wb") orelse return fail("shot open");
         _ = c.fwrite(shot.png.ptr, 1, shot.png.len, f);
         _ = c.fclose(f);

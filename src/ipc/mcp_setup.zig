@@ -354,7 +354,7 @@ fn linkPlugin(arena: std.mem.Allocator, o: Options, r: *Report) !void {
         return r.note("opencode plugin " ++ PLUGIN_FILE ++ " is not installed (share/sketerm/" ++ PLUGIN_REL ++ "); not linked");
     const dir = try std.fs.path.join(arena, &.{ o.opencode_dir, "plugin" });
     const link = try std.fs.path.join(arena, &.{ dir, PLUGIN_FILE });
-    const link_z = try arena.dupeZ(u8, link);
+    const link_z = try arena.dupeSentinel(u8, link, 0);
     var st: c.struct_stat = undefined;
     var was: ?[]const u8 = null;
     if (c.lstat(link_z.ptr, &st) == 0) {
@@ -374,7 +374,7 @@ fn linkPlugin(arena: std.mem.Allocator, o: Options, r: *Report) !void {
     // Staged and renamed over, so a stale link is replaced in one step.
     var stage_buf: atomicwrite.StageBuf = undefined;
     const stage = try atomicwrite.stagePath(&stage_buf, link);
-    const src_z = try arena.dupeZ(u8, src);
+    const src_z = try arena.dupeSentinel(u8, src, 0);
     if (c.symlink(src_z.ptr, stage.ptr) != 0 or c.rename(stage.ptr, link_z.ptr) != 0) {
         const why = errnoText();
         _ = c.unlink(stage.ptr);
@@ -390,8 +390,8 @@ fn runClaude(args: []const []const u8, config_dir: ?[]const u8) u8 {
     const arena = arena_state.allocator();
     const argv = arena.allocSentinel(?[*:0]const u8, args.len + 1, null) catch return 1;
     argv[0] = "claude";
-    for (args, 1..) |a, i| argv[i] = (arena.dupeZ(u8, a) catch return 1).ptr;
-    const dir_z: ?[:0]const u8 = if (config_dir) |d| arena.dupeZ(u8, d) catch return 1 else null;
+    for (args, 1..) |a, i| argv[i] = (arena.dupeSentinel(u8, a, 0) catch return 1).ptr;
+    const dir_z: ?[:0]const u8 = if (config_dir) |d| arena.dupeSentinel(u8, d, 0) catch return 1 else null;
     const pid = c.fork();
     if (pid < 0) return 1;
     if (pid == 0) {
@@ -706,13 +706,13 @@ test "setup writes through a settings symlink keeping its mode, registers once, 
     const real = try std.fs.path.join(a, &.{ dotfiles, "settings.json" });
     try atomicwrite.writeFileExact(real, "{\"statusLine\": {\"type\": \"command\", \"command\": \"ccline\"}}\n", 0o600);
     const settings = try std.fs.path.join(a, &.{ cfg, "settings.json" });
-    try t.expectEqual(@as(c_int, 0), c.symlink((try a.dupeZ(u8, real)).ptr, (try a.dupeZ(u8, settings)).ptr));
+    try t.expectEqual(@as(c_int, 0), c.symlink((try a.dupeSentinel(u8, real, 0)).ptr, (try a.dupeSentinel(u8, settings, 0)).ptr));
     const plugin = try std.fs.path.join(a, &.{ root, PLUGIN_FILE });
     try atomicwrite.writeFile(plugin, "// plugin\n", 0o644);
     const link = try std.fs.path.join(a, &.{ oc, "plugin", PLUGIN_FILE });
     // A stale link from an older install is replaced.
     try pathz.makeDirs(try std.fs.path.join(a, &.{ oc, "plugin" }), 0o700);
-    try t.expectEqual(@as(c_int, 0), c.symlink("/gone/" ++ PLUGIN_FILE, (try a.dupeZ(u8, link)).ptr));
+    try t.expectEqual(@as(c_int, 0), c.symlink("/gone/" ++ PLUGIN_FILE, (try a.dupeSentinel(u8, link, 0)).ptr));
 
     var o: Options = .{
         .dry_run = true,
@@ -741,14 +741,14 @@ test "setup writes through a settings symlink keeping its mode, registers once, 
     try t.expect(std.mem.startsWith(u8, run.lines[5], "relinked opencode plugin: "));
     try t.expectEqual(@as(usize, 1), fake_calls);
     var st: c.struct_stat = undefined;
-    try t.expectEqual(@as(c_int, 0), c.lstat((try a.dupeZ(u8, settings)).ptr, &st));
+    try t.expectEqual(@as(c_int, 0), c.lstat((try a.dupeSentinel(u8, settings, 0)).ptr, &st));
     try t.expectEqual(@as(c_uint, c.S_IFLNK), st.st_mode & c.S_IFMT);
-    try t.expectEqual(@as(c_int, 0), c.stat((try a.dupeZ(u8, real)).ptr, &st));
+    try t.expectEqual(@as(c_int, 0), c.stat((try a.dupeSentinel(u8, real, 0)).ptr, &st));
     try t.expectEqual(@as(c_uint, 0o600), st.st_mode & 0o777);
     const doc = try parse(a, try fileText(a, real));
     try t.expectEqualStrings("sketerm mcp statusline --user-command 'ccline'", doc.get("statusLine").?.object.get("command").?.string);
     var buf: [4096]u8 = undefined;
-    const n = c.readlink((try a.dupeZ(u8, link)).ptr, &buf, buf.len);
+    const n = c.readlink((try a.dupeSentinel(u8, link, 0)).ptr, &buf, buf.len);
     try t.expectEqualStrings(plugin, buf[0..@intCast(n)]);
 
     // 3. A second run finds everything in place.

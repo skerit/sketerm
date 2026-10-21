@@ -187,14 +187,14 @@ pub fn onPrintDone(self: *WebFace, ev: proto.EvPrintPdfDone) void {
     }
     if (ev.staged.len != 0) return self.deliverStagedPdf(ev.staged, path);
     const win = self.ownerWindow() orelse return;
-    const text = std.fmt.bufPrintZ(&msg, "Saved {s}", .{path}) catch "Saved the PDF";
+    const text = std.fmt.bufPrintSentinel(&msg, "Saved {s}", .{path}, 0) catch "Saved the PDF";
     const note = c.adw_toast_new(text.ptr);
     c.adw_toast_set_timeout(note, 8);
     // The toast OWNS the path (mechanism 1): GObject frees attached
     // data at finalize, strictly after the button can be clicked,
     // so the Open handler can never read freed memory. c_allocator
     // and not the face's, because the string outlives the face.
-    if (std.heap.c_allocator.dupeZ(u8, path)) |owned| {
+    if (std.heap.c_allocator.dupeSentinel(u8, path, 0)) |owned| {
         c.adw_toast_set_button_label(note, "Open");
         c.g_object_set_data_full(
             @ptrCast(@alignCast(note)),

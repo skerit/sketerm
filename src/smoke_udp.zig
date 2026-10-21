@@ -78,9 +78,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // socket through $XDG_RUNTIME_DIR, so pointing it here keeps the
     // whole run away from the user's real daemon.
     var dir_buf: [128:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "/tmp/sketerm-smoke-udp-{d}", .{c.getpid()}) catch unreachable;
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "/tmp/sketerm-smoke-udp-{d}", .{c.getpid()}, 0) catch unreachable;
     var sub_buf: [160:0]u8 = undefined;
-    const sub = std.fmt.bufPrintZ(&sub_buf, "{s}/sketerm", .{dir}) catch unreachable;
+    const sub = std.fmt.bufPrintSentinel(&sub_buf, "{s}/sketerm", .{dir}, 0) catch unreachable;
     _ = c.mkdir(dir.ptr, 0o700);
     _ = c.mkdir(sub.ptr, 0o700);
     _ = c.setenv("XDG_RUNTIME_DIR", dir.ptr, 1);
@@ -98,7 +98,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // the config-resolution step targets loopback; the bootstrap execs
     // the real daemon binary with a loopback $SSH_CONNECTION.
     var ssh1_buf: [160:0]u8 = undefined;
-    const ssh1 = std.fmt.bufPrintZ(&ssh1_buf, "{s}/fake-ssh", .{dir}) catch unreachable;
+    const ssh1 = std.fmt.bufPrintSentinel(&ssh1_buf, "{s}/fake-ssh", .{dir}, 0) catch unreachable;
     writeScript(ssh1,
         \\#!/bin/sh
         \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
@@ -111,7 +111,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // real one. The client aims its hellos there (void), so only the
     // server's punch probe + client roaming can complete the connect.
     var ssh2_buf: [160:0]u8 = undefined;
-    const ssh2 = std.fmt.bufPrintZ(&ssh2_buf, "{s}/fake-ssh-natted", .{dir}) catch unreachable;
+    const ssh2 = std.fmt.bufPrintSentinel(&ssh2_buf, "{s}/fake-ssh-natted", .{dir}, 0) catch unreachable;
     writeScript(ssh2,
         \\#!/bin/sh
         \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
@@ -129,10 +129,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // deploys the real mux via the sh-on-stdin path and then boots
     // from the DEPLOYED copy.
     var home2_buf: [176:0]u8 = undefined;
-    const home2 = std.fmt.bufPrintZ(&home2_buf, "{s}/home", .{dir}) catch unreachable;
+    const home2 = std.fmt.bufPrintSentinel(&home2_buf, "{s}/home", .{dir}, 0) catch unreachable;
     _ = c.mkdir(home2.ptr, 0o700);
     var ssh3_buf: [176:0]u8 = undefined;
-    const ssh3 = std.fmt.bufPrintZ(&ssh3_buf, "{s}/fake-ssh-login", .{dir}) catch unreachable;
+    const ssh3 = std.fmt.bufPrintSentinel(&ssh3_buf, "{s}/fake-ssh-login", .{dir}, 0) catch unreachable;
     var ssh3_body_buf: [512]u8 = undefined;
     const ssh3_body = std.fmt.bufPrint(&ssh3_body_buf,
         \\#!/bin/sh
@@ -178,7 +178,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // content-addressed copy exists in the isolated $HOME.
         const hash = @import("util/filehash.zig").sha256File(std.mem.span(argv[1])) orelse fail("hash artifact");
         var dep_buf: [320:0]u8 = undefined;
-        const dep = std.fmt.bufPrintZ(&dep_buf, "{s}/.cache/sketerm/mux/sketerm-mux-{s}", .{ home2, &hash.hex }) catch unreachable;
+        const dep = std.fmt.bufPrintSentinel(&dep_buf, "{s}/.cache/sketerm/mux/sketerm-mux-{s}", .{ home2, &hash.hex }, 0) catch unreachable;
         var st: c.struct_stat = undefined;
         if (c.stat(dep.ptr, &st) != 0) fail("deployed binary missing");
         if (@as(u64, @intCast(st.st_size)) != hash.size) fail("deployed binary size mismatch");
@@ -198,7 +198,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const ticket = conn.requestUdpTicket(null, 15_000) catch fail("ticket mint over live UDP conn");
 
         var ssh4_buf: [176:0]u8 = undefined;
-        const ssh4 = std.fmt.bufPrintZ(&ssh4_buf, "{s}/fake-ssh-refuse", .{dir}) catch unreachable;
+        const ssh4 = std.fmt.bufPrintSentinel(&ssh4_buf, "{s}/fake-ssh-refuse", .{dir}, 0) catch unreachable;
         writeScript(ssh4,
             \\#!/bin/sh
             \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi

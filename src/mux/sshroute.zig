@@ -285,11 +285,11 @@ pub fn multiplexAvailable() bool {
 pub fn controlDir(buf: *[512:0]u8) ?[:0]const u8 {
     if (c.getenv(CONTROL_DIR_ENV)) |raw| {
         const v = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
-        if (v.len > 1 and v[0] == '/') return std.fmt.bufPrintZ(buf, "{s}", .{std.mem.trimEnd(u8, v, "/")}) catch null;
+        if (v.len > 1 and v[0] == '/') return std.fmt.bufPrintSentinel(buf, "{s}", .{std.mem.trimEnd(u8, v, "/")}, 0) catch null;
     }
     const home_raw = c.getenv("HOME") orelse return null;
     const home = std.mem.span(@as([*:0]const u8, @ptrCast(home_raw)));
-    return std.fmt.bufPrintZ(buf, "{s}/.ssh", .{home}) catch null;
+    return std.fmt.bufPrintSentinel(buf, "{s}/.ssh", .{home}, 0) catch null;
 }
 
 pub const Plan = struct {
@@ -335,7 +335,7 @@ pub const Plan = struct {
         if (out.leg.multiplex) {
             var dir_buf: [512:0]u8 = undefined;
             const dir = controlDir(&dir_buf) orelse return error.NoControlDir;
-            const cp = std.fmt.bufPrintZ(&out.control, "ControlPath={s}/" ++ CONTROL_PREFIX ++ "%C", .{dir}) catch return error.ControlPathTooLong;
+            const cp = std.fmt.bufPrintSentinel(&out.control, "ControlPath={s}/" ++ CONTROL_PREFIX ++ "%C", .{dir}, 0) catch return error.ControlPathTooLong;
             out.control_len = cp.len;
         }
         if (self.route == .tor) try out.buildProxy(self.tor_endpoint);

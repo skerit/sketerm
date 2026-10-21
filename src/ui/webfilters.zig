@@ -96,7 +96,7 @@ fn onDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
 
 fn setStatus(self: *Manager, text: []const u8) void {
     var buf: [512]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{text[0..@min(text.len, 500)]}) catch return;
+    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{text[0..@min(text.len, 500)]}, 0) catch return;
     c.gtk_label_set_text(@ptrCast(self.status), z.ptr);
 }
 
@@ -107,7 +107,7 @@ fn rebuild(self: *Manager) void {
     for (lists, 0..) |url, i| {
         const row = managerwin.paddedRow(4, 4);
         var zbuf: [2048]u8 = undefined;
-        const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{url[0..@min(url.len, 2000)]}) catch continue;
+        const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{url[0..@min(url.len, 2000)]}, 0) catch continue;
         const label = c.gtk_label_new(z.ptr);
         c.gtk_label_set_xalign(@ptrCast(label), 0.0);
         c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_MIDDLE);

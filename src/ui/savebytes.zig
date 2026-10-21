@@ -12,7 +12,7 @@ pub fn save(parent: ?*c.GtkWindow, path: []const u8, bytes: *c.GBytes, flags: c.
     replace(path, bytes, flags, &gerr) catch |err| {
         const reason = if (gerr != null) std.mem.span(gerr.*.message) else @errorName(err);
         var buf: [4608:0]u8 = undefined;
-        const message = std.fmt.bufPrintZ(&buf, "Could not save \"{s}\": {s}", .{ path, reason }) catch
+        const message = std.fmt.bufPrintSentinel(&buf, "Could not save \"{s}\": {s}", .{ path, reason }, 0) catch
             "The capture could not be written to the selected location.";
         _ = confirm.present(@ptrCast(parent), .{
             .heading = "Could not save file",

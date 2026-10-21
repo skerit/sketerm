@@ -43,7 +43,7 @@ const Env = struct {
     fn save(self: *Env, allocator: std.mem.Allocator) void {
         for (names, 0..) |n, i| {
             const v = c.getenv(n.ptr) orelse continue;
-            self.saved[i] = allocator.dupeZ(u8, std.mem.span(@as([*:0]const u8, @ptrCast(v)))) catch fail("oom");
+            self.saved[i] = allocator.dupeSentinel(u8, std.mem.span(@as([*:0]const u8, @ptrCast(v))), 0) catch fail("oom");
         }
     }
 
@@ -59,13 +59,13 @@ const Env = struct {
 
 fn setenvFmt(name: [:0]const u8, comptime fmt: []const u8, args: anytype) void {
     var buf: [256:0]u8 = undefined;
-    const v = std.fmt.bufPrintZ(&buf, fmt, args) catch fail("env value too long");
+    const v = std.fmt.bufPrintSentinel(&buf, fmt, args, 0) catch fail("env value too long");
     _ = c.setenv(name.ptr, v.ptr, 1);
 }
 
 fn mkdirZ(comptime fmt: []const u8, args: anytype) void {
     var buf: [256:0]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&buf, fmt, args) catch fail("path too long");
+    const p = std.fmt.bufPrintSentinel(&buf, fmt, args, 0) catch fail("path too long");
     if (c.mkdir(p.ptr, 0o700) != 0) fail("mkdir");
 }
 
@@ -186,14 +186,14 @@ pub fn run(allocator: std.mem.Allocator) void {
     defer env.restore(allocator);
 
     var root_buf: [64:0]u8 = undefined;
-    const root = std.fmt.bufPrintZ(&root_buf, "/tmp/skrl-{d}", .{c.getpid()}) catch unreachable;
+    const root = std.fmt.bufPrintSentinel(&root_buf, "/tmp/skrl-{d}", .{c.getpid()}, 0) catch unreachable;
     pathz.removeTree(root);
     if (c.mkdir(root.ptr, 0o700) != 0) fail("mkdir root");
     defer pathz.removeTree(root);
     mkdirZ("{s}/st", .{root});
     mkdirZ("{s}/cfg", .{root});
     var rt_buf: [96:0]u8 = undefined;
-    const rt = std.fmt.bufPrintZ(&rt_buf, "{s}/rt", .{root}) catch unreachable;
+    const rt = std.fmt.bufPrintSentinel(&rt_buf, "{s}/rt", .{root}, 0) catch unreachable;
     if (c.mkdir(rt.ptr, 0o700) != 0) fail("mkdir rt");
     var log_buf: [96]u8 = undefined;
     const log_path = std.fmt.bufPrint(&log_buf, "{s}/st/mux.log", .{root}) catch unreachable;
@@ -239,7 +239,7 @@ pub fn run(allocator: std.mem.Allocator) void {
     // later broker restart can still adopt it.
     {
         var dir_buf: [160:0]u8 = undefined;
-        const dir = std.fmt.bufPrintZ(&dir_buf, "{s}.w", .{sock}) catch unreachable;
+        const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}.w", .{sock}, 0) catch unreachable;
         const deadline = clock.nowMs() + 5_000;
         while (true) {
             var entries: usize = 0;

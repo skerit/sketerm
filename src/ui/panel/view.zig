@@ -708,7 +708,7 @@ pub const PanelView = struct {
         var owned: usize = 0;
         defer for (arr[0..owned]) |p| a.free(std.mem.span(@as([*:0]const u8, @ptrCast(p))));
         for (s.options, 0..) |o, i| {
-            const z = a.dupeZ(u8, o) catch return null;
+            const z = a.dupeSentinel(u8, o, 0) catch return null;
             arr[i] = z.ptr;
             owned += 1;
         }
@@ -735,7 +735,7 @@ pub const PanelView = struct {
         if (resolution) |resolved| if (resolved.failure) |why| {
             setPicturePrepared(pic, null);
             var buf: [Doc.MAX_PATH + 256]u8 = undefined;
-            const msg = std.fmt.bufPrintZ(&buf, "remote asset unavailable: {s}: {s}", .{ img.src, why }) catch
+            const msg = std.fmt.bufPrintSentinel(&buf, "remote asset unavailable: {s}: {s}", .{ img.src, why }, 0) catch
                 "remote asset unavailable";
             c.gtk_label_set_text(@ptrCast(cap), msg.ptr);
             c.gtk_widget_add_css_class(cap, "error");
@@ -1228,7 +1228,7 @@ fn applyClasses(widget: *c.GtkWidget, classes: []const []u8) void {
 // scale so pixel-peeping shows pixels, not mush.
 
 fn replaceZ(allocator: std.mem.Allocator, target: *[:0]u8, text: []const u8) ?void {
-    if (allocator.dupeZ(u8, text)) |copy| {
+    if (allocator.dupeSentinel(u8, text, 0)) |copy| {
         allocator.free(target.*);
         target.* = copy;
         return {};
@@ -1279,12 +1279,12 @@ const Compare = struct {
         self.* = .{
             .allocator = allocator,
             .area = area,
-            .left_path = try allocator.dupeZ(u8, ""),
-            .right_path = try allocator.dupeZ(u8, ""),
-            .left_error = try allocator.dupeZ(u8, ""),
-            .right_error = try allocator.dupeZ(u8, ""),
-            .left_label = try allocator.dupeZ(u8, ""),
-            .right_label = try allocator.dupeZ(u8, ""),
+            .left_path = try allocator.dupeSentinel(u8, "", 0),
+            .right_path = try allocator.dupeSentinel(u8, "", 0),
+            .left_error = try allocator.dupeSentinel(u8, "", 0),
+            .right_error = try allocator.dupeSentinel(u8, "", 0),
+            .left_label = try allocator.dupeSentinel(u8, "", 0),
+            .right_label = try allocator.dupeSentinel(u8, "", 0),
         };
         // Ownership: the qdata destroy-notify is the single free path,
         // running at widget dispose; the gestures below borrow the
@@ -1348,7 +1348,7 @@ const Compare = struct {
         resolver: *const assets.Resolver,
     ) void {
         const a = self.allocator;
-        if (a.dupeZ(u8, side.label)) |lz| {
+        if (a.dupeSentinel(u8, side.label, 0)) |lz| {
             a.free(label.*);
             label.* = lz;
         } else |_| {}
@@ -1439,7 +1439,7 @@ const Compare = struct {
         // Zoom badge (only when zoomed).
         if (self.zoom > 1.001) {
             var zb: [24]u8 = undefined;
-            const zs = std.fmt.bufPrintZ(&zb, "{d:.1}x", .{self.zoom}) catch return;
+            const zs = std.fmt.bufPrintSentinel(&zb, "{d:.1}x", .{self.zoom}, 0) catch return;
             self.drawBadge(ctx, zs, w / 2, 8);
         }
     }
@@ -1641,12 +1641,12 @@ const Compare = struct {
 };
 
 fn sidePathErrorText(buf: []u8, path: []const u8) [:0]const u8 {
-    return std.fmt.bufPrintZ(buf, "cannot load {s}", .{path}) catch "cannot load image";
+    return std.fmt.bufPrintSentinel(buf, "cannot load {s}", .{path}, 0) catch "cannot load image";
 }
 
 fn sideReasonErrorText(buf: []u8, error_text: []const u8) [:0]const u8 {
     const reason = if (error_text.len > 0) error_text else "cannot decode or read image";
-    return std.fmt.bufPrintZ(buf, "{s}", .{reason}) catch "cannot decode or read image";
+    return std.fmt.bufPrintSentinel(buf, "{s}", .{reason}, 0) catch "cannot decode or read image";
 }
 
 // ─── tests (no GTK widget initialization) ───────────────────────

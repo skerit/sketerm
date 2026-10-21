@@ -522,7 +522,7 @@ pub fn thumbProcess(tc: *ThumbCtx, req: *ThumbReq) void {
     var ubuf: [4096 * 3 + 8]u8 = undefined;
     const uri = thumbs_mod.fileUri(req.path, &ubuf) orelse return;
     var mstr: [24:0]u8 = undefined;
-    const msec = std.fmt.bufPrintZ(&mstr, "{d}", .{@divTrunc(req.mtime_ms, 1000)}) catch return;
+    const msec = std.fmt.bufPrintSentinel(&mstr, "{d}", .{@divTrunc(req.mtime_ms, 1000)}, 0) catch return;
 
     if (req.data == null) {
         // LOCAL: cached thumbnail first (validated by MTime).
@@ -540,7 +540,7 @@ pub fn thumbProcess(tc: *ThumbCtx, req: *ThumbReq) void {
         }
         if (pixbuf == null) {
             var pz: [4300:0]u8 = undefined;
-            const pp = std.fmt.bufPrintZ(&pz, "{s}", .{req.path}) catch return;
+            const pp = std.fmt.bufPrintSentinel(&pz, "{s}", .{req.path}, 0) catch return;
             pixbuf = c.gdk_pixbuf_new_from_file_at_size(pp.ptr, 128, 128, null);
             if (pixbuf != null) saveLocalThumbRecoverable(tc, pixbuf.?, &tp_buf, tp.len, uri, msec);
         }
@@ -633,10 +633,10 @@ pub fn saveLocalThumbRecoverable(tc: *ThumbCtx, pb: *c.GdkPixbuf, tp_buf: *[4300
     var dbuf: [4300]u8 = undefined;
     const dir1 = std.fmt.bufPrint(&dbuf, "{s}/thumbnails", .{tc.cache_dir}) catch return;
     var z: [4300:0]u8 = undefined;
-    if (std.fmt.bufPrintZ(&z, "{s}", .{dir1})) |d1| {
+    if (std.fmt.bufPrintSentinel(&z, "{s}", .{dir1}, 0)) |d1| {
         _ = c.mkdir(d1.ptr, 0o700);
     } else |_| return;
-    if (std.fmt.bufPrintZ(&z, "{s}/normal", .{dir1})) |d2| {
+    if (std.fmt.bufPrintSentinel(&z, "{s}/normal", .{dir1}, 0)) |d2| {
         _ = c.mkdir(d2.ptr, 0o700);
     } else |_| return;
     // gdk_pixbuf_save needs a path of its own, so this cannot go through
@@ -862,7 +862,7 @@ fn remoteThumbCachePath(z: *[4096:0]u8, identity: []const u8) ?[*:0]const u8 {
     var dbuf: [4096]u8 = undefined;
     const dir = remoteThumbCacheDir(&dbuf) orelse return null;
     const name = remoteThumbCacheName(identity);
-    const s = std.fmt.bufPrintZ(z, "{s}/{s}", .{ dir, name }) catch return null;
+    const s = std.fmt.bufPrintSentinel(z, "{s}/{s}", .{ dir, name }, 0) catch return null;
     return s.ptr;
 }
 
@@ -937,7 +937,7 @@ fn writeRemoteThumbCache(host: []const u8, path: []const u8, mtime_ms: i64, byte
     var dbuf: [4096]u8 = undefined;
     const dir = remoteThumbCacheDir(&dbuf) orelse return;
     var dz: [4096:0]u8 = undefined;
-    const dirz = std.fmt.bufPrintZ(&dz, "{s}", .{dir}) catch return;
+    const dirz = std.fmt.bufPrintSentinel(&dz, "{s}", .{dir}, 0) catch return;
     if (c.g_mkdir_with_parents(dirz.ptr, 0o700) != 0) return;
     if (!remote_thumb_cache_swept) {
         remote_thumb_cache_swept = true;
@@ -1857,7 +1857,7 @@ fn fillEntryPanel(self: *BrowserView, tab: *BTab, path: []const u8, entry: ?*Ent
         const raw = mediacols.lookup(self, tab.hc, path, e.mtime_ms, key) orelse continue;
         var disp: [192]u8 = undefined;
         var kz: [64:0]u8 = undefined;
-        const label_z = std.fmt.bufPrintZ(&kz, "{s}", .{colkeys.label(key)}) catch continue;
+        const label_z = std.fmt.bufPrintSentinel(&kz, "{s}", .{colkeys.label(key)}, 0) catch continue;
         addInfoRow(self, label_z, colkeys.display(key, raw, estimated, false, &disp));
     }
 }

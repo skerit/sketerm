@@ -391,9 +391,9 @@ pub fn adoptAppSessionIntoTab(self: *Window, as: *AppSession) ?*Pane {
 
     var title_buf: [160:0]u8 = undefined;
     const title_z = if (term.remote.?.host) |h|
-        std.fmt.bufPrintZ(&title_buf, "⌁ {s} @ {s}", .{ term.remote.?.session, h }) catch "app"
+        std.fmt.bufPrintSentinel(&title_buf, "⌁ {s} @ {s}", .{ term.remote.?.session, h }, 0) catch "app"
     else
-        std.fmt.bufPrintZ(&title_buf, "⌁ {s}", .{term.remote.?.session}) catch "app";
+        std.fmt.bufPrintSentinel(&title_buf, "⌁ {s}", .{term.remote.?.session}, 0) catch "app";
     const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
     c.gtk_widget_set_hexpand(wrapper, 1);
     c.gtk_widget_set_vexpand(wrapper, 1);
@@ -963,9 +963,9 @@ fn attachMuxPreparedMode(self: *Window, conn_in: @import("../mux/client.zig").Co
 
     var title_buf: [160:0]u8 = undefined;
     const title_z = if (host) |h|
-        std.fmt.bufPrintZ(&title_buf, "⌁ {s} @ {s}", .{ name, h }) catch "mux"
+        std.fmt.bufPrintSentinel(&title_buf, "⌁ {s} @ {s}", .{ name, h }, 0) catch "mux"
     else
-        std.fmt.bufPrintZ(&title_buf, "⌁ {s}", .{name}) catch "mux";
+        std.fmt.bufPrintSentinel(&title_buf, "⌁ {s}", .{name}, 0) catch "mux";
 
     // From here on the pane is LISTED (panes/terminals) and owns the
     // connection, so a failure must unlist it - leaving it listed with

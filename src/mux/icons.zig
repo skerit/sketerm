@@ -52,7 +52,7 @@ pub fn resolve(a: std.mem.Allocator, app_id: []const u8) !?Icon {
     var abs_buf: [4096]u8 = undefined;
     // Absolute-path Icon= values are read directly.
     if (icon_name.len > 0 and icon_name[0] == '/') {
-        const p = std.fmt.bufPrintZ(&abs_buf, "{s}", .{icon_name}) catch return null;
+        const p = std.fmt.bufPrintSentinel(&abs_buf, "{s}", .{icon_name}, 0) catch return null;
         if (try readIcon(a, p)) |icon| return icon;
         return null;
     }
@@ -71,7 +71,7 @@ pub fn resolve(a: std.mem.Allocator, app_id: []const u8) !?Icon {
         for (themes) |theme| {
             for (size_dirs) |sz| {
                 for (exts) |ext| {
-                    const p = std.fmt.bufPrintZ(&path_buf, "{s}/{s}/{s}/{s}{s}", .{ root, theme, sz, icon_name, ext }) catch continue;
+                    const p = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}/{s}/{s}{s}", .{ root, theme, sz, icon_name, ext }, 0) catch continue;
                     if (try readIcon(a, p)) |icon| return icon;
                 }
             }
@@ -79,7 +79,7 @@ pub fn resolve(a: std.mem.Allocator, app_id: []const u8) !?Icon {
         // Legacy flat location: <root>/../pixmaps/<name>.
         const parent = std.fs.path.dirname(root) orelse root;
         for (exts) |ext| {
-            const p = std.fmt.bufPrintZ(&path_buf, "{s}/pixmaps/{s}{s}", .{ parent, icon_name, ext }) catch continue;
+            const p = std.fmt.bufPrintSentinel(&path_buf, "{s}/pixmaps/{s}{s}", .{ parent, icon_name, ext }, 0) catch continue;
             if (try readIcon(a, p)) |icon| return icon;
         }
     }
@@ -97,7 +97,7 @@ fn desktopIconName(a: std.mem.Allocator, app_id: []const u8, buf: []u8) ?[]const
     }
     var path_buf: [4096]u8 = undefined;
     for (dirs) |d| {
-        const p = std.fmt.bufPrintZ(&path_buf, "{s}/applications/{s}.desktop", .{ d, app_id }) catch continue;
+        const p = std.fmt.bufPrintSentinel(&path_buf, "{s}/applications/{s}.desktop", .{ d, app_id }, 0) catch continue;
         const text = readFile(a, p, 256 * 1024) catch continue orelse continue;
         defer a.free(text);
         if (parseIconKey(text)) |icon| {

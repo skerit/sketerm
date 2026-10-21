@@ -399,7 +399,7 @@ pub fn main() !void {
 
         // Now the private bus, where the hub advertises a reader.
         var addr_buf: [256]u8 = undefined;
-        const addr = std.fmt.bufPrintZ(&addr_buf, "unix:path={s}", .{hub.bus_path}) catch unreachable;
+        const addr = std.fmt.bufPrintSentinel(&addr_buf, "unix:path={s}", .{hub.bus_path}, 0) catch unreachable;
         _ = c.setenv("DBUS_SESSION_BUS_ADDRESS", addr.ptr, 1);
         const live = a11ydetect.detect(gpa);
         if (!live.enabled()) {

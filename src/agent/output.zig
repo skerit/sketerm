@@ -122,7 +122,7 @@ pub const Interaction = struct {
         } else |_| {}
         var found: ?usize = null;
         for (self.options, 0..) |o, i| {
-            if (std.ascii.indexOfIgnoreCase(o.label, want) == null) continue;
+            if (std.ascii.findIgnoreCase(o.label, want) == null) continue;
             if (found != null) return null;
             found = i;
         }

@@ -353,7 +353,7 @@ test "files entry: a file argument starts in its parent directory" {
 
     // A real regular file resolves to its directory.
     var name_buf: [64]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/sketerm-entry-test-{d}", .{c.getpid()});
+    const name = try std.fmt.bufPrintSentinel(&name_buf, "/tmp/sketerm-entry-test-{d}", .{c.getpid()}, 0);
     const f = c.fopen(name.ptr, "wb") orelse return error.SkipZigTest;
     _ = c.fclose(f);
     defer _ = c.unlink(name.ptr);
@@ -361,7 +361,7 @@ test "files entry: a file argument starts in its parent directory" {
 
     // The whole pipeline: a file:// URI naming a file, with a space.
     var sp_buf: [128]u8 = undefined;
-    const sp_name = try std.fmt.bufPrintZ(&sp_buf, "/tmp/sketerm entry {d}", .{c.getpid()});
+    const sp_name = try std.fmt.bufPrintSentinel(&sp_buf, "/tmp/sketerm entry {d}", .{c.getpid()}, 0);
     const f2 = c.fopen(sp_name.ptr, "wb") orelse return error.SkipZigTest;
     _ = c.fclose(f2);
     defer _ = c.unlink(sp_name.ptr);

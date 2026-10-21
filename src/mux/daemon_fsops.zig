@@ -262,9 +262,9 @@ test "openChecked refuses a FIFO and a device node without opening them" {
     @memcpy(dir_buf[0..27], "/tmp/sketerm-openck-XXXXXX\x00");
     const dir = std.mem.span(@as([*:0]u8, @ptrCast(c.mkdtemp(@ptrCast(&dir_buf)) orelse return error.SkipZigTest)));
     var fifo_z: [96]u8 = undefined;
-    const fifo = try std.fmt.bufPrintZ(&fifo_z, "{s}/fifo", .{dir});
+    const fifo = try std.fmt.bufPrintSentinel(&fifo_z, "{s}/fifo", .{dir}, 0);
     var reg_z: [96]u8 = undefined;
-    const reg = try std.fmt.bufPrintZ(&reg_z, "{s}/reg", .{dir});
+    const reg = try std.fmt.bufPrintSentinel(&reg_z, "{s}/reg", .{dir}, 0);
     defer {
         _ = c.unlink(fifo.ptr);
         _ = c.unlink(reg.ptr);
@@ -305,7 +305,7 @@ test "openChecked refuses a FIFO and a device node without opening them" {
         else => return error.TestUnexpectedResult,
     }
     var missing_z: [96]u8 = undefined;
-    const missing = try std.fmt.bufPrintZ(&missing_z, "{s}/missing", .{dir});
+    const missing = try std.fmt.bufPrintSentinel(&missing_z, "{s}/missing", .{dir}, 0);
     switch (openChecked(missing.ptr, c.O_RDONLY, 0, .file)) {
         .failed => |rc| try t.expect(rc < 0),
         else => return error.TestUnexpectedResult,
@@ -1434,7 +1434,7 @@ pub fn fsApps(self: *Daemon, cl: *Client, r: FsOpReq) void {
             const fname = std.mem.span(@as([*:0]const u8, @ptrCast(&de.*.d_name)));
             if (!std.mem.endsWith(u8, fname, ".desktop")) continue;
             var fz: [4400:0]u8 = undefined;
-            const fp = std.fmt.bufPrintZ(&fz, "{s}/{s}", .{ dir_path, fname }) catch continue;
+            const fp = std.fmt.bufPrintSentinel(&fz, "{s}/{s}", .{ dir_path, fname }, 0) catch continue;
             const f = c.fopen(fp.ptr, "rb") orelse continue;
             var content: [8192]u8 = undefined;
             const n = c.fread(&content, 1, content.len, f);

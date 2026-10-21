@@ -725,8 +725,8 @@ pub fn listCap(window_height: c_int) c_int {
 /// tell one row's Watch from the next.
 pub fn accessibleName(buf: []u8, action: AttachAction, row: []const u8) [:0]const u8 {
     const text = std.mem.span(action.verb().text);
-    if (row.len == 0) return std.fmt.bufPrintZ(buf, "{s}", .{text}) catch "";
-    return std.fmt.bufPrintZ(buf, "{s} {s}", .{ text, row }) catch std.fmt.bufPrintZ(buf, "{s}", .{text}) catch "";
+    if (row.len == 0) return std.fmt.bufPrintSentinel(buf, "{s}", .{text}, 0) catch "";
+    return std.fmt.bufPrintSentinel(buf, "{s} {s}", .{ text, row }, 0) catch std.fmt.bufPrintSentinel(buf, "{s}", .{text}, 0) catch "";
 }
 
 /// Icon and tooltip for each attach intent, shared by the tab-bar
@@ -984,7 +984,7 @@ pub const Watcher = struct {
     fn arm(self: *Watcher) void {
         const dir = mcp_registry.ensureDir() catch return;
         var z: [4096:0]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&z, "{s}", .{dir}) catch return;
+        const path = std.fmt.bufPrintSentinel(&z, "{s}", .{dir}, 0) catch return;
         const file = c.g_file_new_for_path(path.ptr) orelse return;
         defer c.g_object_unref(@ptrCast(file));
         const mon = c.g_file_monitor_directory(file, c.G_FILE_MONITOR_NONE, null, null) orelse return;
@@ -1576,11 +1576,11 @@ pub const Watcher = struct {
         var desc_buf: [96]u8 = undefined;
         const desc = counts.describe(&desc_buf);
         var facts_z: [160:0]u8 = undefined;
-        const facts = std.fmt.bufPrintZ(&facts_z, "{s}{s}{s}", .{
+        const facts = std.fmt.bufPrintSentinel(&facts_z, "{s}{s}{s}", .{
             if (desc.len > 0) desc else "no sessions",
             if (a.mode.isDefault()) "" else ", ",
             if (a.mode.isDefault()) "" else a.mode.text(),
-        }) catch "";
+        }, 0) catch "";
         c.gtk_label_set_text(@ptrCast(h.facts), facts.ptr);
         var tip_buf: [1024]u8 = undefined;
         var tip_z: [1024:0]u8 = undefined;
@@ -2143,7 +2143,7 @@ pub fn attachButton(action: AttachAction, row: []const u8) *c.GtkWidget {
     c.gtk_widget_add_css_class(btn, "flat");
     c.gtk_widget_set_valign(btn, c.GTK_ALIGN_CENTER);
     var tip_buf: [400:0]u8 = undefined;
-    const tip: [*:0]const u8 = if (std.fmt.bufPrintZ(&tip_buf, "{s}: {s}", .{ verb.text, verb.tip })) |z| z.ptr else |_| verb.tip;
+    const tip: [*:0]const u8 = if (std.fmt.bufPrintSentinel(&tip_buf, "{s}: {s}", .{ verb.text, verb.tip }, 0)) |z| z.ptr else |_| verb.tip;
     c.gtk_widget_set_tooltip_text(btn, tip);
     var name_buf: [400]u8 = undefined;
     a11y.setLabel(btn, accessibleName(&name_buf, action, row).ptr);
@@ -2204,7 +2204,7 @@ fn viewsSameSession(earlier: []const *Pane, pane: *Pane) bool {
 /// An agent row's status line: the attention's words, capitalized.
 fn statusText(buf: [:0]u8, attention: ?vocab.Attention) [:0]const u8 {
     const words = if (attention) |a| a.label() else "state unknown (an older sketerm mcp)";
-    const z = std.fmt.bufPrintZ(buf, "{s}", .{words}) catch return "";
+    const z = std.fmt.bufPrintSentinel(buf, "{s}", .{words}, 0) catch return "";
     if (z.len > 0) z[0] = std.ascii.toUpper(z[0]);
     return z;
 }

@@ -358,7 +358,7 @@ pub fn browserInPane(allocator: std.mem.Allocator, here: bool, spec: ?[]const u8
 fn watchPane(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, session: ?[]const u8, pattern: []const u8, timeout_ms: u64, interval_ms: u32) u8 {
     defer allocator.free(sock_path);
 
-    const pat_z = allocator.dupeZ(u8, pattern) catch return 1;
+    const pat_z = allocator.dupeSentinel(u8, pattern, 0) catch return 1;
     defer allocator.free(pat_z);
     var gerr: [*c]c.GError = null;
     const regex = c.g_regex_new(pat_z.ptr, 0, 0, &gerr) orelse {
@@ -401,7 +401,7 @@ fn watchPane(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, sessio
         var lines = std.mem.splitScalar(u8, parsed.value.text, '\n');
         while (lines.next()) |ln| {
             if (ln.len == 0) continue;
-            const ln_z = allocator.dupeZ(u8, ln) catch return 1;
+            const ln_z = allocator.dupeSentinel(u8, ln, 0) catch return 1;
             defer allocator.free(ln_z);
             if (c.g_regex_match(regex, ln_z.ptr, 0, null) != 0) {
                 _ = c.fwrite(ln.ptr, 1, ln.len, platform.stdout());
@@ -474,7 +474,7 @@ fn typeText(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, session
 fn readWholeFile(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
     const from_stdin = std.mem.eql(u8, path, "-");
     const f = if (from_stdin) platform.stdin() orelse return null else blk: {
-        const path_z = allocator.dupeZ(u8, path) catch return null;
+        const path_z = allocator.dupeSentinel(u8, path, 0) catch return null;
         defer allocator.free(path_z);
         break :blk c.fopen(path_z.ptr, "rb") orelse return null;
     };
@@ -499,9 +499,9 @@ fn parsePaneArg(arg: []const u8) ?u32 {
 }
 
 pub fn resolveSocket(allocator: std.mem.Allocator, arg: ?[]const u8) ?[:0]u8 {
-    if (arg) |a| return allocator.dupeZ(u8, a) catch null;
+    if (arg) |a| return allocator.dupeSentinel(u8, a, 0) catch null;
     if (c.getenv("SKETERM_SOCKET")) |env| {
-        return allocator.dupeZ(u8, std.mem.span(env)) catch null;
+        return allocator.dupeSentinel(u8, std.mem.span(env), 0) catch null;
     }
     // Exactly one running instance → unambiguous.
     return discoverGuiSocket(allocator, .single);
@@ -625,7 +625,7 @@ fn talk(allocator: std.mem.Allocator, sock_path: [:0]u8, req: protocol.Request, 
         _ = c.fwrite(resp.ptr, 1, rlen, platform.stdout());
         _ = c.fputc('\n', platform.stdout());
     } else if (!parsed.value.ok) {
-        const msg_z = allocator.dupeZ(u8, parsed.value.@"error") catch return 1;
+        const msg_z = allocator.dupeSentinel(u8, parsed.value.@"error", 0) catch return 1;
         defer allocator.free(msg_z);
         _ = c.fprintf(platform.stderr(), "sketerm: %s\n", msg_z.ptr);
     }

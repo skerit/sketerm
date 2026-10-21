@@ -81,7 +81,7 @@ const ScaledRgba = struct {
 /// Decode `source_path` and scale it down to fit `bound` px; the longest side lands exactly on `bound`.
 fn loadScaledRgba(allocator: std.mem.Allocator, source_path: []const u8, bound: u32) ?ScaledRgba {
     var pz: [4096:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&pz, "{s}", .{source_path}) catch return null;
+    const path = std.fmt.bufPrintSentinel(&pz, "{s}", .{source_path}, 0) catch return null;
     var width: c_int = 0;
     var height: c_int = 0;
     var channels: c_int = 0;
@@ -165,7 +165,7 @@ fn transportPreview(
     // Under /tmp (not next to the source): a daemon killed between
     // asset and cleanup would otherwise orphan sidecars permanently
     // inside the freedesktop thumbnail cache; /tmp dies at boot.
-    const out = std.fmt.bufPrintZ(out_path, "/tmp/.sketerm-preview-{x}.{s}", .{ nonce, ext }) catch return null;
+    const out = std.fmt.bufPrintSentinel(out_path, "/tmp/.sketerm-preview-{x}.{s}", .{ nonce, ext }, 0) catch return null;
     const fd = c.open(out.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC, @as(c.mode_t, 0o600));
     if (fd < 0) return null;
     var open = true;
@@ -194,7 +194,7 @@ fn transportPreview(
 pub fn runPreviewTransport(job: *const Job) u8 {
     const spec = job.spec;
     var source_z: [4096:0]u8 = undefined;
-    const source = std.fmt.bufPrintZ(&source_z, "{s}", .{spec.src}) catch return job.emitError("preview path too long");
+    const source = std.fmt.bufPrintSentinel(&source_z, "{s}", .{spec.src}, 0) catch return job.emitError("preview path too long");
     defer {
         if (spec.delete_source) _ = c.unlink(source.ptr);
     }
@@ -314,7 +314,7 @@ fn fileSize(path: [*:0]const u8) u64 {
 pub fn runPreviewStream(job: *const Job) u8 {
     const spec = job.spec;
     var source_z: [4096:0]u8 = undefined;
-    const source = std.fmt.bufPrintZ(&source_z, "{s}", .{spec.src}) catch return job.emitError("preview path too long");
+    const source = std.fmt.bufPrintSentinel(&source_z, "{s}", .{spec.src}, 0) catch return job.emitError("preview path too long");
     var st: c.struct_stat = undefined;
     if (c.stat(source.ptr, &st) != 0) return job.emitErrno("preview stat");
     if (!binaryExists("ffmpeg")) return job.emitErrorKind("no_encoder", "ffmpeg is not installed on this host");
@@ -325,7 +325,7 @@ pub fn runPreviewStream(job: *const Job) u8 {
         std.mem.writeInt(u64, &random, (@as(u64, @intCast(c.getpid())) << 32) ^ @as(u32, @intCast(ts.tv_nsec)), .little);
     }
     var out_z: [4096:0]u8 = undefined;
-    const out = std.fmt.bufPrintZ(&out_z, SPOOL_PREFIX ++ "{x}.mp4", .{std.mem.readInt(u64, &random, .little)}) catch
+    const out = std.fmt.bufPrintSentinel(&out_z, SPOOL_PREFIX ++ "{x}.mp4", .{std.mem.readInt(u64, &random, .little)}, 0) catch
         return job.emitError("spool path too long");
     // Create it ourselves (exclusive, private) so the name is claimed
     // and registered before ffmpeg starts writing.
@@ -339,7 +339,7 @@ pub fn runPreviewStream(job: *const Job) u8 {
     // A time seek is a fresh job from `start_ms`: input seeking (-ss
     // before -i) lands on the keyframe at or before it, cheaply.
     var ss_buf: [32:0]u8 = undefined;
-    const ss = std.fmt.bufPrintZ(&ss_buf, "{d}.{d:0>3}", .{ spec.start_ms / 1000, spec.start_ms % 1000 }) catch unreachable;
+    const ss = std.fmt.bufPrintSentinel(&ss_buf, "{d}.{d:0>3}", .{ spec.start_ms / 1000, spec.start_ms % 1000 }, 0) catch unreachable;
     const total: u64 = @intCast(st.st_size);
     var encoder: PreviewEncoder = if (vaapiUsable()) .vaapi else .x264;
     var argv_buf: [64]?[*:0]const u8 = undefined;
@@ -488,36 +488,36 @@ fn generateThumbPng(allocator: std.mem.Allocator, src_path: []const u8, source: 
     if (extIs(src_path, &image_exts)) {
         if (extIs(src_path, &[_][]const u8{".svg"})) {
             var size_buf: [16:0]u8 = undefined;
-            const size = std.fmt.bufPrintZ(&size_buf, "{d}", .{bound}) catch unreachable;
+            const size = std.fmt.bufPrintSentinel(&size_buf, "{d}", .{bound}, 0) catch unreachable;
             const argv = [_:null]?[*:0]const u8{ "rsvg-convert", "--keep-aspect-ratio", "-w", size.ptr, "-h", size.ptr, "-o", raw.ptr, source.ptr, null };
             generated = runArgv(&argv);
         } else {
             generated = rasterThumbnail(allocator, source, raw, bound);
             if (!generated) {
                 var vf_buf: [64:0]u8 = undefined;
-                const vf = std.fmt.bufPrintZ(&vf_buf, "scale={d}:{d}:force_original_aspect_ratio=decrease", .{ bound, bound }) catch return false;
+                const vf = std.fmt.bufPrintSentinel(&vf_buf, "scale={d}:{d}:force_original_aspect_ratio=decrease", .{ bound, bound }, 0) catch return false;
                 const argv = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-i", source.ptr, "-frames:v", "1", "-vf", vf.ptr, raw.ptr, null };
                 generated = runArgv(&argv);
             }
         }
     } else if (extIs(src_path, &pdf_exts)) {
         var prefix_buf: [4096:0]u8 = undefined;
-        const prefix = std.fmt.bufPrintZ(&prefix_buf, "{s}.page", .{raw[0 .. raw.len - 4]}) catch return false;
+        const prefix = std.fmt.bufPrintSentinel(&prefix_buf, "{s}.page", .{raw[0 .. raw.len - 4]}, 0) catch return false;
         var scale_buf: [16:0]u8 = undefined;
-        const scale = std.fmt.bufPrintZ(&scale_buf, "{d}", .{bound}) catch unreachable;
+        const scale = std.fmt.bufPrintSentinel(&scale_buf, "{d}", .{bound}, 0) catch unreachable;
         const argv = [_:null]?[*:0]const u8{ "pdftoppm", "-f", "1", "-singlefile", "-scale-to", scale.ptr, "-png", source.ptr, prefix.ptr, null };
         generated = runArgv(&argv);
         if (generated) {
             var made: [4096:0]u8 = undefined;
-            const mp = std.fmt.bufPrintZ(&made, "{s}.png", .{prefix}) catch return false;
+            const mp = std.fmt.bufPrintSentinel(&made, "{s}.png", .{prefix}, 0) catch return false;
             generated = c.rename(mp.ptr, raw.ptr) == 0;
         }
     } else {
         var vf_buf: [64:0]u8 = undefined;
         const vf = if (extIs(src_path, &video_exts))
-            std.fmt.bufPrintZ(&vf_buf, "scale={d}:{d}:force_original_aspect_ratio=decrease", .{ bound, bound }) catch return false
+            std.fmt.bufPrintSentinel(&vf_buf, "scale={d}:{d}:force_original_aspect_ratio=decrease", .{ bound, bound }, 0) catch return false
         else
-            std.fmt.bufPrintZ(&vf_buf, "showwavespic=s={d}x{d}", .{ bound, bound }) catch return false;
+            std.fmt.bufPrintSentinel(&vf_buf, "showwavespic=s={d}x{d}", .{ bound, bound }, 0) catch return false;
         if (extIs(src_path, &video_exts)) {
             generated = videoPosterPng(source, raw, vf);
         } else {
@@ -559,7 +559,7 @@ fn runWireThumb(job: *const Job, thumbnail_only: bool, mtime_sec: i64, cache_roo
     const spec = job.spec;
     const tier: thumbs.Tier = if (thumbnail_only) .normal else .x_large;
     var source_z: [4096:0]u8 = undefined;
-    const source = std.fmt.bufPrintZ(&source_z, "{s}", .{spec.src}) catch return job.emitError("preview path too long");
+    const source = std.fmt.bufPrintSentinel(&source_z, "{s}", .{spec.src}, 0) catch return job.emitError("preview path too long");
     var metadata: [2048]u8 = undefined;
     var metadata_len: usize = 0;
     if (!thumbnail_only) {
@@ -600,7 +600,7 @@ fn runWireThumb(job: *const Job, thumbnail_only: bool, mtime_sec: i64, cache_roo
         _ = c.unlink(r.ptr);
     };
     const enc_src: []const u8 = if (thumbs.validatePng(final, uri, mtime_sec)) final else blk: {
-        const r = std.fmt.bufPrintZ(&raw_buf, "/tmp/.sketerm-thumbgen-{d}.png", .{c.getpid()}) catch return job.emitError("thumbnail path too long");
+        const r = std.fmt.bufPrintSentinel(&raw_buf, "/tmp/.sketerm-thumbgen-{d}.png", .{c.getpid()}, 0) catch return job.emitError("thumbnail path too long");
         if (!generateThumbPng(allocator, spec.src, source, r, if (thumbnail_only) 128 else 512))
             return job.emitError("preview generator unavailable or failed");
         raw = r;
@@ -645,7 +645,7 @@ fn sweepWireThumbs(dir: []const u8) void {
         const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
         if (name.len < 5 or name.len > 44 or name[0] == '.') continue;
         var pz: [4200:0]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&pz, "{s}/{s}", .{ dir, name }) catch continue;
+        const p = std.fmt.bufPrintSentinel(&pz, "{s}/{s}", .{ dir, name }, 0) catch continue;
         var st: c.struct_stat = undefined;
         if (c.stat(p.ptr, &st) != 0) continue;
         const cts = if (@hasField(c.struct_stat, "st_ctim")) st.st_ctim else st.st_ctimespec;
@@ -663,7 +663,7 @@ fn sweepWireThumbs(dir: []const u8) void {
     const doomed = @min(items.items.len - WIRE_THUMB_CACHE_MAX + WIRE_THUMB_CACHE_SWEEP, items.items.len);
     for (items.items[0..doomed]) |item| {
         var pz: [4200:0]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&pz, "{s}/{s}", .{ dir, item.name[0..item.name_len] }) catch continue;
+        const p = std.fmt.bufPrintSentinel(&pz, "{s}/{s}", .{ dir, item.name[0..item.name_len] }, 0) catch continue;
         _ = c.unlink(p.ptr);
     }
 }
@@ -672,7 +672,7 @@ pub fn runPreview(job: *const Job, thumbnail_only: bool) u8 {
     const allocator = job.allocator;
     const spec = job.spec;
     var source_z: [4096:0]u8 = undefined;
-    const source = std.fmt.bufPrintZ(&source_z, "{s}", .{spec.src}) catch return job.emitError("preview path too long");
+    const source = std.fmt.bufPrintSentinel(&source_z, "{s}", .{spec.src}, 0) catch return job.emitError("preview path too long");
     var st: c.struct_stat = undefined;
     if (c.stat(source.ptr, &st) != 0) return job.emitErrno("preview stat");
     const ts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
@@ -722,7 +722,7 @@ pub fn runPreview(job: *const Job, thumbnail_only: bool) u8 {
         const tier_dir = std.fs.path.dirname(final) orelse return job.emitError("bad thumbnail path");
         _ = c.chmod(pathz.pathZ(&mode_z, tier_dir) catch return job.emitError("cache path too long"), 0o700);
         var raw_buf: [4096:0]u8 = undefined;
-        const raw = std.fmt.bufPrintZ(&raw_buf, "{s}.generated-{d}.png", .{ final, c.getpid() }) catch return job.emitError("thumbnail path too long");
+        const raw = std.fmt.bufPrintSentinel(&raw_buf, "{s}.generated-{d}.png", .{ final, c.getpid() }, 0) catch return job.emitError("thumbnail path too long");
         defer _ = c.unlink(raw.ptr);
         const bound: c_int = if (thumbnail_only) 128 else 512;
         if (!generateThumbPng(allocator, spec.src, source, raw, bound))
@@ -747,7 +747,7 @@ pub fn runPreview(job: *const Job, thumbnail_only: bool) u8 {
 test "transportPreview serves PNG when jxl/webp cannot, refuses without any accepted codec" {
     const t = std.testing;
     var src_z: [128:0]u8 = undefined;
-    const src = std.fmt.bufPrintZ(&src_z, "/tmp/.sketerm-test-tp-{d}.png", .{c.getpid()}) catch unreachable;
+    const src = std.fmt.bufPrintSentinel(&src_z, "/tmp/.sketerm-test-tp-{d}.png", .{c.getpid()}, 0) catch unreachable;
     var rgba: [8 * 8 * 4]u8 = undefined;
     @memset(&rgba, 0x80);
     try t.expect(c.stbi_write_png(src.ptr, 8, 8, 4, &rgba, 8 * 4) != 0);
@@ -766,9 +766,9 @@ test "transportPreview serves PNG when jxl/webp cannot, refuses without any acce
 test "rasterThumbnail puts the longest side exactly on the bound and keeps small images as-is" {
     const t = std.testing;
     var src_z: [128:0]u8 = undefined;
-    const src = std.fmt.bufPrintZ(&src_z, "/tmp/.sketerm-test-rt-{d}.png", .{c.getpid()}) catch unreachable;
+    const src = std.fmt.bufPrintSentinel(&src_z, "/tmp/.sketerm-test-rt-{d}.png", .{c.getpid()}, 0) catch unreachable;
     var out_z: [128:0]u8 = undefined;
-    const out = std.fmt.bufPrintZ(&out_z, "/tmp/.sketerm-test-rt-{d}-out.png", .{c.getpid()}) catch unreachable;
+    const out = std.fmt.bufPrintSentinel(&out_z, "/tmp/.sketerm-test-rt-{d}-out.png", .{c.getpid()}, 0) catch unreachable;
     // 289 / (289 / 35) truncates to 34 in floating point; the bound must still be met.
     var rgba: [289 * 10 * 4]u8 = undefined;
     @memset(&rgba, 0x40);
@@ -791,7 +791,7 @@ test "rasterThumbnail puts the longest side exactly on the bound and keeps small
 test "fileHasBytes: absent and empty both read as no output" {
     const t = std.testing;
     var z: [128:0]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&z, "/tmp/.sketerm-test-fhb-{d}", .{c.getpid()}) catch unreachable;
+    const p = std.fmt.bufPrintSentinel(&z, "/tmp/.sketerm-test-fhb-{d}", .{c.getpid()}, 0) catch unreachable;
     _ = c.unlink(p.ptr);
     try t.expect(!fileHasBytes(p.ptr));
     const fd = c.open(p.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC, @as(c.mode_t, 0o600));
@@ -807,7 +807,7 @@ test "video poster: a clip shorter than the 1s seek still yields a frame" {
     const t = std.testing;
     if (!binaryExists("ffmpeg")) return;
     var src_z: [128:0]u8 = undefined;
-    const src = std.fmt.bufPrintZ(&src_z, "/tmp/.sketerm-test-poster-{d}.mp4", .{c.getpid()}) catch unreachable;
+    const src = std.fmt.bufPrintSentinel(&src_z, "/tmp/.sketerm-test-poster-{d}.mp4", .{c.getpid()}, 0) catch unreachable;
     defer _ = c.unlink(src.ptr);
     const make = [_:null]?[*:0]const u8{
         "ffmpeg", "-y",                                      "-v", "error", "-f", "lavfi",
@@ -816,10 +816,10 @@ test "video poster: a clip shorter than the 1s seek still yields a frame" {
     // No lavfi/x264 on this host: nothing to assert about.
     if (!runArgv(&make) or !fileHasBytes(src.ptr)) return;
     var raw_z: [128:0]u8 = undefined;
-    const raw = std.fmt.bufPrintZ(&raw_z, "/tmp/.sketerm-test-poster-{d}.png", .{c.getpid()}) catch unreachable;
+    const raw = std.fmt.bufPrintSentinel(&raw_z, "/tmp/.sketerm-test-poster-{d}.png", .{c.getpid()}, 0) catch unreachable;
     defer _ = c.unlink(raw.ptr);
     var vf_z: [64:0]u8 = undefined;
-    const vf = std.fmt.bufPrintZ(&vf_z, "scale=128:128:force_original_aspect_ratio=decrease", .{}) catch unreachable;
+    const vf = std.fmt.bufPrintSentinel(&vf_z, "scale=128:128:force_original_aspect_ratio=decrease", .{}, 0) catch unreachable;
     try t.expect(videoPosterPng(src, raw, vf));
     try t.expect(fileHasBytes(raw.ptr));
 }

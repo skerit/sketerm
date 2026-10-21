@@ -54,7 +54,7 @@ pub fn sweep(dir: [*:0]const u8, policy: Policy) void {
         if (!std.mem.startsWith(u8, name, policy.prefix) or !std.mem.endsWith(u8, name, policy.suffix)) continue;
         if (name.len > 255) continue;
         var pz: [4352:0]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&pz, "{s}/{s}", .{ std.mem.span(dir), name }) catch continue;
+        const path = std.fmt.bufPrintSentinel(&pz, "{s}/{s}", .{ std.mem.span(dir), name }, 0) catch continue;
         var st: c.struct_stat = undefined;
         if (c.lstat(path.ptr, &st) != 0 or st.st_uid != uid or (st.st_mode & c.S_IFMT) != c.S_IFREG) continue;
         const mtime = mtimeSec(&st);
@@ -80,7 +80,7 @@ pub fn sweep(dir: [*:0]const u8, policy: Policy) void {
     const doomed = @min(kept.items.len - cap + policy.trim_extra, kept.items.len);
     for (kept.items[0..doomed]) |cand| {
         var pz: [4352:0]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&pz, "{s}/{s}", .{ std.mem.span(dir), cand.slice() }) catch continue;
+        const path = std.fmt.bufPrintSentinel(&pz, "{s}/{s}", .{ std.mem.span(dir), cand.slice() }, 0) catch continue;
         _ = c.unlink(path.ptr);
     }
 }
@@ -88,7 +88,7 @@ pub fn sweep(dir: [*:0]const u8, policy: Policy) void {
 /// Test scaffolding: an empty file with the given mtime.
 fn touchAt(dir: []const u8, name: []const u8, mtime: i64) !void {
     var pz: [4352:0]u8 = undefined;
-    const p = try std.fmt.bufPrintZ(&pz, "{s}/{s}", .{ dir, name });
+    const p = try std.fmt.bufPrintSentinel(&pz, "{s}/{s}", .{ dir, name }, 0);
     const fd = c.open(p.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c.mode_t, 0o600));
     if (fd < 0) return error.CreateFailed;
     _ = c.close(fd);
@@ -98,7 +98,7 @@ fn touchAt(dir: []const u8, name: []const u8, mtime: i64) !void {
 
 fn present(dir: []const u8, name: []const u8) bool {
     var pz: [4352:0]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&pz, "{s}/{s}", .{ dir, name }) catch return false;
+    const p = std.fmt.bufPrintSentinel(&pz, "{s}/{s}", .{ dir, name }, 0) catch return false;
     return c.access(p.ptr, c.F_OK) == 0;
 }
 

@@ -1152,7 +1152,7 @@ pub fn refreshBgSource(self: *Window) void {
     const cfg = &self.config;
     if (cfg.background_image.len > 0) blk: {
         var path_z_buf: [4096]u8 = undefined;
-        const path_z = std.fmt.bufPrintZ(&path_z_buf, "{s}", .{cfg.background_image}) catch break :blk;
+        const path_z = std.fmt.bufPrintSentinel(&path_z_buf, "{s}", .{cfg.background_image}, 0) catch break :blk;
         var w: c_int = 0;
         var h: c_int = 0;
         var n: c_int = 0;
@@ -1245,7 +1245,7 @@ pub fn refreshTitlebarCss(self: *Window) void {
     // Generous buffer: a bufPrintZ overflow here would silently drop
     // EVERY rule in this provider, not just the one that grew it.
     var buf: [8192]u8 = undefined;
-    const css = std.fmt.bufPrintZ(&buf,
+    const css = std.fmt.bufPrintSentinel(&buf,
         \\.sketerm-titlebar {{ padding: 1px 2px; min-height: 18px; }}
         \\/* The CSD's application icon (GtkWindowControls draws it when
         \\   the WM button layout asks for one). GTK gives it no margin
@@ -1379,7 +1379,7 @@ pub fn refreshTitlebarCss(self: *Window) void {
         gap[3],
         self.config.pane_gap,
         self.config.pane_gap,
-    }) catch return;
+    }, 0) catch return;
     c.gtk_css_provider_load_from_string(self.titlebar_css.?, css.ptr);
 }
 

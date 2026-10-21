@@ -2323,7 +2323,7 @@ pub const EditorView = struct {
         }
         const ctx = DlgCtx.create(self, tab) orelse return;
         var body: [300:0]u8 = undefined;
-        const b = std.fmt.bufPrintZ(&body, "\"{s}\" has unsaved changes.", .{tab.title()}) catch "This file has unsaved changes.";
+        const b = std.fmt.bufPrintSentinel(&body, "\"{s}\" has unsaved changes.", .{tab.title()}, 0) catch "This file has unsaved changes.";
         if (confirm.present(self.dialogParent(), .{
             .heading = "Save changes?",
             .body = b.ptr,
@@ -2516,10 +2516,11 @@ pub const EditorView = struct {
         if (replaced > 0) editorproj.reportDeferredReplace(self, replaced);
         if (lost > 0) {
             var buf: [160:0]u8 = undefined;
-            const msg = std.fmt.bufPrintZ(
+            const msg = std.fmt.bufPrintSentinel(
                 &buf,
                 "{d} deferred edit(s) could not be applied: the document changed before it loaded.",
                 .{lost},
+                0,
             ) catch "A deferred edit could not be applied.";
             self.setStatusText(msg);
         }
@@ -2532,10 +2533,11 @@ pub const EditorView = struct {
         const lost = self.deferred.drop(self.allocator, tab_id);
         if (lost == 0) return;
         var buf: [200:0]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(
+        const msg = std.fmt.bufPrintSentinel(
             &buf,
             "{d} edit(s) from a cross-file change were NOT applied: {s}.",
             .{ lost, why },
+            0,
         ) catch "A cross-file edit was not applied.";
         self.setStatusText(msg);
     }
@@ -2687,7 +2689,7 @@ pub const EditorView = struct {
         const tab = self.active orelse return;
         const ctx = DlgCtx.create(self, tab) orelse return;
         const entry = c.gtk_entry_new();
-        const z = self.allocator.dupeZ(u8, current) catch {
+        const z = self.allocator.dupeSentinel(u8, current, 0) catch {
             ctx.destroy();
             return;
         };
@@ -3572,9 +3574,9 @@ pub const EditorView = struct {
     fn paintStatus(self: *EditorView, base: []const u8, note: []const u8) void {
         var out: [900:0]u8 = undefined;
         const txt = blk: {
-            if (note.len == 0) break :blk std.fmt.bufPrintZ(&out, "{s}", .{base}) catch return;
-            if (base.len == 0) break :blk std.fmt.bufPrintZ(&out, "{s}", .{note}) catch return;
-            break :blk std.fmt.bufPrintZ(&out, "{s}  —  {s}", .{ base, note }) catch return;
+            if (note.len == 0) break :blk std.fmt.bufPrintSentinel(&out, "{s}", .{base}, 0) catch return;
+            if (base.len == 0) break :blk std.fmt.bufPrintSentinel(&out, "{s}", .{note}, 0) catch return;
+            break :blk std.fmt.bufPrintSentinel(&out, "{s}  —  {s}", .{ base, note }, 0) catch return;
         };
         c.gtk_label_set_text(self.status_label, txt.ptr);
     }
@@ -4262,7 +4264,7 @@ pub const EditorView = struct {
                 self.afterMove(tab);
                 if (n > 0) {
                     var buf: [48]u8 = undefined;
-                    if (std.fmt.bufPrintZ(&buf, "{d} occurrence(s) selected.", .{n})) |z| {
+                    if (std.fmt.bufPrintSentinel(&buf, "{d} occurrence(s) selected.", .{n}, 0)) |z| {
                         self.setStatus(z.ptr);
                     } else |_| {}
                 }
@@ -4346,9 +4348,9 @@ pub const EditorView = struct {
         }
         var buf: [96:0]u8 = undefined;
         const msg = if (untitled > 0)
-            std.fmt.bufPrintZ(&buf, "Saving {d} document(s); {d} untitled need Save As.", .{ saved, untitled }) catch "Saving."
+            std.fmt.bufPrintSentinel(&buf, "Saving {d} document(s); {d} untitled need Save As.", .{ saved, untitled }, 0) catch "Saving."
         else
-            std.fmt.bufPrintZ(&buf, "Saving {d} document(s).", .{saved}) catch "Saving.";
+            std.fmt.bufPrintSentinel(&buf, "Saving {d} document(s).", .{saved}, 0) catch "Saving.";
         self.setStatus(msg.ptr);
     }
 
@@ -4571,10 +4573,10 @@ pub const EditorView = struct {
             .toggle_fold => self.toggleFoldLine(tab, line),
             .copy_line_number => {
                 var buf: [24:0]u8 = undefined;
-                const z = std.fmt.bufPrintZ(&buf, "{d}", .{line + 1}) catch return;
+                const z = std.fmt.bufPrintSentinel(&buf, "{d}", .{line + 1}, 0) catch return;
                 clipboard.copyText(self.allocator, @ptrCast(self.area), z);
                 var msg: [48:0]u8 = undefined;
-                const m = std.fmt.bufPrintZ(&msg, "Copied line number {d}.", .{line + 1}) catch return;
+                const m = std.fmt.bufPrintSentinel(&msg, "Copied line number {d}.", .{line + 1}, 0) catch return;
                 self.setStatus(m.ptr);
             },
             .select_line => {

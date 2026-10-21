@@ -727,11 +727,11 @@ pub fn openFuseFd(mountpoint: [*:0]const u8) !c_int {
     if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &sp) != 0) return error.SocketFailed;
 
     var opts_buf: [256:0]u8 = undefined;
-    const opts = std.fmt.bufPrintZ(&opts_buf, "rootmode=40755,user_id={d},group_id={d},default_permissions,fsname=sketerm,subtype=sketerm", .{
+    const opts = std.fmt.bufPrintSentinel(&opts_buf, "rootmode=40755,user_id={d},group_id={d},default_permissions,fsname=sketerm,subtype=sketerm", .{
         c.getuid(), c.getgid(),
-    }) catch return error.SocketFailed;
+    }, 0) catch return error.SocketFailed;
     var commfd_buf: [32:0]u8 = undefined;
-    const commfd = std.fmt.bufPrintZ(&commfd_buf, "{d}", .{sp[1]}) catch return error.SocketFailed;
+    const commfd = std.fmt.bufPrintSentinel(&commfd_buf, "{d}", .{sp[1]}, 0) catch return error.SocketFailed;
 
     const pid = c.fork();
     if (pid < 0) {
@@ -1327,7 +1327,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     }
 
     var mp_z: [4096:0]u8 = undefined;
-    const mp = std.fmt.bufPrintZ(&mp_z, "{s}", .{args[1]}) catch return 2;
+    const mp = std.fmt.bufPrintSentinel(&mp_z, "{s}", .{args[1]}, 0) catch return 2;
 
     const conn = blk: {
         if (host) |h| {

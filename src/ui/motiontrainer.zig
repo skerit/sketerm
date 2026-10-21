@@ -101,7 +101,7 @@ const Trainer = struct {
     lines: std.EnumArray(Section, *c.GtkWidget),
     pages: std.EnumArray(Section, ?*c.GtkStackPage) = .initFill(null),
     /// Sections whose switcher title says "(done)".
-    done: std.EnumSet(Section) = .initEmpty(),
+    done: std.EnumSet(Section) = .empty,
     meter: *c.GtkWidget,
     meter_label: *c.GtkWidget,
     status: *c.GtkWidget,
@@ -278,7 +278,7 @@ pub fn open(allocator: std.mem.Allocator, app: ?*c.GtkApplication, parent: ?*c.G
     c.gtk_box_append(@ptrCast(pack_row), c.gtk_label_new("Pack name:"));
     if (opts.name.len > 0) {
         var nb: [80]u8 = undefined;
-        const nz = std.fmt.bufPrintZ(&nb, "{s}", .{opts.name[0..@min(opts.name.len, 64)]}) catch "";
+        const nz = std.fmt.bufPrintSentinel(&nb, "{s}", .{opts.name[0..@min(opts.name.len, 64)]}, 0) catch "";
         c.gtk_editable_set_text(@ptrCast(self.name_entry), nz.ptr);
     }
     c.gtk_entry_set_placeholder_text(@ptrCast(self.name_entry), "my-mouse");
@@ -392,7 +392,7 @@ fn pageBox(s: Section) *c.GtkWidget {
 
 fn addPage(self: *Trainer, s: Section, child: *c.GtkWidget) void {
     var tb: [48]u8 = undefined;
-    const title = std.fmt.bufPrintZ(&tb, "{s}", .{page(s).title}) catch "";
+    const title = std.fmt.bufPrintSentinel(&tb, "{s}", .{page(s).title}, 0) catch "";
     self.pages.set(s, c.gtk_stack_add_titled(@ptrCast(self.stack), child, page(s).name, title.ptr));
 }
 
@@ -526,7 +526,7 @@ fn noteDevice(self: *Trainer, ev: *c.GdkEvent) bool {
     };
     if (first) {
         var nb: [80]u8 = undefined;
-        const def = std.fmt.bufPrintZ(&nb, "my-{s}", .{@tagName(cls)}) catch return true;
+        const def = std.fmt.bufPrintSentinel(&nb, "my-{s}", .{@tagName(cls)}, 0) catch return true;
         c.gtk_entry_set_placeholder_text(@ptrCast(self.name_entry), def.ptr);
         if (std.mem.span(c.gtk_editable_get_text(@ptrCast(self.name_entry))).len == 0) offer(self, def);
     }
@@ -760,7 +760,7 @@ fn currentName(self: *Trainer, buf: *[80]u8) []const u8 {
 /// also go to stderr, since `sketerm motion record` is a terminal command.
 fn setStatus(self: *Trainer, kind: Status, comptime fmt: []const u8, args: anytype) void {
     var buf: [900]u8 = undefined;
-    const text = std.fmt.bufPrintZ(&buf, fmt, args) catch blk: {
+    const text = std.fmt.bufPrintSentinel(&buf, fmt, args, 0) catch blk: {
         buf[buf.len - 1] = 0;
         break :blk buf[0 .. buf.len - 1 :0];
     };
@@ -799,13 +799,13 @@ fn refresh(self: *Trainer) void {
     const unsaved = s.unsaved();
     var cb: [200]u8 = undefined;
     const mode = if (self.continues.get()) |base| (if (std.mem.eql(u8, base, name))
-        std.fmt.bufPrintZ(&buf, "Saving updates the installed '{s}'; this session added {s}.", .{ name, countsText(&cb, s.added()) })
+        std.fmt.bufPrintSentinel(&buf, "Saving updates the installed '{s}'; this session added {s}.", .{ name, countsText(&cb, s.added()) }, 0)
     else
-        std.fmt.bufPrintZ(&buf, "Continuing '{s}', saving as '{s}'.", .{ base, name })) else std.fmt.bufPrintZ(&buf, "New pack '{s}'.", .{name});
+        std.fmt.bufPrintSentinel(&buf, "Continuing '{s}', saving as '{s}'.", .{ base, name }, 0)) else std.fmt.bufPrintSentinel(&buf, "New pack '{s}'.", .{name}, 0);
     if (mode) |m| {
         var full: [700]u8 = undefined;
         const line = if (unsaved > 0)
-            std.fmt.bufPrintZ(&full, "{s} {d} recorded item{s} not saved yet.", .{ m, unsaved, if (unsaved == 1) " is" else "s are" }) catch m
+            std.fmt.bufPrintSentinel(&full, "{s} {d} recorded item{s} not saved yet.", .{ m, unsaved, if (unsaved == 1) " is" else "s are" }, 0) catch m
         else
             m;
         setLabel(self.mode_line, line);
@@ -813,16 +813,16 @@ fn refresh(self: *Trainer) void {
 
     const rate = s.rateHz();
     const dev = if (s.device == .unknown)
-        std.fmt.bufPrintZ(&buf, "Device: not seen yet; move the pointer over this window.", .{})
+        std.fmt.bufPrintSentinel(&buf, "Device: not seen yet; move the pointer over this window.", .{}, 0)
     else if (rate <= 1)
-        std.fmt.bufPrintZ(&buf, "Device: {s}, sample rate not measured yet (move it a little).", .{@tagName(s.device)})
+        std.fmt.bufPrintSentinel(&buf, "Device: {s}, sample rate not measured yet (move it a little).", .{@tagName(s.device)}, 0)
     else
-        std.fmt.bufPrintZ(&buf, "Device: {s}, about {d:.0} samples per second. {s}", .{
+        std.fmt.bufPrintSentinel(&buf, "Device: {s}, about {d:.0} samples per second. {s}", .{
             @tagName(s.device), rate, switch (s.clock) {
                 .device => "Times come from the device itself.",
                 .arrival => "WARNING: this display sends no input timestamps, so times are taken when events arrive; your timing is recorded blurred.",
             },
-        });
+        }, 0);
     if (dev) |d| setLabel(self.device_line, d) else |_| {}
 
     for (std.enums.values(Section)) |sec| {
@@ -832,12 +832,12 @@ fn refresh(self: *Trainer) void {
         const limit: []const u8 = if (s.capped.contains(sec)) " The pack limit is reached: more are not recorded." else "";
         const line = switch (sec) {
             .reaches => if (have >= goal)
-                std.fmt.bufPrintZ(&buf, "Reaches: complete, {d} of {d} target cells ({d} reaches). More add variety but are optional.{s}", .{ have, goal, n, limit })
+                std.fmt.bufPrintSentinel(&buf, "Reaches: complete, {d} of {d} target cells ({d} reaches). More add variety but are optional.{s}", .{ have, goal, n, limit }, 0)
             else
-                std.fmt.bufPrintZ(&buf, "Reaches: {d} of {d} target cells ({d} reaches), {s}.{s}", .{
+                std.fmt.bufPrintSentinel(&buf, "Reaches: {d} of {d} target cells ({d} reaches), {s}.{s}", .{
                     have, goal, n, if (n >= recorder.USABLE_REACHES) "usable now" else std.fmt.comptimePrint("usable from {d}", .{recorder.USABLE_REACHES}), limit,
-                }),
-            .typing, .scrolling, .idle => std.fmt.bufPrintZ(&buf, "{s}: {d} of {d} {s}{s}.{s}", .{ page(sec).title, @min(have, goal), goal, sec.noun(), if (have >= goal) ", complete" else "", limit }),
+                }, 0),
+            .typing, .scrolling, .idle => std.fmt.bufPrintSentinel(&buf, "{s}: {d} of {d} {s}{s}.{s}", .{ page(sec).title, @min(have, goal), goal, sec.noun(), if (have >= goal) ", complete" else "", limit }, 0),
         };
         if (line) |l| setLabel(self.lines.get(sec), l) else |_| {}
         markDone(self, sec, have >= goal);
@@ -846,7 +846,7 @@ fn refresh(self: *Trainer) void {
     const want: f64 = @floatFromInt(Section.reaches.goal());
     const have: f64 = @floatFromInt(@min(s.progress(.reaches), Section.reaches.goal()));
     c.gtk_level_bar_set_value(@ptrCast(self.meter), have / want);
-    if (std.fmt.bufPrintZ(&buf, "{d:.0}% of target cells", .{have / want * 100})) |ml| setLabel(self.meter_label, ml) else |_| {}
+    if (std.fmt.bufPrintSentinel(&buf, "{d:.0}% of target cells", .{have / want * 100}, 0)) |ml| setLabel(self.meter_label, ml) else |_| {}
 }
 
 /// Put "(done)" on a section's switcher title once its goal is reached.
@@ -854,7 +854,7 @@ fn markDone(self: *Trainer, s: Section, done: bool) void {
     if (self.done.contains(s) == done) return;
     self.done.setPresent(s, done);
     var tb: [48]u8 = undefined;
-    const title = std.fmt.bufPrintZ(&tb, "{s}{s}", .{ page(s).title, if (done) " (done)" else "" }) catch return;
+    const title = std.fmt.bufPrintSentinel(&tb, "{s}{s}", .{ page(s).title, if (done) " (done)" else "" }, 0) catch return;
     if (self.pages.get(s)) |p| c.gtk_stack_page_set_title(p, title.ptr);
 }
 
@@ -993,7 +993,7 @@ fn offer(self: *Trainer, name: []const u8) void {
             defer self.allocator.free(loaded.bytes);
             var cb: [200]u8 = undefined;
             var body: [600]u8 = undefined;
-            const text = std.fmt.bufPrintZ(&body, "A recording for '{s}' was not saved when its window closed: {s}. Restore it to keep recording and save it, or discard it.", .{ name, countsText(&cb, summaryCounts(loaded.summary)) }) catch "An unsaved recording was found.";
+            const text = std.fmt.bufPrintSentinel(&body, "A recording for '{s}' was not saved when its window closed: {s}. Restore it to keep recording and save it, or discard it.", .{ name, countsText(&cb, summaryCounts(loaded.summary)) }, 0) catch "An unsaved recording was found.";
             ask(self, .restore, name, "Restore the unsaved recording?", text.ptr, &.{
                 .{ .id = "discard", .label = "Discard it", .appearance = .destructive },
                 .{ .id = "restore", .label = "Restore", .appearance = .suggested, .is_default = true, .is_close = true },
@@ -1009,7 +1009,7 @@ fn offerInstalled(self: *Trainer, name: []const u8) void {
     const loaded = store.load(self.allocator, name, &diag) catch |err| {
         if (err != error.Invalid and err != error.ReadFailed) return;
         var body: [600]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&body, "The installed '{s}' cannot be read: {s}. This window records a new pack; saving it as '{s}' asks before replacing the broken one.", .{ name, if (diag.len > 0) diag.msg() else @errorName(err), name }) catch "The installed pack cannot be read.";
+        const text = std.fmt.bufPrintSentinel(&body, "The installed '{s}' cannot be read: {s}. This window records a new pack; saving it as '{s}' asks before replacing the broken one.", .{ name, if (diag.len > 0) diag.msg() else @errorName(err), name }, 0) catch "The installed pack cannot be read.";
         ask(self, .cannot_continue, name, "This pack cannot be continued", text.ptr, &.{
             .{ .id = "new", .label = "Start a new pack", .appearance = .suggested, .is_default = true, .is_close = true },
         });
@@ -1018,9 +1018,9 @@ fn offerInstalled(self: *Trainer, name: []const u8) void {
     defer self.allocator.free(loaded.bytes);
     var cb: [200]u8 = undefined;
     var body: [600]u8 = undefined;
-    const text = std.fmt.bufPrintZ(&body, "'{s}' is installed: {s}. Continue it to add this session's recording to it, or start a new pack (saving that asks before replacing '{s}').", .{ name, countsText(&cb, summaryCounts(loaded.summary)), name }) catch "This pack is installed.";
+    const text = std.fmt.bufPrintSentinel(&body, "'{s}' is installed: {s}. Continue it to add this session's recording to it, or start a new pack (saving that asks before replacing '{s}').", .{ name, countsText(&cb, summaryCounts(loaded.summary)), name }, 0) catch "This pack is installed.";
     var hb: [120]u8 = undefined;
-    const heading = std.fmt.bufPrintZ(&hb, "Continue '{s}'?", .{name}) catch "Continue this pack?";
+    const heading = std.fmt.bufPrintSentinel(&hb, "Continue '{s}'?", .{name}, 0) catch "Continue this pack?";
     ask(self, .continue_pack, name, heading.ptr, text.ptr, &.{
         .{ .id = "new", .label = "Start a new pack" },
         .{ .id = "continue", .label = "Continue", .appearance = .suggested, .is_default = true },
@@ -1084,7 +1084,7 @@ fn block(self: *Trainer) void {
     const name = self.continues.get() orelse "this pack";
     setStatus(self, .err, "Recording stopped: this display sends no input timestamps, and '{s}' was recorded with them.", .{name});
     var body: [600]u8 = undefined;
-    const text = std.fmt.bufPrintZ(&body, "This display sends no input timestamps, and '{s}' was recorded with them; one pack never mixes the two clocks, so nothing more can be added to it here. Start a new pack (timed on arrival), or close this window.", .{name}) catch "This display sends no input timestamps.";
+    const text = std.fmt.bufPrintSentinel(&body, "This display sends no input timestamps, and '{s}' was recorded with them; one pack never mixes the two clocks, so nothing more can be added to it here. Start a new pack (timed on arrival), or close this window.", .{name}, 0) catch "This display sends no input timestamps.";
     ask(self, .blocked, name, "Cannot continue this pack here", text.ptr, &.{
         .{ .id = "close", .label = "Close window", .is_close = true },
         .{ .id = "new", .label = "Start a new pack", .appearance = .suggested, .is_default = true },
@@ -1117,7 +1117,7 @@ fn onCloseRequest(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) c.gboolean {
     var nb: [80]u8 = undefined;
     const name = currentName(self, &nb);
     var body: [400]u8 = undefined;
-    const text = std.fmt.bufPrintZ(&body, "{d} recorded item{s} not saved yet. Save installs the pack as '{s}'; Discard throws the recording away, autosaved draft included.", .{ unsaved, if (unsaved == 1) " is" else "s are", name }) catch "The recording is not saved yet.";
+    const text = std.fmt.bufPrintSentinel(&body, "{d} recorded item{s} not saved yet. Save installs the pack as '{s}'; Discard throws the recording away, autosaved draft included.", .{ unsaved, if (unsaved == 1) " is" else "s are", name }, 0) catch "The recording is not saved yet.";
     ask(self, .close, name, "Save the recording?", text.ptr, &.{
         .{ .id = "cancel", .label = "Cancel", .is_close = true },
         .{ .id = "discard", .label = "Discard", .appearance = .destructive },
@@ -1142,9 +1142,9 @@ fn save(self: *Trainer) void {
             defer self.allocator.free(loaded.bytes);
             var cb: [200]u8 = undefined;
             var body: [600]u8 = undefined;
-            const text = std.fmt.bufPrintZ(&body, "'{s}' is already installed ({s}). Add this recording to it, or replace it with this recording alone?", .{ name, countsText(&cb, summaryCounts(loaded.summary)) }) catch "This pack is already installed.";
+            const text = std.fmt.bufPrintSentinel(&body, "'{s}' is already installed ({s}). Add this recording to it, or replace it with this recording alone?", .{ name, countsText(&cb, summaryCounts(loaded.summary)) }, 0) catch "This pack is already installed.";
             var hb: [120]u8 = undefined;
-            const heading = std.fmt.bufPrintZ(&hb, "'{s}' exists", .{name}) catch "The pack exists";
+            const heading = std.fmt.bufPrintSentinel(&hb, "'{s}' exists", .{name}, 0) catch "The pack exists";
             ask(self, .replace, name, heading.ptr, text.ptr, &.{
                 .{ .id = "cancel", .label = "Cancel", .is_close = true },
                 .{ .id = "replace", .label = "Replace", .appearance = .destructive },
@@ -1154,7 +1154,7 @@ fn save(self: *Trainer) void {
         } else |err| if (err != error.NotInstalled) {
             // A broken installed file is replaced only on purpose.
             var body: [600]u8 = undefined;
-            const text = std.fmt.bufPrintZ(&body, "The installed '{s}' cannot be read ({s}). Replace it with this recording?", .{ name, if (diag.len > 0) diag.msg() else @errorName(err) }) catch "The installed pack cannot be read.";
+            const text = std.fmt.bufPrintSentinel(&body, "The installed '{s}' cannot be read ({s}). Replace it with this recording?", .{ name, if (diag.len > 0) diag.msg() else @errorName(err) }, 0) catch "The installed pack cannot be read.";
             ask(self, .replace, name, "Replace the broken pack?", text.ptr, &.{
                 .{ .id = "cancel", .label = "Cancel", .is_close = true },
                 .{ .id = "replace", .label = "Replace", .appearance = .destructive, .is_default = true },

@@ -1247,7 +1247,7 @@ const Client = struct {
     ack_proto: u32 = 0,
     /// What the helper advertised, through the one list every client
     /// parses (`proto.Cap`).
-    ack_caps: proto.Caps = .initEmpty(),
+    ack_caps: proto.Caps = .empty,
 
     /// Observe family (stage ob). Last `ev_observe_view` and its
     /// counters per state, last `ev_observe_state`.
@@ -3025,7 +3025,7 @@ const geo_page =
 
 fn writeFile(dir: []const u8, name: []const u8, body: []const u8) bool {
     var path_buf: [160]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ dir, name }) catch return false;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ dir, name }, 0) catch return false;
     const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o644));
     if (fd < 0) return false;
     defer _ = c.close(fd);
@@ -3077,7 +3077,7 @@ fn deckStagedPrint(cl: *Client, dir: []const u8, comptime what: []const u8) void
     cl.send(proto.Navigate{ .view = view_id, .url = deck_page });
     if (!cl.waitSeq(&cl.load_seq, load, 20_000)) fail(what ++ ": the deck never finished loading");
     var key_buf: [128]u8 = undefined;
-    const key = std.fmt.bufPrintZ(&key_buf, "{s}/deck-staged-key.pdf", .{dir}) catch fail("pdf key path");
+    const key = std.fmt.bufPrintSentinel(&key_buf, "{s}/deck-staged-key.pdf", .{dir}, 0) catch fail("pdf key path");
     printWait(cl, .{
         .view = view_id,
         .flags = proto.print_flag_css_page_size | proto.print_flag_no_margins | proto.print_flag_background,
@@ -3100,7 +3100,7 @@ fn cssPagePdfStage(cl: *Client, dir: []const u8) void {
 
     // A4 named and landscape asked for: the document's size must still win.
     var pdf_buf: [128]u8 = undefined;
-    const pdf = std.fmt.bufPrintZ(&pdf_buf, "{s}/deck.pdf", .{dir}) catch fail("pdf path");
+    const pdf = std.fmt.bufPrintSentinel(&pdf_buf, "{s}/deck.pdf", .{dir}, 0) catch fail("pdf path");
     printWait(cl, .{
         .view = view_id,
         .flags = proto.print_flag_css_page_size | proto.print_flag_no_margins | proto.print_flag_background | proto.print_flag_landscape,
@@ -3114,7 +3114,7 @@ fn cssPagePdfStage(cl: *Client, dir: []const u8) void {
     // spills onto a second page, measured 6 pages), and none under the flag.
     cl.navigate(deck_unmargined_page);
     var um_buf: [128]u8 = undefined;
-    const um = std.fmt.bufPrintZ(&um_buf, "{s}/deck-um.pdf", .{dir}) catch fail("pdf path");
+    const um = std.fmt.bufPrintSentinel(&um_buf, "{s}/deck-um.pdf", .{dir}, 0) catch fail("pdf path");
     printWait(cl, .{ .view = view_id, .flags = proto.print_flag_css_page_size | proto.print_flag_background, .paper = 0, .path = um }, what ++ " (engine margins)");
     const margined = readPdfShape(um, what ++ " (engine margins)");
     std.debug.print("smoke-web: MEASURED {s}: an unmargined deck prints as {d} pages with engine margins\n", .{ what, margined.count });
@@ -3129,7 +3129,7 @@ fn cssPagePdfStage(cl: *Client, dir: []const u8) void {
     // is the unchanged behaviour here; 22h asserts portrait for a page
     // that declares no `@page` at all.
     var a4_buf: [128]u8 = undefined;
-    const a4 = std.fmt.bufPrintZ(&a4_buf, "{s}/deck-a4.pdf", .{dir}) catch fail("pdf path");
+    const a4 = std.fmt.bufPrintSentinel(&a4_buf, "{s}/deck-a4.pdf", .{dir}, 0) catch fail("pdf path");
     printWait(cl, .{ .view = view_id, .flags = proto.print_flag_background, .paper = @intFromEnum(proto.Paper.a4), .path = a4 }, what ++ " (no flag)");
     const shape = readPdfShape(a4, what ++ " (no flag)");
     if (shape.count == 0) fail(what ++ " (no flag): the A4 print has no pages");
@@ -3768,10 +3768,10 @@ fn runNetChangeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8
         _ = c.setenv("SKETERM_WEB_FAULT_NET_CHANGED", "1", 1);
         defer _ = unsetEnv("SKETERM_WEB_FAULT_NET_CHANGED");
         var cache_buf: [4096]u8 = undefined;
-        const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/nc1-cache", .{dir}) catch fail("stage nc cache path");
+        const cache_dir = std.fmt.bufPrintSentinel(&cache_buf, "{s}/nc1-cache", .{dir}, 0) catch fail("stage nc cache path");
         mkdirZ(cache_dir);
         var sock_buf: [96]u8 = undefined;
-        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/nc1.sock", .{dir}) catch fail("stage nc sock");
+        const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/nc1.sock", .{dir}, 0) catch fail("stage nc sock");
         const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
         var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
         cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
@@ -3811,10 +3811,10 @@ fn runNetChangeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8
         _ = c.setenv("SKETERM_WEB_FAULT_NET_CHANGED", "3", 1);
         defer _ = unsetEnv("SKETERM_WEB_FAULT_NET_CHANGED");
         var cache_buf: [4096]u8 = undefined;
-        const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/nc2-cache", .{dir}) catch fail("stage nc cache path");
+        const cache_dir = std.fmt.bufPrintSentinel(&cache_buf, "{s}/nc2-cache", .{dir}, 0) catch fail("stage nc cache path");
         mkdirZ(cache_dir);
         var sock_buf: [96]u8 = undefined;
-        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/nc2.sock", .{dir}) catch fail("stage nc sock");
+        const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/nc2.sock", .{dir}, 0) catch fail("stage nc sock");
         const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
         var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
         cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
@@ -3863,9 +3863,9 @@ fn runLifecycleStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8
     var url_buf: [128]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{opener.lis.port}) catch fail("lifecycle: opener URL");
     var cache_buf: [4096]u8 = undefined;
-    const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/lifecycle-cache", .{dir}) catch fail("lifecycle: cache path");
+    const cache = std.fmt.bufPrintSentinel(&cache_buf, "{s}/lifecycle-cache", .{dir}, 0) catch fail("lifecycle: cache path");
     var sock_buf: [96]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/lifecycle.sock", .{dir}) catch fail("lifecycle: socket path");
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/lifecycle.sock", .{dir}, 0) catch fail("lifecycle: socket path");
     const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", null, false);
     g_pid = pid;
     var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
@@ -3949,7 +3949,7 @@ fn runLifecycleStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8
     if (!cl.waitBufferAfter(dl_fb, 15_000)) fail("lifecycle: download discard did not remap");
     if (cl.dl_failed != 0) fail("lifecycle: discard cancelled an offered download");
     var file_buf: [4096:0]u8 = undefined;
-    const file = std.fmt.bufPrintZ(&file_buf, "{s}/lifecycle-download.bin", .{dir}) catch fail("lifecycle: download path");
+    const file = std.fmt.bufPrintSentinel(&file_buf, "{s}/lifecycle-download.bin", .{dir}, 0) catch fail("lifecycle: download path");
     cl.send(proto.DownloadDecide{ .view = dl_view, .id = download_id, .path = file });
     if (!cl.waitDlTerminal(download_id, 20_000) or cl.dl_done != 1) fail("lifecycle: preserved download did not complete");
     const fp = c.fopen(file.ptr, "rb") orelse fail("lifecycle: completed download missing");
@@ -4178,10 +4178,10 @@ fn runCaptureStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) 
     defer srv.deinit(gpa);
 
     var cache_buf: [4096]u8 = undefined;
-    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/cap-cache", .{dir}) catch fail("stage cap cache path");
+    const cache_dir = std.fmt.bufPrintSentinel(&cache_buf, "{s}/cap-cache", .{dir}, 0) catch fail("stage cap cache path");
     mkdirZ(cache_dir);
     var sock_buf: [96]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/cap.sock", .{dir}) catch fail("stage cap sock");
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/cap.sock", .{dir}, 0) catch fail("stage cap sock");
     const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
     var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
     cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
@@ -4434,10 +4434,10 @@ fn runDownloadHoldStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const
     _ = c.setenv("SKETERM_WEB_DOWNLOAD_HOLD_MS", "1500", 1);
     defer _ = unsetEnv("SKETERM_WEB_DOWNLOAD_HOLD_MS");
     var cache_buf: [4096]u8 = undefined;
-    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/dlhold-cache", .{dir}) catch fail("stage 22j3 cache path");
+    const cache_dir = std.fmt.bufPrintSentinel(&cache_buf, "{s}/dlhold-cache", .{dir}, 0) catch fail("stage 22j3 cache path");
     mkdirZ(cache_dir);
     var sock_buf: [96]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/dlhold.sock", .{dir}) catch fail("stage 22j3 sock");
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/dlhold.sock", .{dir}, 0) catch fail("stage 22j3 sock");
     const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
     var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
     cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
@@ -4474,7 +4474,7 @@ fn runDownloadHoldStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const
     // filesystem a moment and then insist nothing is left.
     cl.pump(1_000);
     var trash_buf: [128:0]u8 = undefined;
-    const trash = std.fmt.bufPrintZ(&trash_buf, "/tmp/sketerm-webdl-cancel-{d}-{d}.part", .{ pid, id }) catch fail("stage 22j3 path");
+    const trash = std.fmt.bufPrintSentinel(&trash_buf, "/tmp/sketerm-webdl-cancel-{d}-{d}.part", .{ pid, id }, 0) catch fail("stage 22j3 path");
     if (c.access(trash.ptr, c.F_OK) == 0) {
         _ = c.unlink(trash.ptr);
         fail("stage 22j3: the expiry left its throwaway download file in /tmp");
@@ -4497,11 +4497,11 @@ fn runDownloadHoldStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const
 
 fn runWebrequestStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
     var data_buf: [4096]u8 = undefined;
-    const data_dir = std.fmt.bufPrintZ(&data_buf, "{s}/wqdata", .{dir}) catch fail("stage 34 data path");
+    const data_dir = std.fmt.bufPrintSentinel(&data_buf, "{s}/wqdata", .{dir}, 0) catch fail("stage 34 data path");
     mkdirZ(data_dir);
     _ = c.setenv("XDG_DATA_HOME", data_dir.ptr, 1);
     var cache_buf: [4096]u8 = undefined;
-    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/wqcache", .{dir}) catch fail("stage 34 cache path");
+    const cache_dir = std.fmt.bufPrintSentinel(&cache_buf, "{s}/wqcache", .{dir}, 0) catch fail("stage 34 cache path");
     mkdirZ(cache_dir);
 
     var ext_buf: [4096]u8 = undefined;
@@ -4535,7 +4535,7 @@ fn runWebrequestStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
     {
         _ = c.setenv("SKETERM_WEB_WREQ_TIMEOUT_MS", "20000", 1);
         var sock_buf: [96]u8 = undefined;
-        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/wq1.sock", .{dir}) catch fail("stage 34 sock");
+        const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/wq1.sock", .{dir}, 0) catch fail("stage 34 sock");
         const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
         var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
         cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
@@ -4639,7 +4639,7 @@ fn runWebrequestStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
     {
         _ = c.setenv("SKETERM_WEB_WREQ_TIMEOUT_MS", "400", 1);
         var sock_buf: [96]u8 = undefined;
-        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/wq2.sock", .{dir}) catch fail("stage 34 sock2");
+        const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/wq2.sock", .{dir}, 0) catch fail("stage 34 sock2");
         const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
         var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
         cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
@@ -4893,11 +4893,11 @@ const xa_bg_b =
 
 fn runExtApiStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
     var data_buf: [4096]u8 = undefined;
-    const data_dir = std.fmt.bufPrintZ(&data_buf, "{s}/xadata", .{dir}) catch fail("stage 43 data path");
+    const data_dir = std.fmt.bufPrintSentinel(&data_buf, "{s}/xadata", .{dir}, 0) catch fail("stage 43 data path");
     mkdirZ(data_dir);
     _ = c.setenv("XDG_DATA_HOME", data_dir.ptr, 1);
     var cache_buf: [4096]u8 = undefined;
-    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/xacache", .{dir}) catch fail("stage 43 cache path");
+    const cache_dir = std.fmt.bufPrintSentinel(&cache_buf, "{s}/xacache", .{dir}, 0) catch fail("stage 43 cache path");
     mkdirZ(cache_dir);
     var a_buf: [4096]u8 = undefined;
     const a_dir = std.fmt.bufPrint(&a_buf, "{s}/xafixa", .{dir}) catch fail("stage 43 ext path");
@@ -4917,7 +4917,7 @@ fn runExtApiStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     const page = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x/page", .{srv.lis.port}) catch fail("url");
 
     var sock_buf: [96]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/xa.sock", .{dir}) catch fail("stage 43 sock");
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/xa.sock", .{dir}, 0) catch fail("stage 43 sock");
     const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
     var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
     cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
@@ -5052,11 +5052,11 @@ const gm_script =
 
 fn runGmStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
     var data_buf: [4096]u8 = undefined;
-    const data_dir = std.fmt.bufPrintZ(&data_buf, "{s}/gmdata", .{dir}) catch fail("stage 44 data path");
+    const data_dir = std.fmt.bufPrintSentinel(&data_buf, "{s}/gmdata", .{dir}, 0) catch fail("stage 44 data path");
     mkdirZ(data_dir);
     _ = c.setenv("XDG_DATA_HOME", data_dir.ptr, 1);
     var cache_buf: [4096]u8 = undefined;
-    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/gmcache", .{dir}) catch fail("stage 44 cache path");
+    const cache_dir = std.fmt.bufPrintSentinel(&cache_buf, "{s}/gmcache", .{dir}, 0) catch fail("stage 44 cache path");
     mkdirZ(cache_dir);
     var srv = GmServer{};
     if (!srv.start()) fail("stage 44: loopback HTTP server would not start");
@@ -5069,7 +5069,7 @@ fn runGmStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void 
     var runs: u32 = 0;
     for ([_][]const u8{ "gm1.sock", "gm2.sock" }) |sock_name| {
         var sock_buf: [96]u8 = undefined;
-        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/{s}", .{ dir, sock_name }) catch fail("stage 44 sock");
+        const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/{s}", .{ dir, sock_name }, 0) catch fail("stage 44 sock");
         const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
         var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
         cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
@@ -5130,16 +5130,16 @@ fn runGmStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void 
 fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
     // Isolated data dir for storage.json, and the unpacked extension.
     var data_buf: [4096]u8 = undefined;
-    const data_dir = std.fmt.bufPrintZ(&data_buf, "{s}/wedata", .{dir}) catch fail("webext data path");
+    const data_dir = std.fmt.bufPrintSentinel(&data_buf, "{s}/wedata", .{dir}, 0) catch fail("webext data path");
     mkdirZ(data_dir);
     var cache_buf: [4096]u8 = undefined;
-    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/wecache", .{dir}) catch fail("webext cache path");
+    const cache_dir = std.fmt.bufPrintSentinel(&cache_buf, "{s}/wecache", .{dir}, 0) catch fail("webext cache path");
     mkdirZ(cache_dir);
     var ext_buf: [4096]u8 = undefined;
     const ext_dir = std.fmt.bufPrint(&ext_buf, "{s}/wefix", .{dir}) catch fail("webext ext path");
     if (!writeFixture(ext_dir)) fail("stage 33 webext: could not write the fixture extension");
     var reject_buf: [4096]u8 = undefined;
-    const reject_dir = std.fmt.bufPrintZ(&reject_buf, "{s}/we-reject", .{dir}) catch fail("webext reject path");
+    const reject_dir = std.fmt.bufPrintSentinel(&reject_buf, "{s}/we-reject", .{dir}, 0) catch fail("webext reject path");
     mkdirZ(reject_dir);
     if (!writeFile(reject_dir, "manifest.json", fx_manifest)) fail("stage 33 webext: could not write reject fixture");
     // The helper reads XDG_DATA_HOME for its per-extension storage; a
@@ -5157,7 +5157,7 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     // ── Run 1: injection + messaging ──────────────────────────────
     {
         var sock_buf: [96]u8 = undefined;
-        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/we1.sock", .{dir}) catch fail("webext sock");
+        const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/we1.sock", .{dir}, 0) catch fail("webext sock");
         const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
         var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
         cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
@@ -5244,7 +5244,7 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     // ── Run 2: storage.local persisted across the restart ─────────
     {
         var sock_buf: [96]u8 = undefined;
-        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/we2.sock", .{dir}) catch fail("webext sock2");
+        const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/we2.sock", .{dir}, 0) catch fail("webext sock2");
         const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
         var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
         cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
@@ -5483,11 +5483,11 @@ fn staleApiRejects(cl: *Client, api_index: u32, timeout_ms: i64) bool {
 
 fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
     var data_buf: [4096]u8 = undefined;
-    const data_dir = std.fmt.bufPrintZ(&data_buf, "{s}/acdata", .{dir}) catch fail("stage 40 data path");
+    const data_dir = std.fmt.bufPrintSentinel(&data_buf, "{s}/acdata", .{dir}, 0) catch fail("stage 40 data path");
     mkdirZ(data_dir);
     _ = c.setenv("XDG_DATA_HOME", data_dir.ptr, 1);
     var cache_buf: [4096]u8 = undefined;
-    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/accache", .{dir}) catch fail("stage 40 cache path");
+    const cache_dir = std.fmt.bufPrintSentinel(&cache_buf, "{s}/accache", .{dir}, 0) catch fail("stage 40 cache path");
     mkdirZ(cache_dir);
 
     var popup_dir_buf: [4096]u8 = undefined;
@@ -5520,9 +5520,9 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     const page_url = std.fmt.bufPrint(&page_buf, "http://127.0.0.1:{d}/p", .{srv.lis.port}) catch fail("stage 40 page url");
 
     var sock_buf: [96]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/ac.sock", .{dir}) catch fail("stage 40 socket path");
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/ac.sock", .{dir}, 0) catch fail("stage 40 socket path");
     var resolver_buf: [128:0]u8 = undefined;
-    const resolver = std.fmt.bufPrintZ(&resolver_buf, "--host-resolver-rules=MAP * 127.0.0.1", .{}) catch fail("stage 40 resolver rule");
+    const resolver = std.fmt.bufPrintSentinel(&resolver_buf, "--host-resolver-rules=MAP * 127.0.0.1", .{}, 0) catch fail("stage 40 resolver rule");
     const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", resolver.ptr, false);
     g_pid = pid;
     var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
@@ -6220,18 +6220,18 @@ fn writeShapeFixture(dir: []const u8) bool {
 
 fn mkdirZ2(path: []const u8) void {
     var buf: [4096]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return;
+    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0) catch return;
     _ = c.mkdir(z.ptr, 0o700);
 }
 
 /// Stage 35a — the loading SHAPE of a real MV2 extension.
 fn runShapeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
     var data_buf: [4096]u8 = undefined;
-    const data_dir = std.fmt.bufPrintZ(&data_buf, "{s}/shdata", .{dir}) catch fail("stage 35a data path");
+    const data_dir = std.fmt.bufPrintSentinel(&data_buf, "{s}/shdata", .{dir}, 0) catch fail("stage 35a data path");
     mkdirZ(data_dir);
     _ = c.setenv("XDG_DATA_HOME", data_dir.ptr, 1);
     var cache_buf: [4096]u8 = undefined;
-    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/shcache", .{dir}) catch fail("stage 35a cache path");
+    const cache_dir = std.fmt.bufPrintSentinel(&cache_buf, "{s}/shcache", .{dir}, 0) catch fail("stage 35a cache path");
     mkdirZ(cache_dir);
     var ext_buf: [4096]u8 = undefined;
     const ext_dir = std.fmt.bufPrint(&ext_buf, "{s}/shfix", .{dir}) catch fail("stage 35a ext path");
@@ -6247,7 +6247,7 @@ fn runShapeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) vo
     const page_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/p", .{srv.lis.port}) catch fail("url");
 
     var sock_buf: [96]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/sh.sock", .{dir}) catch fail("stage 35a sock");
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/sh.sock", .{dir}, 0) catch fail("stage 35a sock");
     const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
     var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
     cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
@@ -6351,11 +6351,11 @@ fn runUboStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8, pinn
     const ext_id: []const u8 = if (probe != null) probe_id else "uBlock0@raymondhill.net";
 
     var data_buf: [4096]u8 = undefined;
-    const data_dir = std.fmt.bufPrintZ(&data_buf, "{s}/ubdata", .{dir}) catch fail("stage 35b data path");
+    const data_dir = std.fmt.bufPrintSentinel(&data_buf, "{s}/ubdata", .{dir}, 0) catch fail("stage 35b data path");
     mkdirZ(data_dir);
     _ = c.setenv("XDG_DATA_HOME", data_dir.ptr, 1);
     var cache_buf: [4096]u8 = undefined;
-    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/ubcache", .{dir}) catch fail("stage 35b cache path");
+    const cache_dir = std.fmt.bufPrintSentinel(&cache_buf, "{s}/ubcache", .{dir}, 0) catch fail("stage 35b cache path");
     mkdirZ(cache_dir);
 
     var ext_buf: [4096]u8 = undefined;
@@ -6377,7 +6377,7 @@ fn runUboStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8, pinn
             fail("stage 35b storage dir");
         mkdirAllZ(sdir);
         var spath_buf: [4096]u8 = undefined;
-        const spath = std.fmt.bufPrintZ(&spath_buf, "{s}/storage.json", .{sdir}) catch fail("stage 35b storage path");
+        const spath = std.fmt.bufPrintSentinel(&spath_buf, "{s}/storage.json", .{sdir}, 0) catch fail("stage 35b storage path");
         if (!writeWholeFile(spath,
             \\{"selectedFilterLists":["ublock-filters"],
             \\ "userSettings":{"advancedUserEnabled":false},
@@ -6395,7 +6395,7 @@ fn runUboStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8, pinn
     const page_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/p", .{srv.lis.port}) catch fail("url");
 
     var sock_buf: [96]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/ub.sock", .{dir}) catch fail("stage 35b sock");
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/ub.sock", .{dir}, 0) catch fail("stage 35b sock");
     const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
     var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
     cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
@@ -6552,7 +6552,7 @@ fn unpackXpi(gpa: std.mem.Allocator, xpi_path: []const u8, dest: []const u8) boo
         if (entry.is_dir) continue;
         if (std.mem.indexOf(u8, entry.name, "..") != null) continue;
         var full_buf: [4096]u8 = undefined;
-        const full = std.fmt.bufPrintZ(&full_buf, "{s}/{s}", .{ dest, entry.name }) catch continue;
+        const full = std.fmt.bufPrintSentinel(&full_buf, "{s}/{s}", .{ dest, entry.name }, 0) catch continue;
         if (std.fs.path.dirname(full)) |d| mkdirAllZ(d);
         // A LOOPING write, not the rig's `writeFile`: uBO's EasyList
         // copy is 2.2MB and a single `write()` is free to come back
@@ -6586,7 +6586,7 @@ fn uboTrace(gpa: std.mem.Allocator, ext_dir: []const u8) void {
     // startup sequence, and it is the fastest way to see exactly where
     // an extension stops working under this host.
     var path_buf: [4096]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/js/console.js", .{ext_dir}) catch return;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/js/console.js", .{ext_dir}, 0) catch return;
     const src = readWholeFile(gpa, path) orelse return;
     defer gpa.free(src);
     // Two arms silence it: the "ignore" one after an explicit disable,
@@ -6643,7 +6643,7 @@ fn mkdirAllZ(path: []const u8) void {
 
 fn readWholeFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
     var zbuf: [4096]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{path}) catch return null;
+    const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{path}, 0) catch return null;
     const fd = c.open(z.ptr, c.O_RDONLY);
     if (fd < 0) return null;
     defer _ = c.close(fd);
@@ -6667,7 +6667,7 @@ fn readWholeFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
 
 fn markFileStale(path: []const u8) bool {
     var pbuf: [4096]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&pbuf, "{s}", .{path}) catch return false;
+    const p = std.fmt.bufPrintSentinel(&pbuf, "{s}", .{path}, 0) catch return false;
     const times: [2]c.struct_timespec = .{
         .{ .tv_sec = 1, .tv_nsec = 0 },
         .{ .tv_sec = 1, .tv_nsec = 0 },
@@ -6703,14 +6703,14 @@ fn runFilterSubscriptionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: [
     }
 
     var config_buf: [4096]u8 = undefined;
-    const config_home = std.fmt.bufPrintZ(&config_buf, "{s}/filter-config", .{dir}) catch fail("stage 39 config path");
+    const config_home = std.fmt.bufPrintSentinel(&config_buf, "{s}/filter-config", .{dir}, 0) catch fail("stage 39 config path");
     mkdirAllZ(config_home);
     _ = c.setenv("XDG_CONFIG_HOME", config_home.ptr, 1);
     var cache_buf: [4096]u8 = undefined;
-    const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/filter-cache", .{dir}) catch fail("stage 39 cache path");
+    const cache = std.fmt.bufPrintSentinel(&cache_buf, "{s}/filter-cache", .{dir}, 0) catch fail("stage 39 cache path");
     mkdirAllZ(cache);
     var sock_buf: [96]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/f39.sock", .{dir}) catch fail("stage 39 socket path");
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/f39.sock", .{dir}, 0) catch fail("stage 39 socket path");
 
     var http = HttpProbe{ .filter_router = true };
     if (!http.start()) fail("stage 39: loopback HTTP server would not start");
@@ -6845,9 +6845,9 @@ fn sigNoop(_: c_int) callconv(.c) void {}
 /// client's death and exiting with the last.
 fn runMultiClientStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
     var sock_buf: [96]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/mc.sock", .{dir}) catch fail("mc sock path");
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/mc.sock", .{dir}, 0) catch fail("mc sock path");
     var cache_buf: [96]u8 = undefined;
-    const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/mc-cache", .{dir}) catch fail("mc cache path");
+    const cache = std.fmt.bufPrintSentinel(&cache_buf, "{s}/mc-cache", .{dir}, 0) catch fail("mc cache path");
     const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", null, false);
     g_pid = pid;
 
@@ -7057,9 +7057,9 @@ const globals_page =
 /// with the semantic layer off: the engine exactly as it ships.
 fn globalsPrint(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8, url: []const u8, bare: bool, out: []u8) []const u8 {
     var sock_buf: [96]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/gl{d}.sock", .{ dir, @intFromBool(bare) }) catch fail("gl sock path");
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/gl{d}.sock", .{ dir, @intFromBool(bare) }, 0) catch fail("gl sock path");
     var cache_buf: [96]u8 = undefined;
-    const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/gl{d}-cache", .{ dir, @intFromBool(bare) }) catch fail("gl cache path");
+    const cache = std.fmt.bufPrintSentinel(&cache_buf, "{s}/gl{d}-cache", .{ dir, @intFromBool(bare) }, 0) catch fail("gl cache path");
     if (bare) _ = c.setenv("SKETERM_WEB_SEMANTIC", "off", 1);
     const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", null, false);
     _ = unsetEnv("SKETERM_WEB_SEMANTIC");
@@ -7364,13 +7364,13 @@ fn runRouteStages(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         defer probe_b.shutdown();
         var url_a_z: [64:0]u8 = undefined;
         var url_b_z: [64:0]u8 = undefined;
-        const url_a = std.fmt.bufPrintZ(&url_a_z, "socks5://127.0.0.1:{d}", .{probe_a.lis.port}) catch unreachable;
-        const url_b = std.fmt.bufPrintZ(&url_b_z, "socks5://127.0.0.1:{d}", .{probe_b.lis.port}) catch unreachable;
+        const url_a = std.fmt.bufPrintSentinel(&url_a_z, "socks5://127.0.0.1:{d}", .{probe_a.lis.port}, 0) catch unreachable;
+        const url_b = std.fmt.bufPrintSentinel(&url_b_z, "socks5://127.0.0.1:{d}", .{probe_b.lis.port}, 0) catch unreachable;
 
         var sock4_buf: [96]u8 = undefined;
-        const sock4 = std.fmt.bufPrintZ(&sock4_buf, "{s}/x.sock", .{dir}) catch fail("socket path");
+        const sock4 = std.fmt.bufPrintSentinel(&sock4_buf, "{s}/x.sock", .{dir}, 0) catch fail("socket path");
         var cache4_buf: [128]u8 = undefined;
-        const cache4 = std.fmt.bufPrintZ(&cache4_buf, "{s}/cache-egress", .{dir}) catch fail("cache path");
+        const cache4 = std.fmt.bufPrintSentinel(&cache4_buf, "{s}/cache-egress", .{dir}, 0) catch fail("cache path");
         const eg_pid = spawnHelperArgs(exe, sock4.ptr, cache4.ptr, &[_][*:0]const u8{ "--ozone-platform=headless", "--proxy", url_a.ptr });
         g_pid = eg_pid;
         var ec = Client{ .gpa = gpa, .fd = connectWithRetry(sock4.ptr, sock4.len) };
@@ -7443,9 +7443,9 @@ fn runRouteStages(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         // proxy and no other — isolation is per instance, which is what
         // makes a route correct by construction.
         var sock5_buf: [96]u8 = undefined;
-        const sock5 = std.fmt.bufPrintZ(&sock5_buf, "{s}/y.sock", .{dir}) catch fail("socket path");
+        const sock5 = std.fmt.bufPrintSentinel(&sock5_buf, "{s}/y.sock", .{dir}, 0) catch fail("socket path");
         var cache5_buf: [128]u8 = undefined;
-        const cache5 = std.fmt.bufPrintZ(&cache5_buf, "{s}/cache-egress-b", .{dir}) catch fail("cache path");
+        const cache5 = std.fmt.bufPrintSentinel(&cache5_buf, "{s}/cache-egress-b", .{dir}, 0) catch fail("cache path");
         const eg_b_pid = spawnHelperArgs(exe, sock5.ptr, cache5.ptr, &[_][*:0]const u8{ "--ozone-platform=headless", "--proxy", url_b.ptr });
         var eb = Client{ .gpa = gpa, .fd = connectWithRetry(sock5.ptr, sock5.len) };
         eb.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-egress-b" });
@@ -7515,9 +7515,9 @@ fn runRouteStages(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         var url_c_buf: [64]u8 = undefined;
         const url_c = std.fmt.bufPrint(&url_c_buf, "socks5://127.0.0.1:{d}", .{probe_c.lis.port}) catch unreachable;
         var sock_d_buf: [96]u8 = undefined;
-        const sock_d = std.fmt.bufPrintZ(&sock_d_buf, "{s}/xd.sock", .{dir}) catch fail("socket path");
+        const sock_d = std.fmt.bufPrintSentinel(&sock_d_buf, "{s}/xd.sock", .{dir}, 0) catch fail("socket path");
         var cache_d_buf: [128]u8 = undefined;
-        const cache_d = std.fmt.bufPrintZ(&cache_d_buf, "{s}/cache-direct-ctx", .{dir}) catch fail("cache path");
+        const cache_d = std.fmt.bufPrintSentinel(&cache_d_buf, "{s}/cache-direct-ctx", .{dir}, 0) catch fail("cache path");
         const d_pid = spawnHelper(exe, sock_d.ptr, cache_d.ptr, "--ozone-platform=headless", null, false);
         g_pid = d_pid;
         var dc = Client{ .gpa = gpa, .fd = connectWithRetry(sock_d.ptr, sock_d.len) };
@@ -7569,9 +7569,9 @@ fn runRouteStages(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     // direct under a Tor label.
     {
         var sock_fail_buf: [96]u8 = undefined;
-        const sock_fail = std.fmt.bufPrintZ(&sock_fail_buf, "{s}/xf.sock", .{dir}) catch fail("socket path");
+        const sock_fail = std.fmt.bufPrintSentinel(&sock_fail_buf, "{s}/xf.sock", .{dir}, 0) catch fail("socket path");
         var cache_fail_buf: [128]u8 = undefined;
-        const cache_fail = std.fmt.bufPrintZ(&cache_fail_buf, "{s}/cache-egress-fail", .{dir}) catch fail("cache path");
+        const cache_fail = std.fmt.bufPrintSentinel(&cache_fail_buf, "{s}/cache-egress-fail", .{dir}, 0) catch fail("cache path");
         _ = c.setenv("SKETERM_WEB_FAIL_PROXY", "1", 1);
         const fail_pid = spawnHelperArgs(exe, sock_fail.ptr, cache_fail.ptr, &[_][*:0]const u8{ "--ozone-platform=headless", "--proxy", "socks5://127.0.0.1:9" });
         _ = unsetEnv("SKETERM_WEB_FAIL_PROXY");
@@ -7624,9 +7624,9 @@ fn runRouteStages(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     // that keeps UDP inside it fails closed the same way, and says why.
     {
         var sock_w_buf: [96]u8 = undefined;
-        const sock_w = std.fmt.bufPrintZ(&sock_w_buf, "{s}/xw.sock", .{dir}) catch fail("socket path");
+        const sock_w = std.fmt.bufPrintSentinel(&sock_w_buf, "{s}/xw.sock", .{dir}, 0) catch fail("socket path");
         var cache_w_buf: [128]u8 = undefined;
-        const cache_w = std.fmt.bufPrintZ(&cache_w_buf, "{s}/cache-webrtc-fail", .{dir}) catch fail("cache path");
+        const cache_w = std.fmt.bufPrintSentinel(&cache_w_buf, "{s}/cache-webrtc-fail", .{dir}, 0) catch fail("cache path");
         _ = c.setenv("SKETERM_WEB_FAIL_WEBRTC_POLICY", "1", 1);
         const w_pid = spawnHelperArgs(exe, sock_w.ptr, cache_w.ptr, &[_][*:0]const u8{ "--ozone-platform=headless", "--proxy", "socks5://127.0.0.1:9" });
         _ = unsetEnv("SKETERM_WEB_FAIL_WEBRTC_POLICY");
@@ -7656,11 +7656,11 @@ fn runRouteStages(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         if (!probe.start()) fail("stage 26h http proxy: could not start the probe");
         defer probe.shutdown();
         var url_buf: [64:0]u8 = undefined;
-        const url = std.fmt.bufPrintZ(&url_buf, "http://127.0.0.1:{d}", .{probe.lis.port}) catch unreachable;
+        const url = std.fmt.bufPrintSentinel(&url_buf, "http://127.0.0.1:{d}", .{probe.lis.port}, 0) catch unreachable;
         var sock_buf: [96]u8 = undefined;
-        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/xh.sock", .{dir}) catch fail("socket path");
+        const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/xh.sock", .{dir}, 0) catch fail("socket path");
         var cache_buf: [128]u8 = undefined;
-        const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/cache-http-proxy", .{dir}) catch fail("cache path");
+        const cache = std.fmt.bufPrintSentinel(&cache_buf, "{s}/cache-http-proxy", .{dir}, 0) catch fail("cache path");
         const pid = spawnHelperArgs(exe, sock.ptr, cache.ptr, &[_][*:0]const u8{ "--ozone-platform=headless", "--proxy", url.ptr, "--proxy-decides-addresses" });
         g_pid = pid;
         var hc = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
@@ -7720,9 +7720,9 @@ fn runRouteStages(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     // authority without a proxy names nothing.
     {
         var sock_buf: [96]u8 = undefined;
-        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/xr.sock", .{dir}) catch fail("socket path");
+        const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/xr.sock", .{dir}, 0) catch fail("socket path");
         var cache_buf: [128]u8 = undefined;
-        const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/cache-route-refused", .{dir}) catch fail("cache path");
+        const cache = std.fmt.bufPrintSentinel(&cache_buf, "{s}/cache-route-refused", .{dir}, 0) catch fail("cache path");
         expectHelperRefuses(exe, sock.ptr, cache.ptr, &[_][*:0]const u8{ "--ozone-platform=headless", "--proxy", "socks5h://127.0.0.1:9" }, "stage 26r proxy spelling");
         expectHelperRefuses(exe, sock.ptr, cache.ptr, &[_][*:0]const u8{ "--ozone-platform=headless", "--proxy", "http://u@127.0.0.1:9" }, "stage 26r proxy credentials");
         expectHelperRefuses(exe, sock.ptr, cache.ptr, &[_][*:0]const u8{ "--ozone-platform=headless", "--proxy-decides-addresses" }, "stage 26r authority without proxy");
@@ -7784,9 +7784,9 @@ fn runDevtoolsTimingStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []con
     var url_buf: [64]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{http.lis.port}) catch fail("stage dt url");
     var sock_buf: [96]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/dt.sock", .{dir}) catch fail("dt sock path");
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/dt.sock", .{dir}, 0) catch fail("dt sock path");
     var cache_buf: [96]u8 = undefined;
-    const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/dt-cache", .{dir}) catch fail("dt cache path");
+    const cache = std.fmt.bufPrintSentinel(&cache_buf, "{s}/dt-cache", .{dir}, 0) catch fail("dt cache path");
     const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", null, false);
     g_pid = pid;
     var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
@@ -7817,9 +7817,9 @@ fn runDevtoolsTimingStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []con
 
 fn runObserveStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
     var sock_buf: [96]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/ob.sock", .{dir}) catch fail("ob sock path");
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/ob.sock", .{dir}, 0) catch fail("ob sock path");
     var cache_buf: [96]u8 = undefined;
-    const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/ob-cache", .{dir}) catch fail("ob cache path");
+    const cache = std.fmt.bufPrintSentinel(&cache_buf, "{s}/ob-cache", .{dir}, 0) catch fail("ob cache path");
     const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", null, false);
     g_pid = pid;
 
@@ -8339,9 +8339,9 @@ fn encObserver(gpa: std.mem.Allocator, relay: *ThrottledRelay, a: *Client, name:
 /// measurement on it is reported for comparison.
 fn runEncodedStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
     var sock_buf: [96]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/enc.sock", .{dir}) catch fail("enc sock path");
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/enc.sock", .{dir}, 0) catch fail("enc sock path");
     var cache_buf: [96]u8 = undefined;
-    const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/enc-cache", .{dir}) catch fail("enc cache path");
+    const cache = std.fmt.bufPrintSentinel(&cache_buf, "{s}/enc-cache", .{dir}, 0) catch fail("enc cache path");
     const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", null, false);
     g_pid = pid;
 
@@ -8520,9 +8520,9 @@ fn openInProfile(cl: *Client, ctx_id: u32, url: []const u8, prefix: []const u8, 
 /// being on disk afterwards with no explicit flush in between).
 fn runFlushLingerStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
     var sock_buf: [96]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/fl.sock", .{dir}) catch fail("fl sock path");
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/fl.sock", .{dir}, 0) catch fail("fl sock path");
     var cache_buf: [96]u8 = undefined;
-    const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/fl-cache", .{dir}) catch fail("fl cache path");
+    const cache = std.fmt.bufPrintSentinel(&cache_buf, "{s}/fl-cache", .{dir}, 0) catch fail("fl cache path");
 
     var http = HttpProbe{ .body = jar_page };
     if (!http.start()) fail("stage fl: could not start the loopback http probe");
@@ -8780,13 +8780,13 @@ fn findCookie(list: []const CkCookie, name: []const u8) ?*const CkCookie {
 fn runCookieSyncStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
     var sock_a_buf: [96]u8 = undefined;
     var sock_b_buf: [96]u8 = undefined;
-    const sock_a = std.fmt.bufPrintZ(&sock_a_buf, "{s}/cka.sock", .{dir}) catch fail("stage 42 socket path");
-    const sock_b = std.fmt.bufPrintZ(&sock_b_buf, "{s}/ckb.sock", .{dir}) catch fail("stage 42 socket path");
+    const sock_a = std.fmt.bufPrintSentinel(&sock_a_buf, "{s}/cka.sock", .{dir}, 0) catch fail("stage 42 socket path");
+    const sock_b = std.fmt.bufPrintSentinel(&sock_b_buf, "{s}/ckb.sock", .{dir}, 0) catch fail("stage 42 socket path");
     var cache_a_buf: [128]u8 = undefined;
     var cache_b_buf: [128]u8 = undefined;
     // SEPARATE profile directories: two jars is the whole premise.
-    const cache_a = std.fmt.bufPrintZ(&cache_a_buf, "{s}/cache-cka", .{dir}) catch fail("stage 42 cache path");
-    const cache_b = std.fmt.bufPrintZ(&cache_b_buf, "{s}/cache-ckb", .{dir}) catch fail("stage 42 cache path");
+    const cache_a = std.fmt.bufPrintSentinel(&cache_a_buf, "{s}/cache-cka", .{dir}, 0) catch fail("stage 42 cache path");
+    const cache_b = std.fmt.bufPrintSentinel(&cache_b_buf, "{s}/cache-ckb", .{dir}, 0) catch fail("stage 42 cache path");
 
     // 1500ms rather than the 3s default: fast enough that the whole
     // stage runs in seconds, slow enough that a Set-Cookie header is
@@ -9661,9 +9661,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
 
     var sock_buf: [96]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/w.sock", .{dir}) catch fail("socket path");
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/w.sock", .{dir}, 0) catch fail("socket path");
     var cache_buf: [96]u8 = undefined;
-    const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/cache", .{dir}) catch fail("cache path");
+    const cache = std.fmt.bufPrintSentinel(&cache_buf, "{s}/cache", .{dir}, 0) catch fail("cache path");
 
     // ── Spawn the helper ──────────────────────────────────────────
     //
@@ -11460,7 +11460,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (!cl.acks(.print_pdf)) fail("stage 22h print_pdf: hello_ack lacks the print-pdf capability");
         cl.navigate(article_page);
         var pdf_buf: [128]u8 = undefined;
-        const pdf = std.fmt.bufPrintZ(&pdf_buf, "{s}/page.pdf", .{dir}) catch fail("pdf path");
+        const pdf = std.fmt.bufPrintSentinel(&pdf_buf, "{s}/page.pdf", .{dir}, 0) catch fail("pdf path");
         const seq = cl.print_seq;
         cl.send(proto.PrintPdf{
             .view = view_id,
@@ -11497,7 +11497,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // the PDF. Nothing may appear at the request path.
         if (!cl.acks(.print_pdf_staging)) fail("stage 22h print_pdf: hello_ack lacks the print-pdf-staging capability");
         var key_buf: [128]u8 = undefined;
-        const key = std.fmt.bufPrintZ(&key_buf, "{s}/staged-key.pdf", .{dir}) catch fail("pdf key path");
+        const key = std.fmt.bufPrintSentinel(&key_buf, "{s}/staged-key.pdf", .{dir}, 0) catch fail("pdf key path");
         const staged_seq = cl.print_seq;
         cl.send(proto.PrintPdf{ .view = view_id, .flags = proto.print_flag_background, .paper = 0, .path = key, .stage = 1 });
         if (!cl.waitSeq(&cl.print_seq, staged_seq, 30_000)) fail("stage 22h print_pdf: no answer to a staged print");
@@ -11675,7 +11675,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const first_id = cl.dl_id;
 
         var dl_buf: [128]u8 = undefined;
-        const dl_path = std.fmt.bufPrintZ(&dl_buf, "{s}/dl1.bin", .{dir}) catch fail("dl path");
+        const dl_path = std.fmt.bufPrintSentinel(&dl_buf, "{s}/dl1.bin", .{dir}, 0) catch fail("dl path");
         cl.send(proto.DownloadDecide{ .view = view_id, .id = first_id, .path = dl_path });
         if (!cl.waitDlTerminal(first_id, 30_000))
             fail("stage 22j downloads: no terminal ev_download_progress after deciding a path");
@@ -11748,7 +11748,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (cl.dl_req != ASKED_REQ)
             fail("stage 22j2: the offer did not echo the request id that asked for it");
         var dl_buf: [128]u8 = undefined;
-        const asked_path = std.fmt.bufPrintZ(&dl_buf, "{s}/asked.bin", .{dir}) catch fail("dl path");
+        const asked_path = std.fmt.bufPrintSentinel(&dl_buf, "{s}/asked.bin", .{dir}, 0) catch fail("dl path");
         const asked_id = cl.dl_id;
         cl.send(proto.DownloadDecide{ .view = view_id, .id = asked_id, .path = asked_path });
         if (!cl.waitDlTerminal(asked_id, 30_000))
@@ -11919,7 +11919,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // with no compositor must also prove.
     {
         var sock2_buf: [96]u8 = undefined;
-        const sock2 = std.fmt.bufPrintZ(&sock2_buf, "{s}/g.sock", .{dir}) catch fail("socket path");
+        const sock2 = std.fmt.bufPrintSentinel(&sock2_buf, "{s}/g.sock", .{dir}, 0) catch fail("socket path");
         const gpu_pid = spawnHelper(exe, sock2.ptr, cache.ptr, null, null, false);
         g_pid = gpu_pid;
         var gc = Client{ .gpa = gpa, .fd = connectWithRetry(sock2.ptr, sock2.len) };
@@ -11981,7 +11981,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // capability, and the memfd path serving pixels as before.
     {
         var sock3_buf: [96]u8 = undefined;
-        const sock3 = std.fmt.bufPrintZ(&sock3_buf, "{s}/s.sock", .{dir}) catch fail("socket path");
+        const sock3 = std.fmt.bufPrintSentinel(&sock3_buf, "{s}/s.sock", .{dir}, 0) catch fail("socket path");
         const sw_pid = spawnHelper(exe, sock3.ptr, cache.ptr, null, null, true);
         g_pid = sw_pid;
         var sc = Client{ .gpa = gpa, .fd = connectWithRetry(sock3.ptr, sock3.len) };
@@ -12022,9 +12022,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // budget allows.
     {
         var sock5_buf: [96]u8 = undefined;
-        const sock5 = std.fmt.bufPrintZ(&sock5_buf, "{s}/j.sock", .{dir}) catch fail("socket path");
+        const sock5 = std.fmt.bufPrintSentinel(&sock5_buf, "{s}/j.sock", .{dir}, 0) catch fail("socket path");
         var cache5_buf: [128]u8 = undefined;
-        const cache5 = std.fmt.bufPrintZ(&cache5_buf, "{s}/cache-jar", .{dir}) catch fail("cache path");
+        const cache5 = std.fmt.bufPrintSentinel(&cache5_buf, "{s}/cache-jar", .{dir}, 0) catch fail("cache path");
         const jar_pid = spawnHelper(exe, sock5.ptr, cache5.ptr, "--ozone-platform=headless", null, false);
         g_pid = jar_pid;
         var jc = Client{ .gpa = gpa, .fd = connectWithRetry(sock5.ptr, sock5.len) };
@@ -12140,12 +12140,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // ever crosses), damage stays partial, and input works end to end.
     if (argv.len >= 3) {
         var msock_buf: [96]u8 = undefined;
-        const msock = std.fmt.bufPrintZ(&msock_buf, "{s}/m.sock", .{dir}) catch fail("mux socket path");
+        const msock = std.fmt.bufPrintSentinel(&msock_buf, "{s}/m.sock", .{dir}, 0) catch fail("mux socket path");
         var cache5_buf: [128]u8 = undefined;
-        const cache5 = std.fmt.bufPrintZ(&cache5_buf, "{s}/cache-rmt", .{dir}) catch fail("cache path");
+        const cache5 = std.fmt.bufPrintSentinel(&cache5_buf, "{s}/cache-rmt", .{dir}, 0) catch fail("cache path");
         _ = cache5;
         var state_buf: [128:0]u8 = undefined;
-        const state_dir = std.fmt.bufPrintZ(&state_buf, "{s}/state", .{dir}) catch fail("state path");
+        const state_dir = std.fmt.bufPrintSentinel(&state_buf, "{s}/state", .{dir}, 0) catch fail("state path");
         _ = c.mkdir(state_dir.ptr, 0o700);
         {
             const mpid = c.fork();

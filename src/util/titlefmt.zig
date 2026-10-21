@@ -196,7 +196,7 @@ pub fn validate(tmpl: []const u8, diag: *Diag) Error!void {
 /// whatever they parsed before the error; callers only use this on
 /// templates that already passed `validate`.
 pub fn uses(tmpl: []const u8) Mask {
-    var m = Mask.initEmpty();
+    var m = Mask.empty;
     var diag: Diag = .{};
     var p = Parser{ .tmpl = tmpl };
     while (p.next(&diag) catch null) |node| {
@@ -580,7 +580,7 @@ test "titlefmt: uses reports exactly the referenced fields" {
     try t.expect(m.contains(.columns));
     try t.expect(!m.contains(.lines));
     try t.expect(!m.contains(.relative_path));
-    try t.expect(uses("no placeholders here").eql(Mask.initEmpty()));
+    try t.expect(uses("no placeholders here").eql(Mask.empty));
 }
 
 test "titlefmt: render truncates instead of overflowing a short buffer" {

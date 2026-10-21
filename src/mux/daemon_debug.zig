@@ -120,7 +120,7 @@ pub fn handleAppDebug(self: *Daemon, cl: *Client, payload: []const u8) void {
     const tool: []const u8 = if (is_lldb) "lldb" else "gdb";
 
     var pidbuf: [24]u8 = undefined;
-    const pid_s = std.fmt.bufPrintZ(&pidbuf, "{d}", .{target}) catch
+    const pid_s = std.fmt.bufPrintSentinel(&pidbuf, "{d}", .{target}, 0) catch
         return replyErr(cl, "oom");
 
     var out_pipe: [2]c_int = undefined;

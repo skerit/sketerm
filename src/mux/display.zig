@@ -457,7 +457,7 @@ fn generatedName(buf: *[64]u8) []const u8 {
 fn waitSocketGone(path: []const u8) bool {
     if (path.len == 0) return true;
     var zbuf: [4096:0]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{path}) catch return false;
+    const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{path}, 0) catch return false;
     var tries: u32 = 0;
     while (tries < 100) : (tries += 1) {
         if (c.access(z.ptr, c.F_OK) != 0) return true;
@@ -976,7 +976,7 @@ fn runCommand(allocator: std.mem.Allocator, a_in: Args) u8 {
     var argv_ptrs: std.ArrayList(?[*:0]const u8) = .empty;
     defer argv_ptrs.deinit(allocator);
     for (a.command) |arg| {
-        const z = allocator.dupeZ(u8, arg) catch {
+        const z = allocator.dupeSentinel(u8, arg, 0) catch {
             return 125;
         };
         argv_z.append(allocator, z) catch {
@@ -988,17 +988,17 @@ fn runCommand(allocator: std.mem.Allocator, a_in: Args) u8 {
     argv_ptrs.append(allocator, null) catch return 125;
 
     const env = envOf(created.sess());
-    const wl_z = allocator.dupeZ(u8, env.wayland_display) catch return 125;
+    const wl_z = allocator.dupeSentinel(u8, env.wayland_display, 0) catch return 125;
     defer allocator.free(wl_z);
-    const rt_z = allocator.dupeZ(u8, env.xdg_runtime_dir) catch return 125;
+    const rt_z = allocator.dupeSentinel(u8, env.xdg_runtime_dir, 0) catch return 125;
     defer allocator.free(rt_z);
     var pulse_z: ?[:0]u8 = null;
     defer if (pulse_z) |p| allocator.free(p);
     if (env.pulse_socket.len > 0)
         pulse_z = std.fmt.allocPrintSentinel(allocator, "unix:{s}", .{env.pulse_socket}, 0) catch return 125;
-    const display_z: ?[:0]u8 = if (env.x_display.len > 0) allocator.dupeZ(u8, env.x_display) catch return 125 else null;
+    const display_z: ?[:0]u8 = if (env.x_display.len > 0) allocator.dupeSentinel(u8, env.x_display, 0) catch return 125 else null;
     defer if (display_z) |p| allocator.free(p);
-    const xauth_z: ?[:0]u8 = if (env.xauthority.len > 0) allocator.dupeZ(u8, env.xauthority) catch return 125 else null;
+    const xauth_z: ?[:0]u8 = if (env.xauthority.len > 0) allocator.dupeSentinel(u8, env.xauthority, 0) catch return 125 else null;
     defer if (xauth_z) |p| allocator.free(p);
 
     // Block the forwarded signals through handler installation, fork, process

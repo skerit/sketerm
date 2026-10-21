@@ -331,20 +331,20 @@ pub fn updateShield(self: *WebFace) void {
     if (self.widgets_dead) return;
     var buf: [32]u8 = undefined;
     const txt = if (!self.net_enabled)
-        std.fmt.bufPrintZ(&buf, "off", .{}) catch "off"
+        std.fmt.bufPrintSentinel(&buf, "off", .{}, 0) catch "off"
     else if (self.net_blocked > 0)
-        std.fmt.bufPrintZ(&buf, "{d}", .{self.net_blocked}) catch "0"
+        std.fmt.bufPrintSentinel(&buf, "{d}", .{self.net_blocked}, 0) catch "0"
     else
-        std.fmt.bufPrintZ(&buf, "0", .{}) catch "0";
+        std.fmt.bufPrintSentinel(&buf, "0", .{}, 0) catch "0";
     c.gtk_label_set_text(@ptrCast(self.shield_label), txt.ptr);
     self.refreshSiteInfo(false);
     var tip: [128]u8 = undefined;
-    const t = std.fmt.bufPrintZ(&tip, "Content blocking: {s} ({d} blocked of {d} requests, {d} rules)", .{
+    const t = std.fmt.bufPrintSentinel(&tip, "Content blocking: {s} ({d} blocked of {d} requests, {d} rules)", .{
         if (self.net_enabled) "on" else "off",
         self.net_blocked,
         self.net_total,
         self.net_rules,
-    }) catch "Content blocking";
+    }, 0) catch "Content blocking";
     c.gtk_widget_set_tooltip_text(self.shield_btn, t.ptr);
 }
 

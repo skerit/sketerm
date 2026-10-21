@@ -17,7 +17,7 @@ const paths = @import("../filebrowser/paths.zig");
 /// (running from a build tree that only installed `sketerm`).
 fn siblingBinary(name: []const u8, exe: [:0]const u8, buf: *[4096:0]u8) ?[*:0]const u8 {
     const slash = std.mem.lastIndexOfScalar(u8, exe, '/') orelse return null;
-    const candidate = std.fmt.bufPrintZ(buf, "{s}/{s}", .{ exe[0..slash], name }) catch return null;
+    const candidate = std.fmt.bufPrintSentinel(buf, "{s}/{s}", .{ exe[0..slash], name }, 0) catch return null;
     if (c.access(candidate.ptr, c.X_OK) != 0) return null;
     return candidate.ptr;
 }
@@ -63,7 +63,7 @@ pub const EditorOpen = struct {
 pub fn openInEditor(spec: []const u8, line: ?usize, opts: EditorOpen) bool {
     if (spec.len >= 4096) return false;
     var spec_buf: [4096:0]u8 = undefined;
-    const spec_z = std.fmt.bufPrintZ(&spec_buf, "{s}", .{spec}) catch return false;
+    const spec_z = std.fmt.bufPrintSentinel(&spec_buf, "{s}", .{spec}, 0) catch return false;
     var line_buf: [32:0]u8 = undefined;
     var args: [4][*:0]const u8 = undefined;
     var n: usize = 0;
@@ -72,7 +72,7 @@ pub fn openInEditor(spec: []const u8, line: ?usize, opts: EditorOpen) bool {
         n += 1;
     }
     if (line) |l| {
-        const line_z = std.fmt.bufPrintZ(&line_buf, "--line={d}", .{l}) catch return false;
+        const line_z = std.fmt.bufPrintSentinel(&line_buf, "--line={d}", .{l}, 0) catch return false;
         args[n] = line_z.ptr;
         n += 1;
     }
@@ -89,8 +89,8 @@ pub fn showInFiles(spec: []const u8) bool {
     var parent_buf: [paths.SPEC_BUF_LEN]u8 = undefined;
     const parent_spec = paths.formatSpec(&parent_buf, loc.host, parent);
     var parent_z_buf: [4096:0]u8 = undefined;
-    const parent_z = std.fmt.bufPrintZ(&parent_z_buf, "{s}", .{parent_spec}) catch return false;
+    const parent_z = std.fmt.bufPrintSentinel(&parent_z_buf, "{s}", .{parent_spec}, 0) catch return false;
     var select_buf: [4200:0]u8 = undefined;
-    const select = std.fmt.bufPrintZ(&select_buf, "--select={s}", .{spec}) catch return false;
+    const select = std.fmt.bufPrintSentinel(&select_buf, "--select={s}", .{spec}, 0) catch return false;
     return spawnSibling("sketerm-files", "files", &.{ parent_z.ptr, select.ptr });
 }

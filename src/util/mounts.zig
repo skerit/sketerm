@@ -83,7 +83,7 @@ pub fn forEach(ctx: anytype) void {
     const f = blk: {
         if (@import("env.zig").nonEmpty(TABLE_OVERRIDE_ENV)) |table| {
             var z: [4096:0]u8 = undefined;
-            const tz = std.fmt.bufPrintZ(&z, "{s}", .{table}) catch return;
+            const tz = std.fmt.bufPrintSentinel(&z, "{s}", .{table}, 0) catch return;
             break :blk c.fopen(tz.ptr, "r") orelse return;
         }
         break :blk c.fopen("/proc/self/mounts", "r") orelse c.fopen("/proc/mounts", "r") orelse return;

@@ -905,7 +905,7 @@ fn cleanupProcessNamespaces(parent: []const u8, current_root: []const u8) void {
         const pid = parsePidDir(pid_name) orelse continue;
         scanned += 1;
         var pid_path_buf: [4096:0]u8 = undefined;
-        const pid_path = std.fmt.bufPrintZ(&pid_path_buf, "{s}/{s}", .{ parent, pid_name }) catch continue;
+        const pid_path = std.fmt.bufPrintSentinel(&pid_path_buf, "{s}/{s}", .{ parent, pid_name }, 0) catch continue;
         var pid_stat: c.struct_stat = undefined;
         if (c.lstat(pid_path.ptr, &pid_stat) != 0 or (pid_stat.st_mode & c.S_IFMT) != c.S_IFDIR) continue;
         const pid_dir = c.opendir(pid_path.ptr) orelse continue;
@@ -920,12 +920,12 @@ fn cleanupProcessNamespaces(parent: []const u8, current_root: []const u8) void {
                 continue;
             }
             var owner_path_buf: [4096:0]u8 = undefined;
-            const owner_path = std.fmt.bufPrintZ(&owner_path_buf, "{s}/{s}", .{ pid_path, owner }) catch continue;
+            const owner_path = std.fmt.bufPrintSentinel(&owner_path_buf, "{s}/{s}", .{ pid_path, owner }, 0) catch continue;
             if (std.mem.eql(u8, std.mem.span(owner_path.ptr), current_root)) continue;
             var owner_stat: c.struct_stat = undefined;
             if (c.lstat(owner_path.ptr, &owner_stat) != 0 or (owner_stat.st_mode & c.S_IFMT) != c.S_IFDIR) continue;
             var marker_buf: [4096:0]u8 = undefined;
-            const marker = std.fmt.bufPrintZ(&marker_buf, "{s}/{s}", .{ owner_path, OWNER_FILE }) catch continue;
+            const marker = std.fmt.bufPrintSentinel(&marker_buf, "{s}/{s}", .{ owner_path, OWNER_FILE }, 0) catch continue;
             const fd = c.open(marker.ptr, c.O_RDWR | c.O_CLOEXEC | c.O_NOFOLLOW);
             if (fd < 0) continue;
             if (c.flock(fd, c.LOCK_EX | c.LOCK_NB) != 0) {
@@ -990,7 +990,7 @@ fn cleanupLegacyNamespace(path: []const u8) void {
         const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
         if (!validBlobName(name) and !atomicwrite.isStageName(name)) continue;
         var file_buf: [4096:0]u8 = undefined;
-        const file = std.fmt.bufPrintZ(&file_buf, "{s}/{s}", .{ path, name }) catch continue;
+        const file = std.fmt.bufPrintSentinel(&file_buf, "{s}/{s}", .{ path, name }, 0) catch continue;
         var st: c.struct_stat = undefined;
         if (c.lstat(file.ptr, &st) == 0 and (st.st_mode & c.S_IFMT) == c.S_IFREG) _ = c.unlink(file.ptr);
     }

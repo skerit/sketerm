@@ -23,7 +23,7 @@ pub fn mainDevice() ?u64 {
     var buf: [64]u8 = undefined;
     var minor: u32 = first_render_minor;
     while (minor <= last_render_minor) : (minor += 1) {
-        const path = std.fmt.bufPrintZ(&buf, "/dev/dri/renderD{d}", .{minor}) catch return null;
+        const path = std.fmt.bufPrintSentinel(&buf, "/dev/dri/renderD{d}", .{minor}, 0) catch return null;
         if (deviceOf(path)) |dev| return dev;
     }
     return null;

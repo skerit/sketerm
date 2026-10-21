@@ -904,7 +904,7 @@ test "conflict decisions retain a failed durable skip until it can be persisted"
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var state_buf: [4096:0]u8 = undefined;
-    const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const state = try std.fmt.bufPrintSentinel(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}, 0);
     var saved_state: @import("../../util/env.zig").Saved = .{};
     try saved_state.override("XDG_STATE_HOME", state);
     defer saved_state.restore();

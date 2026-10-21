@@ -659,7 +659,7 @@ fn fillRegisterTab(self: *BrowserView, tab: *BTab, name: []const u8) void {
     for (tab.root.entries.items) |*e| e.deinit(self.allocator);
     tab.root.entries.clearRetainingCapacity();
     var lbl: [96:0]u8 = undefined;
-    const ltxt = std.fmt.bufPrintZ(&lbl, "reg: {s}", .{name}) catch "register";
+    const ltxt = std.fmt.bufPrintSentinel(&lbl, "reg: {s}", .{name}, 0) catch "register";
     c.gtk_label_set_text(tab.tab_label, ltxt.ptr);
     const store = regStore(self);
     for (store.entriesOf(name)) |e| {
@@ -877,9 +877,9 @@ pub fn onSelectionMenuClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c)
     c.gtk_box_append(@ptrCast(box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
     const store = regStore(self);
     var head_buf: [96:0]u8 = undefined;
-    const head_txt: [*:0]const u8 = if (std.fmt.bufPrintZ(&head_buf, "Registers ({d} marks kept across restarts)", .{
+    const head_txt: [*:0]const u8 = if (std.fmt.bufPrintSentinel(&head_buf, "Registers ({d} marks kept across restarts)", .{
         store.totalEntries(),
-    })) |v| v.ptr else |_| "Registers";
+    }, 0)) |v| v.ptr else |_| "Registers";
     const head = c.gtk_label_new(head_txt);
     c.gtk_label_set_xalign(@ptrCast(head), 0);
     c.gtk_widget_add_css_class(head, "dim-label");
@@ -896,7 +896,7 @@ pub fn onSelectionMenuClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c)
         const name = store.nameAt(i);
         const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
         var rz: [128:0]u8 = undefined;
-        const rtxt: [*:0]const u8 = if (std.fmt.bufPrintZ(&rz, "{s}  ({d})", .{ name, store.sizeOf(name) })) |v| v.ptr else |_| "register";
+        const rtxt: [*:0]const u8 = if (std.fmt.bufPrintSentinel(&rz, "{s}  ({d})", .{ name, store.sizeOf(name) }, 0)) |v| v.ptr else |_| "register";
         const lab = c.gtk_label_new(rtxt);
         c.gtk_label_set_xalign(@ptrCast(lab), 0);
         c.gtk_widget_set_hexpand(lab, 1);
@@ -1083,7 +1083,7 @@ fn confirmDelete(self: *BrowserView, name: []const u8) void {
         .popover = popover,
     };
     var lbl: [160:0]u8 = undefined;
-    const txt: [*:0]const u8 = if (std.fmt.bufPrintZ(&lbl, "Permanently delete {d} marked item(s) of register {s}", .{ n, name })) |v| v.ptr else |_| "Delete marked items";
+    const txt: [*:0]const u8 = if (std.fmt.bufPrintSentinel(&lbl, "Permanently delete {d} marked item(s) of register {s}", .{ n, name }, 0)) |v| v.ptr else |_| "Delete marked items";
     const btn = c.gtk_button_new_with_label(txt);
     c.gtk_widget_add_css_class(btn, "destructive-action");
     _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onDeleteRegisterConfirmed), @ptrCast(ctx), @ptrCast(&RegCtx.free), c.G_CONNECT_DEFAULT);

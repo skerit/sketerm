@@ -76,7 +76,7 @@ const REMOTE_PANEL_ASSET_PATH = "/proc/self/cwd/" ++ REMOTE_PANEL_ASSET_NAME;
 /// `name` in the fake remote daemon's cwd, as this process opens it; an
 /// empty `name` is the directory itself.
 fn remotePanelAssetFile(buf: []u8, name: []const u8) ?[:0]const u8 {
-    return std.fmt.bufPrintZ(buf, "{s}/r/" ++ REMOTE_PANEL_ASSET_DIR ++ "/{s}", .{ g_rt, name }) catch null;
+    return std.fmt.bufPrintSentinel(buf, "{s}/r/" ++ REMOTE_PANEL_ASSET_DIR ++ "/{s}", .{ g_rt, name }, 0) catch null;
 }
 
 var child_pid: c.pid_t = 0;
@@ -375,7 +375,7 @@ fn onFatalSignal(sig: c_int) callconv(.c) void {
     teardown();
     if (g_rt.len > 0) {
         var z: [256:0]u8 = undefined;
-        if (std.fmt.bufPrintZ(&z, "{s}", .{g_rt})) |p| {
+        if (std.fmt.bufPrintSentinel(&z, "{s}", .{g_rt}, 0)) |p| {
             @import("util/pathz.zig").removeTree(p);
         } else |_| {}
     }
@@ -512,9 +512,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // Every mutable path and the daemon itself are private to this smoke.
     // A protocol bump must never classify the user's live daemon as stale
     // and shut it down.
-    const rt = std.fmt.bufPrintZ(&g_rt_buf, RT_PREFIX ++ "{d}", .{c.getpid()}) catch return fail("runtime path");
+    const rt = std.fmt.bufPrintSentinel(&g_rt_buf, RT_PREFIX ++ "{d}", .{c.getpid()}, 0) catch return fail("runtime path");
     g_rt = rt;
-    g_app_id = std.fmt.bufPrintZ(&g_app_id_buf, "dev.sker.sketerm.e2e.p{d}", .{c.getpid()}) catch return fail("app id");
+    g_app_id = std.fmt.bufPrintSentinel(&g_app_id_buf, "dev.sker.sketerm.e2e.p{d}", .{c.getpid()}, 0) catch return fail("app id");
     _ = c.mkdir(rt.ptr, 0o700);
     _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
     _ = c.setenv("XDG_CONFIG_HOME", rt.ptr, 1);
@@ -533,10 +533,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // user's REAL $HOME.
     {
         var dl_buf: [300:0]u8 = undefined;
-        const dl = std.fmt.bufPrintZ(&dl_buf, "{s}/dl", .{rt}) catch return fail("download dir path");
+        const dl = std.fmt.bufPrintSentinel(&dl_buf, "{s}/dl", .{rt}, 0) catch return fail("download dir path");
         _ = c.mkdir(dl.ptr, 0o700);
         var ud_path_buf: [300:0]u8 = undefined;
-        const ud_path = std.fmt.bufPrintZ(&ud_path_buf, "{s}/user-dirs.dirs", .{rt}) catch return fail("user-dirs path");
+        const ud_path = std.fmt.bufPrintSentinel(&ud_path_buf, "{s}/user-dirs.dirs", .{rt}, 0) catch return fail("user-dirs path");
         var ud_buf: [400]u8 = undefined;
         const ud = std.fmt.bufPrint(&ud_buf, "XDG_DOWNLOAD_DIR=\"{s}\"\n", .{dl}) catch return fail("user-dirs body");
         if (!writeFile(ud_path, ud)) return fail("could not write the rig's user-dirs.dirs");
@@ -568,7 +568,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     daemon_pid = mux_pid;
     var mux_sock_buf: [512]u8 = undefined;
-    const mux_sock = std.fmt.bufPrintZ(&mux_sock_buf, "{s}/sketerm/mux.sock", .{rt}) catch return fail("mux socket path");
+    const mux_sock = std.fmt.bufPrintSentinel(&mux_sock_buf, "{s}/sketerm/mux.sock", .{rt}, 0) catch return fail("mux socket path");
     var waited: u32 = 0;
     while (c.access(mux_sock.ptr, c.F_OK) != 0) {
         _ = c.usleep(50_000);
@@ -603,7 +603,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer parsed.deinit();
         const wl = parsed.value.environment.WAYLAND_DISPLAY;
         if (wl.len == 0 or wl[0] != '/') return fail("display create returned no absolute WAYLAND_DISPLAY");
-        _ = std.fmt.bufPrintZ(&wl_z, "{s}", .{wl}) catch return fail("WAYLAND_DISPLAY too long");
+        _ = std.fmt.bufPrintSentinel(&wl_z, "{s}", .{wl}, 0) catch return fail("WAYLAND_DISPLAY too long");
         have_wl = true;
         say("display session up (sketerm is its own compositor; no X involved)");
 
@@ -628,7 +628,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // pid). Setting SKETERM_SSH also disables the deploy/multiplex
     // legs by design (deploy.prepare returns null under it).
     var rrt_buf: [256]u8 = undefined;
-    const rrt = std.fmt.bufPrintZ(&rrt_buf, "{s}/r", .{rt}) catch return fail("remote rt path");
+    const rrt = std.fmt.bufPrintSentinel(&rrt_buf, "{s}/r", .{rt}, 0) catch return fail("remote rt path");
     _ = c.mkdir(rrt.ptr, 0o700);
     {
         var mux_abs_buf: [4096]u8 = undefined;
@@ -668,7 +668,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
         remote_mux_pid = rmt_pid;
         var rsock_buf: [512]u8 = undefined;
-        const rsock = std.fmt.bufPrintZ(&rsock_buf, "{s}/sketerm/mux.sock", .{rrt}) catch return fail("remote sock path");
+        const rsock = std.fmt.bufPrintSentinel(&rsock_buf, "{s}/sketerm/mux.sock", .{rrt}, 0) catch return fail("remote sock path");
         var rwaited: u32 = 0;
         while (c.access(rsock.ptr, c.F_OK) != 0) {
             _ = c.usleep(50_000);
@@ -677,7 +677,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
 
         var ssh_path_buf: [300:0]u8 = undefined;
-        const ssh_path = std.fmt.bufPrintZ(&ssh_path_buf, "{s}/fake-ssh", .{rt}) catch return fail("fake ssh path");
+        const ssh_path = std.fmt.bufPrintSentinel(&ssh_path_buf, "{s}/fake-ssh", .{rt}, 0) catch return fail("fake ssh path");
         var script_buf: [4096]u8 = undefined;
         const body = std.fmt.bufPrint(&script_buf,
             \\#!/bin/sh
@@ -712,10 +712,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // happened to match would prove nothing.
     {
         var cfg_dir_buf: [300:0]u8 = undefined;
-        const cfg_dir = std.fmt.bufPrintZ(&cfg_dir_buf, "{s}/sketerm", .{rt}) catch return fail("config dir path");
+        const cfg_dir = std.fmt.bufPrintSentinel(&cfg_dir_buf, "{s}/sketerm", .{rt}, 0) catch return fail("config dir path");
         _ = c.mkdir(cfg_dir.ptr, 0o700);
         var cfg_buf: [320:0]u8 = undefined;
-        const cfg = std.fmt.bufPrintZ(&cfg_buf, "{s}/config.conf", .{cfg_dir}) catch return fail("config path");
+        const cfg = std.fmt.bufPrintSentinel(&cfg_buf, "{s}/config.conf", .{cfg_dir}, 0) catch return fail("config path");
         // The browser's Tor route dials `mux_tor_socks_endpoint`; this
         // run's stands in for Tor, so the route stage can prove a Tor
         // tab's bytes go through it. Started here because the config
@@ -740,17 +740,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     if (c.getenv("SKETERM_SMOKE_E2E_OFFLOAD_ONLY") != null) {
         var css_dir_buf: [320:0]u8 = undefined;
-        const css_dir = std.fmt.bufPrintZ(&css_dir_buf, "{s}/gtk-4.0", .{rt}) catch return fail("offload CSS directory");
+        const css_dir = std.fmt.bufPrintSentinel(&css_dir_buf, "{s}/gtk-4.0", .{rt}, 0) catch return fail("offload CSS directory");
         _ = c.mkdir(css_dir.ptr, 0o700);
         var css_path_buf: [350:0]u8 = undefined;
-        const css_path = std.fmt.bufPrintZ(&css_path_buf, "{s}/gtk.css", .{css_dir}) catch return fail("offload CSS path");
+        const css_path = std.fmt.bufPrintSentinel(&css_path_buf, "{s}/gtk.css", .{css_dir}, 0) catch return fail("offload CSS path");
         // A mapped wrapper whose content GSK rejects reproduced callback
         // accumulation despite the old hidden-tab fix. Do not hide it.
         if (!writeFile(css_path, "graphicsoffload { opacity: 0.5; }\n")) return fail("offload CSS write");
     }
 
     var offload_lib_buf: [512:0]u8 = undefined;
-    const offload_lib = std.fmt.bufPrintZ(&offload_lib_buf, "{s}/offload-probe.so", .{rt}) catch return fail("offload observer path");
+    const offload_lib = std.fmt.bufPrintSentinel(&offload_lib_buf, "{s}/offload-probe.so", .{rt}, 0) catch return fail("offload observer path");
     if (!platform.is_macos and !prepareOffloadProbe(rt, offload_lib)) return fail("building the private GTK offload observer failed");
 
     // The AI popovers' icon-only actions are pressed by accessible name:
@@ -773,7 +773,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             const previous = c.getenv("LD_PRELOAD");
             _ = c.setenv("SKETERM_OFFLOAD_PRIOR_PRELOAD", if (previous != null) previous else "", 1);
             var preload_buf: [4096:0]u8 = undefined;
-            const preload = std.fmt.bufPrintZ(&preload_buf, "{s}:{s}", .{ offload_lib, if (previous != null) std.mem.span(previous) else "" }) catch c._exit(126);
+            const preload = std.fmt.bufPrintSentinel(&preload_buf, "{s}:{s}", .{ offload_lib, if (previous != null) std.mem.span(previous) else "" }, 0) catch c._exit(126);
             _ = c.setenv("LD_PRELOAD", preload.ptr, 1);
         }
         _ = c.setenv("SKETERM_APP_ID", g_app_id.ptr, 1);
@@ -934,7 +934,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (c.getenv("SKETERM_SMOKE_E2E_PANEL_ONLY") != null) {
         const app = drive orelse return fail("focused panel smoke has no display driver");
         var gui_session_buf: [64]u8 = undefined;
-        const gui_session = std.fmt.bufPrintZ(&gui_session_buf, "s{d}-1", .{pid}) catch return fail("GUI session name");
+        const gui_session = std.fmt.bufPrintSentinel(&gui_session_buf, "s{d}-1", .{pid}, 0) catch return fail("GUI session name");
         if (panelRelayGuiStage(allocator, mux_sock, gui_session, sock_path)) |why| return failMsg(why);
         say("panel relay: focused transport, session-open, replacement, and lifecycle stage passed");
         if (panelStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
@@ -1569,7 +1569,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // the daemon, file content asserted, pane closed.
     {
         var efile_buf: [512]u8 = undefined;
-        const efile = std.fmt.bufPrintZ(&efile_buf, "{s}/e2e-editor.txt", .{rt}) catch return fail("editor path");
+        const efile = std.fmt.bufPrintSentinel(&efile_buf, "{s}/e2e-editor.txt", .{rt}, 0) catch return fail("editor path");
         var ereq_buf: [700]u8 = undefined;
         const ereq = std.fmt.bufPrint(&ereq_buf, "{{\"cmd\":\"new-editor-tab\",\"data\":\"{s}\"}}\n", .{efile}) catch return fail("editor req fmt");
         const eresp = roundtrip(allocator, sock_path, ereq) orelse return fail("new-editor-tab roundtrip");
@@ -1656,7 +1656,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // back to the editor does.
         {
             var tmp_buf: [600]u8 = undefined;
-            const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}/e2e-editor.new", .{rt}) catch return fail("editor tmp path");
+            const tmp = std.fmt.bufPrintSentinel(&tmp_buf, "{s}/e2e-editor.new", .{rt}, 0) catch return fail("editor tmp path");
             const f = c.fopen(tmp.ptr, "wb") orelse return fail("editor external write open");
             const body = "changed on disk\n";
             _ = c.fwrite(body.ptr, 1, body.len, f);
@@ -1723,7 +1723,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // and the interaction read back over the socket.
     if (drive) |app| {
         var gui_session_buf: [64]u8 = undefined;
-        const gui_session = std.fmt.bufPrintZ(&gui_session_buf, "s{d}-1", .{pid}) catch return fail("GUI session name");
+        const gui_session = std.fmt.bufPrintSentinel(&gui_session_buf, "s{d}-1", .{pid}, 0) catch return fail("GUI session name");
         if (panelRelayGuiStage(allocator, mux_sock, gui_session, sock_path)) |why| return failMsg(why);
         say("panel relay: the daemon selected the exact GUI terminal, which rendered and answered a correlated native panel request");
 
@@ -1889,7 +1889,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     defer if (teardown_requester) |*requester| requester.deinit();
     if (drive != null) {
         var gui_session_buf: [64]u8 = undefined;
-        const gui_session = std.fmt.bufPrintZ(&gui_session_buf, "s{d}-1", .{pid}) catch
+        const gui_session = std.fmt.bufPrintSentinel(&gui_session_buf, "s{d}-1", .{pid}, 0) catch
             return fail("teardown GUI session name");
         var requester = muxclient.connectPanelRequester(allocator, mux_sock, gui_session, 10_000) catch
             return fail("teardown panel requester attach");
@@ -2085,7 +2085,7 @@ fn projectStage(
 ) ?[]const u8 {
     // ── a scratch repository ──────────────────────────────────────
     var cmd_buf: [2048:0]u8 = undefined;
-    const setup = std.fmt.bufPrintZ(&cmd_buf,
+    const setup = std.fmt.bufPrintSentinel(&cmd_buf,
         \\set -e
         \\rm -rf {s}/proj && mkdir -p {s}/proj/src
         \\printf 'const std = @import("std");\n\npub fn main() void {{\n    hello();\n}}\n\nfn hello() void {{\n    _ = std;\n}}\n' > {s}/proj/src/main.zig
@@ -2094,13 +2094,13 @@ fn projectStage(
         \\git init -q -b main .
         \\git config user.email s@e && git config user.name s
         \\git add -A && git commit -q -m init
-    , .{ rt, rt, rt, rt, rt }) catch return "project setup command too long";
+    , .{ rt, rt, rt, rt, rt }, 0) catch return "project setup command too long";
     if (sh(setup.ptr) != 0) return "could not build the scratch git repository (is git installed?)";
 
     var main_buf: [512]u8 = undefined;
-    const main_path = std.fmt.bufPrintZ(&main_buf, "{s}/proj/src/main.zig", .{rt}) catch return "path";
+    const main_path = std.fmt.bufPrintSentinel(&main_buf, "{s}/proj/src/main.zig", .{rt}, 0) catch return "path";
     var other_buf: [512]u8 = undefined;
-    const other_path = std.fmt.bufPrintZ(&other_buf, "{s}/proj/src/other.zig", .{rt}) catch return "path";
+    const other_path = std.fmt.bufPrintSentinel(&other_buf, "{s}/proj/src/other.zig", .{rt}, 0) catch return "path";
 
     // ── open it in an editor tab ──────────────────────────────────
     var req_buf: [900]u8 = undefined;
@@ -2349,7 +2349,7 @@ fn projectStage(
         defer allocator.free(aresp);
         if (std.mem.indexOf(u8, aresp, "\"ok\":true") == null) return "save_layout not ok";
         var lay_buf: [512]u8 = undefined;
-        const lay = std.fmt.bufPrintZ(&lay_buf, "{s}/sketerm/last.json", .{rt}) catch return "layout path";
+        const lay = std.fmt.bufPrintSentinel(&lay_buf, "{s}/sketerm/last.json", .{rt}, 0) catch return "layout path";
         var ok = false;
         var t: u32 = 0;
         while (t < 40 and !ok) : (t += 1) {
@@ -2506,7 +2506,7 @@ fn waitSidebarVisible(app: *appdrive.App, win_id: u32, want: bool, timeout_ms: u
 /// the sidebar in every other window on the next reload.
 fn configHasSidebarKey(allocator: std.mem.Allocator, rt: []const u8) bool {
     var pbuf: [512:0]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch return false;
+    const p = std.fmt.bufPrintSentinel(&pbuf, "{s}/sketerm/config.conf", .{rt}, 0) catch return false;
     const body = readFileAlloc(allocator, p) orelse return false;
     defer allocator.free(body);
     return std.mem.indexOf(u8, body, "show_tab_sidebar") != null;
@@ -2870,7 +2870,7 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     };
     const had_config = blk: {
         var pbuf: [512:0]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch break :blk true;
+        const p = std.fmt.bufPrintSentinel(&pbuf, "{s}/sketerm/config.conf", .{rt}, 0) catch break :blk true;
         break :blk c.access(p.ptr, c.F_OK) == 0;
     };
 
@@ -2895,7 +2895,7 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     // binding used to swallow the chord before the browser saw it.
     {
         var empty_buf: [512:0]u8 = undefined;
-        const empty_dir = std.fmt.bufPrintZ(&empty_buf, "{s}/tree-empty", .{rt}) catch
+        const empty_dir = std.fmt.bufPrintSentinel(&empty_buf, "{s}/tree-empty", .{rt}, 0) catch
             return "building the empty-folder path failed";
         if (c.mkdir(empty_dir.ptr, 0o700) != 0) return "creating the empty folder for real tree-key coverage failed";
         if (focusNewBrowserTab(allocator, app, sock_path, empty_dir)) |err| return err;
@@ -3173,7 +3173,7 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     while (ctries < 60) : (ctries += 1) {
         pumpFor(app, 100);
         var pbuf: [512:0]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch break;
+        const p = std.fmt.bufPrintSentinel(&pbuf, "{s}/sketerm/config.conf", .{rt}, 0) catch break;
         if (readFileAlloc(allocator, p)) |body| {
             defer allocator.free(body);
             if (std.mem.indexOf(u8, body, "tab_sidebar_width = ") != null) {
@@ -3199,7 +3199,7 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     // expect it (step 1 of configReloadStage is the CREATE path).
     if (!had_config) {
         var pbuf: [512:0]u8 = undefined;
-        if (std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch null) |p|
+        if (std.fmt.bufPrintSentinel(&pbuf, "{s}/sketerm/config.conf", .{rt}, 0) catch null) |p|
             _ = c.unlink(p.ptr);
     }
     _ = tabs_before;
@@ -3601,7 +3601,7 @@ fn watchAlongStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: 
         defer allocator.free(opened);
         const origin = parseNumAfter(opened, "\"pane\":") orelse return "the attach origin pane has no id";
         var pane_env: [16:0]u8 = undefined;
-        _ = std.fmt.bufPrintZ(&pane_env, "{d}", .{origin}) catch return "pane env";
+        _ = std.fmt.bufPrintSentinel(&pane_env, "{d}", .{origin}, 0) catch return "pane env";
         _ = c.setenv("SKETERM_PANE_ID", &pane_env, 1);
 
         const before = listedPaneIds(allocator, sock_path) orelse return "listing panes before mux attach failed";
@@ -3802,7 +3802,7 @@ fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
     // The fixture: the image viewer on a solid magenta picture, its own
     // app identity so it cannot join the GUI under test.
     var img_buf: [512:0]u8 = undefined;
-    const img_path = std.fmt.bufPrintZ(&img_buf, "{s}/chip-fixture.png", .{g_rt}) catch return "fixture image path";
+    const img_path = std.fmt.bufPrintSentinel(&img_buf, "{s}/chip-fixture.png", .{g_rt}, 0) catch return "fixture image path";
     if (!writeSolidPng(allocator, img_path.ptr, 0xff, 0x00, 0xff)) return "could not write the fixture image";
     var bin_buf: [4096]u8 = undefined;
     const bin = c.realpath(bindir.path(.sketerm), &bin_buf) orelse return "could not resolve the sketerm under test";
@@ -3819,7 +3819,7 @@ fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
     // opens with "app N", which is the same fact.
     const app_id = mcpNum(opened, "app") orelse parseNumAfter(opened, "\"text\":\"app ") orelse {
         var f_buf: [128:0]u8 = undefined;
-        if (std.fmt.bufPrintZ(&f_buf, "zig-out/smoke-e2e-launch-reply.txt", .{}) catch null) |fp| _ = writeFile(fp, opened);
+        if (std.fmt.bufPrintSentinel(&f_buf, "zig-out/smoke-e2e-launch-reply.txt", .{}, 0) catch null) |fp| _ = writeFile(fp, opened);
         return whyf("launch_app named no app id (reply in zig-out/smoke-e2e-launch-reply.txt): {s}", .{opened[0..@min(opened.len, 300)]});
     };
     if (mcpHas(opened, "isError"))
@@ -4119,7 +4119,7 @@ fn assistantLocalTermStage(allocator: std.mem.Allocator, app: *appdrive.App, soc
         keep_n = listPaneIds(r, &keep_ids);
     }
     var log_buf: [512:0]u8 = undefined;
-    const log_path = std.fmt.bufPrintZ(&log_buf, "{s}/agent-local.log", .{rt}) catch return "log path";
+    const log_path = std.fmt.bufPrintSentinel(&log_buf, "{s}/agent-local.log", .{rt}, 0) catch return "log path";
     var self_buf: [4096]u8 = undefined;
     const self_exe = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath("/proc/self/exe", &self_buf) orelse return "realpath of the rig binary")));
     var m = spawnIsolatedMcp(allocator, log_path.ptr) orelse return "could not spawn an isolated `sketerm mcp`";
@@ -4211,7 +4211,7 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
 
     // The page: red, and a trusted click turns it lime and renames it.
     var page_buf: [512:0]u8 = undefined;
-    const page = std.fmt.bufPrintZ(&page_buf, "{s}/watch-page.html", .{rt}) catch return "watch page path";
+    const page = std.fmt.bufPrintSentinel(&page_buf, "{s}/watch-page.html", .{rt}, 0) catch return "watch page path";
     if (!writeFile(page, "<html><head><title>watch:red</title><style>html,body{margin:0;min-height:100vh;background:red}</style></head>" ++
         "<body onclick=\"document.body.style.background='lime';document.title='watch:clicked:'+event.clientX+':'+event.clientY+':'+innerWidth+':'+innerHeight\">watch</body></html>"))
         return "could not write the watch page";
@@ -4528,23 +4528,23 @@ const web_action_popup =
 
 fn prepareWebActionFixture(allocator: std.mem.Allocator, rt: [:0]const u8) bool {
     var base_buf: [512:0]u8 = undefined;
-    const base = std.fmt.bufPrintZ(&base_buf, "{s}/sketerm/webext", .{rt}) catch return false;
+    const base = std.fmt.bufPrintSentinel(&base_buf, "{s}/sketerm/webext", .{rt}, 0) catch return false;
     mkdirAllPath(base);
     var ext_buf: [640:0]u8 = undefined;
-    const ext = std.fmt.bufPrintZ(&ext_buf, "{s}/fixture", .{base}) catch return false;
+    const ext = std.fmt.bufPrintSentinel(&ext_buf, "{s}/fixture", .{base}, 0) catch return false;
     mkdirAllPath(ext);
     var path_buf: [768:0]u8 = undefined;
-    const manifest_path = std.fmt.bufPrintZ(&path_buf, "{s}/manifest.json", .{ext}) catch return false;
+    const manifest_path = std.fmt.bufPrintSentinel(&path_buf, "{s}/manifest.json", .{ext}, 0) catch return false;
     if (!writeFile(manifest_path, web_action_manifest)) return false;
-    const bg_path = std.fmt.bufPrintZ(&path_buf, "{s}/bg.js", .{ext}) catch return false;
+    const bg_path = std.fmt.bufPrintSentinel(&path_buf, "{s}/bg.js", .{ext}, 0) catch return false;
     if (!writeFile(bg_path, web_action_bg)) return false;
-    const popup_path = std.fmt.bufPrintZ(&path_buf, "{s}/popup.html", .{ext}) catch return false;
+    const popup_path = std.fmt.bufPrintSentinel(&path_buf, "{s}/popup.html", .{ext}, 0) catch return false;
     if (!writeFile(popup_path, web_action_popup)) return false;
-    const blue_path = std.fmt.bufPrintZ(&path_buf, "{s}/blue.png", .{ext}) catch return false;
+    const blue_path = std.fmt.bufPrintSentinel(&path_buf, "{s}/blue.png", .{ext}, 0) catch return false;
     if (!writeSolidPng(allocator, blue_path.ptr, 0x20, 0x60, 0xff)) return false;
-    const orange_path = std.fmt.bufPrintZ(&path_buf, "{s}/orange.png", .{ext}) catch return false;
+    const orange_path = std.fmt.bufPrintSentinel(&path_buf, "{s}/orange.png", .{ext}, 0) catch return false;
     if (!writeSolidPng(allocator, orange_path.ptr, 0xff, 0x70, 0x10)) return false;
-    const registry_path = std.fmt.bufPrintZ(&path_buf, "{s}/registry.json", .{base}) catch return false;
+    const registry_path = std.fmt.bufPrintSentinel(&path_buf, "{s}/registry.json", .{base}, 0) catch return false;
     var registry_buf: [1024]u8 = undefined;
     const registry = std.fmt.bufPrint(&registry_buf, "[{{\"id\":\"{s}\",\"dir\":\"{s}\",\"enabled\":true,\"owned\":false}}]", .{ web_action_id, ext }) catch return false;
     return writeFile(registry_path, registry);
@@ -4865,13 +4865,13 @@ fn helperPidOf(gui_pid: c.pid_t) ?c.pid_t {
         const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
         const pid = std.fmt.parseInt(c.pid_t, name, 10) catch continue;
         var path_buf: [96:0]u8 = undefined;
-        const status_path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/status", .{pid}) catch continue;
+        const status_path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/status", .{pid}, 0) catch continue;
         const status = readFileAlloc(g_alloc, status_path) orelse continue;
         defer g_alloc.free(status);
         var needle_buf: [32]u8 = undefined;
         const needle = std.fmt.bufPrint(&needle_buf, "PPid:\t{d}\n", .{gui_pid}) catch continue;
         if (std.mem.indexOf(u8, status, needle) == null) continue;
-        const cmd_path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/cmdline", .{pid}) catch continue;
+        const cmd_path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/cmdline", .{pid}, 0) catch continue;
         const cmd = readFileAlloc(g_alloc, cmd_path) orelse continue;
         defer g_alloc.free(cmd);
         if (std.mem.indexOf(u8, cmd, "sketerm-webengine") != null) return pid;
@@ -5069,7 +5069,7 @@ fn restoreStage(
     }
     if (!found) {
         var lay_buf: [512]u8 = undefined;
-        const lay = std.fmt.bufPrintZ(&lay_buf, "{s}/sketerm/last.json", .{rt}) catch return "layout path";
+        const lay = std.fmt.bufPrintSentinel(&lay_buf, "{s}/sketerm/last.json", .{rt}, 0) catch return "layout path";
         const f = c.fopen(lay.ptr, "rb");
         if (f) |fp| {
             var buf: [8192]u8 = undefined;
@@ -5379,7 +5379,7 @@ fn webRouteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]con
             const shot = app.screenshotPng(id, 1400, null, 0) catch continue;
             defer allocator.free(shot.png);
             var pbuf: [96:0]u8 = undefined;
-            const p = std.fmt.bufPrintZ(&pbuf, "/tmp/sketerm-e2e-route-fail-{d}.png", .{i}) catch continue;
+            const p = std.fmt.bufPrintSentinel(&pbuf, "/tmp/sketerm-e2e-route-fail-{d}.png", .{i}, 0) catch continue;
             writePng(p.ptr, shot.png);
         }
         return "the route page never painted its magenta body in any toplevel";
@@ -5636,7 +5636,7 @@ fn webPrivateStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]c
     if (!waitWebPaneTitled(allocator, sock, app, normal_pane, "e2e-pages", 30_000)) return "the ordinary tab's page never loaded";
 
     var path_buf: [512:0]u8 = undefined;
-    const history = std.fmt.bufPrintZ(&path_buf, "{s}/sketerm/web/history.jsonl", .{rt}) catch return "history path";
+    const history = std.fmt.bufPrintSentinel(&path_buf, "{s}/sketerm/web/history.jsonl", .{rt}, 0) catch return "history path";
     var recorded = false;
     {
         var waited: u32 = 0;
@@ -5783,7 +5783,7 @@ fn webRemotePrintStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [
     if (!webPaneTitled(allocator, sock, pane, "\"route\":\"on:localhost\"")) return "the on: tab does not report route on:localhost";
 
     var out_buf: [256:0]u8 = undefined;
-    const out = std.fmt.bufPrintZ(&out_buf, "{s}/e2e-remote-print.pdf", .{rt}) catch return "pdf path";
+    const out = std.fmt.bufPrintSentinel(&out_buf, "{s}/e2e-remote-print.pdf", .{rt}, 0) catch return "pdf path";
     _ = c.unlink(out.ptr);
     var known_buf: [16]u32 = undefined;
     const known = known_buf[0..knownToplevels(app, &known_buf)];
@@ -5833,7 +5833,7 @@ fn webRemotePrintStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [
 /// Connections the fake ssh has carried to the fake remote host so far.
 fn sshDials(allocator: std.mem.Allocator, rt: [:0]const u8) usize {
     var path_buf: [320:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/ssh-dials", .{rt}) catch return 0;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/ssh-dials", .{rt}, 0) catch return 0;
     const body = readFileAlloc(allocator, path) orelse return 0;
     defer allocator.free(body);
     return std.mem.count(u8, body, "\n");
@@ -5842,7 +5842,7 @@ fn sshDials(allocator: std.mem.Allocator, rt: [:0]const u8) usize {
 /// Prints the fake ssh's dial lines (time, argv) after the first `skip`; the dialer double-forks, so no caller is named.
 fn dumpSshDials(allocator: std.mem.Allocator, rt: [:0]const u8, skip: usize) void {
     var path_buf: [320:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/ssh-dials", .{rt}) catch return;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/ssh-dials", .{rt}, 0) catch return;
     const body = readFileAlloc(allocator, path) orelse return;
     defer allocator.free(body);
     var it = std.mem.splitScalar(u8, body, '\n');
@@ -5860,13 +5860,13 @@ fn dumpSshDials(allocator: std.mem.Allocator, rt: [:0]const u8, skip: usize) voi
 fn remoteDownloadStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, rt: [:0]const u8) ?[]const u8 {
     const BYTES = "REMOTE-DOWNLOAD-BYTES\n";
     var src_dir_buf: [300:0]u8 = undefined;
-    const src_dir = std.fmt.bufPrintZ(&src_dir_buf, "{s}/dlsrc", .{rt}) catch return "download source dir";
+    const src_dir = std.fmt.bufPrintSentinel(&src_dir_buf, "{s}/dlsrc", .{rt}, 0) catch return "download source dir";
     _ = c.mkdir(src_dir.ptr, 0o700);
     var src_buf: [320:0]u8 = undefined;
-    const src = std.fmt.bufPrintZ(&src_buf, "{s}/e2e-remote-dl.txt", .{src_dir}) catch return "download source path";
+    const src = std.fmt.bufPrintSentinel(&src_buf, "{s}/e2e-remote-dl.txt", .{src_dir}, 0) catch return "download source path";
     if (!writeFile(src, BYTES)) return "could not write the remote download source";
     var dest_buf: [320:0]u8 = undefined;
-    const dest = std.fmt.bufPrintZ(&dest_buf, "{s}/dl/e2e-remote-dl.txt", .{rt}) catch return "download dest path";
+    const dest = std.fmt.bufPrintSentinel(&dest_buf, "{s}/dl/e2e-remote-dl.txt", .{rt}, 0) catch return "download dest path";
     _ = c.unlink(dest.ptr);
 
     const opened = roundtrip(allocator, sock, "{\"cmd\":\"new-durable-tab\",\"host\":\"ssh:localhost\"}\n") orelse return "opening a remote session tab failed";
@@ -5975,7 +5975,7 @@ fn routedHelperBehindLoopbackProxy(pid: c.pid_t, slug_prefix: []const u8) bool {
         const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
         if (name.len == 0 or name[0] < '0' or name[0] > '9') continue;
         var pbuf: [64:0]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&pbuf, "/proc/{s}/cmdline", .{name}) catch continue;
+        const p = std.fmt.bufPrintSentinel(&pbuf, "/proc/{s}/cmdline", .{name}, 0) catch continue;
         const f = c.fopen(p.ptr, "rb") orelse continue;
         var buf: [8192]u8 = undefined;
         const n = c.fread(&buf, 1, buf.len, f);
@@ -5991,7 +5991,7 @@ fn routedHelperBehindLoopbackProxy(pid: c.pid_t, slug_prefix: []const u8) bool {
 /// helper socket naming of `webface.zig`'s `Client.socketPath`.
 fn routedHelperSocketExists(rt: [:0]const u8, pid: c.pid_t, slug_prefix: []const u8) bool {
     var dir_buf: [300:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm", .{rt}) catch return false;
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/sketerm", .{rt}, 0) catch return false;
     const d = c.opendir(dir.ptr) orelse return false;
     defer _ = c.closedir(d);
     var want_buf: [64]u8 = undefined;
@@ -6262,7 +6262,7 @@ fn webManagersStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     app.pressKey(mid, "Return") catch return "pressing Return in the Filter Lists entry failed";
 
     var pbuf: [512:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch return "config path";
+    const path = std.fmt.bufPrintSentinel(&pbuf, "{s}/sketerm/config.conf", .{rt}, 0) catch return "config path";
     var found = false;
     tries = 0;
     while (tries < 60 and !found) : (tries += 1) {
@@ -6329,7 +6329,7 @@ fn motionTrainerStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
     // The CLI entry point opens the window as its own application.
     {
         var id_buf: [96:0]u8 = undefined;
-        const app_id = std.fmt.bufPrintZ(&id_buf, "dev.sker.sketerm.e2e.motion.p{d}", .{c.getpid()}) catch return "motion app id";
+        const app_id = std.fmt.bufPrintSentinel(&id_buf, "dev.sker.sketerm.e2e.motion.p{d}", .{c.getpid()}, 0) catch return "motion app id";
         const pid = spawnSketermChild(app_id, wl, &.{ "motion", "record", "--name", "clipack" });
         if (pid <= 0) return "could not start sketerm motion record";
         defer {
@@ -6359,7 +6359,7 @@ fn motionTrainerStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
 
         app.pressKey(win, "ctrl+s") catch return "pressing Ctrl+S in the trainer failed";
         var dir_buf: [512:0]u8 = undefined;
-        const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm/motion-packs", .{rt}) catch return "packs dir";
+        const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/sketerm/motion-packs", .{rt}, 0) catch return "packs dir";
         var found: ?[]u8 = null;
         defer if (found) |f| allocator.free(f);
         var waited: u32 = 0;
@@ -6877,7 +6877,7 @@ fn waitPopup(app: *appdrive.App, want_open: bool, ms: u32) ?u32 {
 /// The preload only observes GTK properties on the main loop; it changes no widget state.
 fn prepareOffloadProbe(rt: []const u8, library: [:0]const u8) bool {
     var source_buf: [512:0]u8 = undefined;
-    const source = std.fmt.bufPrintZ(&source_buf, "{s}/offload-probe.c", .{rt}) catch return false;
+    const source = std.fmt.bufPrintSentinel(&source_buf, "{s}/offload-probe.c", .{rt}, 0) catch return false;
     if (!writeFile(source,
         \\#include <gtk/gtk.h>
         \\#include <stdio.h>
@@ -6925,15 +6925,15 @@ fn prepareOffloadProbe(rt: []const u8, library: [:0]const u8) bool {
         \\
     )) return false;
     var command_buf: [1400:0]u8 = undefined;
-    const command = std.fmt.bufPrintZ(&command_buf, "cc -shared -fPIC -O2 '{s}' -o '{s}' $(pkg-config --cflags --libs gtk4)", .{ source, library }) catch return false;
+    const command = std.fmt.bufPrintSentinel(&command_buf, "cc -shared -fPIC -O2 '{s}' -o '{s}' $(pkg-config --cflags --libs gtk4)", .{ source, library }, 0) catch return false;
     return c.system(command.ptr) == 0;
 }
 
 fn expectOffload(allocator: std.mem.Allocator, app: *appdrive.App, mapped: u32, min_hidden: u32) ?[]const u8 {
     var req_buf: [512:0]u8 = undefined;
     var result_buf: [512:0]u8 = undefined;
-    const request = std.fmt.bufPrintZ(&req_buf, "{s}/offload-request", .{g_rt}) catch return "offload request path";
-    const result = std.fmt.bufPrintZ(&result_buf, "{s}/offload-result", .{g_rt}) catch return "offload result path";
+    const request = std.fmt.bufPrintSentinel(&req_buf, "{s}/offload-request", .{g_rt}, 0) catch return "offload request path";
+    const result = std.fmt.bufPrintSentinel(&result_buf, "{s}/offload-result", .{g_rt}, 0) catch return "offload result path";
     _ = allocator;
     var counts: [4]c_uint = @splat(0);
     const deadline = clock.nowMs() + 10_000;
@@ -7100,7 +7100,7 @@ fn killSessionMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_p
     };
     const images = c.getenv("SKETERM_SMOKE_E2E_KILL_IMAGES") != null;
     var image_script_buf: [512:0]u8 = undefined;
-    const image_script = std.fmt.bufPrintZ(&image_script_buf, "{s}/kill-images.sh", .{g_rt}) catch return "Kill Session: image script path";
+    const image_script = std.fmt.bufPrintSentinel(&image_script_buf, "{s}/kill-images.sh", .{g_rt}, 0) catch return "Kill Session: image script path";
     if (images) {
         for (0..2) |phase| {
             var stream: std.ArrayList(u8) = .empty;
@@ -7118,7 +7118,7 @@ fn killSessionMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_p
                 stream.appendSlice(allocator, sequence) catch return "Kill Session: image stream allocation";
             }
             var path_buf: [512:0]u8 = undefined;
-            const path = std.fmt.bufPrintZ(&path_buf, "{s}/kill-images-{d}.bin", .{ g_rt, phase }) catch return "Kill Session: image stream path";
+            const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/kill-images-{d}.bin", .{ g_rt, phase }, 0) catch return "Kill Session: image stream path";
             if (!writeFile(path, stream.items)) return "Kill Session: image stream write";
         }
         const script = std.fmt.allocPrint(allocator,
@@ -7194,7 +7194,7 @@ fn killSessionMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_p
         var proxy_pid: c.pid_t = 0;
         if (transport == .ssh or transport == .auto) {
             var proxy_path_buf: [512:0]u8 = undefined;
-            const proxy_path = std.fmt.bufPrintZ(&proxy_path_buf, "{s}/ssh-child-{s}", .{ g_rt, g_app_id }) catch return "Kill Session: proxy proof path";
+            const proxy_path = std.fmt.bufPrintSentinel(&proxy_path_buf, "{s}/ssh-child-{s}", .{ g_rt, g_app_id }, 0) catch return "Kill Session: proxy proof path";
             const f = c.fopen(proxy_path.ptr, "r") orelse return "Kill Session: GUI did not execute fake SSH child";
             const scanned = c.fscanf(f, "%d", &proxy_pid);
             _ = c.fclose(f);
@@ -7608,7 +7608,7 @@ fn castPlaybackStage(
     // green block only printable on the post-resize grid, a marker,
     // and a blue block at 30s.
     var cast_path_buf: [512:0]u8 = undefined;
-    const cast_path = std.fmt.bufPrintZ(&cast_path_buf, "{s}/e2e.cast", .{rt}) catch return "cast path too long";
+    const cast_path = std.fmt.bufPrintSentinel(&cast_path_buf, "{s}/e2e.cast", .{rt}, 0) catch return "cast path too long";
     {
         const body =
             "{\"version\": 2, \"width\": 40, \"height\": 10}\n" ++
@@ -7963,7 +7963,7 @@ fn procDiag(pid: c.pid_t, label: [*:0]const u8) void {
     var path_buf: [64:0]u8 = undefined;
     var i: u32 = 0;
     while (i < 2) : (i += 1) {
-        const stat_path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/stat", .{pid}) catch return;
+        const stat_path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/stat", .{pid}, 0) catch return;
         var buf: [1024]u8 = undefined;
         var n: usize = 0;
         if (c.fopen(stat_path.ptr, "rb")) |f| {
@@ -7972,7 +7972,7 @@ fn procDiag(pid: c.pid_t, label: [*:0]const u8) void {
         }
         var wbuf: [128]u8 = undefined;
         var wn: usize = 0;
-        const wchan_path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/wchan", .{pid}) catch return;
+        const wchan_path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/wchan", .{pid}, 0) catch return;
         if (c.fopen(wchan_path.ptr, "rb")) |f| {
             wn = c.fread(&wbuf, 1, wbuf.len - 1, f);
             _ = c.fclose(f);
@@ -8006,7 +8006,7 @@ fn focusDiag(app: *appdrive.App, win_id: u32, label: [*:0]const u8) void {
 /// so a failure can be read against what the hub saw.
 fn keepMuxLog(rt: []const u8) void {
     var src_buf: [512:0]u8 = undefined;
-    const src = std.fmt.bufPrintZ(&src_buf, "{s}/sketerm/mux.log", .{rt}) catch return;
+    const src = std.fmt.bufPrintSentinel(&src_buf, "{s}/sketerm/mux.log", .{rt}, 0) catch return;
     const in = c.fopen(src.ptr, "rb") orelse return;
     defer _ = c.fclose(in);
     const out = c.fopen("/tmp/sketerm-e2e-mux-fail.log", "wb") orelse return;
@@ -8056,7 +8056,7 @@ fn viewerWhy(expected: []const u8) []const u8 {
 /// covers the frames it managed to grab).
 fn viewerShot(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, tag: [*:0]const u8) void {
     var path_buf: [256:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-e2e-viewer-{s}.png", .{std.mem.span(tag)}) catch return;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-e2e-viewer-{s}.png", .{std.mem.span(tag)}, 0) catch return;
     const shot = app.screenshotPng(win_id, 1024, null, 0) catch return;
     defer allocator.free(shot.png);
     writePng(path, shot.png);
@@ -8088,15 +8088,15 @@ fn filesReuseStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]c
     }
     if (remote_mux_pid <= 0) return "files reuse: the fake-SSH daemon is not running";
     var dir_buf: [512:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/freuse", .{rt}) catch return "files reuse: dir path";
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/freuse", .{rt}, 0) catch return "files reuse: dir path";
     _ = c.mkdir(dir.ptr, 0o700);
     var sub_buf: [540:0]u8 = undefined;
-    const sub = std.fmt.bufPrintZ(&sub_buf, "{s}/sub", .{dir}) catch return "files reuse: sub path";
+    const sub = std.fmt.bufPrintSentinel(&sub_buf, "{s}/sub", .{dir}, 0) catch return "files reuse: sub path";
     _ = c.mkdir(sub.ptr, 0o700);
     var seed_buf: [600:0]u8 = undefined;
-    if (!writeFile(std.fmt.bufPrintZ(&seed_buf, "{s}/firstentry.txt", .{dir}) catch return "files reuse: seed", "1\n"))
+    if (!writeFile(std.fmt.bufPrintSentinel(&seed_buf, "{s}/firstentry.txt", .{dir}, 0) catch return "files reuse: seed", "1\n"))
         return "files reuse: seed first";
-    if (!writeFile(std.fmt.bufPrintZ(&seed_buf, "{s}/secondentry.txt", .{sub}) catch return "files reuse: seed", "2\n"))
+    if (!writeFile(std.fmt.bufPrintSentinel(&seed_buf, "{s}/secondentry.txt", .{sub}, 0) catch return "files reuse: seed", "2\n"))
         return "files reuse: seed second";
 
     var panes: [2]u32 = .{ 0, 0 };
@@ -8144,16 +8144,16 @@ fn viewerReuseStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: [:0]co
     }
     if (remote_mux_pid <= 0) return "viewer reuse: the fake-SSH daemon is not running";
     var dir_buf: [512:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/vreuse", .{rt}) catch return "viewer reuse: dir path";
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/vreuse", .{rt}, 0) catch return "viewer reuse: dir path";
     _ = c.mkdir(dir.ptr, 0o700);
     const words = [_][]const u8{ "ALPHAWORD", "BRAVOWORD", "CHARLIEWORD" };
     var specs: [3][600:0]u8 = undefined;
     for (words, 0..) |word, i| {
         var p: [600:0]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&p, "{s}/{d}.txt", .{ dir, i }) catch return "viewer reuse: path";
+        const path = std.fmt.bufPrintSentinel(&p, "{s}/{d}.txt", .{ dir, i }, 0) catch return "viewer reuse: path";
         var body: [64]u8 = undefined;
         if (!writeFile(path, std.fmt.bufPrint(&body, "{s}\n", .{word}) catch unreachable)) return "viewer reuse: seed";
-        _ = std.fmt.bufPrintZ(&specs[i], "localhost:{s}", .{path}) catch return "viewer reuse: spec";
+        _ = std.fmt.bufPrintSentinel(&specs[i], "localhost:{s}", .{path}, 0) catch return "viewer reuse: spec";
     }
 
     _ = app.drainLive(2_000);
@@ -8241,7 +8241,7 @@ fn viewerCastStage(
     // The cast half: red+green early, a blue guard event at 30s so
     // normal playback never changes the asserted pixels mid-stage.
     var cast_path_buf: [512:0]u8 = undefined;
-    const cast_path = std.fmt.bufPrintZ(&cast_path_buf, "{s}/viewer-e2e.cast", .{rt}) catch return "cast path too long";
+    const cast_path = std.fmt.bufPrintSentinel(&cast_path_buf, "{s}/viewer-e2e.cast", .{rt}, 0) catch return "cast path too long";
     {
         const body =
             "{\"version\": 2, \"width\": 40, \"height\": 10}\n" ++
@@ -8258,7 +8258,7 @@ fn viewerCastStage(
     // Distinct tokens (QUILL vs HEXPROOF) so one item's screen can
     // never satisfy the other's OCR assertion.
     var txt_path_buf: [512:0]u8 = undefined;
-    const txt_path = std.fmt.bufPrintZ(&txt_path_buf, "{s}/viewer-e2e-note.txt", .{rt}) catch return "text path too long";
+    const txt_path = std.fmt.bufPrintSentinel(&txt_path_buf, "{s}/viewer-e2e-note.txt", .{rt}, 0) catch return "text path too long";
     {
         const body = repeat("SKETERM VIEWER TEXTMODE QUILL\n", 12);
         const f = c.fopen(txt_path.ptr, "wb") orelse return "could not write the text file";
@@ -8267,7 +8267,7 @@ fn viewerCastStage(
         if (!ok) return "short write on the text file";
     }
     var bin_path_buf: [512:0]u8 = undefined;
-    const bin_path = std.fmt.bufPrintZ(&bin_path_buf, "{s}/viewer-e2e-data.bin", .{rt}) catch return "binary path too long";
+    const bin_path = std.fmt.bufPrintSentinel(&bin_path_buf, "{s}/viewer-e2e-data.bin", .{rt}, 0) catch return "binary path too long";
     {
         // NULs trip the binary classifier; HEXPROOF lands in the hex
         // dump's ASCII gutter.
@@ -8283,7 +8283,7 @@ fn viewerCastStage(
     // shows). Playback and the poster fallback both paint it, so the
     // assertion holds with or without GStreamer decoders on the host.
     var vid_path_buf: [512:0]u8 = undefined;
-    const vid_path = std.fmt.bufPrintZ(&vid_path_buf, "{s}/viewer-e2e-clip.mp4", .{rt}) catch return "video path too long";
+    const vid_path = std.fmt.bufPrintSentinel(&vid_path_buf, "{s}/viewer-e2e-clip.mp4", .{rt}, 0) catch return "video path too long";
     const have_video = blk: {
         const fpid = c.fork();
         if (fpid < 0) break :blk false;
@@ -8601,7 +8601,7 @@ fn launchRenameFiles(
     }
 
     var app_id_buf: [128:0]u8 = undefined;
-    const app_id = std.fmt.bufPrintZ(&app_id_buf, "dev.sker.sketerm.e2erename{s}", .{tag}) catch return null;
+    const app_id = std.fmt.bufPrintSentinel(&app_id_buf, "dev.sker.sketerm.e2erename{s}", .{tag}, 0) catch return null;
     const pid = c.fork();
     if (pid < 0) return null;
     if (pid == 0) {
@@ -8703,13 +8703,13 @@ fn findRenameControlSocket(
     out: *[512:0]u8,
 ) ?[:0]u8 {
     var dir_buf: [512:0]u8 = undefined;
-    const dir_path = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm", .{rt}) catch return null;
+    const dir_path = std.fmt.bufPrintSentinel(&dir_buf, "{s}/sketerm", .{rt}, 0) catch return null;
     const dir = c.opendir(dir_path.ptr) orelse return null;
     defer _ = c.closedir(dir);
     while (c.readdir(dir)) |ent| {
         const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
         if (!std.mem.endsWith(u8, name, ".sock") or std.mem.eql(u8, name, "mux.sock")) continue;
-        const candidate = std.fmt.bufPrintZ(out, "{s}/sketerm/{s}", .{ rt, name }) catch continue;
+        const candidate = std.fmt.bufPrintSentinel(out, "{s}/sketerm/{s}", .{ rt, name }, 0) catch continue;
         if (std.mem.eql(u8, candidate, main_sock)) continue;
         const probe = roundtrip(allocator, candidate, "{\"cmd\":\"list\"}\n") orelse continue;
         defer allocator.free(probe);
@@ -8737,7 +8737,7 @@ fn secondGuiBrowserStage(
     if (!doc.start()) return "the two-GUI document server did not start";
     defer doc.stop();
     var url_buf: [128:0]u8 = undefined;
-    const url = std.fmt.bufPrintZ(&url_buf, "http://127.0.0.1:{d}/", .{doc.lis.port}) catch return "two-GUI url";
+    const url = std.fmt.bufPrintSentinel(&url_buf, "http://127.0.0.1:{d}/", .{doc.lis.port}, 0) catch return "two-GUI url";
 
     // The FIRST window browses, so its helper owns the profile.
     var req_buf: [512]u8 = undefined;
@@ -8886,7 +8886,7 @@ fn ocrCountScaled(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32,
 /// same private dirs, so the reconnecting tab lands on the same paths.
 fn respawnRemoteMux(rt: []const u8) bool {
     var rrt_buf: [256]u8 = undefined;
-    const rrt = std.fmt.bufPrintZ(&rrt_buf, "{s}/r", .{rt}) catch return false;
+    const rrt = std.fmt.bufPrintSentinel(&rrt_buf, "{s}/r", .{rt}, 0) catch return false;
     const pid = c.fork();
     if (pid < 0) return false;
     if (pid == 0) {
@@ -8901,7 +8901,7 @@ fn respawnRemoteMux(rt: []const u8) bool {
     }
     remote_mux_pid = pid;
     var rsock_buf: [512]u8 = undefined;
-    const rsock = std.fmt.bufPrintZ(&rsock_buf, "{s}/sketerm/mux.sock", .{rrt}) catch return false;
+    const rsock = std.fmt.bufPrintSentinel(&rsock_buf, "{s}/sketerm/mux.sock", .{rrt}, 0) catch return false;
     var waited: u32 = 0;
     while (c.access(rsock.ptr, c.F_OK) != 0) {
         _ = c.usleep(50_000);
@@ -8936,10 +8936,10 @@ fn filesMountBypassStage(
     var dirs: [3][512:0]u8 = undefined;
     const names = [_][]const u8{ "byexport", "bymis", "byunr" };
     for (names, 0..) |name, i| {
-        const d = std.fmt.bufPrintZ(&dirs[i], "{s}/{s}", .{ rt, name }) catch return "files bypass: dir path";
+        const d = std.fmt.bufPrintSentinel(&dirs[i], "{s}/{s}", .{ rt, name }, 0) catch return "files bypass: dir path";
         _ = c.mkdir(d.ptr, 0o700);
         var p: [560:0]u8 = undefined;
-        const z = std.fmt.bufPrintZ(&p, "{s}/BYPASSROW", .{d}) catch return "files bypass: seed path";
+        const z = std.fmt.bufPrintSentinel(&p, "{s}/BYPASSROW", .{d}, 0) catch return "files bypass: seed path";
         const fd = c.open(z.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
         if (fd < 0) return "files bypass: seed create";
         _ = c.close(fd);
@@ -8952,7 +8952,7 @@ fn filesMountBypassStage(
         if (c.utimes(&dirs[1], &times) != 0) return "files bypass: utimes";
     }
     var table_buf: [512:0]u8 = undefined;
-    const table = std.fmt.bufPrintZ(&table_buf, "{s}/mounts.tbl", .{rt}) catch return "files bypass: table path";
+    const table = std.fmt.bufPrintSentinel(&table_buf, "{s}/mounts.tbl", .{rt}, 0) catch return "files bypass: table path";
     {
         var body_buf: [2048]u8 = undefined;
         const body = std.fmt.bufPrint(&body_buf,
@@ -9028,17 +9028,17 @@ fn filesReconnectStage(
     if (remote_mux_pid <= 0) return "files reconnect: the fake-SSH daemon is not running";
 
     var dir_buf: [512:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/reconn", .{rt}) catch return "files reconnect: dir path";
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/reconn", .{rt}, 0) catch return "files reconnect: dir path";
     _ = c.mkdir(dir.ptr, 0o700);
     for ([_][]const u8{ "ALPHAROW", "BETAROW", "GAMMAROW" }) |name| {
         var p: [560:0]u8 = undefined;
-        const z = std.fmt.bufPrintZ(&p, "{s}/{s}", .{ dir, name }) catch return "files reconnect: seed path";
+        const z = std.fmt.bufPrintSentinel(&p, "{s}/{s}", .{ dir, name }, 0) catch return "files reconnect: seed path";
         const fd = c.open(z.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
         if (fd < 0) return "files reconnect: seed create";
         _ = c.close(fd);
     }
     var spec_buf: [560:0]u8 = undefined;
-    const spec = std.fmt.bufPrintZ(&spec_buf, "localhost:{s}", .{dir}) catch return "files reconnect: spec";
+    const spec = std.fmt.bufPrintSentinel(&spec_buf, "localhost:{s}", .{dir}, 0) catch return "files reconnect: spec";
     const child = launchRenameFiles(app, spec, "reconn", "", wl) orelse
         return "files reconnect: the remote Files window never appeared";
     defer if (renamefiles_pid > 0) reap(renamefiles_pid, c.SIGTERM, 3000);
@@ -9088,7 +9088,7 @@ fn filesReconnectStage(
     // Deltas ride the NEW subscription: a file created now must show.
     {
         var p: [560:0]u8 = undefined;
-        const z = std.fmt.bufPrintZ(&p, "{s}/DELTAROW", .{dir}) catch return "files reconnect: delta path";
+        const z = std.fmt.bufPrintSentinel(&p, "{s}/DELTAROW", .{dir}, 0) catch return "files reconnect: delta path";
         const fd = c.open(z.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
         if (fd < 0) return "files reconnect: delta create";
         _ = c.close(fd);
@@ -9220,22 +9220,22 @@ fn filesMutationSelectStage(
 
     // ── 1. created / renamed / pasted entries are selected ─────────
     var dir_buf: [512:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/selmut", .{rt}) catch return "files select: dir path";
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/selmut", .{rt}, 0) catch return "files select: dir path";
     _ = c.mkdir(dir.ptr, 0o700);
     var p_buf: [600:0]u8 = undefined;
-    const aaa = std.fmt.bufPrintZ(&p_buf, "{s}/AAAROW.txt", .{dir}) catch return "files select: seed path";
+    const aaa = std.fmt.bufPrintSentinel(&p_buf, "{s}/AAAROW.txt", .{dir}, 0) catch return "files select: seed path";
     if (!writeFile(aaa, "aaa\n")) return "files select: seed create";
     var sub_buf: [600:0]u8 = undefined;
-    const sub = std.fmt.bufPrintZ(&sub_buf, "{s}/SUBROW", .{dir}) catch return "files select: sub path";
+    const sub = std.fmt.bufPrintSentinel(&sub_buf, "{s}/SUBROW", .{dir}, 0) catch return "files select: sub path";
     _ = c.mkdir(sub.ptr, 0o700);
     var newdir_buf: [600:0]u8 = undefined;
-    const newdir = std.fmt.bufPrintZ(&newdir_buf, "{s}/NEWDIR", .{dir}) catch return "files select: newdir path";
+    const newdir = std.fmt.bufPrintSentinel(&newdir_buf, "{s}/NEWDIR", .{dir}, 0) catch return "files select: newdir path";
     var renamed_buf: [600:0]u8 = undefined;
-    const renamed = std.fmt.bufPrintZ(&renamed_buf, "{s}/RENAMED", .{dir}) catch return "files select: renamed path";
+    const renamed = std.fmt.bufPrintSentinel(&renamed_buf, "{s}/RENAMED", .{dir}, 0) catch return "files select: renamed path";
     var pasted_buf: [600:0]u8 = undefined;
-    const pasted = std.fmt.bufPrintZ(&pasted_buf, "{s}/SUBROW/RENAMED", .{dir}) catch return "files select: pasted path";
+    const pasted = std.fmt.bufPrintSentinel(&pasted_buf, "{s}/SUBROW/RENAMED", .{dir}, 0) catch return "files select: pasted path";
     var moved_buf: [600:0]u8 = undefined;
-    const moved = std.fmt.bufPrintZ(&moved_buf, "{s}/SUBROW/MOVED", .{dir}) catch return "files select: moved path";
+    const moved = std.fmt.bufPrintSentinel(&moved_buf, "{s}/SUBROW/MOVED", .{dir}, 0) catch return "files select: moved path";
 
     const child = launchRenameFiles(app, dir, "selmut", "", wl) orelse
         return "files select: the Files window never appeared";
@@ -9285,7 +9285,7 @@ fn filesMutationSelectStage(
     pumpRenameFor(app, 1_500);
     if (c.getenv("SKETERM_SMOKE_E2E_FILES_ICONS") != null) {
         var update_buf: [600:0]u8 = undefined;
-        const update = std.fmt.bufPrintZ(&update_buf, "{s}/ZZZUPDATE.txt", .{dir}) catch return "icon update path";
+        const update = std.fmt.bufPrintSentinel(&update_buf, "{s}/ZZZUPDATE.txt", .{dir}, 0) catch return "icon update path";
         if (!writeFile(update, "unrelated listing update\n")) return "icon update write";
         pumpRenameFor(app, 1_000);
     }
@@ -9342,13 +9342,13 @@ fn filesMutationSelectStage(
     // ── 2. Ctrl+C on a remote tab exports the path as text ─────────
     if (remote_mux_pid > 0) {
         var rdir_buf: [512:0]u8 = undefined;
-        const rdir = std.fmt.bufPrintZ(&rdir_buf, "{s}/selclip", .{rt}) catch return "files select: remote dir path";
+        const rdir = std.fmt.bufPrintSentinel(&rdir_buf, "{s}/selclip", .{rt}, 0) catch return "files select: remote dir path";
         _ = c.mkdir(rdir.ptr, 0o700);
         var rfile_buf: [600:0]u8 = undefined;
-        const rfile = std.fmt.bufPrintZ(&rfile_buf, "{s}/CLIPROW.txt", .{rdir}) catch return "files select: remote seed path";
+        const rfile = std.fmt.bufPrintSentinel(&rfile_buf, "{s}/CLIPROW.txt", .{rdir}, 0) catch return "files select: remote seed path";
         if (!writeFile(rfile, "clip\n")) return "files select: remote seed create";
         var spec_buf: [600:0]u8 = undefined;
-        const spec = std.fmt.bufPrintZ(&spec_buf, "localhost:{s}", .{rdir}) catch return "files select: remote spec";
+        const spec = std.fmt.bufPrintSentinel(&spec_buf, "localhost:{s}", .{rdir}, 0) catch return "files select: remote spec";
         const rchild = launchRenameFiles(app, spec, "selclip", "", wl) orelse
             return "files select: the remote Files window never appeared";
         if (!viewerWaitOcr(allocator, app, rchild.win, "CLIPROW", 40_000))
@@ -9383,7 +9383,7 @@ fn filesMutationSelectStage(
     // ── 3. a NUL past the probe window is still a text file ────────
     {
         var nul_buf: [600:0]u8 = undefined;
-        const nul_path = std.fmt.bufPrintZ(&nul_buf, "{s}/latenul.txt", .{rt}) catch return "files select: nul path";
+        const nul_path = std.fmt.bufPrintSentinel(&nul_buf, "{s}/latenul.txt", .{rt}, 0) catch return "files select: nul path";
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(allocator);
         body.appendSlice(allocator, "LATENUL-MARK\n") catch return "files select: oom";
@@ -9417,9 +9417,9 @@ fn filesMutationSelectStage(
         var f1_buf: [600:0]u8 = undefined;
         var f2_buf: [600:0]u8 = undefined;
         var f3_buf: [600:0]u8 = undefined;
-        const f1 = std.fmt.bufPrintZ(&f1_buf, "{s}/reuse1.txt", .{rt}) catch return "files select: reuse path";
-        const f2 = std.fmt.bufPrintZ(&f2_buf, "{s}/reuse2.txt", .{rt}) catch return "files select: reuse path";
-        const f3 = std.fmt.bufPrintZ(&f3_buf, "{s}/reuse3.txt", .{rt}) catch return "files select: reuse path";
+        const f1 = std.fmt.bufPrintSentinel(&f1_buf, "{s}/reuse1.txt", .{rt}, 0) catch return "files select: reuse path";
+        const f2 = std.fmt.bufPrintSentinel(&f2_buf, "{s}/reuse2.txt", .{rt}, 0) catch return "files select: reuse path";
+        const f3 = std.fmt.bufPrintSentinel(&f3_buf, "{s}/reuse3.txt", .{rt}, 0) catch return "files select: reuse path";
         if (!writeFile(f1, "REUSEONE\n") or !writeFile(f2, "REUSETWO\n") or !writeFile(f3, "REUSETHREE\n"))
             return "files select: reuse seed";
         _ = app.drainLive(2_000);
@@ -9565,26 +9565,26 @@ fn filesFeaturesStage(
         return null;
     }
     var dir_buf: [512:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/ffeat", .{rt}) catch return "files features: dir path";
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/ffeat", .{rt}, 0) catch return "files features: dir path";
     _ = c.mkdir(dir.ptr, 0o700);
     var p: [10][600:0]u8 = undefined;
-    const one = std.fmt.bufPrintZ(&p[0], "{s}/AAONE.txt", .{dir}) catch return "files features: path";
-    const two = std.fmt.bufPrintZ(&p[1], "{s}/AATWO.txt", .{dir}) catch return "files features: path";
-    const keep = std.fmt.bufPrintZ(&p[2], "{s}/ZKEEP.txt", .{dir}) catch return "files features: path";
-    const b_one = std.fmt.bufPrintZ(&p[3], "{s}/BBONE.txt", .{dir}) catch return "files features: path";
-    const b_two = std.fmt.bufPrintZ(&p[4], "{s}/BBTWO.txt", .{dir}) catch return "files features: path";
-    const stamped = std.fmt.bufPrintZ(&p[5], "{s}/STAMPED-AAONE.txt", .{dir}) catch return "files features: path";
-    const shell_mark = std.fmt.bufPrintZ(&p[6], "{s}/SHELLHERE", .{dir}) catch return "files features: path";
+    const one = std.fmt.bufPrintSentinel(&p[0], "{s}/AAONE.txt", .{dir}, 0) catch return "files features: path";
+    const two = std.fmt.bufPrintSentinel(&p[1], "{s}/AATWO.txt", .{dir}, 0) catch return "files features: path";
+    const keep = std.fmt.bufPrintSentinel(&p[2], "{s}/ZKEEP.txt", .{dir}, 0) catch return "files features: path";
+    const b_one = std.fmt.bufPrintSentinel(&p[3], "{s}/BBONE.txt", .{dir}, 0) catch return "files features: path";
+    const b_two = std.fmt.bufPrintSentinel(&p[4], "{s}/BBTWO.txt", .{dir}, 0) catch return "files features: path";
+    const stamped = std.fmt.bufPrintSentinel(&p[5], "{s}/STAMPED-AAONE.txt", .{dir}, 0) catch return "files features: path";
+    const shell_mark = std.fmt.bufPrintSentinel(&p[6], "{s}/SHELLHERE", .{dir}, 0) catch return "files features: path";
     if (!writeFile(one, "1\n") or !writeFile(two, "2\n") or !writeFile(keep, "k\n")) return "files features: seed";
 
     // User actions live in the (isolated) config home the GUI child
     // inherits. One applies to a single file and uses two tokens; the
     // other is directory-only and must NOT be offered on a file row.
     const cfg = std.mem.span(c.getenv("XDG_CONFIG_HOME") orelse return "files features: no isolated XDG_CONFIG_HOME");
-    const adir = std.fmt.bufPrintZ(&p[7], "{s}/sketerm/actions", .{cfg}) catch return "files features: path";
+    const adir = std.fmt.bufPrintSentinel(&p[7], "{s}/sketerm/actions", .{cfg}, 0) catch return "files features: path";
     @import("util/pathz.zig").makeDirs(adir, 0o700) catch return "files features: actions dir";
-    const stamp_file = std.fmt.bufPrintZ(&p[8], "{s}/stamp.action", .{adir}) catch return "files features: path";
-    const dironly_file = std.fmt.bufPrintZ(&p[9], "{s}/dironly.action", .{adir}) catch return "files features: path";
+    const stamp_file = std.fmt.bufPrintSentinel(&p[8], "{s}/stamp.action", .{adir}, 0) catch return "files features: path";
+    const dironly_file = std.fmt.bufPrintSentinel(&p[9], "{s}/dironly.action", .{adir}, 0) catch return "files features: path";
     if (!writeFile(stamp_file, "Name=Stamp Row\nExec=touch %d/STAMPED-%n\nKind=file\nSelection=single\n") or
         !writeFile(dironly_file, "Name=Folder Verb\nExec=true %f\nKind=dir\n"))
         return "files features: seed actions";
@@ -9668,7 +9668,7 @@ fn filesFeaturesStage(
     // another host or another tool would leave it): the search walks
     // the xattrs, it does not only consult an index.
     var tz: [600:0]u8 = undefined;
-    const two_z = std.fmt.bufPrintZ(&tz, "{s}", .{two}) catch return "files features: path";
+    const two_z = std.fmt.bufPrintSentinel(&tz, "{s}", .{two}, 0) catch return "files features: path";
     if (platform.lsetxattr(two_z, "user.sketerm.tags", "urgent,later")) {
         // The keyboard back on the listing (the action menu had it).
         _ = waitPopup(app, false, 5_000);
@@ -9819,15 +9819,15 @@ fn filesRemoteTrashStage(
     }
     if (remote_mux_pid <= 0) return "files remote trash: the fake-SSH daemon is not running";
     var p: [5][600:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&p[0], "{s}/rtr", .{rt}) catch return "files remote trash: path";
+    const dir = std.fmt.bufPrintSentinel(&p[0], "{s}/rtr", .{rt}, 0) catch return "files remote trash: path";
     _ = c.mkdir(dir.ptr, 0o700);
-    const victim = std.fmt.bufPrintZ(&p[1], "{s}/RTRASHME.txt", .{dir}) catch return "files remote trash: path";
-    const keep = std.fmt.bufPrintZ(&p[2], "{s}/ZSTAYS.txt", .{dir}) catch return "files remote trash: path";
-    const remote_trashed = std.fmt.bufPrintZ(&p[3], "{s}/r/Trash/files/RTRASHME.txt", .{rt}) catch return "files remote trash: path";
-    const local_trashed = std.fmt.bufPrintZ(&p[4], "{s}/Trash/files/RTRASHME.txt", .{rt}) catch return "files remote trash: path";
+    const victim = std.fmt.bufPrintSentinel(&p[1], "{s}/RTRASHME.txt", .{dir}, 0) catch return "files remote trash: path";
+    const keep = std.fmt.bufPrintSentinel(&p[2], "{s}/ZSTAYS.txt", .{dir}, 0) catch return "files remote trash: path";
+    const remote_trashed = std.fmt.bufPrintSentinel(&p[3], "{s}/r/Trash/files/RTRASHME.txt", .{rt}, 0) catch return "files remote trash: path";
+    const local_trashed = std.fmt.bufPrintSentinel(&p[4], "{s}/Trash/files/RTRASHME.txt", .{rt}, 0) catch return "files remote trash: path";
     if (!writeFile(victim, "remote\n") or !writeFile(keep, "stays\n")) return "files remote trash: seed";
     var spec_buf: [600:0]u8 = undefined;
-    const spec = std.fmt.bufPrintZ(&spec_buf, "localhost:{s}", .{dir}) catch return "files remote trash: spec";
+    const spec = std.fmt.bufPrintSentinel(&spec_buf, "localhost:{s}", .{dir}, 0) catch return "files remote trash: spec";
     const child = launchRenameFiles(app, spec, "rtrash", "", wl) orelse
         return "files remote trash: the remote Files window never appeared";
     defer if (renamefiles_pid > 0) reap(renamefiles_pid, c.SIGTERM, 3000);
@@ -9890,16 +9890,16 @@ fn filesTransfersStage(
         return null;
     }
     var p: [7][600:0]u8 = undefined;
-    const top = std.fmt.bufPrintZ(&p[0], "{s}/ftx", .{rt}) catch return "files transfers: path";
-    const src = std.fmt.bufPrintZ(&p[1], "{s}/SRCF", .{top}) catch return "files transfers: path";
-    const dst = std.fmt.bufPrintZ(&p[2], "{s}/DSTF", .{top}) catch return "files transfers: path";
+    const top = std.fmt.bufPrintSentinel(&p[0], "{s}/ftx", .{rt}, 0) catch return "files transfers: path";
+    const src = std.fmt.bufPrintSentinel(&p[1], "{s}/SRCF", .{top}, 0) catch return "files transfers: path";
+    const dst = std.fmt.bufPrintSentinel(&p[2], "{s}/DSTF", .{top}, 0) catch return "files transfers: path";
     _ = c.mkdir(top.ptr, 0o700);
     _ = c.mkdir(src.ptr, 0o700);
     _ = c.mkdir(dst.ptr, 0o700);
-    const s_pay = std.fmt.bufPrintZ(&p[3], "{s}/PAYLOAD.txt", .{src}) catch return "files transfers: path";
-    const s_skip = std.fmt.bufPrintZ(&p[4], "{s}/SKIPME.txt", .{src}) catch return "files transfers: path";
-    const d_pay = std.fmt.bufPrintZ(&p[5], "{s}/PAYLOAD.txt", .{dst}) catch return "files transfers: path";
-    const d_skip = std.fmt.bufPrintZ(&p[6], "{s}/SKIPME.txt", .{dst}) catch return "files transfers: path";
+    const s_pay = std.fmt.bufPrintSentinel(&p[3], "{s}/PAYLOAD.txt", .{src}, 0) catch return "files transfers: path";
+    const s_skip = std.fmt.bufPrintSentinel(&p[4], "{s}/SKIPME.txt", .{src}, 0) catch return "files transfers: path";
+    const d_pay = std.fmt.bufPrintSentinel(&p[5], "{s}/PAYLOAD.txt", .{dst}, 0) catch return "files transfers: path";
+    const d_skip = std.fmt.bufPrintSentinel(&p[6], "{s}/SKIPME.txt", .{dst}, 0) catch return "files transfers: path";
     if (!writeFile(s_pay, "new payload\n") or !writeFile(s_skip, "new skip\n") or
         !writeFile(d_pay, "old payload\n") or !writeFile(d_skip, "old skip\n"))
         return "files transfers: seed";
@@ -10074,19 +10074,19 @@ fn filesCompareSyncStage(
         return null;
     }
     var p: [9][600:0]u8 = undefined;
-    const top = std.fmt.bufPrintZ(&p[0], "{s}/fcmp", .{rt}) catch return "files compare: path";
-    const src = std.fmt.bufPrintZ(&p[1], "{s}/SRCDIR", .{top}) catch return "files compare: path";
-    const dst = std.fmt.bufPrintZ(&p[2], "{s}/TGTDIR", .{top}) catch return "files compare: path";
+    const top = std.fmt.bufPrintSentinel(&p[0], "{s}/fcmp", .{rt}, 0) catch return "files compare: path";
+    const src = std.fmt.bufPrintSentinel(&p[1], "{s}/SRCDIR", .{top}, 0) catch return "files compare: path";
+    const dst = std.fmt.bufPrintSentinel(&p[2], "{s}/TGTDIR", .{top}, 0) catch return "files compare: path";
     _ = c.mkdir(top.ptr, 0o700);
     _ = c.mkdir(src.ptr, 0o700);
     _ = c.mkdir(dst.ptr, 0o700);
-    const src_same = std.fmt.bufPrintZ(&p[3], "{s}/SAME.txt", .{src}) catch return "files compare: path";
-    const src_only = std.fmt.bufPrintZ(&p[4], "{s}/ONLYSRC.txt", .{src}) catch return "files compare: path";
-    const dst_same = std.fmt.bufPrintZ(&p[5], "{s}/SAME.txt", .{dst}) catch return "files compare: path";
-    const extra = std.fmt.bufPrintZ(&p[6], "{s}/EXTRA.txt", .{dst}) catch return "files compare: path";
-    const copied = std.fmt.bufPrintZ(&p[7], "{s}/ONLYSRC.txt", .{dst}) catch return "files compare: path";
+    const src_same = std.fmt.bufPrintSentinel(&p[3], "{s}/SAME.txt", .{src}, 0) catch return "files compare: path";
+    const src_only = std.fmt.bufPrintSentinel(&p[4], "{s}/ONLYSRC.txt", .{src}, 0) catch return "files compare: path";
+    const dst_same = std.fmt.bufPrintSentinel(&p[5], "{s}/SAME.txt", .{dst}, 0) catch return "files compare: path";
+    const extra = std.fmt.bufPrintSentinel(&p[6], "{s}/EXTRA.txt", .{dst}, 0) catch return "files compare: path";
+    const copied = std.fmt.bufPrintSentinel(&p[7], "{s}/ONLYSRC.txt", .{dst}, 0) catch return "files compare: path";
     // XDG_DATA_HOME is the rig dir, so the home trash is there.
-    const trashed = std.fmt.bufPrintZ(&p[8], "{s}/Trash/files/EXTRA.txt", .{rt}) catch return "files compare: path";
+    const trashed = std.fmt.bufPrintSentinel(&p[8], "{s}/Trash/files/EXTRA.txt", .{rt}, 0) catch return "files compare: path";
     if (!writeFile(src_same, "same\n") or !writeFile(src_only, "only in source\n") or
         !writeFile(dst_same, "same\n") or !writeFile(extra, "only in target\n"))
         return "files compare: seed";
@@ -10208,15 +10208,15 @@ fn filesBrowserBugsStage(
     }
 
     var dir_buf: [512:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/fbug", .{rt}) catch return "files bugs: dir path";
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/fbug", .{rt}, 0) catch return "files bugs: dir path";
     _ = c.mkdir(dir.ptr, 0o700);
     var p: [6][600:0]u8 = undefined;
-    const aaa = std.fmt.bufPrintZ(&p[0], "{s}/AAAROW.txt", .{dir}) catch return "files bugs: path";
-    const hidden = std.fmt.bufPrintZ(&p[1], "{s}/.HIDDENROW.txt", .{dir}) catch return "files bugs: path";
-    const sub = std.fmt.bufPrintZ(&p[2], "{s}/DEEPER", .{dir}) catch return "files bugs: path";
-    const dragme = std.fmt.bufPrintZ(&p[3], "{s}/DRAGME.txt", .{dir}) catch return "files bugs: path";
-    const pasted = std.fmt.bufPrintZ(&p[4], "{s}/DEEPER/AAAROW.txt", .{dir}) catch return "files bugs: path";
-    const kept = std.fmt.bufPrintZ(&p[5], "{s}/DEEPER/AAAROW (copy).txt", .{dir}) catch return "files bugs: path";
+    const aaa = std.fmt.bufPrintSentinel(&p[0], "{s}/AAAROW.txt", .{dir}, 0) catch return "files bugs: path";
+    const hidden = std.fmt.bufPrintSentinel(&p[1], "{s}/.HIDDENROW.txt", .{dir}, 0) catch return "files bugs: path";
+    const sub = std.fmt.bufPrintSentinel(&p[2], "{s}/DEEPER", .{dir}, 0) catch return "files bugs: path";
+    const dragme = std.fmt.bufPrintSentinel(&p[3], "{s}/DRAGME.txt", .{dir}, 0) catch return "files bugs: path";
+    const pasted = std.fmt.bufPrintSentinel(&p[4], "{s}/DEEPER/AAAROW.txt", .{dir}, 0) catch return "files bugs: path";
+    const kept = std.fmt.bufPrintSentinel(&p[5], "{s}/DEEPER/AAAROW (copy).txt", .{dir}, 0) catch return "files bugs: path";
     if (!writeFile(aaa, "aaa\n") or !writeFile(hidden, "hidden\n") or !writeFile(dragme, "drag\n"))
         return "files bugs: seed";
     _ = c.mkdir(sub.ptr, 0o700);
@@ -10286,7 +10286,7 @@ fn filesBrowserBugsStage(
     // Ctrl+V in the same folder duplicates beside the original (it
     // used to say "nothing to paste here").
     var dup_buf: [600:0]u8 = undefined;
-    const dup = std.fmt.bufPrintZ(&dup_buf, "{s}/AAAROW (copy).txt", .{dir}) catch return "files bugs: path";
+    const dup = std.fmt.bufPrintSentinel(&dup_buf, "{s}/AAAROW (copy).txt", .{dir}, 0) catch return "files bugs: path";
     app.pressKey(child.win, "ctrl+v") catch return "files bugs: in-place paste failed";
     if (!waitPathState(dup, true, 20_000, app)) {
         viewerShot(allocator, app, child.win, "files-bugs-inplace");
@@ -10398,7 +10398,7 @@ fn filesBrowserBugsStage(
 
     // -- 6. a row dragged onto a folder row moves into it --
     var moved_buf: [600:0]u8 = undefined;
-    const moved = std.fmt.bufPrintZ(&moved_buf, "{s}/DEEPER/DRAGME.txt", .{dir}) catch return "files bugs: path";
+    const moved = std.fmt.bufPrintSentinel(&moved_buf, "{s}/DEEPER/DRAGME.txt", .{dir}, 0) catch return "files bugs: path";
     const from = ocrRowCenter(allocator, app, child.win, "DRAGME", 10_000) orelse return "files bugs: DRAGME row not found";
     const onto = ocrRowCenter(allocator, app, child.win, "DEEPER", 10_000) orelse return "files bugs: DEEPER row not found";
     app.dragDnd(child.win, from.x, from.y, onto.x, onto.y, 1) catch return "files bugs: the drag failed";
@@ -10433,16 +10433,16 @@ fn filesSelectionBugsStage(
     }
 
     var dir_buf: [512:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/fsel", .{rt}) catch return "files selection: dir path";
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/fsel", .{rt}, 0) catch return "files selection: dir path";
     _ = c.mkdir(dir.ptr, 0o700);
     var p: [8][600:0]u8 = undefined;
-    const zaa = std.fmt.bufPrintZ(&p[0], "{s}/ZAAROW.txt", .{dir}) catch return "files selection: path";
-    const zab = std.fmt.bufPrintZ(&p[1], "{s}/ZABROW.txt", .{dir}) catch return "files selection: path";
-    const keep = std.fmt.bufPrintZ(&p[2], "{s}/KEEPME.txt", .{dir}) catch return "files selection: path";
-    const sub = std.fmt.bufPrintZ(&p[3], "{s}/DEEPER", .{dir}) catch return "files selection: path";
-    const nested_twin = std.fmt.bufPrintZ(&p[4], "{s}/DEEPER/DEEPER", .{dir}) catch return "files selection: path";
-    const targ = std.fmt.bufPrintZ(&p[5], "{s}/TARGET.txt", .{dir}) catch return "files selection: path";
-    const lnk = std.fmt.bufPrintZ(&p[6], "{s}/AAAROW", .{dir}) catch return "files selection: path";
+    const zaa = std.fmt.bufPrintSentinel(&p[0], "{s}/ZAAROW.txt", .{dir}, 0) catch return "files selection: path";
+    const zab = std.fmt.bufPrintSentinel(&p[1], "{s}/ZABROW.txt", .{dir}, 0) catch return "files selection: path";
+    const keep = std.fmt.bufPrintSentinel(&p[2], "{s}/KEEPME.txt", .{dir}, 0) catch return "files selection: path";
+    const sub = std.fmt.bufPrintSentinel(&p[3], "{s}/DEEPER", .{dir}, 0) catch return "files selection: path";
+    const nested_twin = std.fmt.bufPrintSentinel(&p[4], "{s}/DEEPER/DEEPER", .{dir}, 0) catch return "files selection: path";
+    const targ = std.fmt.bufPrintSentinel(&p[5], "{s}/TARGET.txt", .{dir}, 0) catch return "files selection: path";
+    const lnk = std.fmt.bufPrintSentinel(&p[6], "{s}/AAAROW", .{dir}, 0) catch return "files selection: path";
     if (!writeFile(zaa, "a\n") or !writeFile(zab, "b\n") or !writeFile(keep, "k\n") or !writeFile(targ, "t\n"))
         return "files selection: seed";
     _ = c.mkdir(sub.ptr, 0o700);
@@ -10666,14 +10666,14 @@ fn filesHtmlOpenCheck(
     const label: []const u8 = if (remote) "remote html" else "html";
     const row_name: []const u8 = if (remote) "PAGEREM" else "PAGEROW";
     var hdir_buf: [512:0]u8 = undefined;
-    const hdir = std.fmt.bufPrintZ(&hdir_buf, "{s}/sel{s}", .{ rt, if (remote) "htmlr" else "html" }) catch return "files select: html dir";
+    const hdir = std.fmt.bufPrintSentinel(&hdir_buf, "{s}/sel{s}", .{ rt, if (remote) "htmlr" else "html" }, 0) catch return "files select: html dir";
     _ = c.mkdir(hdir.ptr, 0o700);
     var html_buf: [600:0]u8 = undefined;
-    const html = std.fmt.bufPrintZ(&html_buf, "{s}/{s}.html", .{ hdir, row_name }) catch return "files select: html path";
+    const html = std.fmt.bufPrintSentinel(&html_buf, "{s}/{s}.html", .{ hdir, row_name }, 0) catch return "files select: html path";
     if (!writeFile(html, "<html><head><title>e2e-files-page</title></head><body style=\"background:#c02020\">page</body></html>"))
         return "files select: html seed";
     var spec_buf: [600:0]u8 = undefined;
-    const spec = std.fmt.bufPrintZ(&spec_buf, "{s}{s}", .{ if (remote) "localhost:" else "", hdir }) catch return "files select: html spec";
+    const spec = std.fmt.bufPrintSentinel(&spec_buf, "{s}{s}", .{ if (remote) "localhost:" else "", hdir }, 0) catch return "files select: html spec";
     const hchild = launchRenameFiles(app, spec, if (remote) "selhtmlr" else "selhtml", "", wl) orelse
         return if (remote) "files select: the remote html Files window never appeared" else "files select: the html Files window never appeared";
     if (!viewerWaitOcr(allocator, app, hchild.win, row_name, 40_000))
@@ -10726,7 +10726,7 @@ fn filesHtmlOpenCheck(
     if (remote) {
         const web_pane = parseNumAfter(last_list.?, "\"pane\":") orelse return "remote download: no pane";
         var dst_buf: [640:0]u8 = undefined;
-        const dst = std.fmt.bufPrintZ(&dst_buf, "{s}/remote-download#1.bin", .{rt}) catch return "remote download path";
+        const dst = std.fmt.bufPrintSentinel(&dst_buf, "{s}/remote-download#1.bin", .{rt}, 0) catch return "remote download path";
         var req_buf: [1024]u8 = undefined;
         const request = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-download\",\"pane\":{d},\"data\":\"data:application/octet-stream,REMOTE-DOWNLOAD\",\"path\":\"{s}\"}}\n", .{ web_pane, dst }) catch return "remote download request";
         const started = roundtrip(allocator, hsock, request) orelse return "remote download start timed out";
@@ -10787,10 +10787,10 @@ fn inlineRenameLifetimeStage(
     var normal_buf: [560:0]u8 = undefined;
 
     // Normal Enter completion in an otherwise idle listing.
-    const normal_dir = std.fmt.bufPrintZ(&dir_buf, "{s}/rename-normal", .{rt}) catch
+    const normal_dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/rename-normal", .{rt}, 0) catch
         return "inline rename normal directory path is too long";
     _ = c.mkdir(normal_dir.ptr, 0o700);
-    const normal = std.fmt.bufPrintZ(&normal_buf, "{s}/normal.txt", .{normal_dir}) catch
+    const normal = std.fmt.bufPrintSentinel(&normal_buf, "{s}/normal.txt", .{normal_dir}, 0) catch
         return "inline rename normal path is too long";
     if (!writeFile(normal, "normal\n")) return "could not seed the normal rename file";
     const normal_child = launchRenameFiles(app, normal_dir, "normal", "", wl) orelse
@@ -10800,7 +10800,7 @@ fn inlineRenameLifetimeStage(
         return "could not begin the normal inline rename";
     app.pressKey(normal_child.win, "Enter") catch return "could not commit the normal inline rename";
     var completed_buf: [560:0]u8 = undefined;
-    const completed = std.fmt.bufPrintZ(&completed_buf, "{s}/completed.txt", .{normal_dir}) catch
+    const completed = std.fmt.bufPrintSentinel(&completed_buf, "{s}/completed.txt", .{normal_dir}, 0) catch
         return "inline rename completed path is too long";
     var completed_ok = false;
     var waited: u32 = 0;
@@ -10816,10 +10816,10 @@ fn inlineRenameLifetimeStage(
         return "normal inline rename child did not close cleanly";
 
     // Close the whole window while an Escape verdict owns a pending source.
-    const window_dir = std.fmt.bufPrintZ(&dir_buf, "{s}/rename-window", .{rt}) catch
+    const window_dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/rename-window", .{rt}, 0) catch
         return "inline rename window directory path is too long";
     _ = c.mkdir(window_dir.ptr, 0o700);
-    const window_file = std.fmt.bufPrintZ(&file_buf, "{s}/window.txt", .{window_dir}) catch
+    const window_file = std.fmt.bufPrintSentinel(&file_buf, "{s}/window.txt", .{window_dir}, 0) catch
         return "inline rename window path is too long";
     if (!writeFile(window_file, "window\n")) return "could not seed the window-close rename file";
     const window_child = launchRenameFiles(app, window_dir, "window", "view", wl) orelse
@@ -10832,10 +10832,10 @@ fn inlineRenameLifetimeStage(
 
     // Closing the browser's own GtkNotebook page frees its BTab while
     // the BrowserView remains alive.
-    const tab_dir = std.fmt.bufPrintZ(&dir_buf, "{s}/rename-tab", .{rt}) catch
+    const tab_dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/rename-tab", .{rt}, 0) catch
         return "inline rename tab directory path is too long";
     _ = c.mkdir(tab_dir.ptr, 0o700);
-    const tab_file = std.fmt.bufPrintZ(&file_buf, "{s}/tab.txt", .{tab_dir}) catch
+    const tab_file = std.fmt.bufPrintSentinel(&file_buf, "{s}/tab.txt", .{tab_dir}, 0) catch
         return "inline rename tab path is too long";
     if (!writeFile(tab_file, "tab\n")) return "could not seed the tab-close rename file";
     const tab_child = launchRenameFiles(app, tab_dir, "tab", "tab", wl) orelse
@@ -10857,10 +10857,10 @@ fn inlineRenameLifetimeStage(
 
     // A split pane owns a separate BrowserView. Close that pane while
     // its cancel source is pending, then prove the sibling still serves.
-    const pane_dir = std.fmt.bufPrintZ(&dir_buf, "{s}/rename-pane", .{rt}) catch
+    const pane_dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/rename-pane", .{rt}, 0) catch
         return "inline rename pane directory path is too long";
     _ = c.mkdir(pane_dir.ptr, 0o700);
-    const pane_file = std.fmt.bufPrintZ(&file_buf, "{s}/pane.txt", .{pane_dir}) catch
+    const pane_file = std.fmt.bufPrintSentinel(&file_buf, "{s}/pane.txt", .{pane_dir}, 0) catch
         return "inline rename pane path is too long";
     if (!writeFile(pane_file, "pane\n")) return "could not seed the pane-close rename file";
     const pane_child = launchRenameFiles(app, pane_dir, "pane", "view", wl) orelse
@@ -10934,7 +10934,7 @@ fn quickLookStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const 
     // Two text files with distinct OCR tokens, in a directory of their
     // own so the display order is exactly known (aaa before bbb).
     var dir_buf: [512:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/qlfiles", .{rt}) catch return "quick look dir path too long";
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/qlfiles", .{rt}, 0) catch return "quick look dir path too long";
     _ = c.mkdir(dir.ptr, 0o700);
     var path_buf: [560:0]u8 = undefined;
     {
@@ -12873,7 +12873,7 @@ fn panelStage(
     const doc_path = std.fmt.allocPrint(allocator, "{s}/panel-doc.json", .{rt}) catch return "alloc";
     defer allocator.free(doc_path);
     {
-        const doc_z = allocator.dupeZ(u8, doc_path) catch return "alloc";
+        const doc_z = allocator.dupeSentinel(u8, doc_path, 0) catch return "alloc";
         defer allocator.free(doc_z);
         const body =
             "{\"version\":1,\"title\":\"From the CLI\",\"root\":\"t\"," ++
@@ -12970,7 +12970,7 @@ const McpChild = struct {
             return null;
         };
         defer identity.deinit();
-        const origin_id = allocator.dupeZ(u8, identity.panelOriginId()) catch {
+        const origin_id = allocator.dupeSentinel(u8, identity.panelOriginId(), 0) catch {
             why.* = "out of memory duplicating the panel origin id";
             return null;
         };
@@ -13151,7 +13151,7 @@ fn mcpWebReaderStage(allocator: std.mem.Allocator, sock_path: [:0]const u8, rt: 
         return "could not resolve sketerm-webengine for the GUI MCP reader stage";
 
     var page_buf: [512]u8 = undefined;
-    const page = std.fmt.bufPrintZ(&page_buf, "{s}/mcp-gui-reader.html", .{rt}) catch
+    const page = std.fmt.bufPrintSentinel(&page_buf, "{s}/mcp-gui-reader.html", .{rt}, 0) catch
         return "GUI MCP reader page path did not fit";
     const f = c.fopen(page.ptr, "wb") orelse return "could not create the GUI MCP reader page";
     const html =
@@ -13238,7 +13238,7 @@ fn mcpWebReaderStage(allocator: std.mem.Allocator, sock_path: [:0]const u8, rt: 
     if (!mcpHas(dl, "\"sha256\"")) return "GUI web_download reported no digest";
     var got_buf: [64]u8 = undefined;
     var dl_z: [512:0]u8 = undefined;
-    const dl_zp = std.fmt.bufPrintZ(&dl_z, "{s}", .{dl_path}) catch return "GUI download path did not fit";
+    const dl_zp = std.fmt.bufPrintSentinel(&dl_z, "{s}", .{dl_path}, 0) catch return "GUI download path did not fit";
     const df = c.fopen(dl_zp.ptr, "rb") orelse return "GUI web_download reported success with no file on disk";
     const dn = c.fread(&got_buf, 1, got_buf.len, df);
     _ = c.fclose(df);
@@ -13320,7 +13320,7 @@ fn guiDownloadStripStage(allocator: std.mem.Allocator, sock_path: [:0]const u8, 
             return "a cancelled request's late offer was accepted instead of declined";
     }
     for (0..2) |i| {
-        const path = std.fmt.bufPrintZ(&path_buf, "{s}/slow-{d}.bin", .{ rt, i }) catch return "slow download path";
+        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/slow-{d}.bin", .{ rt, i }, 0) catch return "slow download path";
         if (c.access(path.ptr, c.F_OK) == 0) return "a cancelled request's late offer still wrote its file";
     }
 
@@ -13757,7 +13757,7 @@ fn remotePanelAssetStage(
     const session = "remote-panel-assets";
 
     var gui_view_buf: [128]u8 = undefined;
-    const gui_view = std.fmt.bufPrintZ(&gui_view_buf, "/proc/{d}/cwd/" ++ REMOTE_PANEL_ASSET_NAME, .{child_pid}) catch
+    const gui_view = std.fmt.bufPrintSentinel(&gui_view_buf, "/proc/{d}/cwd/" ++ REMOTE_PANEL_ASSET_NAME, .{child_pid}, 0) catch
         return "formatting the GUI asset-path probe failed";
     if (c.access(gui_view.ptr, c.F_OK) == 0)
         return "the GUI can open the remote-only panel asset path itself";
@@ -13793,7 +13793,7 @@ fn remotePanelAssetStage(
         .{ session, takeover_pane },
     ) catch return "formatting the remote panel attach failed";
     var delay_buf: [512:0]u8 = undefined;
-    const delay_path = std.fmt.bufPrintZ(&delay_buf, "{s}/ssh-delay", .{rt}) catch
+    const delay_path = std.fmt.bufPrintSentinel(&delay_buf, "{s}/ssh-delay", .{rt}, 0) catch
         return "formatting the delayed-SSH marker failed";
     const delay_file = c.fopen(delay_path.ptr, "wb") orelse
         return "creating the delayed-SSH marker failed";
@@ -13829,13 +13829,13 @@ fn remotePanelAssetStage(
     }
 
     var remote_home_buf: [256]u8 = undefined;
-    const remote_home = std.fmt.bufPrintZ(&remote_home_buf, "{s}/r", .{rt}) catch
+    const remote_home = std.fmt.bufPrintSentinel(&remote_home_buf, "{s}/r", .{rt}, 0) catch
         return "formatting the remote MCP home failed";
     var remote_sock_buf: [512]u8 = undefined;
-    const remote_sock = std.fmt.bufPrintZ(&remote_sock_buf, "{s}/sketerm/mux.sock", .{remote_home}) catch
+    const remote_sock = std.fmt.bufPrintSentinel(&remote_sock_buf, "{s}/sketerm/mux.sock", .{remote_home}, 0) catch
         return "formatting the remote MCP socket failed";
     var session_buf: [64]u8 = undefined;
-    const session_z = std.fmt.bufPrintZ(&session_buf, "{s}", .{session}) catch
+    const session_z = std.fmt.bufPrintSentinel(&session_buf, "{s}", .{session}, 0) catch
         return "formatting the remote MCP session failed";
 
     var spawn_why: ?[]const u8 = null;
@@ -14058,18 +14058,20 @@ fn remotePanelAssetStage(
     const panel_id = mcpNum(show, "panel_id") orelse
         return "remote asset ui_show returned no panel_id";
     var cache_root_buf: [512]u8 = undefined;
-    const cache_root = std.fmt.bufPrintZ(
+    const cache_root = std.fmt.bufPrintSentinel(
         &cache_root_buf,
         "{s}/sketerm/panel-assets/{d}",
         .{ rt, child_pid },
+        0,
     ) catch return "formatting the process-isolated panel cache root failed";
     if (c.access(cache_root.ptr, c.R_OK) != 0)
         return "remote image hydration did not use the GUI process cache namespace";
     var wrong_cache_root_buf: [512]u8 = undefined;
-    const wrong_cache_root = std.fmt.bufPrintZ(
+    const wrong_cache_root = std.fmt.bufPrintSentinel(
         &wrong_cache_root_buf,
         "{s}/sketerm/panel-assets/{d}",
         .{ rt, c.getpid() },
+        0,
     ) catch return "formatting the non-GUI cache root failed";
     if (c.access(wrong_cache_root.ptr, c.F_OK) == 0)
         return "the panel asset cache was shared across GUI and harness processes";
@@ -14575,7 +14577,7 @@ fn panelPickerStage(
     // that would prove nothing.
     const rows_before = paneRows(allocator, sock_path) orelse return "screen-info before the config write";
     var cfg_buf: [4096]u8 = undefined;
-    const cfg_path = std.fmt.bufPrintZ(&cfg_buf, "{s}/sketerm/config.conf", .{rt}) catch return "config path";
+    const cfg_path = std.fmt.bufPrintSentinel(&cfg_buf, "{s}/sketerm/config.conf", .{rt}, 0) catch return "config path";
     if (!writeFile(cfg_path,
         \\# smoke: panel picker
         \\font_size = 13
@@ -14939,7 +14941,7 @@ fn panePanelLifetimeStage(
                 const shot = app.screenshotPng(window.id, 0, null, 0) catch continue;
                 defer allocator.free(shot.png);
                 var name_buf: [96]u8 = undefined;
-                const name = std.fmt.bufPrintZ(&name_buf, "/tmp/e2e-paneface-fail-w{d}.png", .{wi}) catch continue;
+                const name = std.fmt.bufPrintSentinel(&name_buf, "/tmp/e2e-paneface-fail-w{d}.png", .{wi}, 0) catch continue;
                 const f = c.fopen(name.ptr, "wb") orelse continue;
                 _ = c.fwrite(shot.png.ptr, 1, shot.png.len, f);
                 _ = c.fclose(f);
@@ -15002,17 +15004,17 @@ fn themeSingletonStage(
     const app = maybe_app orelse return null;
 
     var theme_cfg_buf: [512:0]u8 = undefined;
-    const theme_cfg = std.fmt.bufPrintZ(&theme_cfg_buf, "{s}/theme-config", .{rt}) catch
+    const theme_cfg = std.fmt.bufPrintSentinel(&theme_cfg_buf, "{s}/theme-config", .{rt}, 0) catch
         return "allocating the theme config directory failed";
     if (c.mkdir(theme_cfg.ptr, 0o700) != 0 and std.posix.errno(@as(c_int, -1)) != .EXIST)
         return "creating the theme config directory failed";
     var theme_cfg_dir_buf: [512:0]u8 = undefined;
-    const theme_cfg_dir = std.fmt.bufPrintZ(&theme_cfg_dir_buf, "{s}/sketerm", .{theme_cfg}) catch
+    const theme_cfg_dir = std.fmt.bufPrintSentinel(&theme_cfg_dir_buf, "{s}/sketerm", .{theme_cfg}, 0) catch
         return "allocating the theme config parent failed";
     if (c.mkdir(theme_cfg_dir.ptr, 0o700) != 0 and std.posix.errno(@as(c_int, -1)) != .EXIST)
         return "creating the theme config parent failed";
     var cfg_path_buf: [512:0]u8 = undefined;
-    const cfg_path = std.fmt.bufPrintZ(&cfg_path_buf, "{s}/config.conf", .{theme_cfg_dir}) catch
+    const cfg_path = std.fmt.bufPrintSentinel(&cfg_path_buf, "{s}/config.conf", .{theme_cfg_dir}, 0) catch
         return "theme config path";
     if (!writeFile(cfg_path, "# secondary-window lifetime smoke\nconfirm_close = never\n"))
         return "writing the theme config failed";
@@ -16200,7 +16202,7 @@ fn editorAtlasLifecycleStage(
 
     // Config sync uses the same rebuild path, including rename-over saves.
     var cfg_buf: [512:0]u8 = undefined;
-    const cfg_path = std.fmt.bufPrintZ(&cfg_buf, "{s}/sketerm/config.conf", .{rt}) catch return "editor atlas config path";
+    const cfg_path = std.fmt.bufPrintSentinel(&cfg_buf, "{s}/sketerm/config.conf", .{rt}, 0) catch return "editor atlas config path";
     const cfg_size_1: u16 = if (stats.font_size != 27) 27 else 28;
     var body_buf: [2048]u8 = undefined;
     const body_1 = std.fmt.bufPrint(&body_buf, "# editor atlas smoke\neditor_font_size = {d}\n", .{cfg_size_1}) catch
@@ -16219,7 +16221,7 @@ fn editorAtlasLifecycleStage(
     ) orelse return "an editor config rebuild did not balance its atlas texture";
 
     var tmp_buf: [512:0]u8 = undefined;
-    const tmp_path = std.fmt.bufPrintZ(&tmp_buf, "{s}/sketerm/config.conf.editor-atlas", .{rt}) catch
+    const tmp_path = std.fmt.bufPrintSentinel(&tmp_buf, "{s}/sketerm/config.conf.editor-atlas", .{rt}, 0) catch
         return "editor atlas temp config path";
     const cfg_size_2: u16 = if (cfg_size_1 == 29) 30 else 29;
     const body_2 = std.fmt.bufPrint(&body_buf, "# editor atlas smoke rename\neditor_font_size = {d}\n", .{cfg_size_2}) catch
@@ -16245,7 +16247,7 @@ fn editorAtlasLifecycleStage(
         return "fontconfig found no font for the editor config smoke";
     defer allocator.free(font_path);
     var link_buf: [512:0]u8 = undefined;
-    const font_link = std.fmt.bufPrintZ(&link_buf, "{s}/editor-font-link.ttf", .{rt}) catch
+    const font_link = std.fmt.bufPrintSentinel(&link_buf, "{s}/editor-font-link.ttf", .{rt}, 0) catch
         return "editor config font link path is too long";
     _ = c.unlink(font_link.ptr);
     if (c.symlink(font_path.ptr, font_link.ptr) != 0)
@@ -16513,7 +16515,7 @@ fn deadKeyStage(allocator: std.mem.Allocator, rt: []const u8, mux_sock: []const 
         defer parsed.deinit();
         const wl = parsed.value.environment.WAYLAND_DISPLAY;
         if (wl.len == 0 or wl[0] != '/') return "the Belgian display returned no absolute WAYLAND_DISPLAY";
-        _ = std.fmt.bufPrintZ(&wl_z, "{s}", .{wl}) catch return "WAYLAND_DISPLAY too long";
+        _ = std.fmt.bufPrintSentinel(&wl_z, "{s}", .{wl}, 0) catch return "WAYLAND_DISPLAY too long";
     }
 
     // Attach before the GUI starts — the compositor brain is
@@ -16572,7 +16574,7 @@ fn deadKeyStage(allocator: std.mem.Allocator, rt: []const u8, mux_sock: []const 
 
     // ── face 2: an editor tab ─────────────────────────────────────
     var path_buf: [512]u8 = undefined;
-    const efile = std.fmt.bufPrintZ(&path_buf, "{s}/e2e-deadkey.txt", .{rt}) catch return "editor path";
+    const efile = std.fmt.bufPrintSentinel(&path_buf, "{s}/e2e-deadkey.txt", .{rt}, 0) catch return "editor path";
     var req_buf: [700]u8 = undefined;
     const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"new-editor-tab\",\"data\":\"{s}\"}}\n", .{efile}) catch
         return "editor req fmt";
@@ -16625,9 +16627,9 @@ fn deadKeyStage(allocator: std.mem.Allocator, rt: []const u8, mux_sock: []const 
 /// fooled by a repaint that came from somewhere else.
 fn configReloadStage(allocator: std.mem.Allocator, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
     var path_buf: [512:0]u8 = undefined;
-    const cfg_path = std.fmt.bufPrintZ(&path_buf, "{s}/sketerm/config.conf", .{rt}) catch return "config path";
+    const cfg_path = std.fmt.bufPrintSentinel(&path_buf, "{s}/sketerm/config.conf", .{rt}, 0) catch return "config path";
     var tmp_buf: [512:0]u8 = undefined;
-    const tmp_path = std.fmt.bufPrintZ(&tmp_buf, "{s}/sketerm/config.conf.editor-tmp", .{rt}) catch return "temp path";
+    const tmp_path = std.fmt.bufPrintSentinel(&tmp_buf, "{s}/sketerm/config.conf.editor-tmp", .{rt}, 0) catch return "temp path";
 
     const base_cols = paneCols(allocator, sock_path) orelse return "screen-info reported no cols";
 
@@ -16871,7 +16873,7 @@ fn wsShot(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, tag: []con
     const shot = app.screenshotPng(win, 1400, null, 0) catch return;
     defer allocator.free(shot.png);
     var name_buf: [128]u8 = undefined;
-    const name = std.fmt.bufPrintZ(&name_buf, "/tmp/sketerm-e2e-workspace-{s}.png", .{tag}) catch return;
+    const name = std.fmt.bufPrintSentinel(&name_buf, "/tmp/sketerm-e2e-workspace-{s}.png", .{tag}, 0) catch return;
     writePng(name.ptr, shot.png);
     _ = c.fprintf(platform.stderr(), "smoke-e2e: workspace screenshot %s\n", name.ptr);
 }
@@ -16946,13 +16948,13 @@ fn waitCapturePng(allocator: std.mem.Allocator, app: *appdrive.App, path: [:0]co
 fn captureSaveStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, rt: []const u8) ?[]const u8 {
     const main_win = wsMainWindow(app) orelse return "capture: no GUI window";
     var dir_buf: [512:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/capture-denied", .{rt}) catch return "capture: directory path";
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/capture-denied", .{rt}, 0) catch return "capture: directory path";
     if (c.mkdir(dir.ptr, 0o700) != 0) return "capture: create denied directory";
     defer _ = c.rmdir(dir.ptr);
     if (c.chmod(dir.ptr, 0o500) != 0) return "capture: make destination read-only";
     defer _ = c.chmod(dir.ptr, 0o700);
     var path_buf: [600:0]u8 = undefined;
-    const denied = std.fmt.bufPrintZ(&path_buf, "{s}/capture.png", .{dir}) catch return "capture: denied path";
+    const denied = std.fmt.bufPrintSentinel(&path_buf, "{s}/capture.png", .{dir}, 0) catch return "capture: denied path";
     if (c.geteuid() != 0) {
         const pick = capturePicker(allocator, app, sock, 1) orelse return "capture: open denied picker";
         if (!capturePickPath(app, pick, denied)) return "capture: accept denied destination";
@@ -16969,7 +16971,7 @@ fn captureSaveStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]
     } else say("capture: permission refusal skipped for root");
 
     var good_buf: [600:0]u8 = undefined;
-    const good = std.fmt.bufPrintZ(&good_buf, "{s}/capture-ok.png", .{rt}) catch return "capture: success path";
+    const good = std.fmt.bufPrintSentinel(&good_buf, "{s}/capture-ok.png", .{rt}, 0) catch return "capture: success path";
     defer _ = c.unlink(good.ptr);
     const pick = capturePicker(allocator, app, sock, 1) orelse return "capture: open successful picker";
     if (!capturePickPath(app, pick, good)) return "capture: accept successful destination";
@@ -16982,14 +16984,14 @@ fn captureSaveStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]
     const replacement = wsNewTab(allocator, sock) orelse return "capture: create replacement pane";
     defer _ = wsClosePane(allocator, sock, replacement);
     var stale_buf: [600:0]u8 = undefined;
-    const stale = std.fmt.bufPrintZ(&stale_buf, "{s}/capture-stale.png", .{rt}) catch return "capture: stale path";
+    const stale = std.fmt.bufPrintSentinel(&stale_buf, "{s}/capture-stale.png", .{rt}, 0) catch return "capture: stale path";
     defer _ = c.unlink(stale.ptr);
     if (!capturePickPath(app, stale_pick, stale)) return "capture: accept stale pane picker";
     // A stale pick is dropped silently, so a missing file proves nothing
     // until the GUI has provably handled the pick. A capture of a live
     // pane accepted after it, through the same main loop, is that proof.
     var after_buf: [600:0]u8 = undefined;
-    const after = std.fmt.bufPrintZ(&after_buf, "{s}/capture-after-stale.png", .{rt}) catch return "capture: control path";
+    const after = std.fmt.bufPrintSentinel(&after_buf, "{s}/capture-after-stale.png", .{rt}, 0) catch return "capture: control path";
     defer _ = c.unlink(after.ptr);
     const after_pick = capturePicker(allocator, app, sock, 1) orelse return "capture: open picker after the stale pick";
     if (!capturePickPath(app, after_pick, after)) return "capture: accept the picker after the stale pick";
@@ -17094,7 +17096,7 @@ fn placeholderStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]
     script.appendSlice(allocator, "#!/bin/sh\nstty -echo\n") catch return "placeholders: script alloc";
     for (&frames, 0..) |*f, i| {
         var path_buf: [512:0]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "{s}/ph-{d}.bin", .{ rt, i }) catch return "placeholders: frame path";
+        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/ph-{d}.bin", .{ rt, i }, 0) catch return "placeholders: frame path";
         if (!writeFile(path, f.items)) return "placeholders: frame write";
         const line = std.fmt.allocPrint(allocator, "cat '{s}'; read a\n", .{path}) catch return "placeholders: script alloc";
         defer allocator.free(line);
@@ -17102,7 +17104,7 @@ fn placeholderStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]
     }
     script.appendSlice(allocator, "printf '\\033[?1049l'; stty echo\n") catch return "placeholders: script alloc";
     var script_buf: [512:0]u8 = undefined;
-    const script_path = std.fmt.bufPrintZ(&script_buf, "{s}/placeholders.sh", .{rt}) catch return "placeholders: script path";
+    const script_path = std.fmt.bufPrintSentinel(&script_buf, "{s}/placeholders.sh", .{rt}, 0) catch return "placeholders: script path";
     if (!writeFile(script_path, script.items)) return "placeholders: script write";
 
     const pane = wsNewTab(allocator, sock) orelse return "placeholders: open tab";
@@ -17390,7 +17392,7 @@ fn wsPin(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const 
 
 fn wsRestoreClosed(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
     var dir_buf: [300:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/zwrestore", .{rt}) catch return "restore: dir path";
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/zwrestore", .{rt}, 0) catch return "restore: dir path";
     _ = c.mkdir(dir.ptr, 0o700);
     const tab_pane = wsNewTab(allocator, sock_path) orelse return "restore: new-tab failed";
     _ = app.waitIdle(300, 5_000);
@@ -17540,14 +17542,14 @@ fn wsApplyProfile(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, so
 
 fn wsShaderPreset(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
     var dir_buf: [300:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm/shader-presets", .{rt}) catch return "shader: dir";
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/sketerm/shader-presets", .{rt}, 0) catch return "shader: dir";
     _ = c.mkdir(dir.ptr, 0o700);
     var shader_buf: [320:0]u8 = undefined;
-    const shader = std.fmt.bufPrintZ(&shader_buf, "{s}/zw-magenta.glsl", .{rt}) catch return "shader: path";
+    const shader = std.fmt.bufPrintSentinel(&shader_buf, "{s}/zw-magenta.glsl", .{rt}, 0) catch return "shader: path";
     if (!writeFile(shader, "void mainImage(out vec4 fragColor, in vec2 fragCoord) { fragColor = vec4(1.0, 0.0, 1.0, 1.0); }\n"))
         return "shader: writing the shader failed";
     var preset_buf: [340:0]u8 = undefined;
-    const preset = std.fmt.bufPrintZ(&preset_buf, "{s}/zw-magenta.conf", .{dir}) catch return "shader: preset path";
+    const preset = std.fmt.bufPrintSentinel(&preset_buf, "{s}/zw-magenta.conf", .{dir}, 0) catch return "shader: preset path";
     var body_buf: [400]u8 = undefined;
     const body = std.fmt.bufPrint(&body_buf, "shader = {s}\nanimate = false\n", .{shader}) catch return "shader: preset body";
     if (!writeFile(preset, body)) return "shader: writing the preset failed";
@@ -17822,7 +17824,7 @@ fn wsCloseButtons(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, so
 /// A captured strip as raw RGBA under /tmp, for a failed comparison.
 fn wsDumpStrip(tag: []const u8, px: []const u8, w: u32, h: u32) void {
     var name_buf: [128]u8 = undefined;
-    const name = std.fmt.bufPrintZ(&name_buf, "/tmp/sketerm-e2e-closebtn-{s}-{d}x{d}.rgba", .{ tag, w, h }) catch return;
+    const name = std.fmt.bufPrintSentinel(&name_buf, "/tmp/sketerm-e2e-closebtn-{s}-{d}x{d}.rgba", .{ tag, w, h }, 0) catch return;
     writePng(name.ptr, px);
     _ = c.fprintf(platform.stderr(), "smoke-e2e: close buttons: raw strip %s\n", name.ptr);
 }
@@ -17830,7 +17832,7 @@ fn wsDumpStrip(tag: []const u8, px: []const u8, w: u32, h: u32) void {
 fn workspaceStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
     const win = wsMainWindow(app) orelse return "workspace: no GUI window";
     var path_buf: [512:0]u8 = undefined;
-    const cfg_path = std.fmt.bufPrintZ(&path_buf, "{s}/sketerm/config.conf", .{rt}) catch return "workspace: config path";
+    const cfg_path = std.fmt.bufPrintSentinel(&path_buf, "{s}/sketerm/config.conf", .{rt}, 0) catch return "workspace: config path";
     const base_cols = paneCols(allocator, sock_path) orelse return "workspace: no cols";
     var cfg_buf: [512]u8 = undefined;
     if (!writeFile(cfg_path, wsConfig(&cfg_buf, true, 13) orelse return "workspace: config fmt"))
@@ -17951,7 +17953,7 @@ fn quakeToggleStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
 
     // Live reload: the mapped window follows a changed percentage.
     var cfg_buf: [512:0]u8 = undefined;
-    const cfg_path = std.fmt.bufPrintZ(&cfg_buf, "{s}/sketerm/config.conf", .{rt}) catch return "config path";
+    const cfg_path = std.fmt.bufPrintSentinel(&cfg_buf, "{s}/sketerm/config.conf", .{rt}, 0) catch return "config path";
     if (!writeFile(cfg_path, "# smoke-e2e\napp_view = window\ngraphics_offload = true\n" ++ QUAKE_CONFIG_LINE ++ "quake_height_percent = 25\n"))
         return "could not rewrite config.conf";
     const deadline = clock.nowMs() + 20_000;
@@ -18009,7 +18011,7 @@ fn quakeWaitShown(app: *appdrive.App, old_id: u32, timeout_ms: i64) ?u32 {
 /// `LD_DEBUG=libs` (glibc appends the pid to LD_DEBUG_OUTPUT).
 fn quakeLinkOrder(allocator: std.mem.Allocator, rt: []const u8) ?[]const u8 {
     var out_buf: [512:0]u8 = undefined;
-    const out = std.fmt.bufPrintZ(&out_buf, "{s}/ld-libs", .{rt}) catch return "LD_DEBUG output path";
+    const out = std.fmt.bufPrintSentinel(&out_buf, "{s}/ld-libs", .{rt}, 0) catch return "LD_DEBUG output path";
     const pid = c.fork();
     if (pid < 0) return "fork for the link-order check failed";
     if (pid == 0) {
@@ -18025,7 +18027,7 @@ fn quakeLinkOrder(allocator: std.mem.Allocator, rt: []const u8) ?[]const u8 {
         return "`sketerm --version` under LD_DEBUG did not exit";
     }
     var path_buf: [560:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}.{d}", .{ out, pid }) catch return "LD_DEBUG output file path";
+    const path = std.fmt.bufPrintSentinel(&path_buf, "{s}.{d}", .{ out, pid }, 0) catch return "LD_DEBUG output file path";
     const text = readFileAlloc(allocator, path) orelse return "LD_DEBUG=libs wrote nothing for the shipped binary";
     defer allocator.free(text);
     const layer = std.mem.indexOf(u8, text, "find library=libgtk4-layer-shell.so") orelse
@@ -18042,7 +18044,7 @@ fn quakeLinkOrder(allocator: std.mem.Allocator, rt: []const u8) ?[]const u8 {
 /// starts after the LAST ')'.
 fn cpuJiffies(pid: c.pid_t) ?u64 {
     var path: [64:0]u8 = undefined;
-    _ = std.fmt.bufPrintZ(&path, "/proc/{d}/stat", .{pid}) catch return null;
+    _ = std.fmt.bufPrintSentinel(&path, "/proc/{d}/stat", .{pid}, 0) catch return null;
     const fp = c.fopen(&path, "rb") orelse return null;
     defer _ = c.fclose(fp);
     var buf: [1024]u8 = undefined;
@@ -18110,7 +18112,7 @@ fn cursorTrailStage(
     }
 
     var path_buf: [512:0]u8 = undefined;
-    const cfg_path = std.fmt.bufPrintZ(&path_buf, "{s}/sketerm/config.conf", .{rt}) catch return "config path";
+    const cfg_path = std.fmt.bufPrintSentinel(&path_buf, "{s}/sketerm/config.conf", .{rt}, 0) catch return "config path";
 
     const base_cols = paneCols(allocator, sock_path) orelse return "screen-info reported no cols";
 
@@ -18467,7 +18469,7 @@ fn mcpCallReply(m: *McpChild, name: []const u8, args: []const u8, timeout_ms: i6
 /// Start one fake host's per-user daemon under its own runtime dir.
 fn startFakeHostDaemon(host_rt: [:0]const u8, log_path: [:0]const u8) ?c.pid_t {
     var sock_buf: [512:0]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/sketerm/mux.sock", .{host_rt}) catch return null;
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/sketerm/mux.sock", .{host_rt}, 0) catch return null;
     // An earlier stage's daemon here is gone: its socket file must not
     // pass for this one's.
     _ = c.unlink(sock.ptr);
@@ -19105,7 +19107,7 @@ const FakeHosts = struct {
             _ = c.mkdir(bin.ptr, 0o700);
             const mux = std.fmt.allocPrintSentinel(arena, "{s}/sketerm-mux", .{bin}, 0) catch return null;
             _ = c.unlink(mux.ptr);
-            if (c.symlink((arena.dupeZ(u8, mux_abs) catch return null).ptr, mux.ptr) != 0) return null;
+            if (c.symlink((arena.dupeSentinel(u8, mux_abs, 0) catch return null).ptr, mux.ptr) != 0) return null;
         }
         const route_ssh = std.fmt.allocPrintSentinel(arena, "{s}/route-ssh", .{rt}, 0) catch return null;
         const body = std.fmt.allocPrint(arena,

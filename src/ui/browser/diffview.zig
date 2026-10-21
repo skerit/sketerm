@@ -113,7 +113,7 @@ fn showDiffWindow(self: *BrowserView) void {
     }
     const win = c.gtk_window_new();
     var tz: [560:0]u8 = undefined;
-    const t = std.fmt.bufPrintZ(&tz, "Compare: {s}", .{st.title[0..st.title_len]}) catch "Compare";
+    const t = std.fmt.bufPrintSentinel(&tz, "Compare: {s}", .{st.title[0..st.title_len]}, 0) catch "Compare";
     c.gtk_window_set_title(@ptrCast(win), t.ptr);
     c.gtk_window_set_default_size(@ptrCast(win), 760, 560);
     const scroll = c.gtk_scrolled_window_new();

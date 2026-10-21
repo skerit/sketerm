@@ -363,7 +363,7 @@ fn handleChooser(
 
     const call = try alloc.create(ActiveCall);
     errdefer alloc.destroy(call);
-    const handle_owned = try alloc.dupeZ(u8, spanZ(handle_c));
+    const handle_owned = try alloc.dupeSentinel(u8, spanZ(handle_c), 0);
     call.* = .{
         .allocator = alloc,
         .invocation = invocation,
@@ -617,7 +617,7 @@ fn onPickerResult(ctx: ?*anyopaque, result: ?fpicker.Result) void {
             for (result.?.specs) |spec| {
                 const local = policy.localPath(spec) orelse continue;
                 const uri = policy.fileUriAlloc(a, local) catch continue;
-                uris.append(a, a.dupeZ(u8, uri) catch continue) catch continue;
+                uris.append(a, a.dupeSentinel(u8, uri, 0) catch continue) catch continue;
             }
         },
         .save_files => {
@@ -625,7 +625,7 @@ fn onPickerResult(ctx: ?*anyopaque, result: ?fpicker.Result) void {
             if (dir) |d| {
                 for (call.names) |nm| {
                     const uri = policy.joinedUriAlloc(a, d, nm) catch continue;
-                    uris.append(a, a.dupeZ(u8, uri) catch continue) catch continue;
+                    uris.append(a, a.dupeSentinel(u8, uri, 0) catch continue) catch continue;
                 }
             }
         },
@@ -667,8 +667,8 @@ fn finish(call: *ActiveCall, response: u32, uris: []const [:0]const u8) void {
                 // terminator is not guaranteed, so copy out.
                 var idz: [128:0]u8 = undefined;
                 var valz: [128:0]u8 = undefined;
-                const id = std.fmt.bufPrintZ(&idz, "{s}", .{pair[0..sep]}) catch continue;
-                const val = std.fmt.bufPrintZ(&valz, "{s}", .{pair[sep + 1 ..]}) catch continue;
+                const id = std.fmt.bufPrintSentinel(&idz, "{s}", .{pair[0..sep]}, 0) catch continue;
+                const val = std.fmt.bufPrintSentinel(&valz, "{s}", .{pair[sep + 1 ..]}, 0) catch continue;
                 c.g_variant_builder_add(&cb, "(ss)", id.ptr, val.ptr);
             }
             c.g_variant_builder_add(&results, "{sv}", "choices", c.g_variant_builder_end(&cb));

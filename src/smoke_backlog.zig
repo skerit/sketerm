@@ -111,7 +111,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
     // stays open so content can be rewritten between commits.
     const POOL_SIZE: usize = 64 * 1024;
     var tmp_buf: [128]u8 = undefined;
-    const tmp_path = std.fmt.bufPrintZ(&tmp_buf, "/tmp/sketerm-bk-smoke-{d}-pool", .{c.getpid()}) catch unreachable;
+    const tmp_path = std.fmt.bufPrintSentinel(&tmp_buf, "/tmp/sketerm-bk-smoke-{d}-pool", .{c.getpid()}, 0) catch unreachable;
     const pool_fd = c.open(tmp_path.ptr, c.O_RDWR | c.O_CREAT | c.O_TRUNC, @as(c.mode_t, 0o600));
     if (pool_fd < 0) fail("pool open");
     defer _ = c.close(pool_fd);

@@ -129,7 +129,7 @@ pub fn main() u8 {
     defer fs.deinit();
 
     var mnt_z: [4096:0]u8 = undefined;
-    const mp = std.fmt.bufPrintZ(&mnt_z, "{s}", .{mnt}) catch unreachable;
+    const mp = std.fmt.bufPrintSentinel(&mnt_z, "{s}", .{mnt}, 0) catch unreachable;
     const fuse_fd = fsmount.openFuseFd(mp.ptr) catch {
         // Sandboxes may deny the mount syscall even with the binary
         // present — that is an environment SKIP, not a code failure.
@@ -159,7 +159,7 @@ pub fn main() u8 {
     std.debug.print("smoke-fuse: stage readdir-unlink\n", .{});
     {
         var source_buf: [4096:0]u8 = undefined;
-        const source_dir = std.fmt.bufPrintZ(&source_buf, "{s}/enumerate", .{src}) catch unreachable;
+        const source_dir = std.fmt.bufPrintSentinel(&source_buf, "{s}/enumerate", .{src}, 0) catch unreachable;
         if (c.mkdir(source_dir.ptr, 0o700) != 0) fail("enumeration fixture mkdir");
         const padding = @as([96]u8, @splat('x'));
         for (0..500) |i| {
@@ -168,7 +168,7 @@ pub fn main() u8 {
             writeFile(source_dir, name, "");
         }
         var mounted_buf: [4096:0]u8 = undefined;
-        const mounted_dir = std.fmt.bufPrintZ(&mounted_buf, "{s}/enumerate", .{mnt}) catch unreachable;
+        const mounted_dir = std.fmt.bufPrintSentinel(&mounted_buf, "{s}/enumerate", .{mnt}, 0) catch unreachable;
         const dir = c.opendir(mounted_dir.ptr) orelse fail("enumeration fixture opendir");
         defer _ = c.closedir(dir);
         var removed: usize = 0;
@@ -176,7 +176,7 @@ pub fn main() u8 {
             const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
             if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
             var file_buf: [4096:0]u8 = undefined;
-            const file = std.fmt.bufPrintZ(&file_buf, "{s}/{s}", .{ mounted_dir, name }) catch unreachable;
+            const file = std.fmt.bufPrintSentinel(&file_buf, "{s}/{s}", .{ mounted_dir, name }, 0) catch unreachable;
             if (c.unlink(file.ptr) != 0) fail("unlink enumerated file");
             removed += 1;
         }
@@ -260,13 +260,13 @@ pub fn main() u8 {
         writeFile(src, "hardlink-a", "hardlink content\n");
         var source_a: [4096:0]u8 = undefined;
         var source_b: [4096:0]u8 = undefined;
-        const a = std.fmt.bufPrintZ(&source_a, "{s}/hardlink-a", .{src}) catch unreachable;
-        const b = std.fmt.bufPrintZ(&source_b, "{s}/hardlink-b", .{src}) catch unreachable;
+        const a = std.fmt.bufPrintSentinel(&source_a, "{s}/hardlink-a", .{src}, 0) catch unreachable;
+        const b = std.fmt.bufPrintSentinel(&source_b, "{s}/hardlink-b", .{src}, 0) catch unreachable;
         if (c.link(a.ptr, b.ptr) != 0) fail("hardlink fixture");
         var mount_a: [4096:0]u8 = undefined;
         var mount_b: [4096:0]u8 = undefined;
-        const ma = std.fmt.bufPrintZ(&mount_a, "{s}/hardlink-a", .{mnt}) catch unreachable;
-        const mb = std.fmt.bufPrintZ(&mount_b, "{s}/hardlink-b", .{mnt}) catch unreachable;
+        const ma = std.fmt.bufPrintSentinel(&mount_a, "{s}/hardlink-a", .{mnt}, 0) catch unreachable;
+        const mb = std.fmt.bufPrintSentinel(&mount_b, "{s}/hardlink-b", .{mnt}, 0) catch unreachable;
         const fa = c.open(ma.ptr, c.O_RDONLY | c.O_CLOEXEC);
         if (fa < 0) fail("open first hardlink");
         defer _ = c.close(fa);

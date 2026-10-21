@@ -650,7 +650,8 @@ test "spawn preparation normalizes requests and detects live-worker name collisi
     dead_worker.origin_name = dead_origin[0..];
     dead_worker.dead = true;
     var worker_items = [_]*Worker{ &collision_worker, &dead_worker };
-    broker.workers = .{ .items = &worker_items, .capacity = worker_items.len };
+    broker.workers = .initBuffer(&worker_items);
+    broker.workers.items.len = worker_items.len;
     for ([_][]const u8{ "taken", "spawned-as", "dead-taken", "dead-spawned-as", "free" }) |name| {
         try t.expectEqual(brokerFindWorker(&broker, name) != null, brokerNameInUse(&broker, name, null));
     }
@@ -739,7 +740,7 @@ test "new workers close every broker descriptor and release stale listeners" {
     const t = std.testing;
     const a = t.allocator;
     var dir_buf: [128]u8 = undefined;
-    const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/sketerm-worker-fds-{d}", .{c.getpid()});
+    const dir = try std.fmt.bufPrintSentinel(&dir_buf, "/tmp/sketerm-worker-fds-{d}", .{c.getpid()}, 0);
     _ = c.mkdir(dir.ptr, 0o700);
     defer pathz.removeTree(dir);
     var path_buf: [160]u8 = undefined;
@@ -1046,7 +1047,7 @@ test "the list reply reports this host's live MCP servers and their agents" {
     const t = std.testing;
     const a = t.allocator;
     var rt_buf: [128]u8 = undefined;
-    const rt = try std.fmt.bufPrintZ(&rt_buf, "/tmp/sketerm-list-assistants-{d}", .{c.getpid()});
+    const rt = try std.fmt.bufPrintSentinel(&rt_buf, "/tmp/sketerm-list-assistants-{d}", .{c.getpid()}, 0);
     _ = c.mkdir(rt.ptr, 0o700);
     var saved: @import("../util/env.zig").Saved = .{};
     try saved.override("XDG_RUNTIME_DIR", rt.ptr);
@@ -1531,7 +1532,7 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
     var argv_ptrs: std.ArrayList([*:0]const u8) = .empty;
     defer argv_ptrs.deinit(allocator);
     for (req.argv) |a| {
-        const z = try allocator.dupeZ(u8, a);
+        const z = try allocator.dupeSentinel(u8, a, 0);
         try argv_z.append(allocator, z);
         try argv_ptrs.append(allocator, z.ptr);
     }
@@ -1541,10 +1542,10 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
     var wl_disp_z: ?[:0]u8 = null;
     defer if (wl_disp_z) |z| allocator.free(z);
     if (hub) |h| {
-        wl_disp_z = try allocator.dupeZ(u8, h.display_path);
+        wl_disp_z = try allocator.dupeSentinel(u8, h.display_path, 0);
     } else if (req.local and req.host_wayland_display.len > 0) {
         // Local passthrough: point the child at the host compositor.
-        wl_disp_z = try allocator.dupeZ(u8, req.host_wayland_display);
+        wl_disp_z = try allocator.dupeSentinel(u8, req.host_wayland_display, 0);
     }
     // Likewise the audio server: PULSE_SERVER=unix:<hub socket>.
     var pa_env_z: ?[:0]u8 = null;
@@ -1571,7 +1572,7 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
         rt_dir_owned = p;
         var z_buf: [4096]u8 = undefined;
         _ = c.mkdir(try pathZ(&z_buf, p), 0o700);
-        rt_dir_z = try allocator.dupeZ(u8, p);
+        rt_dir_z = try allocator.dupeSentinel(u8, p, 0);
     }
 
     var xwl: ?xwayland.Instance = null;
@@ -1610,13 +1611,13 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
     // Null-terminated copies of the GUI-supplied env/identity strings,
     // freed after spawn (the child has its own env copy by then). All
     // optional — empty/absent falls back to Pty.spawn's defaults.
-    const sock_z: ?[:0]u8 = if (req.socket.len > 0) allocator.dupeZ(u8, req.socket) catch null else null;
+    const sock_z: ?[:0]u8 = if (req.socket.len > 0) allocator.dupeSentinel(u8, req.socket, 0) catch null else null;
     defer if (sock_z) |z| allocator.free(z);
     // The daemon owns the session name, so it (not the GUI) exports the
     // stable SKETERM_SESSION identity — no plumbing through the client.
-    const name_z: ?[:0]u8 = if (req.name.len > 0) allocator.dupeZ(u8, req.name) catch null else null;
+    const name_z: ?[:0]u8 = if (req.name.len > 0) allocator.dupeSentinel(u8, req.name, 0) catch null else null;
     defer if (name_z) |z| allocator.free(z);
-    const origin_id_z = try allocator.dupeZ(u8, &origin_id);
+    const origin_id_z = try allocator.dupeSentinel(u8, &origin_id, 0);
     defer allocator.free(origin_id_z);
     const owning_mux_socket = if (self.sock_path.len > 0)
         self.sock_path
@@ -1625,13 +1626,13 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
     else
         "";
     const mux_socket_z: ?[:0]u8 = if (owning_mux_socket.len > 0)
-        allocator.dupeZ(u8, owning_mux_socket) catch null
+        allocator.dupeSentinel(u8, owning_mux_socket, 0) catch null
     else
         null;
     defer if (mux_socket_z) |z| allocator.free(z);
-    const term_z: ?[:0]u8 = if (req.term.len > 0) allocator.dupeZ(u8, req.term) catch null else null;
+    const term_z: ?[:0]u8 = if (req.term.len > 0) allocator.dupeSentinel(u8, req.term, 0) catch null else null;
     defer if (term_z) |z| allocator.free(z);
-    const cterm_z: ?[:0]u8 = if (req.color_term.len > 0) allocator.dupeZ(u8, req.color_term) catch null else null;
+    const cterm_z: ?[:0]u8 = if (req.color_term.len > 0) allocator.dupeSentinel(u8, req.color_term, 0) catch null else null;
     defer if (cterm_z) |z| allocator.free(z);
     var si_script_z: ?[:0]u8 = null;
     var si_shim_z: ?[:0]u8 = null;
@@ -1642,8 +1643,8 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
         const si = req.shell_integration orelse break :blk null;
         const kind: PtyMod.ShellIntegration.Kind =
             if (std.mem.eql(u8, si.kind, "zsh")) .zsh else if (std.mem.eql(u8, si.kind, "fish")) .fish else if (std.mem.eql(u8, si.kind, "bash")) .bash else break :blk null;
-        si_script_z = allocator.dupeZ(u8, si.script) catch break :blk null;
-        si_shim_z = allocator.dupeZ(u8, si.shim_dir) catch break :blk null;
+        si_script_z = allocator.dupeSentinel(u8, si.script, 0) catch break :blk null;
+        si_shim_z = allocator.dupeSentinel(u8, si.shim_dir, 0) catch break :blk null;
         break :blk .{ .kind = kind, .script = si_script_z.?.ptr, .shim_dir = si_shim_z.?.ptr };
     };
     var env_z: std.ArrayList([:0]u8) = .empty;
@@ -1655,7 +1656,7 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
     defer env_ptrs.deinit(allocator);
     for (req.env) |kv| {
         if (std.mem.indexOfScalar(u8, kv, '=') == null) continue; // not K=V
-        const z = try allocator.dupeZ(u8, kv);
+        const z = try allocator.dupeSentinel(u8, kv, 0);
         try env_z.append(allocator, z);
         try env_ptrs.append(allocator, z.ptr);
     }

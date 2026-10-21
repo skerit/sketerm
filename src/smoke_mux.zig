@@ -181,7 +181,7 @@ fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_pa
     var pool_bytes: [64]u8 = undefined;
     for (&pool_bytes, 0..) |*b, i| b.* = @intCast(i);
     var tmp_buf: [128]u8 = undefined;
-    const tmp_path = std.fmt.bufPrintZ(&tmp_buf, "/tmp/sketerm-mux-smoke-{d}-pool", .{c.getpid()}) catch unreachable;
+    const tmp_path = std.fmt.bufPrintSentinel(&tmp_buf, "/tmp/sketerm-mux-smoke-{d}-pool", .{c.getpid()}, 0) catch unreachable;
     const pool_fd = c.open(tmp_path.ptr, c.O_RDWR | c.O_CREAT | c.O_TRUNC, @as(c.mode_t, 0o600));
     if (pool_fd < 0) fail("pool file open");
     _ = c.unlink(tmp_path.ptr);
@@ -965,7 +965,7 @@ fn dmabufStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_path: 
         0xc0, 0xc1, 0xc2, 0xc3,
     };
     var tmp_buf: [128]u8 = undefined;
-    const tmp_path = std.fmt.bufPrintZ(&tmp_buf, "/tmp/sketerm-mux-smoke-{d}-dmabuf", .{c.getpid()}) catch unreachable;
+    const tmp_path = std.fmt.bufPrintSentinel(&tmp_buf, "/tmp/sketerm-mux-smoke-{d}-dmabuf", .{c.getpid()}, 0) catch unreachable;
     const pool_fd = c.open(tmp_path.ptr, c.O_RDWR | c.O_CREAT | c.O_TRUNC, @as(c.mode_t, 0o600));
     if (pool_fd < 0) fail("dmabuf source open");
     defer _ = c.close(pool_fd);
@@ -1675,7 +1675,7 @@ fn pendingAppStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
     var pool_bytes: [16]u8 = undefined;
     for (&pool_bytes, 0..) |*bt, i| bt.* = @intCast(i + 100);
     var tmp_buf: [128]u8 = undefined;
-    const tmp_path = std.fmt.bufPrintZ(&tmp_buf, "/tmp/sketerm-mux-smoke-{d}-pend", .{c.getpid()}) catch unreachable;
+    const tmp_path = std.fmt.bufPrintSentinel(&tmp_buf, "/tmp/sketerm-mux-smoke-{d}-pend", .{c.getpid()}, 0) catch unreachable;
     const pool_fd = c.open(tmp_path.ptr, c.O_RDWR | c.O_CREAT | c.O_TRUNC, @as(c.mode_t, 0o600));
     if (pool_fd < 0) fail("pend pool open");
     _ = c.unlink(tmp_path.ptr);

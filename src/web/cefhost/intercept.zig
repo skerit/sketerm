@@ -1369,7 +1369,7 @@ pub fn filterSubReconcile(self: *Host) void {
             // A stage is always an orphan: the writer renames its own.
             if (staged == null and subUrlWanted(self.filter_sub_urls.items, cache_name)) continue;
             var p_buf: [4352:0]u8 = undefined;
-            const p = std.fmt.bufPrintZ(&p_buf, "{s}/{s}", .{ dir, name }) catch continue;
+            const p = std.fmt.bufPrintSentinel(&p_buf, "{s}/{s}", .{ dir, name }, 0) catch continue;
             if (c.unlink(p.ptr) == 0 and filtersub.isCacheName(name)) self.filter_sub_reload = true;
         }
     }
@@ -1379,7 +1379,7 @@ pub fn filterSubReconcile(self: *Host) void {
         var nb: [filtersub.MAX_NAME]u8 = undefined;
         const name = filtersub.cacheName(u, &nb) catch continue;
         var p_buf: [4352:0]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&p_buf, "{s}/{s}", .{ dir, name }) catch continue;
+        const path = std.fmt.bufPrintSentinel(&p_buf, "{s}/{s}", .{ dir, name }, 0) catch continue;
         var st: c.struct_stat = undefined;
         // Darwin spells it st_mtimespec; the same @hasField idiom guards
         // every other stat site in the repo, and this was the one that
@@ -2029,10 +2029,10 @@ pub fn filtersDir(buf: []u8) ?[:0]const u8 {
     if (c.getenv("XDG_CONFIG_HOME")) |xdg| {
         const base = std.mem.span(xdg);
         if (base.len != 0)
-            return std.fmt.bufPrintZ(buf, "{s}/sketerm/filters", .{base}) catch null;
+            return std.fmt.bufPrintSentinel(buf, "{s}/sketerm/filters", .{base}, 0) catch null;
     }
     const home = c.getenv("HOME") orelse return null;
-    return std.fmt.bufPrintZ(buf, "{s}/.config/sketerm/filters", .{std.mem.span(home)}) catch null;
+    return std.fmt.bufPrintSentinel(buf, "{s}/.config/sketerm/filters", .{std.mem.span(home)}, 0) catch null;
 }
 
 /// Build a fresh engine from the seed list, every *.txt in the config
@@ -2053,7 +2053,7 @@ pub fn interceptReload(gpa: std.mem.Allocator, extra_paths: []const []const u8) 
                 const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entp.*.d_name)));
                 if (!std.mem.endsWith(u8, name, ".txt")) continue;
                 var path_buf: [4352:0]u8 = undefined;
-                const p = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ dir, name }) catch continue;
+                const p = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ dir, name }, 0) catch continue;
                 const text = readFileBounded(gpa, p.ptr, 16 * 1024 * 1024) orelse continue;
                 eng.addList(text) catch {
                     gpa.free(text);
@@ -2066,7 +2066,7 @@ pub fn interceptReload(gpa: std.mem.Allocator, extra_paths: []const []const u8) 
     }
     for (extra_paths) |path| {
         var path_buf: [4352:0]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch continue;
+        const p = std.fmt.bufPrintSentinel(&path_buf, "{s}", .{path}, 0) catch continue;
         const text = readFileBounded(gpa, p.ptr, 16 * 1024 * 1024) orelse continue;
         eng.addList(text) catch {
             gpa.free(text);

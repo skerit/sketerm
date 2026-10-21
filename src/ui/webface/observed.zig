@@ -24,7 +24,7 @@ pub fn seedObserved(self: *WebFace, w: u16, h: u16, scale_x1000: u16, url: []con
         // address, and focus follows the new page); nobody has
         // typed into it yet, so the seed is written regardless.
         if (!self.widgets_dead) {
-            if (self.allocator.dupeZ(u8, url) catch null) |z| {
+            if (self.allocator.dupeSentinel(u8, url, 0) catch null) |z| {
                 defer self.allocator.free(z);
                 c.gtk_editable_set_text(@ptrCast(self.entry), z.ptr);
             }

@@ -197,7 +197,7 @@ fn realDiscover(_: *anyopaque, allocator: std.mem.Allocator) ?[:0]u8 {
     // $SKETERM_SOCKET (this server runs inside a sketerm pane) names the
     // GUI exactly; otherwise any live one will do.
     if (c.getenv("SKETERM_SOCKET")) |env| {
-        const path = allocator.dupeZ(u8, std.mem.span(env)) catch return null;
+        const path = allocator.dupeSentinel(u8, std.mem.span(env), 0) catch return null;
         if (realAlive(undefined, path)) return path;
         allocator.free(path);
     }
@@ -207,7 +207,7 @@ fn realDiscover(_: *anyopaque, allocator: std.mem.Allocator) ?[:0]u8 {
 fn guiExecutable(own: [:0]const u8, gui_build: bool, buf: []u8) ?[:0]const u8 {
     if (gui_build) return own;
     const dir = std.fs.path.dirname(own) orelse return null;
-    return std.fmt.bufPrintZ(buf, "{s}/sketerm", .{dir}) catch null;
+    return std.fmt.bufPrintSentinel(buf, "{s}/sketerm", .{dir}, 0) catch null;
 }
 
 /// Spawn a detached GUI with stdio redirected away from JSON-RPC and without the private daemon's idle-exit hint.
@@ -381,7 +381,7 @@ const FakeOps = struct {
         const i = @min(self.discover_calls, self.discoveries.len -| 1);
         if (self.discoveries.len == 0) return null;
         const d = self.discoveries[i] orelse return null;
-        return allocator.dupeZ(u8, d) catch null;
+        return allocator.dupeSentinel(u8, d, 0) catch null;
     }
     fn spawnFn(ctx: *anyopaque) bool {
         const self: *FakeOps = @ptrCast(@alignCast(ctx));

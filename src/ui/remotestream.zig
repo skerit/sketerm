@@ -394,7 +394,7 @@ fn instanceOf(stream: ?*anyopaque) *Instance {
 
 fn setError(err: [*c][*c]c.GError, backend: *const Backend) void {
     var z: [256:0]u8 = undefined;
-    const msg = std.fmt.bufPrintZ(&z, "{s}", .{backend.errText()}) catch "file service error";
+    const msg = std.fmt.bufPrintSentinel(&z, "{s}", .{backend.errText()}, 0) catch "file service error";
     c.g_set_error_literal(err, c.g_io_error_quark(), c.G_IO_ERROR_FAILED, msg.ptr);
 }
 

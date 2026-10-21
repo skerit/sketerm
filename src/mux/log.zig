@@ -128,13 +128,13 @@ fn defaultPath(buf: []u8) ?[]const u8 {
 
 fn openLog(path: []const u8) c_int {
     var z_buf: [4096]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&z_buf, "{s}", .{path}) catch return -1;
+    const z = std.fmt.bufPrintSentinel(&z_buf, "{s}", .{path}, 0) catch return -1;
     mkdirParents(z);
     // Rotate a grown log before appending (one .old generation).
     var st: c.struct_stat = undefined;
     if (c.stat(z, &st) == 0 and st.st_size > rotate_bytes) {
         var old_buf: [4096]u8 = undefined;
-        if (std.fmt.bufPrintZ(&old_buf, "{s}.old", .{path})) |old| {
+        if (std.fmt.bufPrintSentinel(&old_buf, "{s}.old", .{path}, 0)) |old| {
             _ = c.rename(z, old);
         } else |_| {}
     }

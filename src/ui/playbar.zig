@@ -378,20 +378,20 @@ pub const Playbar = struct {
 /// freeze at 0:00 for a typical short GIF.
 pub fn formatPosition(buf: *[64:0]u8, kind: Playbar.Kind, position_ms: u64, duration_ms: u64) [:0]const u8 {
     if (kind == .seeking)
-        return std.fmt.bufPrintZ(buf, "seeking...", .{}) catch unreachable;
+        return std.fmt.bufPrintSentinel(buf, "seeking...", .{}, 0) catch unreachable;
     if (duration_ms > 0 and duration_ms < 10_000)
-        return std.fmt.bufPrintZ(buf, "{d}.{d}s / {d}.{d}s", .{
+        return std.fmt.bufPrintSentinel(buf, "{d}.{d}s / {d}.{d}s", .{
             position_ms / 1000, (position_ms % 1000) / 100,
             duration_ms / 1000, (duration_ms % 1000) / 100,
-        }) catch "0.0s";
+        }, 0) catch "0.0s";
     if (duration_ms > 0)
-        return std.fmt.bufPrintZ(buf, "{d}:{d:0>2} / {d}:{d:0>2}", .{
+        return std.fmt.bufPrintSentinel(buf, "{d}:{d:0>2} / {d}:{d:0>2}", .{
             position_ms / 60_000, (position_ms / 1000) % 60,
             duration_ms / 60_000, (duration_ms / 1000) % 60,
-        }) catch "0:00";
-    return std.fmt.bufPrintZ(buf, "{d}:{d:0>2} / --:--", .{
+        }, 0) catch "0:00";
+    return std.fmt.bufPrintSentinel(buf, "{d}:{d:0>2} / --:--", .{
         position_ms / 60_000, (position_ms / 1000) % 60,
-    }) catch "0:00";
+    }, 0) catch "0:00";
 }
 
 test "formatPosition covers unknown duration, known duration and seeking" {

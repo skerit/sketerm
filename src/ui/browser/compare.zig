@@ -193,18 +193,18 @@ pub const CompareCtx = struct {
         var szl: [48:0]u8 = undefined;
         var szr: [48:0]u8 = undefined;
         const desc = switch (status) {
-            .left_only => std.fmt.bufPrintZ(&lblz, "{s}{s}  [only in source{s}]", .{
-                rel, if (is_dir) "/" else "", if (is_dir) "" else (std.fmt.bufPrintZ(&szl, ", {d} B", .{l.?.size}) catch ""),
-            }) catch "?",
-            .right_only => std.fmt.bufPrintZ(&lblz, "{s}{s}  [only in target{s}]", .{
-                rel, if (is_dir) "/" else "", if (is_dir) "" else (std.fmt.bufPrintZ(&szr, ", {d} B", .{r.?.size}) catch ""),
-            }) catch "?",
-            .differs => std.fmt.bufPrintZ(&lblz, "{s}  [differs: {s} vs {s}{s}]", .{
+            .left_only => std.fmt.bufPrintSentinel(&lblz, "{s}{s}  [only in source{s}]", .{
+                rel, if (is_dir) "/" else "", if (is_dir) "" else (std.fmt.bufPrintSentinel(&szl, ", {d} B", .{l.?.size}, 0) catch ""),
+            }, 0) catch "?",
+            .right_only => std.fmt.bufPrintSentinel(&lblz, "{s}{s}  [only in target{s}]", .{
+                rel, if (is_dir) "/" else "", if (is_dir) "" else (std.fmt.bufPrintSentinel(&szr, ", {d} B", .{r.?.size}, 0) catch ""),
+            }, 0) catch "?",
+            .differs => std.fmt.bufPrintSentinel(&lblz, "{s}  [differs: {s} vs {s}{s}]", .{
                 rel,
                 fmtSize(&szl, l.?.size),
                 fmtSize(&szr, r.?.size),
                 if (l.?.mtime_ms >= r.?.mtime_ms) ", source newer" else ", target newer",
-            }) catch "?",
+            }, 0) catch "?",
         };
         const lab = c.gtk_label_new(desc.ptr);
         c.gtk_label_set_xalign(@ptrCast(lab), 0);
@@ -268,15 +268,15 @@ pub const CompareCtx = struct {
         var info: [256:0]u8 = undefined;
         const trunc = self.left.truncated or self.right.truncated;
         const txt = if (ndiff == 0)
-            std.fmt.bufPrintZ(&info, "Trees are identical ({d} entries scanned).{s}", .{
+            std.fmt.bufPrintSentinel(&info, "Trees are identical ({d} entries scanned).{s}", .{
                 self.left.entries.count() + self.right.entries.count(),
                 if (trunc) " WARNING: scan truncated at 100k entries/side — comparison is PARTIAL." else "",
-            }) catch "identical"
+            }, 0) catch "identical"
         else
-            std.fmt.bufPrintZ(&info, "{d} difference(s). Review directions, then Execute.{s}", .{
+            std.fmt.bufPrintSentinel(&info, "{d} difference(s). Review directions, then Execute.{s}", .{
                 ndiff,
                 if (trunc) " WARNING: scan truncated at 100k entries/side — comparison is PARTIAL." else "",
-            }) catch "differences found";
+            }, 0) catch "differences found";
         c.gtk_label_set_text(self.info_label, txt.ptr);
     }
 
@@ -358,9 +358,9 @@ pub const CompareCtx = struct {
             },
         };
         var heading: [96:0]u8 = undefined;
-        const head = std.fmt.bufPrintZ(&heading, "Move {d} item{s} to the Trash?", .{
+        const head = std.fmt.bufPrintSentinel(&heading, "Move {d} item{s} to the Trash?", .{
             pending.deletes.len, if (pending.deletes.len == 1) "" else "s",
-        }) catch "Move items to the Trash?";
+        }, 0) catch "Move items to the Trash?";
         const body = self.confirmBody(pending.deletes) orelse {
             pending.destroy();
             return;
@@ -552,11 +552,11 @@ pub const CompareCtx = struct {
                 var lz: [700:0]u8 = undefined;
                 if (std.mem.eql(u8, &pp.l_hash, &pp.r_hash)) {
                     c.gtk_drop_down_set_selected(@ptrCast(pp.row.dd), @intFromEnum(Action.skip));
-                    if (std.fmt.bufPrintZ(&lz, "{s}  [content IDENTICAL — mtime noise]", .{pp.row.rel})) |t| {
+                    if (std.fmt.bufPrintSentinel(&lz, "{s}  [content IDENTICAL — mtime noise]", .{pp.row.rel}, 0)) |t| {
                         c.gtk_label_set_text(@ptrCast(pp.row.lab), t.ptr);
                     } else |_| {}
                 } else {
-                    if (std.fmt.bufPrintZ(&lz, "{s}  [content DIFFERS — hash mismatch]", .{pp.row.rel})) |t| {
+                    if (std.fmt.bufPrintSentinel(&lz, "{s}  [content DIFFERS — hash mismatch]", .{pp.row.rel}, 0)) |t| {
                         c.gtk_label_set_text(@ptrCast(pp.row.lab), t.ptr);
                     } else |_| {}
                 }
@@ -656,9 +656,9 @@ pub fn startCompare(self: *BrowserView, tab: *BTab, right_path: []const u8) void
     c.gtk_widget_set_margin_bottom(vbox, 10);
 
     var hdr: [1024:0]u8 = undefined;
-    const htxt = std.fmt.bufPrintZ(&hdr, "Source: {s}:{s}\nTarget: {s}:{s}", .{
+    const htxt = std.fmt.bufPrintSentinel(&hdr, "Source: {s}:{s}\nTarget: {s}:{s}", .{
         left_hc.label(), src_path, right_hc.label(), right_path,
-    }) catch "Compare";
+    }, 0) catch "Compare";
     const header = c.gtk_label_new(htxt.ptr);
     c.gtk_label_set_xalign(@ptrCast(header), 0);
     c.gtk_box_append(@ptrCast(vbox), header);

@@ -1566,9 +1566,9 @@ test "surface icon cache replays every live surface independently" {
 test "daemon startup preserves live owners and socket inode ownership" {
     const t = std.testing;
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-daemon-owner-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-daemon-owner-{d}.sock", .{c.getpid()}, 0);
     var lock_buf: [280:0]u8 = undefined;
-    const lock_path = try std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path});
+    const lock_path = try std.fmt.bufPrintSentinel(&lock_buf, "{s}.lock", .{path}, 0);
     _ = c.unlink(path.ptr);
     _ = c.unlink(lock_path.ptr);
     defer {
@@ -1594,9 +1594,9 @@ test "daemon startup preserves live owners and socket inode ownership" {
 test "daemon startup recovers a refused stale socket" {
     const t = std.testing;
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-daemon-stale-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-daemon-stale-{d}.sock", .{c.getpid()}, 0);
     var lock_buf: [280:0]u8 = undefined;
-    const lock_path = try std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path});
+    const lock_path = try std.fmt.bufPrintSentinel(&lock_buf, "{s}.lock", .{path}, 0);
     _ = c.unlink(path.ptr);
     _ = c.unlink(lock_path.ptr);
     defer {
@@ -1619,9 +1619,9 @@ test "daemon startup recovers a refused stale socket" {
 test "a closed lifetime fence stops the daemon on the next tick" {
     const t = std.testing;
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-daemon-fence-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-daemon-fence-{d}.sock", .{c.getpid()}, 0);
     var lock_buf: [280:0]u8 = undefined;
-    const lock_path = try std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path});
+    const lock_path = try std.fmt.bufPrintSentinel(&lock_buf, "{s}.lock", .{path}, 0);
     _ = c.unlink(path.ptr);
     _ = c.unlink(lock_path.ptr);
     defer {
@@ -1649,9 +1649,9 @@ test "a closed lifetime fence stops the daemon on the next tick" {
 test "--idle-exit retires a daemon holding nothing; 0 never does" {
     const t = std.testing;
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-daemon-idle-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-daemon-idle-{d}.sock", .{c.getpid()}, 0);
     var lock_buf: [280:0]u8 = undefined;
-    const lock_path = try std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path});
+    const lock_path = try std.fmt.bufPrintSentinel(&lock_buf, "{s}.lock", .{path}, 0);
     _ = c.unlink(path.ptr);
     _ = c.unlink(lock_path.ptr);
     defer {
@@ -1696,9 +1696,9 @@ test "lsp_open resolves the root remotely, bridges stdio bytes, and reaps on clo
     const t = std.testing;
     const muxclient = @import("client.zig");
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-daemon-lsp-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-daemon-lsp-{d}.sock", .{c.getpid()}, 0);
     var lock_buf: [280:0]u8 = undefined;
-    const lock_path = try std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path});
+    const lock_path = try std.fmt.bufPrintSentinel(&lock_buf, "{s}.lock", .{path}, 0);
     _ = c.unlink(path.ptr);
     _ = c.unlink(lock_path.ptr);
     defer {
@@ -1711,11 +1711,11 @@ test "lsp_open resolves the root remotely, bridges stdio bytes, and reaps on clo
     // A project tree whose marker sits one level above the document:
     // the daemon must answer the MARKER directory as the root.
     var root_buf: [256:0]u8 = undefined;
-    const root = try std.fmt.bufPrintZ(&root_buf, "/tmp/sketerm-lsp-root-{d}", .{c.getpid()});
+    const root = try std.fmt.bufPrintSentinel(&root_buf, "/tmp/sketerm-lsp-root-{d}", .{c.getpid()}, 0);
     var sub_buf: [256:0]u8 = undefined;
-    const sub = try std.fmt.bufPrintZ(&sub_buf, "{s}/src", .{root});
+    const sub = try std.fmt.bufPrintSentinel(&sub_buf, "{s}/src", .{root}, 0);
     var mark_buf: [256:0]u8 = undefined;
-    const mark = try std.fmt.bufPrintZ(&mark_buf, "{s}/rootmark", .{root});
+    const mark = try std.fmt.bufPrintSentinel(&mark_buf, "{s}/rootmark", .{root}, 0);
     _ = c.mkdir(root.ptr, 0o700);
     _ = c.mkdir(sub.ptr, 0o700);
     {
@@ -1838,11 +1838,11 @@ test "a remote language server's stderr tail rides its chan_close" {
     const t = std.testing;
     const muxclient = @import("client.zig");
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-daemon-lsperr-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-daemon-lsperr-{d}.sock", .{c.getpid()}, 0);
     var lock_buf: [280:0]u8 = undefined;
-    const lock_path = try std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path});
+    const lock_path = try std.fmt.bufPrintSentinel(&lock_buf, "{s}.lock", .{path}, 0);
     var script_buf: [256:0]u8 = undefined;
-    const script = try std.fmt.bufPrintZ(&script_buf, "/tmp/sketerm-lsperr-{d}.sh", .{c.getpid()});
+    const script = try std.fmt.bufPrintSentinel(&script_buf, "/tmp/sketerm-lsperr-{d}.sh", .{c.getpid()}, 0);
     _ = c.unlink(path.ptr);
     _ = c.unlink(lock_path.ptr);
     defer {
@@ -1892,9 +1892,9 @@ test "web_helper_open: missing helper is a described refusal, a spawn bridges a 
     const t = std.testing;
     const muxclient = @import("client.zig");
     var path_buf: [256:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-daemon-web-{d}.sock", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-daemon-web-{d}.sock", .{c.getpid()}, 0);
     var lock_buf: [280:0]u8 = undefined;
-    const lock_path = try std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path});
+    const lock_path = try std.fmt.bufPrintSentinel(&lock_buf, "{s}.lock", .{path}, 0);
     _ = c.unlink(path.ptr);
     _ = c.unlink(lock_path.ptr);
     defer {
@@ -2000,14 +2000,14 @@ test "web_helper_connect: bridges a helper serving beside the daemon socket, des
     const t = std.testing;
     const muxclient = @import("client.zig");
     var dir_buf: [128:0]u8 = undefined;
-    const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/sk-webc-{d}", .{c.getpid()});
+    const dir = try std.fmt.bufPrintSentinel(&dir_buf, "/tmp/sk-webc-{d}", .{c.getpid()}, 0);
     _ = c.mkdir(dir.ptr, 0o700);
     var path_buf: [160:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/mux.sock", .{dir});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/mux.sock", .{dir}, 0);
     var lock_buf: [180:0]u8 = undefined;
-    const lock_path = try std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path});
+    const lock_path = try std.fmt.bufPrintSentinel(&lock_buf, "{s}.lock", .{path}, 0);
     var helper_buf: [160:0]u8 = undefined;
-    const helper_path = try std.fmt.bufPrintZ(&helper_buf, "{s}/web.sock", .{dir});
+    const helper_path = try std.fmt.bufPrintSentinel(&helper_buf, "{s}/web.sock", .{dir}, 0);
     _ = c.unlink(path.ptr);
     _ = c.unlink(lock_path.ptr);
     _ = c.unlink(helper_path.ptr);
@@ -2147,17 +2147,17 @@ test "web_helper_connect: an instance name re-anchors the lookup in that MCP ins
     const t = std.testing;
     const muxclient = @import("client.zig");
     var dir_buf: [128:0]u8 = undefined;
-    const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/sk-webi-{d}", .{c.getpid()});
+    const dir = try std.fmt.bufPrintSentinel(&dir_buf, "/tmp/sk-webi-{d}", .{c.getpid()}, 0);
     _ = c.mkdir(dir.ptr, 0o700);
     var inst_buf: [160:0]u8 = undefined;
-    const inst_dir = try std.fmt.bufPrintZ(&inst_buf, "{s}/mcp-hub", .{dir});
+    const inst_dir = try std.fmt.bufPrintSentinel(&inst_buf, "{s}/mcp-hub", .{dir}, 0);
     _ = c.mkdir(inst_dir.ptr, 0o700);
     var path_buf: [160:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/mux.sock", .{dir});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/mux.sock", .{dir}, 0);
     var lock_buf: [180:0]u8 = undefined;
-    const lock_path = try std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path});
+    const lock_path = try std.fmt.bufPrintSentinel(&lock_buf, "{s}.lock", .{path}, 0);
     var helper_buf: [180:0]u8 = undefined;
-    const helper_path = try std.fmt.bufPrintZ(&helper_buf, "{s}/web.sock", .{inst_dir});
+    const helper_path = try std.fmt.bufPrintSentinel(&helper_buf, "{s}/web.sock", .{inst_dir}, 0);
     _ = c.unlink(path.ptr);
     _ = c.unlink(lock_path.ptr);
     _ = c.unlink(helper_path.ptr);
@@ -2758,7 +2758,7 @@ test "daemon listener paths are canonicalized before bind and export" {
     var orig_cwd_buf: [4096]u8 = undefined;
     try t.expect(c.getcwd(&orig_cwd_buf, orig_cwd_buf.len) != null);
     var root_buf: [64:0]u8 = undefined;
-    const root = try std.fmt.bufPrintZ(&root_buf, "/tmp/sk-canon-{d}", .{c.getpid()});
+    const root = try std.fmt.bufPrintSentinel(&root_buf, "/tmp/sk-canon-{d}", .{c.getpid()}, 0);
     _ = c.mkdir(root.ptr, 0o700);
     defer _ = c.rmdir(root.ptr);
     try t.expectEqual(@as(c_int, 0), c.chdir(root.ptr));
@@ -2784,7 +2784,7 @@ test "equivalent dot and symlinked socket spellings share one physical identity"
     // (a git worktree, a CI workspace) pushes the canonical path past
     // the ~108-byte cap and fails the test for the wrong reason.
     var root_buf: [64:0]u8 = undefined;
-    const root = try std.fmt.bufPrintZ(&root_buf, "/tmp/sk-sockid-{d}", .{c.getpid()});
+    const root = try std.fmt.bufPrintSentinel(&root_buf, "/tmp/sk-sockid-{d}", .{c.getpid()}, 0);
     _ = c.mkdir(root.ptr, 0o700);
     const real_rel = try std.fmt.allocPrint(t.allocator, "{s}/real", .{root});
     defer t.allocator.free(real_rel);
@@ -3095,7 +3095,7 @@ pub const FsJob = struct {
     fn unlinkOwned(self: *FsJob, path: []const u8) void {
         _ = self;
         var z: [4096:0]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return;
+        const p = std.fmt.bufPrintSentinel(&z, "{s}", .{path}, 0) catch return;
         _ = c.unlink(p.ptr);
     }
 
@@ -3446,7 +3446,7 @@ pub const Daemon = struct {
     /// still have found nothing anyway.
     fn migrateLegacyFsJournals(sock_dir: []const u8, new_dir: []const u8) void {
         var legacy_buf: [4096:0]u8 = undefined;
-        const legacy = std.fmt.bufPrintZ(&legacy_buf, "{s}/fsjobs", .{sock_dir}) catch return;
+        const legacy = std.fmt.bufPrintSentinel(&legacy_buf, "{s}/fsjobs", .{sock_dir}, 0) catch return;
         if (std.mem.eql(u8, legacy, new_dir)) return;
         const dir = c.opendir(legacy.ptr) orelse return;
         defer _ = c.closedir(dir);
@@ -3461,10 +3461,10 @@ pub const Daemon = struct {
             var from_buf: [4096:0]u8 = undefined;
             var to_buf: [4096:0]u8 = undefined;
             var stage_buf: [4096:0]u8 = undefined;
-            const from = std.fmt.bufPrintZ(&from_buf, "{s}/{s}", .{ legacy, name }) catch continue;
-            const to = std.fmt.bufPrintZ(&to_buf, "{s}/{s}", .{ new_dir, name }) catch continue;
+            const from = std.fmt.bufPrintSentinel(&from_buf, "{s}/{s}", .{ legacy, name }, 0) catch continue;
+            const to = std.fmt.bufPrintSentinel(&to_buf, "{s}/{s}", .{ new_dir, name }, 0) catch continue;
             if (c.rename(from.ptr, to.ptr) == 0) continue;
-            const stage = std.fmt.bufPrintZ(&stage_buf, "{s}/.{s}.{d}.part", .{ new_dir, name, c.getpid() }) catch continue;
+            const stage = std.fmt.bufPrintSentinel(&stage_buf, "{s}/.{s}.{d}.part", .{ new_dir, name, c.getpid() }, 0) catch continue;
             if (copyJournalFile(from.ptr, stage.ptr) and c.rename(stage.ptr, to.ptr) == 0) {
                 _ = c.unlink(from.ptr);
             } else _ = c.unlink(stage.ptr);
@@ -3584,7 +3584,7 @@ pub const Daemon = struct {
         var lock_fd: c_int = -1;
         var lock_buf: [4096:0]u8 = undefined;
         if (self.sock_path.len > 0) {
-            if (std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{self.sock_path})) |lock_path| {
+            if (std.fmt.bufPrintSentinel(&lock_buf, "{s}.lock", .{self.sock_path}, 0)) |lock_path| {
                 const fd = c.open(lock_path.ptr, c.O_CREAT | c.O_RDWR | c.O_CLOEXEC, @as(c_uint, 0o600));
                 if (fd >= 0) {
                     var lock = std.mem.zeroes(c.struct_flock);
@@ -4444,9 +4444,9 @@ pub const Daemon = struct {
                     const id = s.next_capture_id;
                     var path_buf: [4096]u8 = undefined;
                     const path = (if (id <= 1)
-                        std.fmt.bufPrintZ(&path_buf, "{s}.wav", .{stem})
+                        std.fmt.bufPrintSentinel(&path_buf, "{s}.wav", .{stem}, 0)
                     else
-                        std.fmt.bufPrintZ(&path_buf, "{s}-{d}.wav", .{ stem, id })) catch continue;
+                        std.fmt.bufPrintSentinel(&path_buf, "{s}-{d}.wav", .{ stem, id }, 0)) catch continue;
                     const w = wavcap.Writer.open(path.ptr, fmt, chans, rate) orelse {
                         log.warn("audio capture: cannot open '{s}' (or unmappable PA format {d}) — stream {d} not captured", .{ path, fmt, stream });
                         continue;
@@ -6440,7 +6440,7 @@ pub const Daemon = struct {
         @memcpy(hostz[0..req.host.len], req.host);
         hostz[req.host.len] = 0;
         var portz: [8]u8 = undefined;
-        const ports = std.fmt.bufPrintZ(&portz, "{d}", .{req.port}) catch {
+        const ports = std.fmt.bufPrintSentinel(&portz, "{d}", .{req.port}, 0) catch {
             cl.queueJson(.stream_reply, .{ .req = req.req, .ok = false, .@"error" = "bad port" });
             return;
         };
@@ -6652,7 +6652,7 @@ pub const Daemon = struct {
         // The child's argv, NUL-terminated before the fork (no
         // allocation between fork and exec).
         var fd_arg: [16:0]u8 = undefined;
-        const fd_str = std.fmt.bufPrintZ(&fd_arg, "{d}", .{pair[1]}) catch unreachable;
+        const fd_str = std.fmt.bufPrintSentinel(&fd_arg, "{d}", .{pair[1]}, 0) catch unreachable;
         const pid = c.fork();
         if (pid < 0) {
             _ = c.close(pair[0]);
@@ -6837,7 +6837,7 @@ pub const Daemon = struct {
         var it = std.mem.splitScalar(u8, text, '\n');
         while (it.next()) |line| : (idx += 1) {
             if (line.len == 0) continue;
-            if (std.ascii.indexOfIgnoreCase(line, req.pattern) == null) continue;
+            if (std.ascii.findIgnoreCase(line, req.pattern) == null) continue;
             total += 1;
             if (hits.items.len < max) {
                 // Cap hit lines; back off a mid-UTF-8 cut so the JSON

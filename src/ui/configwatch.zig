@@ -51,7 +51,7 @@ pub const Watcher = struct {
     pub fn start(window: *Window, path: []const u8) ?*Watcher {
         const allocator = window.allocator;
         const self = allocator.create(Watcher) catch return null;
-        const owned = allocator.dupeZ(u8, path) catch {
+        const owned = allocator.dupeSentinel(u8, path, 0) catch {
             allocator.destroy(self);
             return null;
         };

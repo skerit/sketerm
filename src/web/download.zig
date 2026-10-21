@@ -105,7 +105,7 @@ test "uniquePath never hands back an existing file" {
     const first = uniquePath(&buf, td.path(), "f.bin", 100).?;
     try std.testing.expect(std.mem.endsWith(u8, first, "/f.bin"));
     var fz: [512:0]u8 = undefined;
-    const fzp = std.fmt.bufPrintZ(&fz, "{s}", .{first}) catch unreachable;
+    const fzp = std.fmt.bufPrintSentinel(&fz, "{s}", .{first}, 0) catch unreachable;
     const f = c.fopen(fzp.ptr, "wb") orelse return error.SkipZigTest;
     _ = c.fclose(f);
     const second = uniquePath(&buf, td.path(), "f.bin", 100).?;

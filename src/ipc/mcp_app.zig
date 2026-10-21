@@ -2068,7 +2068,7 @@ fn appWaitText(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *ap
                 const tail = if (o.text.len > last_tail.len) o.text[o.text.len - last_tail.len ..] else o.text;
                 @memcpy(last_tail[0..tail.len], tail);
                 last_tail_len = tail.len;
-                if (std.ascii.indexOfIgnoreCase(o.text, query) != null) seen = try dupeOcrOut(arena, o);
+                if (std.ascii.findIgnoreCase(o.text, query) != null) seen = try dupeOcrOut(arena, o);
             },
             .err => |e| {
                 if (!std.mem.startsWith(u8, e, "no rendered")) return ocrErr(arena, e);
@@ -2874,7 +2874,7 @@ pub fn runActionSteps(
                 _ = ocr_scratch.reset(.free_all);
                 switch (try ocrWindow(ocr_scratch.allocator(), app, wid, region, scale, psm, lang)) {
                     .out => |o| {
-                        if (std.ascii.indexOfIgnoreCase(o.text, query) != null) seen = try dupeOcrOut(arena, o);
+                        if (std.ascii.findIgnoreCase(o.text, query) != null) seen = try dupeOcrOut(arena, o);
                     },
                     .err => |e| {
                         // "not rendered yet" is transient; a missing
@@ -3421,7 +3421,7 @@ test "app recordings use private complete replacement" {
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/capture.webm", .{base});
     var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    const path_z = try std.fmt.bufPrintSentinel(&path_z_buf, "{s}", .{path}, 0);
     defer _ = c.unlink(path_z.ptr);
 
     try saveRecording(path, "recording");
@@ -3485,17 +3485,17 @@ test "app_macros show re-serializes the stored macro, never echoes it" {
     const dir_z = c.mkdtemp(&dirbuf) orelse return error.SkipZigTest;
     const dir = std.mem.span(@as([*:0]u8, @ptrCast(dir_z)));
     var envbuf: [160]u8 = undefined;
-    const env = try std.fmt.bufPrintZ(&envbuf, "{s}", .{dir});
+    const env = try std.fmt.bufPrintSentinel(&envbuf, "{s}", .{dir}, 0);
     var saved: EnvSave = .{};
     try saved.override("XDG_STATE_HOME", env);
     var zbuf: [4096]u8 = undefined;
     defer {
         saved.restore();
-        if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm/macros/pretty.json", .{dir})) |f| {
+        if (std.fmt.bufPrintSentinel(&zbuf, "{s}/sketerm/macros/pretty.json", .{dir}, 0)) |f| {
             _ = c.unlink(f.ptr);
         } else |_| {}
-        if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm/macros", .{dir})) |d| _ = c.rmdir(d.ptr) else |_| {}
-        if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm", .{dir})) |d| _ = c.rmdir(d.ptr) else |_| {}
+        if (std.fmt.bufPrintSentinel(&zbuf, "{s}/sketerm/macros", .{dir}, 0)) |d| _ = c.rmdir(d.ptr) else |_| {}
+        if (std.fmt.bufPrintSentinel(&zbuf, "{s}/sketerm", .{dir}, 0)) |d| _ = c.rmdir(d.ptr) else |_| {}
         _ = c.rmdir(dir_z);
     }
 
@@ -3529,17 +3529,17 @@ test "app_macros show prints a malformed macro's stored bytes in text mode" {
     const dir_z = c.mkdtemp(&dirbuf) orelse return error.SkipZigTest;
     const dir = std.mem.span(@as([*:0]u8, @ptrCast(dir_z)));
     var envbuf: [160]u8 = undefined;
-    const env = try std.fmt.bufPrintZ(&envbuf, "{s}", .{dir});
+    const env = try std.fmt.bufPrintSentinel(&envbuf, "{s}", .{dir}, 0);
     var saved: EnvSave = .{};
     try saved.override("XDG_STATE_HOME", env);
     var zbuf: [4096]u8 = undefined;
     defer {
         saved.restore();
-        if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm/macros/bad.json", .{dir})) |f| {
+        if (std.fmt.bufPrintSentinel(&zbuf, "{s}/sketerm/macros/bad.json", .{dir}, 0)) |f| {
             _ = c.unlink(f.ptr);
         } else |_| {}
-        if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm/macros", .{dir})) |d| _ = c.rmdir(d.ptr) else |_| {}
-        if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm", .{dir})) |d| _ = c.rmdir(d.ptr) else |_| {}
+        if (std.fmt.bufPrintSentinel(&zbuf, "{s}/sketerm/macros", .{dir}, 0)) |d| _ = c.rmdir(d.ptr) else |_| {}
+        if (std.fmt.bufPrintSentinel(&zbuf, "{s}/sketerm", .{dir}, 0)) |d| _ = c.rmdir(d.ptr) else |_| {}
         _ = c.rmdir(dir_z);
     }
     try mcpassets.save(t.allocator, .macro, "bad", "{\"steps\":[1]}");
@@ -4312,7 +4312,7 @@ pub fn a11yFindMatch(node: std.json.Value, role: ?i64, name_sub: ?[]const u8) ?s
     if (ok) {
         if (name_sub) |sub| {
             const nn = node.object.get("name") orelse std.json.Value{ .string = "" };
-            if (nn != .string or std.ascii.indexOfIgnoreCase(nn.string, sub) == null) ok = false;
+            if (nn != .string or std.ascii.findIgnoreCase(nn.string, sub) == null) ok = false;
         } else if (role == null) ok = false; // no criteria = no match
     }
     if (ok) return node;
@@ -4978,7 +4978,7 @@ pub fn findWordRun(words: []const ocr.Word, query: []const u8) ?struct { x: u32,
     var i: usize = 0;
     outer: while (i + ntok <= words.len) : (i += 1) {
         for (toks[0..ntok], 0..) |tok, j| {
-            if (std.ascii.indexOfIgnoreCase(words[i + j].text, tok) == null) continue :outer;
+            if (std.ascii.findIgnoreCase(words[i + j].text, tok) == null) continue :outer;
         }
         var x0 = words[i].x;
         var y0 = words[i].y;
@@ -5967,7 +5967,7 @@ test "screenshot_app path writes a full-resolution PNG and inline:false skips th
     const app_tools = @import("mcp_app.zig");
     const path = try std.fmt.allocPrint(arena, "/tmp/sketerm-mcp-shot-test-{d}.png", .{c.getpid()});
     defer _ = c.unlink(path.ptr);
-    const pathz_ = try arena.dupeZ(u8, path);
+    const pathz_ = try arena.dupeSentinel(u8, path, 0);
     _ = c.unlink(pathz_.ptr);
     const args = try std.fmt.allocPrint(arena, "{{\"app\":1,\"window\":1,\"path\":\"{s}\",\"inline\":false}}", .{path});
     const result = try app_tools.appTool(arena, .screenshot_app, try parseTestValue(arena, args));

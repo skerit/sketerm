@@ -73,7 +73,7 @@ pub fn onFindResult(self: *WebFace, ev: proto.EvFindResult) void {
     if (self.widgets_dead) return;
     if (c.gtk_widget_get_visible(self.find_bar) == 0) return;
     var buf: [64]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{d}/{d}", .{ ev.active, ev.count }) catch return;
+    const z = std.fmt.bufPrintSentinel(&buf, "{d}/{d}", .{ ev.active, ev.count }, 0) catch return;
     c.gtk_label_set_text(@ptrCast(self.find_count), z.ptr);
 }
 

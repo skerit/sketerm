@@ -28,13 +28,13 @@ pub fn copyZ(buf: *[256:0]u8, text: []const u8) [*:0]const u8 {
 
 pub fn fmtSize(buf: *[48:0]u8, size: u64) [:0]const u8 {
     const s = if (size >= (1 << 30))
-        std.fmt.bufPrintZ(buf, "{d:.1} GB", .{@as(f64, @floatFromInt(size)) / (1 << 30)}) catch "?"
+        std.fmt.bufPrintSentinel(buf, "{d:.1} GB", .{@as(f64, @floatFromInt(size)) / (1 << 30)}, 0) catch "?"
     else if (size >= (1 << 20))
-        std.fmt.bufPrintZ(buf, "{d:.1} MB", .{@as(f64, @floatFromInt(size)) / (1 << 20)}) catch "?"
+        std.fmt.bufPrintSentinel(buf, "{d:.1} MB", .{@as(f64, @floatFromInt(size)) / (1 << 20)}, 0) catch "?"
     else if (size >= 1024)
-        std.fmt.bufPrintZ(buf, "{d:.1} KB", .{@as(f64, @floatFromInt(size)) / 1024}) catch "?"
+        std.fmt.bufPrintSentinel(buf, "{d:.1} KB", .{@as(f64, @floatFromInt(size)) / 1024}, 0) catch "?"
     else
-        std.fmt.bufPrintZ(buf, "{d} B", .{size}) catch "?";
+        std.fmt.bufPrintSentinel(buf, "{d} B", .{size}, 0) catch "?";
     return @ptrCast(s);
 }
 

@@ -52,7 +52,7 @@ test "the embedded stories are titled, attributed, plain ASCII paragraphs" {
     try t.expect(std.mem.startsWith(u8, TEXT, "# "));
     try t.expect(TEXT.len > 100 << 10 and TEXT.len < 300 << 10);
     for (TEXT) |ch| try t.expect(ch == '\n' or (ch >= 0x20 and ch < 0x7f));
-    try t.expect(std.ascii.indexOfIgnoreCase(TEXT, "gutenberg") == null);
+    try t.expect(std.ascii.findIgnoreCase(TEXT, "gutenberg") == null);
     try t.expect(count() >= 5);
     try t.expect(get(count()) == null);
     for (0..count()) |i| {

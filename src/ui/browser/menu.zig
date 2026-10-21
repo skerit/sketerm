@@ -499,7 +499,7 @@ fn buildOpenWith(self: *BrowserView, ctx: *MenuCtx, m: classicmenu.Menu) void {
     }
     var namez: [512:0]u8 = undefined;
     var ct: [*c]c.gchar = null;
-    if (std.fmt.bufPrintZ(&namez, "{s}", .{std.fs.path.basename(path)})) |bz| {
+    if (std.fmt.bufPrintSentinel(&namez, "{s}", .{std.fs.path.basename(path)}, 0)) |bz| {
         var uncertain: c.gboolean = 0;
         ct = c.g_content_type_guess(bz.ptr, null, 0, &uncertain);
     } else |_| {}
@@ -853,7 +853,7 @@ fn appendLocalTemplatesFallback(self: *BrowserView, ctx: *MenuCtx, docs: classic
     var dbuf: [4096]u8 = undefined;
     const dir = localTemplatesDir(&dbuf) orelse return false;
     var dz: [4096:0]u8 = undefined;
-    const dzs = std.fmt.bufPrintZ(&dz, "{s}", .{dir}) catch return false;
+    const dzs = std.fmt.bufPrintSentinel(&dz, "{s}", .{dir}, 0) catch return false;
     const d = c.opendir(dzs.ptr) orelse return false;
     defer _ = c.closedir(d);
 
@@ -902,7 +902,7 @@ fn localTemplatesDir(buf: []u8) ?[]const u8 {
     }
     const dir = candidate.?;
     var z: [2048:0]u8 = undefined;
-    const zs = std.fmt.bufPrintZ(&z, "{s}", .{dir}) catch return null;
+    const zs = std.fmt.bufPrintSentinel(&z, "{s}", .{dir}, 0) catch return null;
     if (c.access(zs.ptr, c.F_OK) != 0) return null;
     const n = @min(dir.len, buf.len - 1);
     @memcpy(buf[0..n], dir[0..n]);
@@ -1162,7 +1162,7 @@ pub fn onMenuWebBrowser(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         });
         return;
     };
-    const pz = self.allocator.dupeZ(u8, copied) catch return;
+    const pz = self.allocator.dupeSentinel(u8, copied, 0) catch return;
     defer self.allocator.free(pz);
     const uri = c.g_filename_to_uri(pz.ptr, null, null) orelse return;
     defer c.g_free(uri);
@@ -1479,7 +1479,7 @@ pub const ActionCtx = struct {
 pub fn appendActionItems(self: *BrowserView, m: classicmenu.Menu, ctx: *MenuCtx) void {
     var dirbuf: [4096:0]u8 = undefined;
     const cfg = c.g_get_user_config_dir();
-    const adir = std.fmt.bufPrintZ(&dirbuf, "{s}/sketerm/actions", .{cfg}) catch return;
+    const adir = std.fmt.bufPrintSentinel(&dirbuf, "{s}/sketerm/actions", .{cfg}, 0) catch return;
     const d = c.opendir(adir.ptr) orelse return;
     defer _ = c.closedir(d);
     const remote = ctx.tab.hc.host != null;
@@ -1490,7 +1490,7 @@ pub fn appendActionItems(self: *BrowserView, m: classicmenu.Menu, ctx: *MenuCtx)
         const fname = std.mem.span(@as([*:0]const u8, @ptrCast(&de.*.d_name)));
         if (!std.mem.endsWith(u8, fname, ".action")) continue;
         var fbuf: [4200:0]u8 = undefined;
-        const fpath = std.fmt.bufPrintZ(&fbuf, "{s}/{s}", .{ adir, fname }) catch continue;
+        const fpath = std.fmt.bufPrintSentinel(&fbuf, "{s}/{s}", .{ adir, fname }, 0) catch continue;
         const f = c.fopen(fpath.ptr, "rb") orelse continue;
         var content: [4096]u8 = undefined;
         const n = c.fread(&content, 1, content.len, f);
@@ -1564,14 +1564,14 @@ pub fn onActionActivated(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
         if (self.on_host_exec) |cb| {
             if (self.hooks_ctx) |hctx| {
                 var z: [4096:0]u8 = undefined;
-                const cl = std.fmt.bufPrintZ(&z, "{s}", .{actx.cmdline}) catch return;
+                const cl = std.fmt.bufPrintSentinel(&z, "{s}", .{actx.cmdline}, 0) catch return;
                 cb(hctx, actx.host orelse "", cl);
                 self.setStatus("action started (app session)");
             }
         }
     } else {
         var z: [4096:0]u8 = undefined;
-        const cl = std.fmt.bufPrintZ(&z, "{s}", .{actx.cmdline}) catch return;
+        const cl = std.fmt.bufPrintSentinel(&z, "{s}", .{actx.cmdline}, 0) catch return;
         _ = c.g_spawn_command_line_async(cl.ptr, null);
         self.setStatus("action started");
     }

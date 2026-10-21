@@ -73,7 +73,7 @@ fn countSpools() usize {
 
 fn fileSize(path: []const u8) u64 {
     var z: [4096:0]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return 0;
+    const p = std.fmt.bufPrintSentinel(&z, "{s}", .{path}, 0) catch return 0;
     var st: c.struct_stat = undefined;
     return if (c.stat(p.ptr, &st) == 0 and st.st_size > 0) @intCast(st.st_size) else 0;
 }
@@ -99,7 +99,7 @@ fn spoolPath(allocator: std.mem.Allocator, before: usize) ?[]u8 {
         const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
         if (!std.mem.startsWith(u8, name, ".sketerm-preview-") or !std.mem.endsWith(u8, name, ".mp4")) continue;
         var z: [4096:0]u8 = undefined;
-        const full = std.fmt.bufPrintZ(&z, "/tmp/{s}", .{name}) catch continue;
+        const full = std.fmt.bufPrintSentinel(&z, "/tmp/{s}", .{name}, 0) catch continue;
         var st: c.struct_stat = undefined;
         if (c.stat(full.ptr, &st) != 0) continue;
         const ts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
@@ -133,10 +133,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return 0;
     }
     var state_buf: [128:0]u8 = undefined;
-    const state_dir = std.fmt.bufPrintZ(&state_buf, "/tmp/sketerm-smoke-stream-state-{d}", .{c.getpid()}) catch unreachable;
+    const state_dir = std.fmt.bufPrintSentinel(&state_buf, "/tmp/sketerm-smoke-stream-state-{d}", .{c.getpid()}, 0) catch unreachable;
     _ = c.setenv("XDG_STATE_HOME", state_dir.ptr, 1);
     var cache_buf: [128:0]u8 = undefined;
-    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "/tmp/sketerm-smoke-stream-cache-{d}", .{c.getpid()}) catch unreachable;
+    const cache_dir = std.fmt.bufPrintSentinel(&cache_buf, "/tmp/sketerm-smoke-stream-cache-{d}", .{c.getpid()}, 0) catch unreachable;
     _ = c.setenv("XDG_CACHE_HOME", cache_dir.ptr, 1);
 
     var gpa_state: std.heap.DebugAllocator(.{ .safety = true }) = .{};
@@ -147,17 +147,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const allocator = gpa_state.allocator();
 
     var dir_buf: [128:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "/tmp/sketerm-smoke-stream-{d}", .{c.getpid()}) catch unreachable;
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "/tmp/sketerm-smoke-stream-{d}", .{c.getpid()}, 0) catch unreachable;
     if (c.mkdir(dir.ptr, 0o700) != 0) fail("mkdir");
     defer {
         var cmd: [256:0]u8 = undefined;
-        const rm = std.fmt.bufPrintZ(&cmd, "rm -rf {s} {s} {s}", .{ dir, state_dir, cache_dir }) catch unreachable;
+        const rm = std.fmt.bufPrintSentinel(&cmd, "rm -rf {s} {s} {s}", .{ dir, state_dir, cache_dir }, 0) catch unreachable;
         _ = c.system(rm.ptr);
     }
     // A 3-second synthetic clip with audio, big enough that the spool
     // is still growing when the first bytes are read.
     var clip_buf: [160:0]u8 = undefined;
-    const clip = std.fmt.bufPrintZ(&clip_buf, "{s}/clip.mp4", .{dir}) catch unreachable;
+    const clip = std.fmt.bufPrintSentinel(&clip_buf, "{s}/clip.mp4", .{dir}, 0) catch unreachable;
     if (!run(&[_:null]?[*:0]const u8{
         "ffmpeg", "-nostdin", "-y",       "-v",       "error", "-f",   "lavfi", "-i", "testsrc=size=1920x1080:rate=30:duration=3",
         "-f",     "lavfi",    "-i",       "sine=frequency=440:duration=3", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
@@ -196,7 +196,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (std.mem.count(u8, bytes, "moof") < 2) fail("spool has fewer than two fragments (keyframe cadence)");
         // Decodable end to end: what the viewer will hand GStreamer.
         var spool_copy_buf: [160:0]u8 = undefined;
-        const spool_copy = std.fmt.bufPrintZ(&spool_copy_buf, "{s}/spool.mp4", .{dir}) catch unreachable;
+        const spool_copy = std.fmt.bufPrintSentinel(&spool_copy_buf, "{s}/spool.mp4", .{dir}, 0) catch unreachable;
         writeFile(spool_copy.ptr, bytes);
         if (!run(&[_:null]?[*:0]const u8{ "ffmpeg", "-nostdin", "-v", "error", "-i", spool_copy.ptr, "-f", "null", "-", null })) fail("spool does not decode");
         std.debug.print("smoke-stream: PASS transcode ({d} -> {d} bytes, fragmented MP4, decodes)\n", .{ clip_size, bytes.len });
@@ -275,7 +275,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // A longer clip, so the encode outlives the check; lead shrunk to
         // what its spool reaches within the first progress events.
         var long_buf: [160:0]u8 = undefined;
-        const long_clip = std.fmt.bufPrintZ(&long_buf, "{s}/long.mp4", .{dir}) catch unreachable;
+        const long_clip = std.fmt.bufPrintSentinel(&long_buf, "{s}/long.mp4", .{dir}, 0) catch unreachable;
         if (!run(&[_:null]?[*:0]const u8{
             "ffmpeg", "-nostdin", "-y",       "-v",       "error", "-f",   "lavfi", "-i", "testsrc=size=1920x1080:rate=30:duration=40",
             "-c:v",   "libx264",  "-preset",  "ultrafast", "-pix_fmt", "yuv420p", long_clip.ptr, null,

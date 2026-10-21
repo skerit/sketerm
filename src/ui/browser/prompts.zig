@@ -106,7 +106,7 @@ pub fn onMenuTags(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     c.gtk_box_append(@ptrCast(box), entry);
     var kb: [600:0]u8 = undefined;
     const known_list: []const u8 = if (ctx.tab.hc.known_tags) |k| (if (k.len > 0) k[0..@min(k.len, 500)] else "none yet") else "none yet";
-    const known = std.fmt.bufPrintZ(&kb, "In use: {s}\nSearch with #tag", .{known_list}) catch "Search with #tag";
+    const known = std.fmt.bufPrintSentinel(&kb, "In use: {s}\nSearch with #tag", .{known_list}, 0) catch "Search with #tag";
     const hint = c.gtk_label_new(known.ptr);
     c.gtk_label_set_xalign(@ptrCast(hint), 0);
     c.gtk_label_set_wrap(@ptrCast(hint), 1);
@@ -203,7 +203,7 @@ fn refreshBatchPreview(ctx: *MenuCtx) void {
     var buf: [512]u8 = undefined;
     var z: [520:0]u8 = undefined;
     const line = batchrename.describe(&plan, &buf);
-    const zl = std.fmt.bufPrintZ(&z, "{s}", .{line}) catch return;
+    const zl = std.fmt.bufPrintSentinel(&z, "{s}", .{line}, 0) catch return;
     c.gtk_label_set_text(@ptrCast(ctx.preview.?), zl.ptr);
     c.gtk_widget_set_sensitive(ctx.apply.?, if (plan.ok()) 1 else 0);
 }

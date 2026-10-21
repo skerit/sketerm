@@ -63,13 +63,13 @@ var g_shot_buf: [160:0]u8 = undefined;
 /// "zig-out/smoke-lsp-gui[-remote]-<name>" in a static buffer (one
 /// screenshot is saved at a time).
 fn shot(comptime name: []const u8) [*:0]const u8 {
-    const s = std.fmt.bufPrintZ(&g_shot_buf, "zig-out/smoke-lsp-gui{s}-" ++ name, .{g_leg}) catch unreachable;
+    const s = std.fmt.bufPrintSentinel(&g_shot_buf, "zig-out/smoke-lsp-gui{s}-" ++ name, .{g_leg}, 0) catch unreachable;
     return s.ptr;
 }
 
 fn say(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
-    const s = std.fmt.bufPrintZ(&buf, "smoke-lsp-gui: " ++ fmt ++ "\n", args) catch return;
+    const s = std.fmt.bufPrintSentinel(&buf, "smoke-lsp-gui: " ++ fmt ++ "\n", args, 0) catch return;
     _ = c.fprintf(platform.stdout(), "%s", s.ptr);
     _ = c.fflush(platform.stdout());
 }
@@ -107,7 +107,7 @@ fn teardown() void {
 
 fn fail(comptime fmt: []const u8, args: anytype) u8 {
     var buf: [512]u8 = undefined;
-    const s = std.fmt.bufPrintZ(&buf, "smoke-lsp-gui: FAIL — " ++ fmt ++ "\n", args) catch "FAIL\n";
+    const s = std.fmt.bufPrintSentinel(&buf, "smoke-lsp-gui: FAIL — " ++ fmt ++ "\n", args, 0) catch "FAIL\n";
     _ = c.fprintf(platform.stderr(), "%s", s.ptr);
     teardown();
     return 1;
@@ -285,7 +285,7 @@ fn tsInitOptions() []const u8 {
     const bin_dir = std.fs.path.dirname(full) orelse return "";
     const modules = std.fs.path.dirname(bin_dir) orelse return "";
     var probe: [4300]u8 = undefined;
-    const ts = std.fmt.bufPrintZ(&probe, "{s}/typescript/lib/tsserver.js", .{modules}) catch return "";
+    const ts = std.fmt.bufPrintSentinel(&probe, "{s}/typescript/lib/tsserver.js", .{modules}, 0) catch return "";
     if (c.access(ts.ptr, c.F_OK) != 0) return "";
     return std.fmt.bufPrint(&ts_init_buf, "{{\"tsserver\":{{\"path\":\"{s}\"}}}}", .{ts}) catch "";
 }
@@ -708,7 +708,7 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
     // daemon that cannot bind makes the GUI autostart the INSTALLED one
     // (CLAUDE.md).
     var rt_buf: [128]u8 = undefined;
-    const rt = std.fmt.bufPrintZ(&rt_buf, "/tmp/skl{s}-{d}", .{ if (remote) "r" else "", c.getpid() }) catch return fail("runtime path", .{});
+    const rt = std.fmt.bufPrintSentinel(&rt_buf, "/tmp/skl{s}-{d}", .{ if (remote) "r" else "", c.getpid() }, 0) catch return fail("runtime path", .{});
     _ = c.mkdir(rt.ptr, 0o700);
     _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
     _ = c.setenv("XDG_CONFIG_HOME", rt.ptr, 1);
@@ -732,21 +732,21 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
 
     // Project directory + document.
     var proj_buf: [256]u8 = undefined;
-    const proj = std.fmt.bufPrintZ(&proj_buf, "{s}/proj", .{rt}) catch return fail("proj path", .{});
+    const proj = std.fmt.bufPrintSentinel(&proj_buf, "{s}/proj", .{rt}, 0) catch return fail("proj path", .{});
     _ = c.mkdir(proj.ptr, 0o700);
     var path_buf: [512]u8 = undefined;
-    const marker_path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ proj, plan.marker }) catch return fail("marker path", .{});
+    const marker_path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ proj, plan.marker }, 0) catch return fail("marker path", .{});
     if (!writeFile(marker_path.ptr, plan.marker_body)) return fail("could not write the root marker", .{});
     var doc_buf: [512]u8 = undefined;
-    const doc_path = std.fmt.bufPrintZ(&doc_buf, "{s}/{s}", .{ proj, plan.file }) catch return fail("doc path", .{});
+    const doc_path = std.fmt.bufPrintSentinel(&doc_buf, "{s}/{s}", .{ proj, plan.file }, 0) catch return fail("doc path", .{});
     if (!writeFile(doc_path.ptr, plan.body)) return fail("could not write the document", .{});
 
     // Config: isolated, so the user's real config.conf is untouched.
     var cfg_buf: [256]u8 = undefined;
-    const cfg_dir = std.fmt.bufPrintZ(&cfg_buf, "{s}/sketerm", .{rt}) catch return fail("cfg dir", .{});
+    const cfg_dir = std.fmt.bufPrintSentinel(&cfg_buf, "{s}/sketerm", .{rt}, 0) catch return fail("cfg dir", .{});
     _ = c.mkdir(cfg_dir.ptr, 0o700);
     var cfg_path_buf: [512]u8 = undefined;
-    const cfg_path = std.fmt.bufPrintZ(&cfg_path_buf, "{s}/config.conf", .{cfg_dir}) catch return fail("cfg path", .{});
+    const cfg_path = std.fmt.bufPrintSentinel(&cfg_path_buf, "{s}/config.conf", .{cfg_dir}, 0) catch return fail("cfg path", .{});
     var cfg_text: std.ArrayList(u8) = .empty;
     defer cfg_text.deinit(allocator);
     cfg_text.print(allocator,
@@ -767,7 +767,7 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
     // The stub writes the didOpen payload SIZE here (see lsp_stub.zig).
     // It is inherited by the GUI and from there by the server child.
     var report_buf: [256]u8 = undefined;
-    const report_path = std.fmt.bufPrintZ(&report_buf, "{s}/didopen.txt", .{rt}) catch
+    const report_path = std.fmt.bufPrintSentinel(&report_buf, "{s}/didopen.txt", .{rt}, 0) catch
         return fail("report path", .{});
     _ = c.unlink(report_path.ptr);
 
@@ -782,7 +782,7 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
     }
     daemon_pid = mux_pid;
     var sock_buf: [256]u8 = undefined;
-    const mux_sock = std.fmt.bufPrintZ(&sock_buf, "{s}/sketerm/mux.sock", .{rt}) catch return fail("sock path", .{});
+    const mux_sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/sketerm/mux.sock", .{rt}, 0) catch return fail("sock path", .{});
     var waited: u32 = 0;
     while (c.access(mux_sock.ptr, c.F_OK) != 0) {
         _ = c.usleep(50_000);
@@ -800,7 +800,7 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
     // spawns the stub on this leg.
     if (remote) {
         var rrt_buf: [160]u8 = undefined;
-        const rrt = std.fmt.bufPrintZ(&rrt_buf, "{s}/r", .{rt}) catch return fail("remote rt path", .{});
+        const rrt = std.fmt.bufPrintSentinel(&rrt_buf, "{s}/r", .{rt}, 0) catch return fail("remote rt path", .{});
         _ = c.mkdir(rrt.ptr, 0o700);
         var mux_abs_buf: [4096]u8 = undefined;
         const mux_abs_raw = c.realpath(bindir.path(.@"sketerm-mux"), &mux_abs_buf) orelse return fail("realpath sketerm-mux", .{});
@@ -821,7 +821,7 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
         }
         remote_mux_pid = rmt_pid;
         var rsock_buf: [256]u8 = undefined;
-        const rsock = std.fmt.bufPrintZ(&rsock_buf, "{s}/sketerm/mux.sock", .{rrt}) catch return fail("remote sock path", .{});
+        const rsock = std.fmt.bufPrintSentinel(&rsock_buf, "{s}/sketerm/mux.sock", .{rrt}, 0) catch return fail("remote sock path", .{});
         var rwaited: u32 = 0;
         while (c.access(rsock.ptr, c.F_OK) != 0) {
             _ = c.usleep(50_000);
@@ -829,7 +829,7 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
             if (rwaited > 100) return fail("remote mux socket never appeared", .{});
         }
         var ssh_path_buf: [200:0]u8 = undefined;
-        const ssh_path = std.fmt.bufPrintZ(&ssh_path_buf, "{s}/fake-ssh", .{rt}) catch return fail("fake ssh path", .{});
+        const ssh_path = std.fmt.bufPrintSentinel(&ssh_path_buf, "{s}/fake-ssh", .{rt}, 0) catch return fail("fake ssh path", .{});
         var script_buf: [2048]u8 = undefined;
         const body = std.fmt.bufPrint(&script_buf,
             \\#!/bin/sh
@@ -864,7 +864,7 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
         defer parsed.deinit();
         const wl = parsed.value.environment.WAYLAND_DISPLAY;
         if (wl.len == 0 or wl[0] != '/') return fail("no absolute WAYLAND_DISPLAY", .{});
-        _ = std.fmt.bufPrintZ(&wl_z, "{s}", .{wl}) catch return fail("WAYLAND_DISPLAY too long", .{});
+        _ = std.fmt.bufPrintSentinel(&wl_z, "{s}", .{wl}, 0) catch return fail("WAYLAND_DISPLAY too long", .{});
     }
     // BEFORE the GUI: the brain is client-side.
     drive = appdrive.App.attachExisting(allocator, g_session, null, mux_sock, null) catch
@@ -876,7 +876,7 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
     // language server — through the fake ssh hop on the remote leg.
     var spec_buf: [560:0]u8 = undefined;
     const doc_spec: [:0]const u8 = if (remote)
-        std.fmt.bufPrintZ(&spec_buf, "rbox:{s}", .{doc_path}) catch return fail("doc spec", .{})
+        std.fmt.bufPrintSentinel(&spec_buf, "rbox:{s}", .{doc_path}, 0) catch return fail("doc spec", .{})
     else
         doc_path;
     const pid = c.fork();

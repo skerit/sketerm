@@ -156,9 +156,9 @@ pub fn feedProbes(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payl
                 var buf: [1024:0]u8 = undefined;
                 var human: [48:0]u8 = undefined;
                 const text: [*:0]const u8 = switch (probe.kind) {
-                    .size => if (std.fmt.bufPrintZ(&buf, "{s} ({d} bytes) in {d} items{s}", .{
+                    .size => if (std.fmt.bufPrintSentinel(&buf, "{s} ({d} bytes) in {d} items{s}", .{
                         fmtSize(&human, ev.done), ev.done, ev.total, if (done) "" else " ...",
-                    })) |v| v.ptr else |_| "",
+                    }, 0)) |v| v.ptr else |_| "",
                     .hash => if (!done) "hashing..." else copyZ(@ptrCast(&buf), ev.hash),
                     // Handled entirely above; never reached.
                     .media => "",
@@ -300,7 +300,7 @@ pub const PropsCtx = struct {
 
     fn setOctal(self: *PropsCtx, mode: u32) void {
         var buf: [16:0]u8 = undefined;
-        const txt = std.fmt.bufPrintZ(&buf, "{o:0>4}", .{mode & 0o7777}) catch return;
+        const txt = std.fmt.bufPrintSentinel(&buf, "{o:0>4}", .{mode & 0o7777}, 0) catch return;
         self.syncing = true;
         c.gtk_editable_set_text(@ptrCast(self.octal), txt.ptr);
         self.syncing = false;
@@ -352,7 +352,7 @@ pub fn closePropsWindows(self: *BrowserView) void {
 
 pub fn propsRow(box: *c.GtkWidget, label: []const u8, value: []const u8) void {
     var buf: [1024:0]u8 = undefined;
-    const txt = std.fmt.bufPrintZ(&buf, "{s}: {s}", .{ label, value }) catch return;
+    const txt = std.fmt.bufPrintSentinel(&buf, "{s}: {s}", .{ label, value }, 0) catch return;
     const w = c.gtk_label_new(txt.ptr);
     c.gtk_label_set_xalign(@ptrCast(w), 0);
     c.gtk_label_set_selectable(@ptrCast(w), 1);
@@ -411,7 +411,7 @@ pub fn showProperties(self: *BrowserView, tab: *BTab, path: []const u8, e: *cons
     // A real, non-modal dialog: browsing continues behind it, and
     // several files can have their properties open side by side.
     var title_z: [576:0]u8 = undefined;
-    const win_title = std.fmt.bufPrintZ(&title_z, "{s} Properties", .{std.fs.path.basename(path)}) catch "Properties";
+    const win_title = std.fmt.bufPrintSentinel(&title_z, "{s} Properties", .{std.fs.path.basename(path)}, 0) catch "Properties";
     c.gtk_window_set_title(@ptrCast(window), win_title.ptr);
     // Tall enough that a plain file fits without a vertical
     // scrollbar; clamped to 90% of the monitor for small screens.
@@ -518,7 +518,7 @@ pub fn showProperties(self: *BrowserView, tab: *BTab, path: []const u8, e: *cons
             const info = c.g_app_info_get_default_for_type(ct, 0) orelse break :blk "Opens with: (no default)";
             defer c.g_object_unref(@as(?*anyopaque, @ptrCast(info)));
             const name = c.g_app_info_get_display_name(info) orelse break :blk "Opens with: (no default)";
-            if (std.fmt.bufPrintZ(&app_buf, "Opens with: {s}", .{std.mem.span(@as([*:0]const u8, @ptrCast(name)))})) |v| {
+            if (std.fmt.bufPrintSentinel(&app_buf, "Opens with: {s}", .{std.mem.span(@as([*:0]const u8, @ptrCast(name)))}, 0)) |v| {
                 break :blk v.ptr;
             } else |_| break :blk "Opens with:";
         };
@@ -630,13 +630,13 @@ pub fn showProperties(self: *BrowserView, tab: *BTab, path: []const u8, e: *cons
     const uid_entry = c.gtk_entry_new();
     c.gtk_widget_set_size_request(uid_entry, 80, -1);
     var idbuf: [16:0]u8 = undefined;
-    if (std.fmt.bufPrintZ(&idbuf, "{d}", .{e.uid})) |v| c.gtk_editable_set_text(@ptrCast(uid_entry), v.ptr) else |_| {}
+    if (std.fmt.bufPrintSentinel(&idbuf, "{d}", .{e.uid}, 0)) |v| c.gtk_editable_set_text(@ptrCast(uid_entry), v.ptr) else |_| {}
     ctx.uid_entry = uid_entry;
     c.gtk_box_append(@ptrCast(own_row), uid_entry);
     c.gtk_box_append(@ptrCast(own_row), c.gtk_label_new("gid"));
     const gid_entry = c.gtk_entry_new();
     c.gtk_widget_set_size_request(gid_entry, 80, -1);
-    if (std.fmt.bufPrintZ(&idbuf, "{d}", .{e.gid})) |v| c.gtk_editable_set_text(@ptrCast(gid_entry), v.ptr) else |_| {}
+    if (std.fmt.bufPrintSentinel(&idbuf, "{d}", .{e.gid}, 0)) |v| c.gtk_editable_set_text(@ptrCast(gid_entry), v.ptr) else |_| {}
     ctx.gid_entry = gid_entry;
     c.gtk_box_append(@ptrCast(own_row), gid_entry);
     c.gtk_box_append(@ptrCast(box), own_row);
@@ -1069,7 +1069,7 @@ pub fn snapDegrade(self: *BrowserView) void {
 fn snapFinishNone(self: *BrowserView, sr: *SnapRequest) void {
     if (sr.denied) |dir| {
         var msg: [640:0]u8 = undefined;
-        if (std.fmt.bufPrintZ(&msg, "Snapshots at {s} are not readable (permission denied)", .{dir})) |m| {
+        if (std.fmt.bufPrintSentinel(&msg, "Snapshots at {s} are not readable (permission denied)", .{dir}, 0)) |m| {
             setSnapLine(sr.box, m.ptr);
         } else |_| {
             setSnapLine(sr.box, "Snapshots exist but are not readable (permission denied)");
@@ -1182,9 +1182,9 @@ fn appendSnapRow(self: *BrowserView, sr: *SnapRequest, vpath: []const u8, v: sna
     var tbuf: [40:0]u8 = undefined;
     var human: [48:0]u8 = undefined;
     var text: [96:0]u8 = undefined;
-    const label_txt = std.fmt.bufPrintZ(&text, "{s}  {s}", .{
+    const label_txt = std.fmt.bufPrintSentinel(&text, "{s}  {s}", .{
         std.mem.span(fmtTimeZ(&tbuf, v.mtime_ms)), fmtSize(&human, v.size),
-    }) catch return;
+    }, 0) catch return;
     const lbl = c.gtk_label_new(label_txt.ptr);
     c.gtk_label_set_xalign(@ptrCast(lbl), 0);
     c.gtk_widget_set_hexpand(lbl, 1);

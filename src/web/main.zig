@@ -200,7 +200,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             const dir = cache_dir orelse return 2;
             pathz.makeDirs(dir, 0o700) catch return 1;
             var dir_buf: [4096]u8 = undefined;
-            const dir_z = std.fmt.bufPrintZ(&dir_buf, "{s}", .{dir}) catch return 1;
+            const dir_z = std.fmt.bufPrintSentinel(&dir_buf, "{s}", .{dir}, 0) catch return 1;
             // The broker makes every connection of this helper, so a
             // routed one dials the route's proxy and nothing else, in
             // curl's spelling (socks5h: the proxy resolves the host).
@@ -348,8 +348,8 @@ fn scrubUntrustedEnv() bool {
     for (untrusted_env.sets) |kv| {
         var key: [64:0]u8 = undefined;
         var value: [64:0]u8 = undefined;
-        const k = std.fmt.bufPrintZ(&key, "{s}", .{kv[0]}) catch return false;
-        const v = std.fmt.bufPrintZ(&value, "{s}", .{kv[1]}) catch return false;
+        const k = std.fmt.bufPrintSentinel(&key, "{s}", .{kv[0]}, 0) catch return false;
+        const v = std.fmt.bufPrintSentinel(&value, "{s}", .{kv[1]}, 0) catch return false;
         if (c.setenv(k.ptr, v.ptr, 1) != 0) return false;
     }
     return true;
@@ -357,7 +357,7 @@ fn scrubUntrustedEnv() bool {
 
 fn reexecPreloaded(argv: []const [*:0]const u8) void {
     var preload: [4096]u8 = undefined;
-    const lib = std.fmt.bufPrintZ(&preload, "{s}/libcef.so", .{build_options.cef_release_dir}) catch return;
+    const lib = std.fmt.bufPrintSentinel(&preload, "{s}/libcef.so", .{build_options.cef_release_dir}, 0) catch return;
     if (c.setenv("LD_PRELOAD", lib.ptr, 1) != 0) return;
     if (c.setenv(PRELOAD_GUARD, "1", 1) != 0) return;
 
@@ -366,7 +366,7 @@ fn reexecPreloaded(argv: []const [*:0]const u8) void {
     for (argv, 0..) |a, i| vec[i] = @constCast(a);
     vec[argv.len] = null;
     var exe: [4096:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&exe, "/proc/self/exe", .{}) catch return;
+    const path = std.fmt.bufPrintSentinel(&exe, "/proc/self/exe", .{}, 0) catch return;
     _ = c.execv(path.ptr, @ptrCast(&vec));
 }
 
@@ -595,10 +595,10 @@ fn waylandReachable() bool {
     var path: [108]u8 = undefined;
     const disp = if (c.getenv("WAYLAND_DISPLAY")) |d| std.mem.span(d) else "wayland-0";
     const full = if (disp.len != 0 and disp[0] == '/')
-        std.fmt.bufPrintZ(&path, "{s}", .{disp}) catch return false
+        std.fmt.bufPrintSentinel(&path, "{s}", .{disp}, 0) catch return false
     else blk: {
         const dir = c.getenv("XDG_RUNTIME_DIR") orelse return false;
-        break :blk std.fmt.bufPrintZ(&path, "{s}/{s}", .{ std.mem.span(dir), disp }) catch return false;
+        break :blk std.fmt.bufPrintSentinel(&path, "{s}/{s}", .{ std.mem.span(dir), disp }, 0) catch return false;
     };
 
     var addr = std.mem.zeroes(c.struct_sockaddr_un);

@@ -87,7 +87,7 @@ pub fn ensureTransparentCss() void {
 /// as sketerm.
 pub fn applyAppId(window: *c.GtkWindow, app_id: []const u8) void {
     var buf: [256:0]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{app_id}) catch return;
+    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{app_id}, 0) catch return;
     c.gtk_window_set_icon_name(window, z.ptr);
     if (comptime !builtin.os.tag.isDarwin()) {
         const display = c.gdk_display_get_default() orelse return;

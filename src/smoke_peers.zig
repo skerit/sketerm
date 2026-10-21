@@ -67,10 +67,10 @@ fn mkdirOrFail(path: [:0]const u8) void {
 /// Before the rig forks its broker: a short private root, the broker's
 /// state home inside it (mailboxes never land in the user's), the TTL.
 pub fn prepare() void {
-    const root = std.fmt.bufPrintZ(&root_buf, "/tmp/skp-{d}", .{c.getpid()}) catch unreachable;
-    const rt = std.fmt.bufPrintZ(&rt_buf, "{s}/rt", .{root}) catch unreachable;
-    const st = std.fmt.bufPrintZ(&st_buf, "{s}/st", .{root}) catch unreachable;
-    const cfg = std.fmt.bufPrintZ(&cfg_buf, "{s}/cfg", .{root}) catch unreachable;
+    const root = std.fmt.bufPrintSentinel(&root_buf, "/tmp/skp-{d}", .{c.getpid()}, 0) catch unreachable;
+    const rt = std.fmt.bufPrintSentinel(&rt_buf, "{s}/rt", .{root}, 0) catch unreachable;
+    const st = std.fmt.bufPrintSentinel(&st_buf, "{s}/st", .{root}, 0) catch unreachable;
+    const cfg = std.fmt.bufPrintSentinel(&cfg_buf, "{s}/cfg", .{root}, 0) catch unreachable;
     mkdirOrFail(root);
     mkdirOrFail(rt);
     mkdirOrFail(st);
@@ -422,12 +422,12 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
     // The isolated runtime dir's per-user socket IS the rig broker.
     {
         var dir_buf: [96:0]u8 = undefined;
-        const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm", .{std.mem.sliceTo(&rt_buf, 0)}) catch unreachable;
+        const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/sketerm", .{std.mem.sliceTo(&rt_buf, 0)}, 0) catch unreachable;
         mkdirOrFail(dir);
         var link_buf: [112:0]u8 = undefined;
-        const link = std.fmt.bufPrintZ(&link_buf, "{s}/mux.sock", .{dir}) catch unreachable;
+        const link = std.fmt.bufPrintSentinel(&link_buf, "{s}/mux.sock", .{dir}, 0) catch unreachable;
         var target_buf: [256:0]u8 = undefined;
-        const target = std.fmt.bufPrintZ(&target_buf, "{s}", .{sock_path}) catch fail("socket path too long");
+        const target = std.fmt.bufPrintSentinel(&target_buf, "{s}", .{sock_path}, 0) catch fail("socket path too long");
         _ = c.unlink(link.ptr);
         if (c.symlink(target.ptr, link.ptr) != 0) fail("symlink the per-user socket to the rig broker");
     }
@@ -530,7 +530,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
     // 11. the plugin's own argv against bob2's parent (the shell).
     {
         var pid_buf: [16:0]u8 = undefined;
-        const parent = std.fmt.bufPrintZ(&pid_buf, "{d}", .{bob2.pid}) catch unreachable;
+        const parent = std.fmt.bufPrintSentinel(&pid_buf, "{d}", .{bob2.pid}, 0) catch unreachable;
         var follower = Mcp.spawnWith(allocator, exe, .{
             .extra = &.{ "agent-wait", "--server", "--follow", "--json", "--parent", parent.ptr },
             .unset_env = &UNSET,
@@ -1152,7 +1152,7 @@ const FedHost = struct {
         defer f.deinit(allocator);
         const List = struct { sessions: []const struct { name: []const u8 = "", origin_id: []const u8 = "" } = &.{} };
         const l = std.json.parseFromSliceLeaky(List, arena, arena.dupe(u8, f.payload) catch fail("oom"), .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch fail("f9. list parse");
-        for (l.sessions) |s| if (std.mem.eql(u8, s.name, name)) return arena.dupeZ(u8, s.origin_id) catch fail("oom");
+        for (l.sessions) |s| if (std.mem.eql(u8, s.name, name)) return arena.dupeSentinel(u8, s.origin_id, 0) catch fail("oom");
         fail("f9. the spawned session is not listed");
     }
 

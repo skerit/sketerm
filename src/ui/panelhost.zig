@@ -4563,7 +4563,7 @@ test "panel host epoch-fences acknowledgement before mixed reader mutation" {
 test "local panel reads enforce deadline byte and dimension bounds off GTK" {
     const a = std.testing.allocator;
     var path_buf: [160]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-local-bounds-{d}.png", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-panel-local-bounds-{d}.png", .{c.getpid()}, 0);
     defer _ = c.unlink(path.ptr);
 
     const writeBytes = struct {

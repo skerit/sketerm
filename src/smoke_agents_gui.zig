@@ -63,7 +63,7 @@ var lease: ?mcp_registry.Lease = null;
 
 fn say(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
-    const s = std.fmt.bufPrintZ(&buf, "smoke-agents-gui: " ++ fmt ++ "\n", args) catch return;
+    const s = std.fmt.bufPrintSentinel(&buf, "smoke-agents-gui: " ++ fmt ++ "\n", args, 0) catch return;
     _ = c.fprintf(platform.stdout(), "%s", s.ptr);
     _ = c.fflush(platform.stdout());
 }
@@ -98,7 +98,7 @@ fn teardown() void {
 
 fn fail(comptime fmt: []const u8, args: anytype) u8 {
     var buf: [512]u8 = undefined;
-    const s = std.fmt.bufPrintZ(&buf, "smoke-agents-gui: FAIL - " ++ fmt ++ "\n", args) catch "FAIL\n";
+    const s = std.fmt.bufPrintSentinel(&buf, "smoke-agents-gui: FAIL - " ++ fmt ++ "\n", args, 0) catch "FAIL\n";
     _ = c.fprintf(platform.stderr(), "%s", s.ptr);
     teardown();
     return 1;
@@ -120,7 +120,7 @@ fn savePng(app: *appdrive.App, win_id: u32, stem: []const u8) void {
     const png = app.screenshotPng(win_id, 1600, null, 0) catch return;
     defer g_alloc.free(png.png);
     var path_buf: [256]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "zig-out/smoke-agents-gui-{s}-{s}.png", .{ g_theme.name(), stem }) catch return;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "zig-out/smoke-agents-gui-{s}-{s}.png", .{ g_theme.name(), stem }, 0) catch return;
     _ = writeFile(path.ptr, png.png);
 }
 
@@ -322,7 +322,7 @@ fn ocrText(app: *appdrive.App, win_id: u32, region: ?appdrive.App.Region) ?[]u8 
 fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
     var hb: [4096]u8 = undefined;
     var nb: [128]u8 = undefined;
-    return std.ascii.indexOfIgnoreCase(squeeze(&hb, hay), squeeze(&nb, needle)) != null;
+    return std.ascii.findIgnoreCase(squeeze(&hb, hay), squeeze(&nb, needle)) != null;
 }
 
 fn squeeze(buf: []u8, s: []const u8) []const u8 {
@@ -422,7 +422,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // Short isolated runtime dir: a long socket path cannot bind and the
     // GUI would autostart the INSTALLED daemon (CLAUDE.md).
     var rt_buf: [128]u8 = undefined;
-    const rt = std.fmt.bufPrintZ(&rt_buf, "/tmp/ska-{d}", .{c.getpid()}) catch return fail("runtime path", .{});
+    const rt = std.fmt.bufPrintSentinel(&rt_buf, "/tmp/ska-{d}", .{c.getpid()}, 0) catch return fail("runtime path", .{});
     _ = c.mkdir(rt.ptr, 0o700);
     _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
     _ = c.setenv("XDG_CONFIG_HOME", rt.ptr, 1);
@@ -443,7 +443,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     daemon_pid = mux_pid;
     var sock_buf: [256]u8 = undefined;
-    const mux_sock = std.fmt.bufPrintZ(&sock_buf, "{s}/sketerm/mux.sock", .{rt}) catch return fail("sock path", .{});
+    const mux_sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/sketerm/mux.sock", .{rt}, 0) catch return fail("sock path", .{});
     var waited: u32 = 0;
     while (c.access(mux_sock.ptr, c.F_OK) != 0) {
         _ = c.usleep(50_000);
@@ -464,7 +464,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer parsed.deinit();
         const wl = parsed.value.environment.WAYLAND_DISPLAY;
         if (wl.len == 0 or wl[0] != '/') return fail("no absolute WAYLAND_DISPLAY", .{});
-        _ = std.fmt.bufPrintZ(&wl_z, "{s}", .{wl}) catch return fail("WAYLAND_DISPLAY too long", .{});
+        _ = std.fmt.bufPrintSentinel(&wl_z, "{s}", .{wl}, 0) catch return fail("WAYLAND_DISPLAY too long", .{});
     }
     drive = appdrive.App.attachExisting(allocator, SESSION, null, mux_sock, null) catch
         return fail("could not attach a viewer", .{});
@@ -766,9 +766,9 @@ fn peerStage(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, rt: 
     var addr_buf: [peeraddr.PANE_NAME_LEN]u8 = undefined;
     const address = peeraddr.paneName(&addr_buf, origin_id) orelse return "the pane session reports no valid origin id";
     var addr_z_buf: [peeraddr.PANE_NAME_LEN + 1]u8 = undefined;
-    const address_z = std.fmt.bufPrintZ(&addr_z_buf, "{s}", .{address}) catch unreachable;
+    const address_z = std.fmt.bufPrintSentinel(&addr_z_buf, "{s}", .{address}, 0) catch unreachable;
     var sock_buf: [160]u8 = undefined;
-    const gui_sock = std.fmt.bufPrintZ(&sock_buf, "{s}/sketerm/{d}.sock", .{ rt, child_pid }) catch return "GUI socket path";
+    const gui_sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/sketerm/{d}.sock", .{ rt, child_pid }, 0) catch return "GUI socket path";
 
     // 5a. the user titles the pane BEFORE any peer runs in it.
     if (setPaneTitle(allocator, app, win_id, gui_sock, pane.name, PEER_TITLE)) |why| return why;

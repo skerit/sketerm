@@ -3944,7 +3944,7 @@ test "config: loadFromPath refuses an unreadable file instead of returning defau
     const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
     const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
     var path_buf: [512:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/config.conf", .{base});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/config.conf", .{base}, 0);
     // Defers unwind in reverse: the file must go before its directory.
     defer _ = c.rmdir(dir);
     defer _ = c.unlink(path.ptr);
@@ -5487,7 +5487,7 @@ test "config: the prefs save path keeps platform sections and flattens this plat
     const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
     const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
     var path_buf: [512:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/config.conf", .{base});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/config.conf", .{base}, 0);
     // Defers unwind in reverse: the file must go before its directory.
     defer _ = c.rmdir(dir);
     defer _ = c.unlink(path.ptr);
@@ -5536,7 +5536,7 @@ test "config: save accepts the load limit and preserves the old file on rejectio
     defer _ = c.rmdir(dir);
     const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
     var path_buf: [512:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/config.conf", .{base});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/config.conf", .{base}, 0);
     defer _ = c.unlink(path.ptr);
 
     var empty_value = Config{ .word_chars = "" };
@@ -5853,7 +5853,8 @@ test "config: every table key round-trips through serialise and parse" {
     fillSamples(app_keys, &cfg);
     fillSamples(profile_keys, &cfg.settings);
     var lists = [_][]const u8{ "https://example.test/a.txt", "https://example.test/b.txt" };
-    cfg.filter_lists = .{ .items = &lists, .capacity = lists.len };
+    cfg.filter_lists = .initBuffer(&lists);
+    cfg.filter_lists.items.len = lists.len;
 
     var buf: [MAX_FILE_BYTES]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -5902,7 +5903,8 @@ test "config: every profile key round-trips inside a [profile.<name>] section" {
     var cfg = Config{};
     var profs = [_]Profile{.{ .name = "rt" }};
     fillSamples(profile_keys, &profs[0].settings);
-    cfg.profiles = .{ .items = &profs, .capacity = profs.len };
+    cfg.profiles = .initBuffer(&profs);
+    cfg.profiles.items.len = profs.len;
 
     var buf: [MAX_FILE_BYTES]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -6035,7 +6037,7 @@ test "config: loadFromPath refuses a file over the size cap" {
     const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
     const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
     var path_buf: [512:0]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/config.conf", .{base});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/config.conf", .{base}, 0);
     defer _ = c.rmdir(dir);
     defer _ = c.unlink(path.ptr);
     {

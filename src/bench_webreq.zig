@@ -124,7 +124,7 @@ const Client = struct {
     fd: c_int,
     in: std.ArrayList(u8) = .empty,
     ack_proto: u32 = 0,
-    ack_caps: proto.Caps = .initEmpty(),
+    ack_caps: proto.Caps = .empty,
     we_ok: u8 = 0xff,
     title: [4096]u8 = @splat(0),
     title_len: usize = 0,
@@ -325,7 +325,7 @@ fn mkdirZ(path: []const u8) void {
 
 fn writeFile(dir: []const u8, name: []const u8, body: []const u8) bool {
     var buf: [4300]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, name }) catch return false;
+    const path = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, name }, 0) catch return false;
     const f = c.fopen(path.ptr, "wb") orelse return false;
     defer _ = c.fclose(f);
     return c.fwrite(body.ptr, 1, body.len, f) == body.len;
@@ -444,9 +444,9 @@ fn runScenario(
     spin: bool,
 ) Result {
     var sock_buf: [110]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/{s}.sock", .{ dir, tag }) catch fail("sock path");
+    const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/{s}.sock", .{ dir, tag }, 0) catch fail("sock path");
     var cache_buf: [4096]u8 = undefined;
-    const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/cache-{s}", .{ dir, tag }) catch fail("cache path");
+    const cache = std.fmt.bufPrintSentinel(&cache_buf, "{s}/cache-{s}", .{ dir, tag }, 0) catch fail("cache path");
     mkdirZ(cache);
 
     _ = c.setenv("SKETERM_WEB_WREQ_SPIN", if (spin) "1" else "0", 1);
@@ -546,7 +546,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     // Isolated data dir so a bench run never touches the real
     // per-extension storage.
     var data_buf: [256]u8 = undefined;
-    const data = std.fmt.bufPrintZ(&data_buf, "{s}/data", .{dir}) catch fail("data path");
+    const data = std.fmt.bufPrintSentinel(&data_buf, "{s}/data", .{dir}, 0) catch fail("data path");
     mkdirZ(data);
     _ = c.setenv("XDG_DATA_HOME", data.ptr, 1);
 

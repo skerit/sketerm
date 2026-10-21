@@ -147,11 +147,11 @@ pub fn looksLikeFilterList(body: []const u8) bool {
     var i: usize = 0;
     while (i < head.len and std.ascii.isWhitespace(head[i])) i += 1;
     if (i < head.len and head[i] == '<') return false;
-    if (std.ascii.indexOfIgnoreCase(head, "<html") != null) return false;
-    if (std.ascii.indexOfIgnoreCase(head, "<!doctype") != null) return false;
+    if (std.ascii.findIgnoreCase(head, "<html") != null) return false;
+    if (std.ascii.findIgnoreCase(head, "<!doctype") != null) return false;
 
     // The conventional header is enough on its own.
-    if (std.ascii.indexOfIgnoreCase(head, "[adblock") != null) return true;
+    if (std.ascii.findIgnoreCase(head, "[adblock") != null) return true;
 
     // Otherwise want several lines that are actually rules or comments.
     var rules: u32 = 0;

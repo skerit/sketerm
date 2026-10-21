@@ -86,13 +86,13 @@ pub fn parse(args: []const []const u8) Request {
 
 fn say(comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
-    const s = std.fmt.bufPrintZ(&buf, fmt, args) catch return;
+    const s = std.fmt.bufPrintSentinel(&buf, fmt, args, 0) catch return;
     _ = c.fputs(s.ptr, platform.stdout());
 }
 
 fn complain(comptime fmt: []const u8, args: anytype) u8 {
     var buf: [1024]u8 = undefined;
-    const s = std.fmt.bufPrintZ(&buf, "sketerm motion: " ++ fmt ++ "\n", args) catch return 1;
+    const s = std.fmt.bufPrintSentinel(&buf, "sketerm motion: " ++ fmt ++ "\n", args, 0) catch return 1;
     _ = c.fputs(s.ptr, platform.stderr());
     return 1;
 }

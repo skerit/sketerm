@@ -921,7 +921,7 @@ pub const Set = struct {
     /// Every `*.json` in `dir`, in name order; a missing directory is no error.
     pub fn loadDir(self: *Set, dir: []const u8) !void {
         var zbuf: [4096]u8 = undefined;
-        const dz = std.fmt.bufPrintZ(&zbuf, "{s}", .{dir}) catch return;
+        const dz = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{dir}, 0) catch return;
         const d = c.opendir(dz.ptr) orelse return;
         defer _ = c.closedir(d);
         var names: std.ArrayList([]u8) = .empty;

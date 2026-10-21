@@ -80,7 +80,7 @@ test "wav writer round-trips header and data sizes" {
     const t_ = std.testing;
     var path_buf: [256]u8 = undefined;
     const dir = if (std.c.getenv("TMPDIR")) |d| std.mem.span(d) else "/tmp";
-    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/sketerm-wavcap-test-{d}.wav", .{ dir, c.getpid() });
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/sketerm-wavcap-test-{d}.wav", .{ dir, c.getpid() }, 0);
 
     var w = Writer.open(path.ptr, 3, 2, 44100) orelse return error.OpenFailed;
     const pcm = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
@@ -109,6 +109,6 @@ test "unsupported PA format refuses to open" {
     const t_ = std.testing;
     try t_.expectEqual(@as(?Writer, null), Writer.open("/nonexistent-dir/x.wav", 3, 2, 44100));
     var path_buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-wavcap-badfmt-{d}.wav", .{c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sketerm-wavcap-badfmt-{d}.wav", .{c.getpid()}, 0);
     try t_.expectEqual(@as(?Writer, null), Writer.open(path.ptr, 4, 2, 44100)); // s16be
 }

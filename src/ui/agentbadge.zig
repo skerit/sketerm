@@ -351,9 +351,9 @@ pub const Badge = struct {
         }
         var tip: [96:0]u8 = undefined;
         const tz = if (g.urgent) |a|
-            std.fmt.bufPrintZ(&tip, "{d} agent(s); most urgent: {s}", .{ g.total, a.label() }) catch null
+            std.fmt.bufPrintSentinel(&tip, "{d} agent(s); most urgent: {s}", .{ g.total, a.label() }, 0) catch null
         else
-            std.fmt.bufPrintZ(&tip, "{d} agent(s)", .{g.total}) catch null;
+            std.fmt.bufPrintSentinel(&tip, "{d} agent(s)", .{g.total}, 0) catch null;
         if (tz) |t| c.gtk_widget_set_tooltip_text(self.box, t.ptr);
         c.gtk_widget_set_visible(self.box, 1);
     }

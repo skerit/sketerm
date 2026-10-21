@@ -456,7 +456,7 @@ fn buildGraph(self: *BrowserView, section: *Section, w: *const Widget, index: us
     if (run) |r| {
         if (r.hist_len > 0) {
             var vz: [64:0]u8 = undefined;
-            if (std.fmt.bufPrintZ(&vz, "{d:.6}", .{trimFloat(r.history[r.hist_len - 1])})) |txt| {
+            if (std.fmt.bufPrintSentinel(&vz, "{d:.6}", .{trimFloat(r.history[r.hist_len - 1])}, 0)) |txt| {
                 const lab = c.gtk_label_new(trimZeros(&vz, txt));
                 c.gtk_label_set_xalign(@ptrCast(lab), 0);
                 c.gtk_widget_add_css_class(lab, "caption");

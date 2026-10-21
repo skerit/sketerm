@@ -263,10 +263,10 @@ fn pngHeader(buf: *[45]u8, w: u32, h: u32) []const u8 {
     buf[26] = 0; // deflate
     buf[27] = 0; // adaptive filtering
     buf[28] = 0; // no interlace
-    std.mem.writeInt(u32, buf[29..33], std.hash.crc.Crc32.hash(buf[12..29]), .big);
+    std.mem.writeInt(u32, buf[29..33], std.hash.Crc32.hash(buf[12..29]), .big);
     std.mem.writeInt(u32, buf[33..37], 0, .big);
     buf[37..41].* = "IDAT".*;
-    std.mem.writeInt(u32, buf[41..45], std.hash.crc.Crc32.hash(buf[37..41]), .big);
+    std.mem.writeInt(u32, buf[41..45], std.hash.Crc32.hash(buf[37..41]), .big);
     return buf[0..45];
 }
 

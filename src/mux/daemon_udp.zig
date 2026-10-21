@@ -48,7 +48,7 @@ pub fn handleUdpTicketReq(self: *Daemon, cl: *Client, payload: []const u8) void 
             defer p.deinit();
             if (p.value.range) |r| {
                 if (!punch.validPortRange(r)) return udpTicketErr(cl, "bad port range");
-                range = std.fmt.bufPrintZ(&range_buf, "{s}", .{r}) catch return udpTicketErr(cl, "bad port range");
+                range = std.fmt.bufPrintSentinel(&range_buf, "{s}", .{r}, 0) catch return udpTicketErr(cl, "bad port range");
             }
         } else |_| return udpTicketErr(cl, "bad request");
     }
@@ -58,7 +58,7 @@ pub fn handleUdpTicketReq(self: *Daemon, cl: *Client, payload: []const u8) void 
     const sock = if (self.sock_path.len > 0) self.sock_path else self.broker_sock orelse
         return udpTicketErr(cl, "daemon socket path unknown");
     var sock_z_buf: [4096:0]u8 = undefined;
-    const sock_z = std.fmt.bufPrintZ(&sock_z_buf, "{s}", .{sock}) catch
+    const sock_z = std.fmt.bufPrintSentinel(&sock_z_buf, "{s}", .{sock}, 0) catch
         return udpTicketErr(cl, "socket path too long");
 
     // The listener must be a binary that answers --udp-listen: the

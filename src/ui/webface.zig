@@ -2656,7 +2656,7 @@ pub const WebFace = struct {
     pub fn setStatus(self: *WebFace, text: []const u8, retryable: bool) void {
         if (self.widgets_dead) return;
         var buf: [512]u8 = undefined;
-        const z = std.fmt.bufPrintZ(&buf, "{s}", .{text}) catch "";
+        const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{text}, 0) catch "";
         c.gtk_label_set_text(@ptrCast(self.status_label), z.ptr);
         c.gtk_widget_set_visible(self.status_box, 1);
         // The Reload button is the second child of the status box.
@@ -3080,7 +3080,7 @@ pub const WebFace = struct {
         // that opens focused would land the user's typing in front of
         // it.
         const shown: []const u8 = if (std.mem.eql(u8, url, "about:blank")) "" else url;
-        const z = self.allocator.dupeZ(u8, shown) catch return;
+        const z = self.allocator.dupeSentinel(u8, shown, 0) catch return;
         defer self.allocator.free(z);
         // Never fight the user's typing: only rewrite an unfocused bar.
         if (!focusWithin(self.entry))
@@ -3289,7 +3289,7 @@ pub const WebFace = struct {
     fn toastBlockedPopup(self: *WebFace, url: []const u8) void {
         const win = self.ownerWindow() orelse return;
         var buf: [256]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&buf, "Popup blocked — {s}", .{hostOf(url)}) catch return;
+        const text = std.fmt.bufPrintSentinel(&buf, "Popup blocked — {s}", .{hostOf(url)}, 0) catch return;
         // Named `t` because the face already has a `toast` METHOD (the
         // plain, buttonless one); this popup toast needs a button, so
         // it is built here instead of going through it.

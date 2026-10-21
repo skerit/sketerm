@@ -499,7 +499,7 @@ const TmpState = struct {
         var self: TmpState = .{ .dir = std.testing.tmpDir(.{}) };
         errdefer self.dir.cleanup();
         var state_buf: [4096:0]u8 = undefined;
-        const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&self.dir.sub_path});
+        const state = try std.fmt.bufPrintSentinel(&state_buf, ".zig-cache/tmp/{s}", .{&self.dir.sub_path}, 0);
         try self.saved.override("XDG_STATE_HOME", state.ptr);
         return self;
     }

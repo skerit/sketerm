@@ -241,7 +241,7 @@ fn runHintCommand(self: *Window, pane: *Pane, m: @import("hints.zig").Match) voi
     if (c.fork() != 0) c._exit(0);
     if (pane.terminal.cwd) |dir| {
         var dz: [4096]u8 = undefined;
-        if (std.fmt.bufPrintZ(&dz, "{s}", .{dir})) |z| {
+        if (std.fmt.bufPrintSentinel(&dz, "{s}", .{dir}, 0)) |z| {
             _ = c.chdir(z.ptr);
         } else |_| {}
     }
@@ -308,7 +308,7 @@ pub fn openPathInEditor(self: *Window, pane: *Pane, text: []const u8) bool {
     const cwd: ?[]const u8 = if (pane.terminal.cwd) |d| d else null;
     const abs = resolveHintPath(&abs_buf, fl.path, profile_util.getenv("HOME"), cwd) orelse return false;
     var z_buf: [4096]u8 = undefined;
-    const abs_z = std.fmt.bufPrintZ(&z_buf, "{s}", .{abs}) catch return false;
+    const abs_z = std.fmt.bufPrintSentinel(&z_buf, "{s}", .{abs}, 0) catch return false;
     if (c.access(abs_z.ptr, c.F_OK) != 0) return false;
 
     const editor = hintEditor(self.config.hint_editor, profile_util.getenv("EDITOR"), profile_util.getenv("VISUAL")) orelse return false;
@@ -318,7 +318,7 @@ pub fn openPathInEditor(self: *Window, pane: *Pane, text: []const u8) bool {
     const cmd = hints_mod.buildEditorCommand(self.allocator, editor, abs, fl.line, fl.col) catch return false;
     defer self.allocator.free(cmd);
     var sh_buf: [5200:0]u8 = undefined;
-    const sh_cmd = std.fmt.bufPrintZ(&sh_buf, "{s}", .{cmd}) catch return false;
+    const sh_cmd = std.fmt.bufPrintSentinel(&sh_buf, "{s}", .{cmd}, 0) catch return false;
     const argv = [_][*:0]const u8{ "/bin/sh", "-c", sh_cmd.ptr };
     self.addTabInternal("Editor", &argv, cwd) catch return false;
     return true;
@@ -413,7 +413,7 @@ pub fn searchIgnoresCase(query: []const u8, ci_override: bool, force_cs: bool) b
 /// The search bar's "current/total" counter, 1-based.
 pub fn matchCountLabel(buf: []u8, idx: usize, len: usize) [:0]const u8 {
     if (len == 0) return "0/0";
-    return std.fmt.bufPrintZ(buf, "{d}/{d}", .{ idx + 1, len }) catch "?/?";
+    return std.fmt.bufPrintSentinel(buf, "{d}/{d}", .{ idx + 1, len }, 0) catch "?/?";
 }
 
 /// The match after (or before) `idx` among `len`, wrapping at both

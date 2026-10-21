@@ -70,7 +70,7 @@ pub const Report = struct {
 pub fn prepare(ssh_bin: [*:0]const u8, args: *const sshroute.Args, destination: []const u8, policy: Policy) Report {
     var r: Report = .{};
     var dest_buf: [256:0]u8 = undefined;
-    const dest = std.fmt.bufPrintZ(&dest_buf, "{s}", .{destination}) catch return r;
+    const dest = std.fmt.bufPrintSentinel(&dest_buf, "{s}", .{destination}, 0) catch return r;
     var out: [16 * 1024]u8 = undefined;
 
     const g = run(ssh_bin, args, &.{"-G"}, dest, &out) orelse return r;
@@ -139,7 +139,7 @@ pub fn parseMasterPid(text: []const u8) ?i32 {
 /// as 0 s (measured); the mtime also works on macOS, which has no `/proc`.
 fn socketAge(path: []const u8) ?u64 {
     var buf: [600]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return null;
+    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0) catch return null;
     var st: c.struct_stat = undefined;
     if (c.stat(z.ptr, &st) != 0) return null;
     const now = @divTrunc(clock.wallMs(), 1000);

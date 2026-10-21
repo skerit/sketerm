@@ -269,7 +269,7 @@ pub fn announcePreedit(widget: *c.GtkWidget, text: []const u8) void {
         }
         return;
     }
-    st.preedit = st.allocator.dupeZ(u8, text) catch return;
+    st.preedit = st.allocator.dupeSentinel(u8, text, 0) catch return;
     if (st.preedit_timer != 0) return; // trailing emit already scheduled
     st.preedit_timer = c.g_timeout_add_full(
         c.G_PRIORITY_DEFAULT,

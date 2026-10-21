@@ -701,7 +701,7 @@ test "docs/config.md lists exactly the action vocabulary" {
     const close = std.mem.indexOfPos(u8, doc, open + 4, "```") orelse return error.NameBlockUnterminated;
     const block = doc[open + 4 .. close];
 
-    var seen = std.EnumSet(input.Action).initEmpty();
+    var seen = std.EnumSet(input.Action).empty;
     var it = std.mem.tokenizeAny(u8, block, " \n");
     while (it.next()) |name| {
         const a = std.meta.stringToEnum(input.Action, name) orelse {

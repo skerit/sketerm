@@ -153,7 +153,7 @@ pub const Ctx = struct {
 
 pub fn writeFile(path: []const u8, body: []const u8) bool {
     var zbuf: [512]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{path}) catch return false;
+    const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{path}, 0) catch return false;
     const fp = c.fopen(z.ptr, "wb") orelse return false;
     defer _ = c.fclose(fp);
     return c.fwrite(body.ptr, 1, body.len, fp) == body.len;
@@ -163,7 +163,7 @@ pub fn writeFile(path: []const u8, body: []const u8) bool {
 /// runtime dir), and a real failure shows up as the fixture write.
 pub fn mkdir(path: []const u8) void {
     var zbuf: [512]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{path}) catch return;
+    const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{path}, 0) catch return;
     _ = c.mkdir(z.ptr, 0o755);
 }
 

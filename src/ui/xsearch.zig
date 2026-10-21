@@ -156,7 +156,7 @@ pub fn collectHits(
         for (reply.value.hits) |h| {
             const hit = Hit{
                 .session = try arena.dupe(u8, s.name),
-                .title = try arena.dupeZ(u8, h.text),
+                .title = try arena.dupeSentinel(u8, h.text, 0),
                 .subtitle = try std.fmt.allocPrintSentinel(arena, "{s}  (line -{d})", .{ s.name, h.back }, 0),
             };
             try out.append(arena, hit);

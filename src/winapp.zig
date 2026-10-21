@@ -326,7 +326,7 @@ pub const WsHost = struct {
                 const id = std.mem.readInt(u32, u.payload[0..4], .little);
                 const win = self.windows.get(id) orelse return;
                 var buf: [256:0]u8 = undefined;
-                const z = std.fmt.bufPrintZ(&buf, "{s}", .{u.payload[4..]}) catch return;
+                const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{u.payload[4..]}, 0) catch return;
                 c.gtk_window_set_title(win.window, z.ptr);
             },
             .win_close => {
@@ -388,7 +388,7 @@ pub const WsHost = struct {
         // undecorated (the macOS title bar is in the captured
         // pixels), transparent, taskbar-joined. See remote_window.zig.
         var tbuf: [256:0]u8 = undefined;
-        const tz: [:0]const u8 = std.fmt.bufPrintZ(&tbuf, "{s}", .{title}) catch "remote app";
+        const tz: [:0]const u8 = std.fmt.bufPrintSentinel(&tbuf, "{s}", .{title}, 0) catch "remote app";
         const widgets = rw.create(tz, w, h, false) orelse {
             self.allocator.destroy(win);
             return null;

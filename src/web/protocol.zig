@@ -585,7 +585,7 @@ pub const Caps = std.EnumSet(Cap);
 
 /// A `hello_ack` capability list as a set; unknown names are skipped.
 pub fn parseCaps(names: []const []const u8) Caps {
-    var set = Caps.initEmpty();
+    var set = Caps.empty;
     for (names) |n| {
         if (Cap.fromName(n)) |cap| set.insert(cap);
     }
@@ -4641,7 +4641,9 @@ pub const SyncCookie = struct {
     /// rather than making every client rediscover it.
     expires_ms: u64,
 
-    fn encodeTo(self: SyncCookie, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+    /// `pub` so `encodePayload`'s `@hasDecl` sees it: Zig 0.17 hides
+    /// non-`pub` declarations from `@hasDecl` even within this file.
+    pub fn encodeTo(self: SyncCookie, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
         try putStr(gpa, out, self.name);
         try putStr(gpa, out, self.value);
         try putStr(gpa, out, self.domain);

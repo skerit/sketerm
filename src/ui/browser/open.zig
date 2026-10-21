@@ -125,7 +125,7 @@ fn launchMounted(self: *BrowserView, host: []const u8, path: []const u8, appid: 
 fn downloadAndOpen(self: *BrowserView, hc: *HostConn, host: []const u8, path: []const u8, appid: ?[]const u8) void {
     const cache_root = c.g_get_user_cache_dir();
     var dirbuf: [4096:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dirbuf, "{s}/sketerm/fsopen", .{cache_root}) catch return;
+    const dir = std.fmt.bufPrintSentinel(&dirbuf, "{s}/sketerm/fsopen", .{cache_root}, 0) catch return;
     _ = c.g_mkdir_with_parents(dir.ptr, 0o700);
     var h = std.hash.Wyhash.init(0);
     h.update(host);
@@ -184,11 +184,11 @@ fn writeViewerManifest(bytes: []const u8, out: *[4096:0]u8) ?[:0]const u8 {
     var attempts: u8 = 0;
     while (attempts < 8) : (attempts += 1) {
         viewer_manifest_serial +%= 1;
-        path = std.fmt.bufPrintZ(out, "{s}/viewer-batch-{d}-{x}", .{
+        path = std.fmt.bufPrintSentinel(out, "{s}/viewer-batch-{d}-{x}", .{
             dir,
             c.getpid(),
             @as(u64, @bitCast(c.g_get_monotonic_time())) ^ viewer_manifest_serial,
-        }) catch return null;
+        }, 0) catch return null;
         fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC, @as(c.mode_t, 0o600));
         if (fd >= 0) break;
     }
@@ -237,7 +237,7 @@ fn scheduleViewerManifestCleanup(path: []const u8) void {
     const cleanup = allocator.create(ManifestCleanup) catch return;
     cleanup.* = .{
         .allocator = allocator,
-        .path = allocator.dupeZ(u8, path) catch {
+        .path = allocator.dupeSentinel(u8, path, 0) catch {
             allocator.destroy(cleanup);
             return;
         },
@@ -335,7 +335,7 @@ pub fn launchViewer(self: *BrowserView, tab: *BTab, current: []const u8) void {
     var viewer_buf: [4096:0]u8 = undefined;
     const sibling: ?[*:0]const u8 = blk: {
         const slash = std.mem.lastIndexOfScalar(u8, exe, '/') orelse break :blk null;
-        const candidate = std.fmt.bufPrintZ(&viewer_buf, "{s}/sketerm-viewer", .{exe[0..slash]}) catch break :blk null;
+        const candidate = std.fmt.bufPrintSentinel(&viewer_buf, "{s}/sketerm-viewer", .{exe[0..slash]}, 0) catch break :blk null;
         if (c.access(candidate.ptr, c.X_OK) != 0) break :blk null;
         break :blk candidate.ptr;
     };
@@ -350,7 +350,7 @@ pub fn launchViewer(self: *BrowserView, tab: *BTab, current: []const u8) void {
         return;
     };
     var manifest_arg_buf: [4200:0]u8 = undefined;
-    const manifest_arg = std.fmt.bufPrintZ(&manifest_arg_buf, "{s}{s}", .{ viewer_model.MANIFEST_OPTION, manifest_path }) catch {
+    const manifest_arg = std.fmt.bufPrintSentinel(&manifest_arg_buf, "{s}{s}", .{ viewer_model.MANIFEST_OPTION, manifest_path }, 0) catch {
         _ = c.unlink(manifest_path.ptr);
         return;
     };
@@ -399,12 +399,12 @@ pub fn launchCastPlayer(self: *BrowserView, spec: []const u8) void {
     var sibling_buf: [4096:0]u8 = undefined;
     const binary: [*:0]const u8 = blk: {
         const slash = std.mem.lastIndexOfScalar(u8, exe, '/') orelse break :blk exe.ptr;
-        const candidate = std.fmt.bufPrintZ(&sibling_buf, "{s}/sketerm", .{exe[0..slash]}) catch break :blk exe.ptr;
+        const candidate = std.fmt.bufPrintSentinel(&sibling_buf, "{s}/sketerm", .{exe[0..slash]}, 0) catch break :blk exe.ptr;
         if (c.access(candidate.ptr, c.X_OK) != 0) break :blk exe.ptr;
         break :blk candidate.ptr;
     };
     var spec_buf: [paths.SPEC_BUF_LEN:0]u8 = undefined;
-    const spec_z = std.fmt.bufPrintZ(&spec_buf, "{s}", .{spec}) catch return;
+    const spec_z = std.fmt.bufPrintSentinel(&spec_buf, "{s}", .{spec}, 0) catch return;
     var argv: [4]?[*:0]u8 = .{
         @constCast(binary),
         @constCast(@as([*:0]const u8, "play")),
@@ -574,7 +574,7 @@ fn addAppChoiceButton(
         .popover = popover,
     };
     var lbl: [256:0]u8 = undefined;
-    const ltxt = std.fmt.bufPrintZ(&lbl, "{s}", .{name}) catch return;
+    const ltxt = std.fmt.bufPrintSentinel(&lbl, "{s}", .{name}, 0) catch return;
     const btn = c.gtk_button_new_with_label(ltxt.ptr);
     c.gtk_button_set_has_frame(@ptrCast(btn), 0);
     c.gtk_widget_set_halign(c.gtk_button_get_child(@ptrCast(btn)), c.GTK_ALIGN_START);
@@ -596,7 +596,7 @@ fn appendLocalApps(
     var namez: [512:0]u8 = undefined;
     const base = std.fs.path.basename(path);
     var app_count: usize = 0;
-    if (std.fmt.bufPrintZ(&namez, "{s}", .{base})) |bz| {
+    if (std.fmt.bufPrintSentinel(&namez, "{s}", .{base}, 0)) |bz| {
         var uncertain: c.gboolean = 0;
         const ct = c.g_content_type_guess(bz.ptr, null, 0, &uncertain);
         if (ct != null) {
@@ -668,7 +668,7 @@ pub fn onAppBtnClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
                 if (buildHostExecCmd(self.allocator, exec, actx.path)) |cmd| {
                     defer self.allocator.free(cmd);
                     var z: [4600:0]u8 = undefined;
-                    if (std.fmt.bufPrintZ(&z, "{s}", .{cmd})) |cz| {
+                    if (std.fmt.bufPrintSentinel(&z, "{s}", .{cmd}, 0)) |cz| {
                         cb(hctx, tab.hc.host orelse "", cz);
                         self.setStatus("opening on host (app window forwards here)…");
                     } else |_| {}
@@ -697,7 +697,7 @@ pub fn onAppBtnClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 /// @return "" when nothing could be guessed or `buf` is too small.
 pub fn guessMime(buf: []u8, name: []const u8) []const u8 {
     var namez: [512:0]u8 = undefined;
-    const bz = std.fmt.bufPrintZ(&namez, "{s}", .{name}) catch return "";
+    const bz = std.fmt.bufPrintSentinel(&namez, "{s}", .{name}, 0) catch return "";
     var uncertain: c.gboolean = 0;
     const ct = c.g_content_type_guess(bz.ptr, null, 0, &uncertain);
     if (ct == null) return "";
@@ -721,7 +721,7 @@ pub fn populateHostApps(self: *BrowserView, ow: *OpenWithCtx, ok: bool, apps: []
         return;
     }
     var hostz: [280:0]u8 = undefined;
-    const htxt = std.fmt.bufPrintZ(&hostz, "On {s}:", .{ow.tab.hc.label()}) catch "On host:";
+    const htxt = std.fmt.bufPrintSentinel(&hostz, "On {s}:", .{ow.tab.hc.label()}, 0) catch "On host:";
     c.gtk_label_set_text(@ptrCast(ow.host_label), htxt.ptr);
 
     // Guess the MIME locally from the file name.
@@ -774,7 +774,7 @@ pub fn registerEditWatch(self: *BrowserView, host: []const u8, remote_path: []co
         },
     };
     var z: [4600:0]u8 = undefined;
-    const pz = std.fmt.bufPrintZ(&z, "{s}", .{cache_path}) catch {
+    const pz = std.fmt.bufPrintSentinel(&z, "{s}", .{cache_path}, 0) catch {
         wt.destroy(self.allocator);
         return;
     };
@@ -849,7 +849,7 @@ pub fn launchLocalWithApp(appid: []const u8, path: []const u8) void {
 
 pub fn filenameUri(path: []const u8) ?[*c]c.gchar {
     var path_buf: [4096:0]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return null;
+    const path_z = std.fmt.bufPrintSentinel(&path_buf, "{s}", .{path}, 0) catch return null;
     const uri = c.g_filename_to_uri(path_z.ptr, null, null);
     return if (uri == null) null else uri;
 }
@@ -858,7 +858,7 @@ pub fn filenameUri(path: []const u8) ?[*c]c.gchar {
 pub fn setDefaultAppForPath(appid: []const u8, path: []const u8) void {
     var namez: [512:0]u8 = undefined;
     const base = std.fs.path.basename(path);
-    const bz = std.fmt.bufPrintZ(&namez, "{s}", .{base}) catch return;
+    const bz = std.fmt.bufPrintSentinel(&namez, "{s}", .{base}, 0) catch return;
     var uncertain: c.gboolean = 0;
     const ct = c.g_content_type_guess(bz.ptr, null, 0, &uncertain);
     if (ct == null) return;

@@ -329,7 +329,7 @@ fn findMpv(buf: *[512]u8) ?[]const u8 {
     const path = std.mem.span(c.getenv("PATH") orelse return null);
     var it = std.mem.tokenizeScalar(u8, path, ':');
     while (it.next()) |dir| {
-        const p = std.fmt.bufPrintZ(buf, "{s}/mpv", .{dir}) catch continue;
+        const p = std.fmt.bufPrintSentinel(buf, "{s}/mpv", .{dir}, 0) catch continue;
         if (c.access(p.ptr, c.X_OK) == 0) return p;
     }
     return null;

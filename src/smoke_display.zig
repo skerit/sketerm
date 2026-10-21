@@ -611,7 +611,7 @@ fn childAlive(pid: c.pid_t) bool {
 /// of a display session. Nothing about it goes through sketerm.
 fn spawnExternalApp(wl_path: []const u8) c.pid_t {
     var wl_z: [4096:0]u8 = undefined;
-    const wz = std.fmt.bufPrintZ(&wl_z, "{s}", .{wl_path}) catch fail("wl path too long");
+    const wz = std.fmt.bufPrintSentinel(&wl_z, "{s}", .{wl_path}, 0) catch fail("wl path too long");
     const pid = c.fork();
     if (pid < 0) fail("fork external app");
     if (pid == 0) {
@@ -628,9 +628,9 @@ fn spawnExternalApp(wl_path: []const u8) c.pid_t {
 
 fn spawnExternalX11(display: []const u8, authority: []const u8) c.pid_t {
     var display_buf: [64:0]u8 = undefined;
-    const display_z = std.fmt.bufPrintZ(&display_buf, "{s}", .{display}) catch fail("X11 display too long");
+    const display_z = std.fmt.bufPrintSentinel(&display_buf, "{s}", .{display}, 0) catch fail("X11 display too long");
     var auth_buf: [4096:0]u8 = undefined;
-    const auth_z = std.fmt.bufPrintZ(&auth_buf, "{s}", .{authority}) catch fail("Xauthority path too long");
+    const auth_z = std.fmt.bufPrintSentinel(&auth_buf, "{s}", .{authority}, 0) catch fail("Xauthority path too long");
     const pid = c.fork();
     if (pid < 0) fail("fork X11 app");
     if (pid == 0) {
@@ -823,7 +823,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
         defer {
             if (prior) |p| {
                 var zbuf: [128:0]u8 = undefined;
-                const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{p}) catch fail("prior LIBGL value too long");
+                const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{p}, 0) catch fail("prior LIBGL value too long");
                 _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", z.ptr, 1);
             } else _ = unsetEnv("LIBGL_ALWAYS_SOFTWARE");
         }
@@ -1006,7 +1006,7 @@ fn xwaylandStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
         if (env.DISPLAY.len < 2 or env.DISPLAY[0] != ':') fail("Xwayland create omitted DISPLAY");
         if (env.XAUTHORITY.len == 0) fail("Xwayland create omitted XAUTHORITY");
         var zbuf: [4096:0]u8 = undefined;
-        const auth_z = std.fmt.bufPrintZ(&zbuf, "{s}", .{env.XAUTHORITY}) catch fail("Xauthority path too long");
+        const auth_z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{env.XAUTHORITY}, 0) catch fail("Xauthority path too long");
         var st: c.struct_stat = undefined;
         if (c.stat(auth_z.ptr, &st) != 0 or st.st_mode & 0o777 != 0o600)
             fail("Xauthority is missing or not mode 0600");
@@ -1082,13 +1082,13 @@ fn xwaylandStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
     if (hasDisplay(allocator, sock_path, "dspx11"))
         fail("xwayland-satellite kept an otherwise abandoned display alive past TTL");
     var auth_zbuf: [4096:0]u8 = undefined;
-    const auth_z = std.fmt.bufPrintZ(&auth_zbuf, "{s}", .{authority}) catch fail("Xauthority path too long");
+    const auth_z = std.fmt.bufPrintSentinel(&auth_zbuf, "{s}", .{authority}, 0) catch fail("Xauthority path too long");
     if (c.access(auth_z.ptr, c.F_OK) == 0) fail("Xauthority survived display teardown");
     var x_socket_buf: [128:0]u8 = undefined;
-    const x_socket = std.fmt.bufPrintZ(&x_socket_buf, "/tmp/.X11-unix/X{s}", .{display[1..]}) catch fail("X socket path too long");
+    const x_socket = std.fmt.bufPrintSentinel(&x_socket_buf, "/tmp/.X11-unix/X{s}", .{display[1..]}, 0) catch fail("X socket path too long");
     if (c.access(x_socket.ptr, c.F_OK) == 0) fail("X11 listener survived display teardown");
     var x_lock_buf: [128:0]u8 = undefined;
-    const x_lock = std.fmt.bufPrintZ(&x_lock_buf, "/tmp/.X{s}-lock", .{display[1..]}) catch fail("X lock path too long");
+    const x_lock = std.fmt.bufPrintSentinel(&x_lock_buf, "/tmp/.X{s}-lock", .{display[1..]}, 0) catch fail("X lock path too long");
     if (c.access(x_lock.ptr, c.F_OK) == 0) fail("X11 lock survived display teardown");
     std.debug.print("smoke-display: authenticated rootless X11 frame + close + auxiliary TTL ok\n", .{});
 }
