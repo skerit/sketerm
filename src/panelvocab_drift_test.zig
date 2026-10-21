@@ -13,6 +13,7 @@
 //! again.
 
 const std = @import("std");
+const reflect = @import("util/reflect.zig");
 const t = std.testing;
 
 const vocab = @import("panelvocab.zig");
@@ -51,7 +52,7 @@ test "GUI and daemon answer identically on every id shape" {
 test "GUI and daemon share one interaction-kind set" {
     // Every kind the GUI can queue must be a kind the daemon accepts,
     // and the reverse: one enum, one token spelling.
-    inline for (@typeInfo(events.Kind).@"enum".fields) |f| {
+    inline for (reflect.fields(events.Kind)) |f| {
         try t.expect(panelrpc.validEventKind(f.name));
         try t.expectEqual(@field(vocab.Kind, f.name), vocab.kindFromName(f.name).?);
     }
@@ -60,7 +61,7 @@ test "GUI and daemon share one interaction-kind set" {
 }
 
 test "the component kinds are the vocabulary's, in its append-only order" {
-    const fields = @typeInfo(doc.Kind).@"enum".fields;
+    const fields = reflect.fields(doc.Kind);
     try t.expectEqual(vocab.COMPONENT_KINDS.len, fields.len);
     inline for (fields, 0..) |f, i| try t.expectEqualStrings(vocab.COMPONENT_KINDS[i], f.name);
 }
@@ -68,7 +69,7 @@ test "the component kinds are the vocabulary's, in its append-only order" {
 test "interaction kinds keep their wire order" {
     // Append-only as well: a new interaction goes after these.
     const pinned = [_][]const u8{ "click", "change", "submit" };
-    const fields = @typeInfo(vocab.Kind).@"enum".fields;
+    const fields = reflect.fields(vocab.Kind);
     try t.expect(fields.len >= pinned.len);
     inline for (pinned, 0..) |name, i| try t.expectEqualStrings(name, fields[i].name);
 }

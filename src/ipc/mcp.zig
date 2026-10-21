@@ -12,6 +12,7 @@
 //!   { "command": "sketerm", "args": ["mcp"] }
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const builtin = @import("builtin");
 const c = @import("../c.zig").c;
 const EnvSave = @import("../util/env.zig").Saved;
@@ -1613,7 +1614,7 @@ fn detailParts(arena: std.mem.Allocator, out: *std.ArrayList([]const u8), msg: [
     const T = @TypeOf(value);
     switch (@typeInfo(T)) {
         .optional => if (value) |v| try detailParts(arena, out, msg, key, v),
-        .@"struct" => |s| inline for (s.fields) |f| {
+        .@"struct" => inline for (reflect.fields(T)) |f| {
             const sub = if (key.len == 0) f.name else try std.fmt.allocPrint(arena, "{s}.{s}", .{ key, f.name });
             try detailParts(arena, out, msg, sub, @field(value, f.name));
         },

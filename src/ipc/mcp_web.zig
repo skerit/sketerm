@@ -36,6 +36,7 @@
 
 const std = @import("std");
 const repeat = @import("../util/repeat.zig").repeat;
+const reflect = @import("../util/reflect.zig");
 const diagnostic = @import("../web/diagnostic.zig");
 const numtext = @import("../util/numtext.zig");
 const urlshort = @import("urlshort.zig");
@@ -5361,7 +5362,7 @@ fn streamEncodingArg(arena: std.mem.Allocator, args: std.json.Value) !union(enum
 
 fn encodingNames() []const u8 {
     var out: []const u8 = "";
-    for (@typeInfo(web_proto.StreamEncoding).@"enum".fields, 0..) |f, i| out = out ++ (if (i > 0) ", " else "") ++ f.name;
+    for (reflect.fields(web_proto.StreamEncoding), 0..) |f, i| out = out ++ (if (i > 0) ", " else "") ++ f.name;
     return out;
 }
 
@@ -5867,7 +5868,7 @@ fn policyJson(arena: std.mem.Allocator, p: *const webdrive.NetPolicy) ![]const u
     }
     try w.writeAll(",\"block_types\":[");
     var first = true;
-    inline for (std.meta.fields(filter.RType)) |f| {
+    inline for (reflect.fields(filter.RType)) |f| {
         if (p.block_types & (@as(filter.RType, @enumFromInt(f.value))).bit() != 0) {
             if (!first) try w.writeByte(',');
             try w.print("\"{s}\"", .{f.name});
@@ -5876,7 +5877,7 @@ fn policyJson(arena: std.mem.Allocator, p: *const webdrive.NetPolicy) ![]const u
     }
     try w.writeAll("],\"allow_schemes\":[");
     first = true;
-    inline for (std.meta.fields(netpolicy.Scheme)) |f| {
+    inline for (reflect.fields(netpolicy.Scheme)) |f| {
         if (p.allow_schemes & (@as(netpolicy.Scheme, @enumFromInt(f.value))).bit() != 0) {
             if (!first) try w.writeByte(',');
             try w.print("\"{s}\"", .{f.name});
@@ -5900,13 +5901,13 @@ fn policyText(arena: std.mem.Allocator, p: *const webdrive.NetPolicy) ![]const u
     if (p.allow_sub.len > 0) try w.print(" subresource hosts {s};", .{try joinNames(arena, p.allow_sub)});
     if (p.block_types != 0) {
         try w.writeAll(" blocks");
-        inline for (std.meta.fields(filter.RType)) |f| {
+        inline for (reflect.fields(filter.RType)) |f| {
             if (p.block_types & (@as(filter.RType, @enumFromInt(f.value))).bit() != 0) try w.print(" {s}", .{f.name});
         }
         try w.writeAll(";");
     }
     try w.writeAll(" schemes");
-    inline for (std.meta.fields(netpolicy.Scheme)) |f| {
+    inline for (reflect.fields(netpolicy.Scheme)) |f| {
         if (p.allow_schemes & (@as(netpolicy.Scheme, @enumFromInt(f.value))).bit() != 0) try w.print(" {s}", .{f.name});
     }
     try w.writeAll(";");
@@ -6390,7 +6391,7 @@ fn captureJson(arena: std.mem.Allocator, f: *const webdrive.CaptureFilter) ![]co
     const w = &aw.writer;
     try w.writeAll("{\"types\":[");
     var first = true;
-    inline for (std.meta.fields(filter.RType)) |fld| {
+    inline for (reflect.fields(filter.RType)) |fld| {
         if (f.types == 0 or f.types & (@as(filter.RType, @enumFromInt(fld.value))).bit() != 0) {
             if (!first) try w.writeByte(',');
             try w.print("\"{s}\"", .{fld.name});
@@ -7621,7 +7622,7 @@ fn printTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: 
 
 fn paperNames() []const u8 {
     var out: []const u8 = "";
-    for (@typeInfo(web_proto.Paper).@"enum".fields, 0..) |f, i| out = out ++ (if (i > 0) ", " else "") ++ f.name;
+    for (reflect.fields(web_proto.Paper), 0..) |f, i| out = out ++ (if (i > 0) ", " else "") ++ f.name;
     return out;
 }
 
@@ -10918,7 +10919,7 @@ test "web_query schemas: the kind enum is web_proto.SemQuery, drift-tested" {
         const end = std.mem.indexOfPos(u8, schema, start, "]") orelse return error.MissingKindEnum;
         const listed = schema[start..end];
         var n: usize = 0;
-        inline for (@typeInfo(web_proto.SemQuery).@"enum".fields) |f| {
+        inline for (reflect.fields(web_proto.SemQuery)) |f| {
             if (web_proto.SemQuery.fromName(f.name) != null) {
                 try t.expect(std.mem.indexOf(u8, listed, "\"" ++ f.name ++ "\"") != null);
                 n += 1;

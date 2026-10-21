@@ -10,6 +10,7 @@
 //! is off) whenever the file changes on disk (`ui/configwatch.zig`).
 
 const std = @import("std");
+const reflect = @import("util/reflect.zig");
 const builtin = @import("builtin");
 const lsp_servers = @import("lsp/servers.zig");
 const filtersub = @import("web/filtersub.zig");
@@ -2997,11 +2998,11 @@ comptime {
             },
         }
     }
-    for (std.meta.fields(ProfileSettings)) |f| {
+    for (reflect.fields(ProfileSettings)) |f| {
         if (rowsClaiming(profile_keys, f.name) != 1)
             @compileError("ProfileSettings." ++ f.name ++ " needs exactly one profile-scope row in config.zig's key table");
     }
-    for (std.meta.fields(Config)) |f| {
+    for (reflect.fields(Config)) |f| {
         var section = false;
         for (config_non_keys) |n| {
             if (std.mem.eql(u8, n, f.name)) section = true;
@@ -3010,7 +3011,7 @@ comptime {
         if (rowsClaiming(app_keys, f.name) != 1)
             @compileError("Config." ++ f.name ++ " needs exactly one app-scope row in config.zig's key table (or a config_non_keys entry)");
     }
-    for (std.meta.fields(ColorSet)) |f| {
+    for (reflect.fields(ColorSet)) |f| {
         if (rowsClaiming(color_set_keys, f.name) != 1)
             @compileError("ColorSet." ++ f.name ++ " has no profile row of that name in config.zig's key table");
     }
@@ -3030,7 +3031,7 @@ fn hyphenated(comptime name: []const u8) []const u8 {
 
 /// Enum member for `text`, accepting `-` and `_` interchangeably.
 fn parseEnum(comptime E: type, text: []const u8) ?E {
-    inline for (@typeInfo(E).@"enum".fields) |f| {
+    inline for (reflect.fields(E)) |f| {
         if (std.mem.eql(u8, text, f.name) or std.mem.eql(u8, text, hyphenated(f.name))) return @field(E, f.name);
     }
     return null;
@@ -4343,7 +4344,7 @@ test "config: hint rules parse, keep file order and round-trip" {
 }
 
 test "config: files_default_view parses every browser view mode by name" {
-    inline for (std.meta.fields(FilesView)) |f| {
+    inline for (reflect.fields(FilesView)) |f| {
         var cfg = try Config.loadFromBytes(std.testing.allocator, "files_default_view = " ++ f.name ++ "\n");
         defer cfg.deinit();
         try std.testing.expectEqual(@field(FilesView, f.name), cfg.files_default_view);
@@ -5729,7 +5730,7 @@ fn sampleChild(comptime row: Key, comptime C: type, base: ?C) C {
         .color_a => return .{ 0x12.0 / 255.0, 0x34.0 / 255.0, 0x56.0 / 255.0, 0x78.0 / 255.0 },
         .palette16 => return rt_palette,
         .enum_ => {
-            inline for (@typeInfo(C).@"enum".fields) |f| {
+            inline for (reflect.fields(C)) |f| {
                 const v = @field(C, f.name);
                 if (base == null or v != base.?) return v;
             }

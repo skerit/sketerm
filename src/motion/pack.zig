@@ -7,6 +7,7 @@
 //! from the body, never trusted from the header.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 
 pub const FORMAT = "sketerm-motion";
 pub const VERSION: i64 = 1;
@@ -80,7 +81,7 @@ pub const KeyClass = enum {
     space,
     other,
 
-    pub const count = @typeInfo(KeyClass).@"enum".fields.len;
+    pub const count = reflect.fields(KeyClass).len;
 
     /// The class of the key that types `cp` on a US layout.
     pub fn of(cp: u21) KeyClass {

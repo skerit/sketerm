@@ -12,6 +12,7 @@
 //! arrival order, and fs_delta pushes arriving mid-wait are stashed.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const c = @import("../c.zig").c;
 const client = @import("../mux/client.zig");
 const wire = @import("../mux/wire.zig");
@@ -373,11 +374,11 @@ pub const JobEventWire = struct {
 };
 
 comptime {
-    for (std.meta.fields(JobEventWire)) |f| {
+    for (reflect.fields(JobEventWire)) |f| {
         if (!@hasField(JobEvent, f.name)) @compileError("JobEvent lacks wire field " ++ f.name);
         if (@FieldType(JobEvent, f.name) != f.type) @compileError("JobEvent field type drifted from the wire: " ++ f.name);
     }
-    if (std.meta.fields(JobEvent).len != std.meta.fields(JobEventWire).len + 1)
+    if (reflect.fields(JobEvent).len != reflect.fields(JobEventWire).len + 1)
         @compileError("JobEvent carries a field the wire shape does not declare");
 }
 
@@ -600,7 +601,7 @@ pub const Fs = struct {
             return;
         };
         var ev: JobEvent = .{ .arena = arena };
-        inline for (std.meta.fields(JobEventWire)) |f| @field(ev, f.name) = @field(parsed, f.name);
+        inline for (reflect.fields(JobEventWire)) |f| @field(ev, f.name) = @field(parsed, f.name);
         self.job_events.append(self.allocator, ev) catch arena.deinit();
     }
 
@@ -820,7 +821,7 @@ pub const Fs = struct {
             expected_mtime_ns: ?i64 = null,
         };
         var b: Base = .{ .req = req, .op = op };
-        inline for (@typeInfo(@TypeOf(args)).@"struct".fields) |fld| {
+        inline for (reflect.fields(@TypeOf(args))) |fld| {
             @field(b, fld.name) = @field(args, fld.name);
         }
         try self.sendJsonFor(.fs_op, b, timeout_ms);

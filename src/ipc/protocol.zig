@@ -6,6 +6,7 @@
 //! Responses: {"ok":true,...} or {"ok":false,"error":"..."}
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 
 /// Maximum accepted request line. A valid panel document may itself occupy
 /// 1 MiB; wrapping that JSON as the `document` string can nearly double it.
@@ -223,7 +224,7 @@ pub fn writeOk(out: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime f
 pub fn writeOkFlat(out: *std.ArrayList(u8), allocator: std.mem.Allocator, payload: anytype) !void {
     // `.{}` is an empty TUPLE, which stringifies as `[]` — the one
     // shape that cannot be merged. It means "no extra fields".
-    if (@typeInfo(@TypeOf(payload)).@"struct".fields.len == 0) {
+    if (reflect.fields(@TypeOf(payload)).len == 0) {
         try out.appendSlice(allocator, "{\"ok\":true}\n");
         return;
     }
@@ -386,7 +387,7 @@ test "error codes are append-only wire tokens" {
         "failed",                "event_epoch_required", "invalid_event_epoch",
         "event_epoch_mismatch",  "invalid_request_token", "request_token_conflict",
     };
-    const fields = @typeInfo(ErrorCode).@"enum".fields;
+    const fields = reflect.fields(ErrorCode);
     try std.testing.expect(fields.len >= pinned.len);
     for (pinned, 0..) |name, i| try std.testing.expectEqualStrings(name, fields[i].name);
     try std.testing.expect(errorCodeOf(.null) == null);

@@ -8,6 +8,7 @@
 //! like local ones and this module never touches a disk.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const Allocator = std.mem.Allocator;
 
 pub const FILE_NAME = ".editorconfig";
@@ -36,7 +37,7 @@ pub const Props = struct {
 
     /// Whether any property is set at all.
     pub fn any(self: Props) bool {
-        inline for (std.meta.fields(Props)) |f| {
+        inline for (reflect.fields(Props)) |f| {
             if (@field(self, f.name) != null) return true;
         }
         return false;

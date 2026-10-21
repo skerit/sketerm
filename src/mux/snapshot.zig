@@ -36,6 +36,7 @@
 //! derived from the serialized mark count (zero when the ring is full).
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const grid = @import("../grid/screen.zig");
 const Screen = grid.Screen;
 const Line = @import("../grid/line.zig").Line;
@@ -256,7 +257,7 @@ const field_policy = [_]struct { name: []const u8, class: FieldClass }{
 
 comptime {
     @setEvalBranchQuota(200_000);
-    for (std.meta.fields(Screen)) |f| {
+    for (reflect.fields(Screen)) |f| {
         var classified = false;
         for (field_policy) |p| {
             if (std.mem.eql(u8, p.name, f.name)) classified = true;
@@ -267,7 +268,7 @@ comptime {
     }
     for (field_policy) |p| {
         var exists = false;
-        for (std.meta.fields(Screen)) |f| {
+        for (reflect.fields(Screen)) |f| {
             if (std.mem.eql(u8, p.name, f.name)) exists = true;
         }
         if (!exists) @compileError("snapshot.zig field_policy classifies Screen." ++ p.name ++ ", which no longer exists");

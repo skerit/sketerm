@@ -19,6 +19,7 @@
 //! shortcut sink). The tag name is the stable config/IPC spelling.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 
 pub const Action = enum {
     // Window-level (dispatched via shortcut_sink to Window).
@@ -350,7 +351,7 @@ pub fn fromName(n: []const u8) ?Action {
 }
 
 test "action names round-trip and the aliases resolve" {
-    inline for (@typeInfo(Action).@"enum".fields) |f| {
+    inline for (reflect.fields(Action)) |f| {
         const a: Action = @field(Action, f.name);
         try std.testing.expectEqual(@as(?Action, a), fromName(name(a)));
     }

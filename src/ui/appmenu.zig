@@ -14,6 +14,7 @@
 //! `AdwAboutDialog`.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const classicmenu = @import("browser/classicmenu.zig");
@@ -192,7 +193,7 @@ pub fn appendHelp(
 test "appmenu: every identity names an app and an icon" {
     // A missing arm here is an About window titled after the wrong
     // application, which nobody notices until a bug report shows it.
-    inline for (@typeInfo(Identity).@"enum".fields) |field| {
+    inline for (reflect.fields(Identity)) |field| {
         const id: Identity = @enumFromInt(field.value);
         try std.testing.expect(std.mem.span(id.appName()).len != 0);
         try std.testing.expect(std.mem.startsWith(u8, std.mem.span(id.iconName()), "dev.sker.sketerm"));

@@ -17,6 +17,7 @@
 //! socket) as context of that turn, or for `peer_read`.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const c = @import("../c.zig").c;
 const mcp = @import("mcp.zig");
 const mcp_tools = @import("mcp_tools.zig");
@@ -187,9 +188,9 @@ fn dupeDeep(comptime T: type, a: std.mem.Allocator, value: T) error{OutOfMemory}
     switch (@typeInfo(T)) {
         .bool, .int, .float, .@"enum" => return value,
         .optional => |o| return if (value) |v| try dupeDeep(o.child, a, v) else null,
-        .@"struct" => |s| {
+        .@"struct" => {
             var out: T = undefined;
-            inline for (s.fields) |f| @field(out, f.name) = try dupeDeep(f.type, a, @field(value, f.name));
+            inline for (reflect.fields(T)) |f| @field(out, f.name) = try dupeDeep(f.type, a, @field(value, f.name));
             return out;
         },
         .@"union" => switch (value) {

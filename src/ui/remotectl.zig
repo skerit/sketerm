@@ -5,6 +5,7 @@
 //! sides of the split.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const c = @import("../c.zig").c;
 const atomicwrite = @import("../util/atomicwrite.zig");
 const crashlog = @import("../util/crashlog.zig");
@@ -1782,7 +1783,7 @@ test "addressed actions route by target, not by focus" {
     // action joining one of these is a new `Window` twin to wire, not a
     // drift to absorb.
     var explicit: usize = 0;
-    inline for (@typeInfo(input.Action).@"enum".fields) |f| {
+    inline for (reflect.fields(input.Action)) |f| {
         const route = paneRoute(@field(input.Action, f.name));
         switch (std.meta.activeTag(route)) {
             .pane_local, .window, .focus_derived => {},

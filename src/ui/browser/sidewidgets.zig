@@ -10,6 +10,7 @@
 //! remote tab's host.
 
 const std = @import("std");
+const reflect = @import("../../util/reflect.zig");
 const c = @import("../../c.zig").c;
 const places_mod = @import("../../filebrowser/places.zig");
 const strz = @import("../../util/strz.zig");
@@ -26,7 +27,7 @@ pub const Kind = enum {
     graph,
 
     pub fn fromString(s: []const u8) Kind {
-        inline for (@typeInfo(Kind).@"enum".fields) |f| {
+        inline for (reflect.fields(Kind)) |f| {
             if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
         }
         return .title;

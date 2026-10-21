@@ -43,6 +43,7 @@
 //! process; nothing is shared between them but the message strings.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const host_obs = @import("cefhost/observe.zig");
 const host_us = @import("cefhost/usercontent.zig");
 const host_sec = @import("cefhost/security.zig");
@@ -7636,7 +7637,7 @@ fn onCursorChange(
 fn guiCursor(name: []const u8) proto.Cursor {
     if (std.mem.eql(u8, name, "col-resize")) return .ew_resize;
     if (std.mem.eql(u8, name, "row-resize")) return .ns_resize;
-    inline for (std.meta.fields(proto.Cursor)) |f| {
+    inline for (reflect.fields(proto.Cursor)) |f| {
         const css = comptime blk: {
             var b = f.name[0..f.name.len].*;
             std.mem.replaceScalar(u8, &b, '_', '-');

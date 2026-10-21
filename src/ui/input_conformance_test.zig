@@ -6,6 +6,7 @@
 //! src/ui/input.zig at every modifier combo.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const builtin = @import("builtin");
 
 // Re-import the helpers via a thin internal module include.
@@ -713,7 +714,7 @@ test "docs/config.md lists exactly the action vocabulary" {
         }
         seen.insert(a);
     }
-    inline for (@typeInfo(input.Action).@"enum".fields) |f| {
+    inline for (reflect.fields(input.Action)) |f| {
         if (!seen.contains(@field(input.Action, f.name))) {
             std.debug.print("docs/config.md does not list action '{s}'\n", .{f.name});
             return error.ActionUndocumented;

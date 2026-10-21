@@ -11,6 +11,7 @@
 //! Pure code, no GTK, no sockets — unit-tested headless.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const Event = @import("../parser/event.zig").Event;
 const framing = @import("../util/framing.zig");
 
@@ -1606,7 +1607,7 @@ pub const PlayCommand = union(enum) {
 test "every play_control op round-trips, carrying only its own field" {
     const t = std.testing;
     var buf: [96]u8 = undefined;
-    inline for (@typeInfo(PlayCommand).@"union".fields) |f| {
+    inline for (reflect.fields(PlayCommand)) |f| {
         const cmd = @unionInit(PlayCommand, f.name, switch (f.type) {
             void => {},
             u64 => 12_500,

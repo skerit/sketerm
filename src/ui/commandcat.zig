@@ -14,6 +14,7 @@
 //! strings and resolved by whichever view renders them.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const Action = @import("action.zig").Action;
 const ecmd = @import("../editor/commands.zig");
 const suggest = @import("../util/suggest.zig");
@@ -303,7 +304,7 @@ pub fn build(gpa: std.mem.Allocator, ctx: Context, out: *std.ArrayList(Row)) err
     out.clearRetainingCapacity();
     try out.appendSlice(gpa, &curated);
     if (ctx.editor) {
-        inline for (@typeInfo(ecmd.Command).@"enum".fields) |field| {
+        inline for (reflect.fields(ecmd.Command)) |field| {
             const cmd: ecmd.Command = @enumFromInt(field.value);
             try out.append(gpa, .{
                 .icon = "document-edit-symbolic",

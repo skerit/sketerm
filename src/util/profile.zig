@@ -8,6 +8,7 @@
 //! pays only an atomic-bool load per call site.
 
 const std = @import("std");
+const reflect = @import("reflect.zig");
 
 pub const Stage = enum(u8) {
     onrender_total,
@@ -20,7 +21,7 @@ pub const Stage = enum(u8) {
     image_pass,
 };
 
-const N_STAGES = @typeInfo(Stage).@"enum".fields.len;
+const N_STAGES = reflect.fields(Stage).len;
 
 const Stats = struct {
     count: u64 = 0,
@@ -97,7 +98,7 @@ fn flush() void {
     var w = std.Io.Writer.fixed(&buf);
     w.writeAll("sketerm-profile:") catch return;
 
-    const fields = @typeInfo(Stage).@"enum".fields;
+    const fields = reflect.fields(Stage);
     inline for (fields) |f| {
         const s = &stats[f.value];
         if (s.count > 0) {

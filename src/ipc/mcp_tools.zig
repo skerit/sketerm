@@ -15,6 +15,7 @@
 //! defaults into them when it renders tools/list.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const vocab = @import("../agent/vocab.zig");
 const agentpush = @import("agentpush.zig");
 const select = @import("../agent/select.zig");
@@ -43,7 +44,7 @@ const vcodec = @import("../wlhost/vcodec.zig");
 /// `web_policy`/`web_network` cannot drift from the wire vocabulary.
 const NET_REASON_ENUM = blk: {
     var out: []const u8 = "";
-    for (std.meta.fields(web_proto.NetReason)) |f| out = out ++ "\"" ++ f.name ++ "\",";
+    for (reflect.fields(web_proto.NetReason)) |f| out = out ++ "\"" ++ f.name ++ "\",";
     break :blk out ++ "\"unknown\"";
 };
 
@@ -322,7 +323,7 @@ const EXCHANGE_ITEM_Z =
 fn enumItems(comptime E: type) []const u8 {
     comptime {
         var out: []const u8 = "";
-        for (@typeInfo(E).@"enum".fields, 0..) |f, i| out = out ++ (if (i > 0) "," else "") ++ "\"" ++ f.name ++ "\"";
+        for (reflect.fields(E), 0..) |f, i| out = out ++ (if (i > 0) "," else "") ++ "\"" ++ f.name ++ "\"";
         return out;
     }
 }
@@ -341,7 +342,7 @@ pub const AGENT_WAIT_MAX_ANY: usize = 32;
 /// A peer's `work` counts, derived from `vocab.PeerWork`'s fields.
 const PEER_WORK_PROPS = blk: {
     var out: []const u8 = "";
-    for (std.meta.fields(vocab.PeerWork), 0..) |f, i| out = out ++ (if (i > 0) "," else "") ++ "\"" ++ f.name ++ "\":{\"type\":\"integer\"}";
+    for (reflect.fields(vocab.PeerWork), 0..) |f, i| out = out ++ (if (i > 0) "," else "") ++ "\"" ++ f.name ++ "\":{\"type\":\"integer\"}";
     break :blk out;
 };
 
@@ -2800,7 +2801,7 @@ test "the persistence schema names exactly the Persistence fields, and every tab
     const arena = arena_state.allocator();
     const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, PERSISTENCE_SCHEMA, .{});
     const props = schema.object.get("properties").?.object;
-    const fields = @typeInfo(webpersist.Persistence).@"struct".fields;
+    const fields = reflect.fields(webpersist.Persistence);
     try t.expectEqual(fields.len, props.count());
     try t.expectEqual(fields.len, schema.object.get("required").?.array.items.len);
     inline for (fields) |f| try t.expect(props.get(f.name) != null);
@@ -2871,7 +2872,7 @@ test "web_stream schemas register the headless socket contract and nullable runt
     // The encoding and codec enums are the protocol's and vcodec's own.
     const in_props = input.object.get("properties").?.object;
     const enc_items = in_props.get("encoding").?.object.get("enum").?.array.items;
-    const enc_fields = @typeInfo(web_proto.StreamEncoding).@"enum".fields;
+    const enc_fields = reflect.fields(web_proto.StreamEncoding);
     try testing.expectEqual(enc_fields.len, enc_items.len);
     inline for (enc_fields, 0..) |f, i| try testing.expectEqualStrings(f.name, enc_items[i].string);
     try testing.expectEqualStrings("raw", in_props.get("encoding").?.object.get("default").?.string);
@@ -2889,7 +2890,7 @@ test "web_stream schemas register the headless socket contract and nullable runt
     try testing.expectEqualStrings("string", scr_types[0].string);
     try testing.expectEqualStrings("null", scr_types[1].string);
     const src_items = cp.get("web_screen_source").?.object.get("enum").?.array.items;
-    const src_fields = @typeInfo(@import("../motion/replay.zig").Source).@"enum".fields;
+    const src_fields = reflect.fields(@import("../motion/replay.zig").Source);
     try testing.expectEqual(src_fields.len, src_items.len);
     inline for (src_fields, 0..) |f, i| try testing.expectEqualStrings(f.name, src_items[i].string);
 }
@@ -2971,7 +2972,7 @@ test "every table entry routes to exactly its own group's handler enum" {
         per_group.getPtr(t.group).* += 1;
     }
     inline for (comptime std.enums.values(Group)) |g| {
-        try testing.expectEqual(per_group.get(g), @typeInfo(GroupTool(g)).@"enum".fields.len);
+        try testing.expectEqual(per_group.get(g), reflect.fields(GroupTool(g)).len);
     }
     try testing.expect(route("no_such_tool") == null);
     try testing.expect(route("") == null);

@@ -12,6 +12,7 @@
 //! import from build.zig's `addAgentAdapters`.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const vocab = @import("vocab.zig");
 const facts_mod = @import("facts.zig");
 const http = @import("http.zig");
@@ -627,7 +628,7 @@ const Validator = struct {
             for (pr) |ch| if (ch < 0x20 or ch == 0x7f) return self.fail("retry.prompt contains a control character", .{});
         }
         try self.recipe(s, s.launch.exit, "launch.exit");
-        inline for (@typeInfo(Actions).@"struct".fields) |f| try self.recipe(s, @field(s.actions, f.name), "actions." ++ f.name);
+        inline for (reflect.fields(Actions)) |f| try self.recipe(s, @field(s.actions, f.name), "actions." ++ f.name);
         const errs = try self.arena.alloc(ErrorMatcher, s.errors.len);
         for (s.errors, errs, 0..) |r, *out, i| {
             out.* = .{
@@ -669,7 +670,7 @@ const Validator = struct {
                 return self.fail("api.generations: \"{s}\" is named twice", .{g.name});
             if (g.probe.len == 0 or g.probe[0] != '/') return self.fail("api.generations[{d}].probe \"{s}\" is not a path", .{ i, g.probe });
             for (g.attach_args) |x| try self.placeholders(x, "api.generations[].attach_args");
-            inline for (@typeInfo(Routes).@"struct".fields) |f| {
+            inline for (reflect.fields(Routes)) |f| {
                 const v: ?[]const u8 = @field(g.routes, f.name);
                 if (v) |r| try self.route(r, g.name, f.name);
             }

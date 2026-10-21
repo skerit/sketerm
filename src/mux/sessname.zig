@@ -4,6 +4,7 @@
 //! subject come only from the latter, `daemon_peers.sessionTitle`).
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 
 /// Who mints a name, which fixes its prefix: `<prefix><pid>-<seq>`.
 pub const Minter = enum {
@@ -35,7 +36,7 @@ pub fn alloc(allocator: std.mem.Allocator, minter: Minter, pid: i64, seq: u64) e
 
 /// Whether `name` has the shape some `Minter` gives.
 pub fn isMinted(name: []const u8) bool {
-    inline for (std.meta.fields(Minter)) |f| {
+    inline for (reflect.fields(Minter)) |f| {
         const p = @as(Minter, @enumFromInt(f.value)).prefix();
         if (std.mem.startsWith(u8, name, p) and pidSeq(name[p.len..])) return true;
     }
@@ -58,7 +59,7 @@ const t = std.testing;
 
 test "every minted shape is recognised; names a user gives are not" {
     var buf: [48]u8 = undefined;
-    inline for (std.meta.fields(Minter)) |f| {
+    inline for (reflect.fields(Minter)) |f| {
         const m: Minter = @enumFromInt(f.value);
         try t.expect(isMinted(try print(&buf, m, 85382, 27)));
         const owned = try alloc(t.allocator, m, 7, 1);

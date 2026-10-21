@@ -18,6 +18,7 @@
 //! GTK-free and libc-only, like every other src/ipc module.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const c = @import("../c.zig").c;
 const clock = @import("../util/clock.zig");
 const muxclient = @import("../mux/client.zig");
@@ -323,7 +324,7 @@ fn WithReq(comptime Body: type) type {
             try jw.beginObject();
             try jw.objectField("req");
             try jw.write(self.req);
-            inline for (@typeInfo(Body).@"struct".fields) |f| {
+            inline for (reflect.fields(Body)) |f| {
                 try jw.objectField(f.name);
                 try jw.write(@field(self.body, f.name));
             }

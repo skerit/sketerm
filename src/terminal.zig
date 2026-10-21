@@ -9,6 +9,7 @@
 //! no ring) — local shells are daemon sessions the GUI attaches to.
 
 const std = @import("std");
+const reflect = @import("util/reflect.zig");
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const Event = @import("parser/event.zig").Event;
@@ -3812,7 +3813,7 @@ test "clearSinks nulls every on_* callback (reflection drift guard)" {
     term.drain = &drain;
     term.remote = null; // failPendingTicket + the napp loop bail out
 
-    const fields = @typeInfo(Terminal).@"struct".fields;
+    const fields = reflect.fields(Terminal);
     inline for (fields) |fld| {
         if (comptime (isSinkField(fld.type) and std.mem.startsWith(u8, fld.name, "on_"))) {
             @field(term, fld.name) = @ptrFromInt(0x1000);

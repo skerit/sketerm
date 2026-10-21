@@ -4,6 +4,7 @@
 //! aliased back into Daemon.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const c = @import("../c.zig").c;
 const log = @import("log.zig");
 const wire = @import("wire.zig");
@@ -1480,7 +1481,7 @@ test "every viewer unit tag is classified, and the gate reads the classification
     };
     const describes = [_]wlpipe.Tag{ .offer_selection, .offer_primary, .set_scale };
     const transfers = [_]wlpipe.Tag{ .clip_send, .clip_data, .primary_data };
-    inline for (@typeInfo(wlpipe.Tag).@"enum".fields) |f| {
+    inline for (reflect.fields(wlpipe.Tag)) |f| {
         const tag: wlpipe.Tag = @enumFromInt(f.value);
         const kind = viewerUnitKind(tag);
         const expected: ViewerUnit = if (std.mem.indexOfScalar(wlpipe.Tag, &intents, tag) != null)

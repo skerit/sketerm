@@ -39,6 +39,7 @@
 //! until the table hits. Themes then map kind -> colour + face.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const Document = @import("document.zig").Document;
 const Rope = @import("rope.zig").Rope;
 const tr = @import("transaction.zig");
@@ -101,7 +102,7 @@ pub const Kind = enum(u8) {
 };
 
 /// `_` is not a field, so this stays the count of NAMED kinds.
-pub const KIND_COUNT: usize = @typeInfo(Kind).@"enum".fields.len;
+pub const KIND_COUNT: usize = reflect.fields(Kind).len;
 
 // ----------------------------------------------------------------------
 // The semantic-token modifier band

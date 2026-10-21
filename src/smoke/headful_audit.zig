@@ -7,6 +7,7 @@
 //! that differs from the reference; an id missing from `TABLE` fails closed.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const c = @import("../c.zig").c;
 const tcpserver = @import("tcpserver.zig");
 const SpinLock = @import("../util/spinlock.zig").SpinLock;
@@ -319,7 +320,7 @@ pub const Server = struct {
     allocator: std.mem.Allocator,
     lock: SpinLock = .init,
     /// Raw header blocks (after the request line), per `Slot`.
-    hdr: [@typeInfo(Slot).@"enum".fields.len]?[]u8 = @splat(null),
+    hdr: [reflect.fields(Slot).len]?[]u8 = @splat(null),
     passive: ?[]u8 = null,
     inputs: std.ArrayList([]u8) = .empty,
 

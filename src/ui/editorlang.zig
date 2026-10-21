@@ -9,6 +9,7 @@
 //! the view, so every call site in `editorview.zig` stays one line.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const c = @import("../c.zig").c;
 const ev = @import("editorview.zig");
 const EditorView = ev.EditorView;
@@ -170,7 +171,7 @@ pub fn inspect(view: *EditorView, data: ?[]const u8) ?Info {
 
 fn kindName(k: syntax.Kind) []const u8 {
     const base = syntax.baseKind(k);
-    inline for (@typeInfo(syntax.Kind).@"enum".fields) |f| {
+    inline for (reflect.fields(syntax.Kind)) |f| {
         if (@intFromEnum(base) == f.value) return f.name;
     }
     return "none";

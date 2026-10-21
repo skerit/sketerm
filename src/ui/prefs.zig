@@ -9,6 +9,7 @@
 //! Open via Ctrl+, or the right-click context menu.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const render_kick = @import("../util/render_kick.zig");
@@ -2374,7 +2375,7 @@ fn keybindsPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
         "Backspace unbinds. Conflicts log a warning to stderr.");
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(group)));
 
-    inline for (@typeInfo(input_mod.Action).@"enum".fields) |field| {
+    inline for (reflect.fields(input_mod.Action)) |field| {
         const action: input_mod.Action = @enumFromInt(field.value);
         addKeybindRow(@ptrCast(@alignCast(group)), ctx, .{ .act = action });
     }
@@ -2387,7 +2388,7 @@ fn keybindsPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
         "Stored as editor_keybind.&lt;command&gt; lines; they never shadow a terminal key.");
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(ed_group)));
 
-    inline for (@typeInfo(ecmd.Command).@"enum".fields) |field| {
+    inline for (reflect.fields(ecmd.Command)) |field| {
         const cmd: ecmd.Command = @enumFromInt(field.value);
         addKeybindRow(@ptrCast(@alignCast(ed_group)), ctx, .{ .ed = cmd });
     }

@@ -5,6 +5,7 @@
 //! the enum, so adding a member is one edit or the build breaks.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 
 /// Where an adapter reads the agent from. Adding a screen app is a JSON
 /// file; adding a source kind is code.
@@ -97,7 +98,7 @@ pub const PeerWork = struct {
     other_tasks: u32 = 0,
 
     pub fn isEmpty(self: PeerWork) bool {
-        inline for (std.meta.fields(PeerWork)) |f| if (@field(self, f.name) != 0) return false;
+        inline for (reflect.fields(PeerWork)) |f| if (@field(self, f.name) != 0) return false;
         return true;
     }
 
@@ -108,7 +109,7 @@ pub const PeerWork = struct {
     /// Add `n` to the field whose noun `word` is (singular or plural).
     /// @return false when no field names it.
     pub fn addTerm(self: *PeerWork, n: u32, word: []const u8) bool {
-        inline for (std.meta.fields(PeerWork)) |f| {
+        inline for (reflect.fields(PeerWork)) |f| {
             const one = comptime singular(f.name);
             if (std.mem.eql(u8, word, one) or (word.len == one.len + 1 and std.mem.startsWith(u8, word, one) and word[one.len] == 's')) {
                 @field(self, f.name) +|= n;
@@ -121,7 +122,7 @@ pub const PeerWork = struct {
     /// `2 subagents, 1 shell`: the counts that are not 0, in field order.
     pub fn write(self: PeerWork, w: *std.Io.Writer) std.Io.Writer.Error!void {
         var first = true;
-        inline for (std.meta.fields(PeerWork)) |f| {
+        inline for (reflect.fields(PeerWork)) |f| {
             const n = @field(self, f.name);
             if (n != 0) {
                 if (!first) try w.writeAll(", ");
@@ -546,7 +547,7 @@ pub const ToolStatus = enum { pending, running, completed, @"error" };
 
 /// The member names of `E`, in declaration order (for schemas and help text).
 pub fn names(comptime E: type) []const []const u8 {
-    const fields = @typeInfo(E).@"enum".fields;
+    const fields = reflect.fields(E);
     const list = comptime blk: {
         var out: [fields.len][]const u8 = undefined;
         for (fields, 0..) |f, i| out[i] = f.name;

@@ -11,6 +11,7 @@
 //! as the anonymous import `ts_query_<tag>`.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 
 /// One pinned upstream source tree; a repository hosting several
 /// grammars (typescript + tsx, markdown + markdown_inline) is one member.
@@ -187,7 +188,7 @@ pub const Query = enum {
     }
 };
 
-pub const COUNT: usize = @typeInfo(Grammar).@"enum".fields.len;
+pub const COUNT: usize = reflect.fields(Grammar).len;
 
 test "grammars: every query and every upstream is used by some grammar" {
     for (std.enums.values(Query)) |q| {

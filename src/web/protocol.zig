@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const repeat = @import("../util/repeat.zig").repeat;
+const reflect = @import("../util/reflect.zig");
 
 /// Protocol revision carried by `hello`/`hello_ack`.
 pub const PROTO_VERSION: u32 = 1;
@@ -571,7 +572,7 @@ pub const Cap = enum {
     /// The member a wire name denotes; null for a name this build does
     /// not know (a newer helper's capability is not an error).
     pub fn fromName(wire: []const u8) ?Cap {
-        inline for (@typeInfo(Cap).@"enum".fields) |f| {
+        inline for (reflect.fields(Cap)) |f| {
             const cap: Cap = @enumFromInt(f.value);
             if (std.mem.eql(u8, wire, cap.name())) return cap;
         }
@@ -610,23 +611,23 @@ comptime {
     // the enum fails the build here instead of never being parsed.
     @setEvalBranchQuota(100_000);
     var n: usize = 0;
-    for (@typeInfo(protocol).@"struct".decls) |d| {
-        if (!std.mem.startsWith(u8, d.name, "CAP_")) continue;
+    for (reflect.declNames(protocol)) |decl| {
+        if (!std.mem.startsWith(u8, decl, "CAP_")) continue;
         n += 1;
         var found = false;
-        for (@typeInfo(Cap).@"enum".fields) |f| {
-            if (std.mem.eql(u8, capConstName(f.name), d.name)) {
+        for (reflect.fields(Cap)) |f| {
+            if (std.mem.eql(u8, capConstName(f.name), decl)) {
                 found = true;
                 break;
             }
         }
-        if (!found) @compileError(d.name ++ " has no member in protocol.Cap");
+        if (!found) @compileError(decl ++ " has no member in protocol.Cap");
     }
-    if (n != @typeInfo(Cap).@"enum".fields.len) @compileError("protocol.Cap and the CAP_* constants disagree");
+    if (n != reflect.fields(Cap).len) @compileError("protocol.Cap and the CAP_* constants disagree");
 }
 
 test "every capability round-trips through its wire name and parseCaps skips unknowns" {
-    inline for (@typeInfo(Cap).@"enum".fields) |f| {
+    inline for (reflect.fields(Cap)) |f| {
         const cap: Cap = @enumFromInt(f.value);
         try std.testing.expectEqual(cap, Cap.fromName(cap.name()).?);
     }
@@ -3482,7 +3483,7 @@ pub const NetReason = enum(u8) {
 };
 
 /// Reasons a `denied` counter array carries, indexed by `NetReason`.
-pub const NREASONS = std.meta.fields(NetReason).len;
+pub const NREASONS = reflect.fields(NetReason).len;
 
 /// The counters an `EvNetPolicy` carried before the untrusted reasons were appended.
 pub const NREASONS_LEGACY = 12;
@@ -5489,7 +5490,7 @@ pub fn encodePayload(gpa: std.mem.Allocator, out: *std.ArrayList(u8), value: any
     if (@hasDecl(T, "encodeTo")) {
         try value.encodeTo(gpa, out);
     } else {
-        inline for (std.meta.fields(T)) |f| {
+        inline for (reflect.fields(T)) |f| {
             const v = @field(value, f.name);
             switch (f.type) {
                 u8 => try putU8(gpa, out, v),
@@ -5515,7 +5516,7 @@ pub fn decode(comptime T: type, payload: []const u8) !T {
     if (@hasDecl(T, "decodeFrom")) return T.decodeFrom(payload);
     var cur = Cur{ .buf = payload };
     var out: T = undefined;
-    inline for (std.meta.fields(T)) |f| {
+    inline for (reflect.fields(T)) |f| {
         @field(out, f.name) = switch (f.type) {
             u8 => try cur.readU8(),
             u16 => try cur.readU16(),
@@ -5695,7 +5696,7 @@ fn roundTrip(comptime T: type, value: T) !void {
     try std.testing.expectEqual(T.tag, frame.tag);
     try std.testing.expectEqual(buf.items.len, r.consumed());
     const got = try decode(T, frame.payload);
-    inline for (std.meta.fields(T)) |f| {
+    inline for (reflect.fields(T)) |f| {
         if (f.type == []const u8) {
             try std.testing.expectEqualStrings(@field(value, f.name), @field(got, f.name));
         } else if (f.type == Text) {

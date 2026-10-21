@@ -15,6 +15,7 @@
 //! worked cases.
 
 const std = @import("std");
+const reflect = @import("reflect.zig");
 
 /// Longest title we will ever produce. Tab labels ellipsize far below
 /// this; the window title is the only consumer that gets near it.
@@ -78,7 +79,7 @@ pub const Diag = struct {
 /// the warning `config.zig` prints when `validate` rejects a template.
 pub const field_list = blk: {
     var s: []const u8 = "";
-    for (std.meta.fields(Field), 0..) |f, i| {
+    for (reflect.fields(Field), 0..) |f, i| {
         s = s ++ (if (i == 0) "" else ", ") ++ f.name;
     }
     break :blk s;
@@ -99,7 +100,7 @@ fn trim(s: []const u8) []const u8 {
 /// Placeholder names are case-insensitive (Rio accepts `{{ program }}`
 /// and `{{ PROGRAM }}` alike), and `_` is the only word separator.
 fn fieldFromName(name: []const u8) ?Field {
-    inline for (std.meta.fields(Field)) |f| {
+    inline for (reflect.fields(Field)) |f| {
         if (name.len == f.name.len) {
             var same = true;
             for (name, f.name) |a, b| {
@@ -549,7 +550,7 @@ test "titlefmt: dimensions render as a pair" {
 
 test "titlefmt: validate accepts the whole placeholder set" {
     var diag: Diag = .{};
-    inline for (std.meta.fields(Field)) |f| {
+    inline for (reflect.fields(Field)) |f| {
         try validate("{{ " ++ f.name ++ " }}", &diag);
     }
     try validate("plain text", &diag);

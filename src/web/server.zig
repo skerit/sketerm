@@ -22,6 +22,7 @@
 //! `protocol` frames.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const builtin = @import("builtin");
 const c = @import("cbindings");
 const proto = @import("protocol.zig");
@@ -203,7 +204,7 @@ fn withheld(cap: proto.Cap) bool {
 /// the protocol's own vocabulary (`proto.Cap`), so there is no size to
 /// bump and advertising more capabilities than exist is not expressible.
 const CapList = struct {
-    const capacity = @typeInfo(proto.Cap).@"enum".fields.len;
+    const capacity = reflect.fields(proto.Cap).len;
 
     buf: [capacity][]const u8 = undefined,
     len: usize = 0,

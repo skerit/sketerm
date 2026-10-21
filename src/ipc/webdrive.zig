@@ -71,6 +71,7 @@
 
 const std = @import("std");
 const repeat = @import("../util/repeat.zig").repeat;
+const reflect = @import("../util/reflect.zig");
 const diagnostic = @import("../web/diagnostic.zig");
 const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
@@ -681,8 +682,8 @@ pub const NetPolicyPatch = struct {
     /// optional would be the "empty = nothing said" special case this
     /// type exists to remove, so it fails the build.
     fn assertMirrorsPolicy() void {
-        const policy_fields = std.meta.fields(NetPolicy);
-        const patch_fields = std.meta.fields(NetPolicyPatch);
+        const policy_fields = reflect.fields(NetPolicy);
+        const patch_fields = reflect.fields(NetPolicyPatch);
         if (policy_fields.len != patch_fields.len)
             @compileError("NetPolicyPatch must carry exactly NetPolicy's fields (a patch field without a policy counterpart is never applied)");
         inline for (policy_fields) |pf| {
@@ -706,7 +707,7 @@ pub const NetPolicyPatch = struct {
     /// defaults. Generic over the fields, so it cannot drift.
     pub fn effective(self: NetPolicyPatch) NetPolicy {
         var out = NetPolicy{};
-        inline for (std.meta.fields(NetPolicy)) |f| {
+        inline for (reflect.fields(NetPolicy)) |f| {
             if (@field(self, f.name)) |v| @field(out, f.name) = v;
         }
         return out;
@@ -6774,7 +6775,7 @@ test "NetPolicyPatch.effective carries every said field, checked field by field"
         .deadline_ms = 44,
     };
     const eff = full.effective();
-    inline for (std.meta.fields(NetPolicy)) |f| {
+    inline for (reflect.fields(NetPolicy)) |f| {
         const want = @field(full, f.name).?;
         const got = @field(eff, f.name);
         if (@typeInfo(f.type) == .optional) {
@@ -6790,7 +6791,7 @@ test "NetPolicyPatch.effective carries every said field, checked field by field"
     // A fully-null patch is byte-for-byte NetPolicy's defaults.
     const none = (NetPolicyPatch{}).effective();
     const dflt = NetPolicy{};
-    inline for (std.meta.fields(NetPolicy)) |f| {
+    inline for (reflect.fields(NetPolicy)) |f| {
         if (@typeInfo(f.type) == .pointer) {
             try std.testing.expectEqual(@as(usize, 0), @field(none, f.name).len);
         } else {

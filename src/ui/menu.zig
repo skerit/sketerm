@@ -8,6 +8,7 @@
 //! via action-name.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const menuchrome = @import("menuchrome.zig");
@@ -192,7 +193,7 @@ const GROUP_PREFIX = GROUP ++ ".";
 /// name may not contain `_`.
 const GACTION_DETAILED = blk: {
     @setEvalBranchQuota(20_000);
-    const fields = @typeInfo(Action).@"enum".fields;
+    const fields = reflect.fields(Action);
     var names: [fields.len][:0]const u8 = undefined;
     for (fields, 0..) |f, i| {
         var buf: [GROUP_PREFIX.len + f.name.len:0]u8 = @splat(0);

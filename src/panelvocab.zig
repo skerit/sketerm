@@ -11,6 +11,7 @@
 //! Pure `std`: no libc, no GTK, importable from every dependency set.
 
 const std = @import("std");
+const reflect = @import("util/reflect.zig");
 
 /// Longest component id. Both sides of the wire read this constant.
 pub const MAX_ID: usize = 64;
@@ -94,7 +95,7 @@ test "validId table" {
 }
 
 test "kindFromName covers the wire tokens and nothing else" {
-    inline for (@typeInfo(Kind).@"enum".fields) |f| {
+    inline for (reflect.fields(Kind)) |f| {
         try t.expectEqual(@field(Kind, f.name), kindFromName(f.name).?);
     }
     try t.expect(kindFromName("") == null);

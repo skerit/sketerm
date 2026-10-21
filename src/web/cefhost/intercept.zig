@@ -6,6 +6,7 @@
 //! methods are free functions taking `*Host`, re-exported from `Host`.
 
 const std = @import("std");
+const reflect = @import("../../util/reflect.zig");
 const SpinLock = @import("../../util/spinlock.zig").SpinLock;
 const atomicwrite = @import("../../util/atomicwrite.zig");
 const c = @import("cbindings");
@@ -517,7 +518,7 @@ test "destroy before browser creation releases installed and rejected policy slo
 }
 
 fn validPolicySet(req: proto.NetPolicySet) bool {
-    const schemes: u16 = (1 << std.meta.fields(netpolicy.Scheme).len) - 1;
+    const schemes: u16 = (1 << reflect.fields(netpolicy.Scheme).len) - 1;
     const types: u16 = filter.RType.all_mask;
     if (req.flags & ~(proto.NetPolicySet.flag_allow_private | proto.NetPolicySet.flag_untrusted) != 0 or
         req.allow_schemes & ~schemes != 0 or req.block_types & ~types != 0 or

@@ -22,6 +22,7 @@
 //! point of targeting the Firefox surface.
 
 const std = @import("std");
+const reflect = @import("../../util/reflect.zig");
 const SpinLock = @import("../../util/spinlock.zig").SpinLock;
 const manifest = @import("manifest.zig");
 const match = @import("match.zig");
@@ -41,7 +42,7 @@ pub const Event = enum(u8) {
     error_occurred = 6,
 
     pub fn fromStr(s: []const u8) ?Event {
-        inline for (@typeInfo(Event).@"enum".fields) |f| {
+        inline for (reflect.fields(Event)) |f| {
             const ev: Event = @enumFromInt(f.value);
             if (std.mem.eql(u8, s, ev.toStr())) return ev;
         }
@@ -121,7 +122,7 @@ pub const RType = enum(u8) {
     imageset = 13,
 
     pub fn fromStr(s: []const u8) ?RType {
-        inline for (@typeInfo(RType).@"enum".fields) |f| {
+        inline for (reflect.fields(RType)) |f| {
             if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
         }
         // MV2 spells these with a different casing/name than a Zig tag.

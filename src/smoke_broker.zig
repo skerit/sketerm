@@ -13,6 +13,7 @@
 //! feature and this mirrors the manual validation.
 
 const std = @import("std");
+const reflect = @import("util/reflect.zig");
 const c = @import("c.zig").c;
 const lifetime = @import("util/lifetime.zig");
 const clock = @import("util/clock.zig");
@@ -210,7 +211,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // Nobody ever attached, so the worker holds the exited session for its
     // spawner's attach (`Daemon.exit_hold_ms`): listed as exited, worker
     // alive. Only once the hold ends is it dropped and the worker reaped.
-    const hold_ms: i64 = comptime std.meta.fieldInfo(Daemon, .exit_hold_ms).defaultValue().?;
+    const hold_ms: i64 = comptime reflect.defaultValue(Daemon, "exit_hold_ms").?;
     var waited: usize = 0;
     while (sessionState(sock_path, allocator, "ephemeral") == .live) : (waited += 1) {
         if (waited >= 40) fail("eph: clean exit never listed as exited");

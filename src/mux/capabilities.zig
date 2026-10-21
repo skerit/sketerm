@@ -8,6 +8,7 @@
 //! the parse, the reset and the drift test all derive from the enum.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 
 /// Every welcome flag, in wire order. The tag IS the JSON key.
 pub const Flag = enum {
@@ -206,7 +207,7 @@ pub const Set = std.enums.EnumFieldStruct(Flag, bool, false);
 /// What a current daemon advertises: every flag it knows.
 pub const all: Set = blk: {
     var s: Set = .{};
-    for (@typeInfo(Set).@"struct".fields) |f| @field(s, f.name) = true;
+    for (reflect.fields(Set)) |f| @field(s, f.name) = true;
     break :blk s;
 };
 
@@ -214,20 +215,20 @@ pub const all: Set = blk: {
 /// FLAT (old clients read top-level keys; nesting would hide every
 /// flag from them).
 pub fn WithFlags(comptime Base: type) type {
-    const base = @typeInfo(Base).@"struct".fields;
-    const flags = @typeInfo(Set).@"struct".fields;
+    const base = reflect.fields(Base);
+    const flags = reflect.fields(Set);
     var names: [base.len + flags.len][:0]const u8 = undefined;
     var types: [base.len + flags.len]type = undefined;
-    var attrs: [base.len + flags.len]std.builtin.Type.StructField.Attributes = undefined;
+    var attrs: [base.len + flags.len]reflect.StructFieldAttributes = undefined;
     for (base, 0..) |f, i| {
         names[i] = f.name;
         types[i] = f.type;
-        attrs[i] = .{ .default_value_ptr = f.default_value_ptr, .@"comptime" = f.is_comptime, .@"align" = f.alignment };
+        attrs[i] = f.attrs;
     }
     for (flags, 0..) |f, i| {
         names[base.len + i] = f.name;
         types[base.len + i] = f.type;
-        attrs[base.len + i] = .{ .default_value_ptr = f.default_value_ptr };
+        attrs[base.len + i] = .{ .default_value_ptr = f.attrs.default_value_ptr };
     }
     const final_names = names;
     const final_types = types;
@@ -238,8 +239,8 @@ pub fn WithFlags(comptime Base: type) type {
 /// `base`'s fields followed by `flags`, as a `WithFlags(@TypeOf(base))`.
 pub fn withFlags(base: anytype, flags: Set) WithFlags(@TypeOf(base)) {
     var out: WithFlags(@TypeOf(base)) = undefined;
-    inline for (@typeInfo(@TypeOf(base)).@"struct".fields) |f| @field(out, f.name) = @field(base, f.name);
-    inline for (@typeInfo(Set).@"struct".fields) |f| @field(out, f.name) = @field(flags, f.name);
+    inline for (reflect.fields(@TypeOf(base))) |f| @field(out, f.name) = @field(base, f.name);
+    inline for (reflect.fields(Set)) |f| @field(out, f.name) = @field(flags, f.name);
     return out;
 }
 
@@ -264,15 +265,15 @@ test "every flag is advertised, parsed back and reset by the same table" {
     const json = aw.written();
     // Flat keys, every flag present and true, base fields intact.
     try t.expect(std.mem.indexOf(u8, json, "\"proto\":7") != null);
-    inline for (@typeInfo(Flag).@"enum".fields) |f| {
+    inline for (reflect.fields(Flag)) |f| {
         try t.expect(std.mem.indexOf(u8, json, "\"" ++ f.name ++ "\":true") != null);
     }
     const back = parse(t.allocator, json);
-    inline for (@typeInfo(Set).@"struct".fields) |f| try t.expect(@field(back, f.name));
+    inline for (reflect.fields(Set)) |f| try t.expect(@field(back, f.name));
     // An old daemon's welcome (no flags) reads as none; a partial one
     // keeps only what it names; a malformed value yields none.
     const none = parse(t.allocator, "{\"proto\":5}");
-    inline for (@typeInfo(Set).@"struct".fields) |f| try t.expect(!@field(none, f.name));
+    inline for (reflect.fields(Set)) |f| try t.expect(!@field(none, f.name));
     const some = parse(t.allocator, "{\"proto\":6,\"lsp\":true,\"future_flag\":true}");
     try t.expect(some.lsp);
     try t.expect(!some.udp_ticket);
@@ -281,6 +282,6 @@ test "every flag is advertised, parsed back and reset by the same table" {
     try t.expect(!bad.stream_open);
     // The reset value is the all-false set.
     const reset: Set = .{};
-    inline for (@typeInfo(Set).@"struct".fields) |f| try t.expect(!@field(reset, f.name));
-    try t.expectEqual(@typeInfo(Flag).@"enum".fields.len, @typeInfo(Set).@"struct".fields.len);
+    inline for (reflect.fields(Set)) |f| try t.expect(!@field(reset, f.name));
+    try t.expectEqual(reflect.fields(Flag).len, reflect.fields(Set).len);
 }

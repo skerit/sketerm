@@ -20,6 +20,7 @@
 //! which is the only allocation this module manages for the caller.
 
 const std = @import("std");
+const reflect = @import("util/reflect.zig");
 const c = @import("c.zig").c;
 const cast = @import("util/cast.zig");
 const picker = @import("ui/picker.zig");
@@ -382,10 +383,10 @@ test "host menu: winapp's state can never produce a row it has no handler for" {
 }
 
 test "host menu: every row has a non-empty label and no two share one" {
-    inline for (@typeInfo(HostMenuItem).@"enum".fields) |fa| {
+    inline for (reflect.fields(HostMenuItem)) |fa| {
         const a: HostMenuItem = @enumFromInt(fa.value);
         try testing.expect(std.mem.span(hostMenuLabel(a)).len > 0);
-        inline for (@typeInfo(HostMenuItem).@"enum".fields) |fb| {
+        inline for (reflect.fields(HostMenuItem)) |fb| {
             const b: HostMenuItem = @enumFromInt(fb.value);
             if (fa.value == fb.value) continue;
             try testing.expect(!std.mem.eql(u8, std.mem.span(hostMenuLabel(a)), std.mem.span(hostMenuLabel(b))));

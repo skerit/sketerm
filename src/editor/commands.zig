@@ -17,6 +17,7 @@
 //! prefix, the syntax gate) and passes them in.
 
 const std = @import("std");
+const reflect = @import("../util/reflect.zig");
 const Allocator = std.mem.Allocator;
 const Document = @import("document.zig").Document;
 const tr = @import("transaction.zig");
@@ -114,7 +115,7 @@ pub const Command = enum {
     indent_auto,
 };
 
-pub const COMMAND_COUNT: usize = @typeInfo(Command).@"enum".fields.len;
+pub const COMMAND_COUNT: usize = reflect.fields(Command).len;
 
 /// Everything the UI says about one command. A single record per
 /// command, so adding one is one switch arm and the build breaks
@@ -306,7 +307,7 @@ pub fn name(cmd: Command) []const u8 {
 }
 
 pub fn fromName(s: []const u8) ?Command {
-    inline for (@typeInfo(Command).@"enum".fields) |f| {
+    inline for (reflect.fields(Command)) |f| {
         if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
     }
     return null;
@@ -1397,7 +1398,7 @@ fn expectText(doc: *const Document, expected: []const u8) !void {
 }
 
 test "commands registry round trip" {
-    inline for (@typeInfo(Command).@"enum".fields) |f| {
+    inline for (reflect.fields(Command)) |f| {
         const cmd: Command = @enumFromInt(f.value);
         try testing.expectEqual(cmd, fromName(name(cmd)).?);
         try testing.expect(label(cmd).len > 0);
