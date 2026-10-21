@@ -23343,3 +23343,30 @@ tests in peerhold, peermail, peerlink, backoff; smoke peers f7 (a second hub
 refused while the first holds a member's uplink) and f8b (a second call-in
 daemon of one host refused for a whole retry while the first keeps its peers
 listed, then let in once the first stops).
+
+## 2026-10-21: builds on Zig 0.17 as well as 0.16
+
+Arch moved to Zig 0.17.0 and the tree stopped parsing: 0.17 removed the `**`
+repetition operator (116 files used it), `@cImport` (3), `errdefer |err|`, and
+a set of std names (`bufPrintZ` 1395 call sites, `dupeZ`, `indexOfIgnoreCase`,
+`initEmpty()`), reshaped `std.builtin.Type` into struct-of-arrays, and moved
+`zig build` to a separate maker process with its own environment. Every change
+is written to compile on BOTH versions; CLAUDE.md's "Building on both 0.16
+and 0.17" lists the rules. New helpers: `src/util/reflect.zig` (field/decl
+walks), `src/util/repeat.zig` (multi-byte string repetition; one byte is
+`&@as([n:0]u8, @splat(c))`, sentinel kept — a sentinel-less version reached
+C `setenv` and read past the end), `src/util/testalloc.zig` (`no_resize`
+backing for allocation-failure tests, which 0.17's in-place-growing
+`SafeAllocator` testing allocator made nondeterministic). Tree-sitter's API
+header and epoxy's EGL header are now TranslateC modules. build.zig's
+`compat` struct holds the build-API differences (`b.root`, passthru args,
+install paths as LazyPaths); the unit-test daemon path moved from an env var
+to `build_options.test_mux_bin` because 0.17 cannot hand a configure-time
+path to a step's environment, and `sketerm-gui.pc` is linked per `Requires:`
+package unless the caller exported `vendor/pkgconfig` (macOS GUI builds then
+fail with that export, since per-package linking is the duplicate-dylib bug
+the virtual package exists for). 0.17 also surfaced two real test bugs: the
+`editor_layout` inlay-hint tests read a `line()` cache entry after the next
+`line()` freed it (0.16's allocator left the freed bytes readable), and a
+non-`pub` `encodeTo` that `@hasDecl` no longer sees. Installer, PKGBUILD and
+their test accept 0.16.x and 0.17.x.
