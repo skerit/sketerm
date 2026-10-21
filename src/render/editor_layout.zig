@@ -1161,7 +1161,7 @@ test "layout: CJK wraps between ideographs and fills the width" {
     // Neither one character per row nor a line that never wraps: the
     // scriptless text still fills each row.
     try testing.expectEqual(@as(usize, 3), ll.rows.len);
-    var counts = [_]usize{0} ** 3;
+    var counts = @as([3]usize, @splat(0));
     for (ll.clusters) |cl| {
         counts[cl.row] += 1;
         try testing.expect(cl.x1 - ll.rows[cl.row].x0 <= rig.layout.wrap_width.? + 0.01);
@@ -1179,6 +1179,9 @@ test "layout: an inlay hint moves the wrap break" {
     rig.layout.wrap_width = 110;
     const plain = try rig.layout.line(&doc, 0);
     const plain_rows = plain.rows.len;
+    // `line` hands out its cache entry, which the hinted relayout below
+    // frees: keep what the assertions need before that.
+    const plain_clusters = plain.clusters.len;
     const plain_break = if (plain_rows > 1) firstClusterOfRow(plain, 1).?.byte_start else 0;
 
     // A fat hint before "beta" pushes everything after it right, so
@@ -1197,7 +1200,7 @@ test "layout: an inlay hint moves the wrap break" {
     // Break positions remain permitted opportunities (after a space).
     try testing.expectEqual(@as(u8, ' '), hinted.text[hinted_break - 1]);
     // The document byte space is untouched by the hint.
-    try testing.expectEqual(plain.clusters.len, hinted.clusters.len);
+    try testing.expectEqual(plain_clusters, hinted.clusters.len);
 }
 
 test "layout: highlighted glyphs carry kinds and re-lay out on parse" {
@@ -1243,8 +1246,8 @@ test "layout: theme faces become itemization style spans" {
 
     // `const` is bold in the theme, the identifier after it is not, so
     // the piece must split into at least two shaping runs.
-    const kinds = [_]u8{@intFromEnum(syntax.Kind.keyword)} ** 5 ++
-        [_]u8{@intFromEnum(syntax.Kind.none)} ** 5;
+    const kinds = @as([5]u8, @splat(@intFromEnum(syntax.Kind.keyword))) ++
+        @as([5]u8, @splat(@intFromEnum(syntax.Kind.none)));
     const spans = try rig.layout.styleSpansFor(&kinds);
     defer a.free(spans);
     try testing.expectEqual(@as(usize, 2), spans.len);
@@ -1255,7 +1258,7 @@ test "layout: theme faces become itemization style spans" {
     try testing.expect(!spans[1].italic);
 
     // Comments are italic in both built-in themes.
-    const cm = [_]u8{@intFromEnum(syntax.Kind.comment)} ** 4;
+    const cm = @as([4]u8, @splat(@intFromEnum(syntax.Kind.comment)));
     const cspans = try rig.layout.styleSpansFor(&cm);
     defer a.free(cspans);
     try testing.expectEqual(@as(usize, 1), cspans.len);
@@ -1272,6 +1275,11 @@ test "layout: an inlay hint shifts glyphs but adds no cluster" {
     const plain = try rig.layout.line(&doc, 0);
     const n_clusters = plain.clusters.len;
     const x_after = Layout.caretPos(plain, 8).x;
+    const plain_width = plain.width;
+    // `line` hands out its cache entry, which the hinted relayout below
+    // frees: copy the clusters out first.
+    const plain_clusters = try a.dupe(Cluster, plain.clusters);
+    defer a.free(plain_clusters);
 
     // ": i32" before byte 5 (the '=').
     const hints = [_]InlayHint{.{ .offset = 5, .text = ": i32" }};
@@ -1282,13 +1290,13 @@ test "layout: an inlay hint shifts glyphs but adds no cluster" {
     // The document's byte space is untouched: same clusters, same
     // byte ranges, so hit testing and caret movement cannot move.
     try testing.expectEqual(n_clusters, hinted.clusters.len);
-    for (hinted.clusters, plain.clusters) |h, p| {
+    for (hinted.clusters, plain_clusters) |h, p| {
         try testing.expectEqual(p.byte_start, h.byte_start);
         try testing.expectEqual(p.byte_end, h.byte_end);
     }
     // …but everything at or after the anchor is pushed right.
     try testing.expect(Layout.caretPos(hinted, 8).x > x_after);
-    try testing.expect(hinted.width > plain.width);
+    try testing.expect(hinted.width > plain_width);
 
     // Hint glyphs exist, are tagged, and no x inside the hint resolves
     // to a byte that is not a real document offset.
@@ -1307,7 +1315,7 @@ test "layout: an inlay hint shifts glyphs but adds no cluster" {
     rig.layout.hints = &.{};
     rig.layout.hints_gen = 0;
     const back = try rig.layout.line(&doc, 0);
-    try testing.expectApproxEqAbs(plain.width, back.width, 0.01);
+    try testing.expectApproxEqAbs(plain_width, back.width, 0.01);
 }
 
 test "layout: a hint at the line end lays out on an empty line too" {
