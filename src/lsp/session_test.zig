@@ -479,7 +479,7 @@ test "session: didOpen escapes control characters and multibyte text survives" {
 
 test "session: document notifications preserve queued messages on every allocation failure" {
     inline for (.{ true, false }) |opening| {
-        try testing.checkAllAllocationFailures(testing.allocator, struct {
+        try testing.checkAllAllocationFailures(@import("../util/testalloc.zig").no_resize, struct {
             fn run(allocator: std.mem.Allocator) !void {
                 var fx: Fixture = undefined;
                 fx.init();

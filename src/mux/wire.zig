@@ -941,7 +941,7 @@ fn runPutEventAllocationFailure(fail_index: ?usize) !usize {
     const t = std.testing;
     var failing_config: t.FailingAllocator.Config = .{};
     if (fail_index) |index| failing_config.fail_index = index;
-    var failing = t.FailingAllocator.init(t.allocator, failing_config);
+    var failing = t.FailingAllocator.init(@import("../util/testalloc.zig").no_resize, failing_config);
 
     var writer = Writer.init(failing.allocator());
     defer writer.buf.deinit(t.allocator);
@@ -990,7 +990,7 @@ fn runAppendFrameAllocationFailure(fail_index: ?usize) !usize {
     const t = std.testing;
     var failing_config: t.FailingAllocator.Config = .{};
     if (fail_index) |index| failing_config.fail_index = index;
-    var failing = t.FailingAllocator.init(t.allocator, failing_config);
+    var failing = t.FailingAllocator.init(@import("../util/testalloc.zig").no_resize, failing_config);
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(t.allocator);

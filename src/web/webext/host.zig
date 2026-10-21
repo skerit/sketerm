@@ -1154,7 +1154,7 @@ fn registrationAllocationCase(dir: []const u8, fail_index: ?usize) !usize {
     const t = std.testing;
     var config: t.FailingAllocator.Config = .{};
     if (fail_index) |index| config.fail_index = index;
-    var failing = t.FailingAllocator.init(t.allocator, config);
+    var failing = t.FailingAllocator.init(@import("../../util/testalloc.zig").no_resize, config);
     var host = Host{ .gpa = failing.allocator(), .data_dir = &.{} };
     defer host.deinit();
 
@@ -1191,7 +1191,7 @@ fn reloadAllocationCase(old_dir: []const u8, new_dir: []const u8, fail_index: ?u
     const t = std.testing;
     var config: t.FailingAllocator.Config = .{};
     if (fail_index) |index| config.fail_index = index;
-    var failing = t.FailingAllocator.init(t.allocator, config);
+    var failing = t.FailingAllocator.init(@import("../../util/testalloc.zig").no_resize, config);
     var host = Host{ .gpa = failing.allocator(), .data_dir = &.{} };
     defer host.deinit();
 

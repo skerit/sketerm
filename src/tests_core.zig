@@ -280,6 +280,7 @@ comptime {
     _ = @import("util/churn.zig");
     _ = @import("util/clock.zig");
     _ = @import("util/reflect.zig");
+    _ = @import("util/testalloc.zig");
     _ = @import("util/repeat.zig");
     _ = @import("util/backoff.zig");
     _ = @import("util/env.zig");
