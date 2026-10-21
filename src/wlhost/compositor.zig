@@ -4312,7 +4312,7 @@ test "clipboard: copy offer, fetch, paste offer, receive answer" {
     // scratch buffers. A long but legal MIME must remain a normal offer.
     comp.clearOut();
     evs.clearRetainingCapacity();
-    const long_mime = "application/x-sketerm-" ++ ("a" ** 512);
+    const long_mime = "application/x-sketerm-" ++ (&@as([512:0]u8, @splat('a')));
     try comp.offerSelection(long_mime);
     try drainEvents(&comp, &evs);
     try t.expectEqual(@as(usize, 3), evs.items.len);

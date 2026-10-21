@@ -38,6 +38,7 @@
 //! it, and a second waiter on the same agent does not wake for it.
 
 const std = @import("std");
+const repeat = @import("../util/repeat.zig").repeat;
 const c = @import("../c.zig").c;
 const fdio = @import("../util/fdio.zig");
 const vocab = @import("../agent/vocab.zig");
@@ -931,7 +932,7 @@ test "wake lines: encode, parse, and one compact printed line" {
     try t.expectEqualStrings("claude-1 done: All done. (+1 more: message) [1 more held back; latest: second] [state idle]", aw.written());
     // A long digest text is cut between words with an explicit ellipsis,
     // never inside a value its own brackets would make look like a field.
-    const long = "Waiting for the zenit red run; it reports " ++ "[state \"idle\"] " ** 12;
+    const long = "Waiting for the zenit red run; it reports " ++ repeat("[state \"idle\"] ", 12);
     var aw2: std.Io.Writer.Allocating = .init(a);
     try formatWake(&aw2.writer, .{ .type = "wake", .agent = "claude-1", .state = "idle", .digest = .{ .count = 2, .latest = long } });
     const out = aw2.written();

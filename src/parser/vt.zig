@@ -74,7 +74,7 @@ pub const Parser = struct {
     /// single `print_run` event when a non-printable byte arrives or
     /// the buffer fills. Cuts per-event overhead substantially for
     /// "shell prints long line" workloads.
-    print_buf: [64]u8 = .{0} ** 64,
+    print_buf: [64]u8 = @splat(0),
     print_len: u8 = 0,
 
     /// Hard cap on osc_buf growth; refusing further bytes once

@@ -4068,8 +4068,8 @@ test "panel cache decode runs off-caller and teardown discards its prepared resu
     pathz.removeTree(root);
     defer pathz.removeTree(root);
 
-    const rgba = [_]u8{ 0x20, 0x80, 0xff, 0xff } ** (8 * 8);
-    const encoded = try @import("../util/png.zig").encodeRgba(a, &rgba, 8, 8);
+    const rgba = std.mem.asBytes(&@as([8 * 8][4]u8, @splat(.{ 0x20, 0x80, 0xff, 0xff })));
+    const encoded = try @import("../util/png.zig").encodeRgba(a, rgba, 8, 8);
     var drain = DrainHandle{};
     const job = try a.create(CacheJob);
     job.* = .{
@@ -4593,8 +4593,8 @@ test "local panel reads enforce deadline byte and dimension bounds off GTK" {
     try writeBytes(path.ptr, encoded);
     try std.testing.expectError(error.Dimensions, decodeCachedImage(std.mem.span(path.ptr)));
 
-    const small_rgba = [_]u8{ 0x20, 0x40, 0x80, 0xff } ** (8 * 8);
-    const small_encoded = try @import("../util/png.zig").encodeRgba(a, &small_rgba, 8, 8);
+    const small_rgba = std.mem.asBytes(&@as([8 * 8][4]u8, @splat(.{ 0x20, 0x40, 0x80, 0xff })));
+    const small_encoded = try @import("../util/png.zig").encodeRgba(a, small_rgba, 8, 8);
     defer a.free(small_encoded);
     try writeBytes(path.ptr, small_encoded);
     // Reserve-before-decode against the real process budget: fill every

@@ -128,12 +128,12 @@ test "looksBinary keeps text and flags NUL or control-heavy data" {
 test "renderedSize covers whole and partial rows" {
     const t = std.testing;
     var buf: [4096]u8 = undefined;
-    const bytes = [_]u8{0xAA} ** 33;
+    const bytes = @as([33]u8, @splat(0xAA));
     const out = render(buf[0..renderedSize(bytes.len)], &bytes, 0);
     try t.expect(out != null);
     try t.expectEqual(@as(usize, 3), std.mem.count(u8, out.?, "\n"));
     // A dump of the size the preview fetches must still fit.
-    const big = [_]u8{0} ** DEFAULT_CAP;
+    const big = @as([DEFAULT_CAP]u8, @splat(0));
     try t.expect(render(buf[0..0], &big, 0) == null);
     try t.expectEqual(renderedSize(DEFAULT_CAP), (DEFAULT_CAP / BYTES_PER_ROW) * ROW_WIDTH);
 }

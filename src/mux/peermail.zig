@@ -34,6 +34,7 @@
 //! rewritten only on the hub (`peeraddr.qualify`/`localize`).
 
 const std = @import("std");
+const repeat = @import("../util/repeat.zig").repeat;
 const c = @import("../c.zig").c;
 const vocab = @import("../agent/vocab.zig");
 const peeraddr = @import("../ipc/peeraddr.zig");
@@ -4182,11 +4183,11 @@ test "subject: set by a registration, kept across re-registrations, a new server
         try t.expectEqualStrings("template links", (listed(&s, a, "Arcana") orelse return error.TestUnexpectedResult).subject);
         // 5. Refused subjects change nothing: too long, a control
         // character (C0 or C1), not UTF-8; an unknown address.
-        try t.expectError(error.SubjectTooLong, s.setSubject("Arcana", "x" ** (SUBJECT_MAX + 1)));
+        try t.expectError(error.SubjectTooLong, s.setSubject("Arcana", &@as([(SUBJECT_MAX + 1):0]u8, @splat('x'))));
         try t.expectError(error.SubjectNotText, s.setSubject("Arcana", "two\nlines"));
         try t.expectError(error.SubjectNotText, s.setSubject("Arcana", "\xc2\x85"));
         try t.expectError(error.SubjectNotText, s.setSubject("Arcana", "\xff"));
-        try checkSubject("x" ** SUBJECT_MAX);
+        try checkSubject(&@as([SUBJECT_MAX:0]u8, @splat('x')));
         try checkSubject("caf\u{e9} \u{1f600}");
         var bad = reg("Arcana", true);
         bad.subject = "tab\there";
@@ -4276,10 +4277,10 @@ test "notes: a live peer's own, trimmed, refused too long or multi-line, stale a
     _ = try sendText(&s, 1, "qq", "is the push yours?", 3000, &idb);
     try t.expectEqualStrings(note, rec.last().sender_note);
     // 3. Refused: too long, a newline or a tab inside; nothing changes.
-    try t.expectError(error.NoteTooLong, s.setNote("zenit", "x" ** (NOTE_MAX + 1), 4000));
+    try t.expectError(error.NoteTooLong, s.setNote("zenit", &@as([(NOTE_MAX + 1):0]u8, @splat('x')), 4000));
     try t.expectError(error.NoteNotText, s.setNote("zenit", "two\nlines", 4000));
     try t.expectError(error.NoteNotText, s.setNote("zenit", "tab\there", 4000));
-    try t.expectEqualStrings("x" ** NOTE_MAX, try checkNote("x" ** NOTE_MAX));
+    try t.expectEqualStrings(&@as([NOTE_MAX:0]u8, @splat('x')), try checkNote(&@as([NOTE_MAX:0]u8, @splat('x'))));
     try t.expectEqualStrings(note, s.noteOf("zenit", 4000));
     // 4. Stale after NOTE_STALE_MS without being set again: hidden from the
     // list and from headers; setting it again (unchanged) restarts it.
@@ -5620,7 +5621,7 @@ test "a link that is not up says why: its host line and its peers, with when it 
     // 5. The member, whose hub dials it, waits for the hub.
     try t.expectEqual(@as(?PeerLinkWhy, .awaiting_dial), (try net.mem.hostList(a, 40_030))[0].why);
     // 6. A long detail is cut on a UTF-8 boundary.
-    net.hub.linkWhy("box", .refused, "é" ** 200, 0, 50_000);
+    net.hub.linkWhy("box", .refused, repeat("é", 200), 0, 50_000);
     try t.expect((try net.hub.hostList(a, 50_000))[0].detail.len <= LINK_DETAIL_MAX);
     // 7. Up again clears it on both sides.
     try net.connect(60_000);

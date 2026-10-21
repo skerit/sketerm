@@ -70,6 +70,7 @@
 //! created it and no client can address another's.
 
 const std = @import("std");
+const repeat = @import("../util/repeat.zig").repeat;
 const diagnostic = @import("../web/diagnostic.zig");
 const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
@@ -5883,7 +5884,7 @@ test "ev_cert_error is answered: refused by default, accepted only for the named
 
     const v = try p.eng.openViewIn("https://10.0.0.1/", 800, 600, .default, null);
     _ = p.drain(&buf);
-    const fp = "ab" ** 32;
+    const fp = repeat("ab", 32);
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(gpa);
     try proto.encodePayload(gpa, &payload, proto.EvCertError{
@@ -5928,7 +5929,7 @@ test "ev_cert_error is answered: refused by default, accepted only for the named
     // Opting in names ONE certificate, case-insensitively; a string
     // that cannot be a fingerprint is refused at the call.
     try std.testing.expectError(error.InvalidFingerprint, p.eng.setAcceptCert(v.id, "abc"));
-    try p.eng.setAcceptCert(v.id, "AB" ** 32);
+    try p.eng.setAcceptCert(v.id, repeat("AB", 32));
     p.eng.loadStarted(v, "https://10.0.0.1/");
     try std.testing.expect(v.cert == null and v.load_error == null);
     p.eng.dispatch(.{ .tag = .ev_cert_error, .payload = payload.items });
@@ -5971,7 +5972,7 @@ test "ev_cert_error is answered: refused by default, accepted only for the named
         .msg = "CERT_DATE_INVALID",
         .subject = "",
         .issuer = "",
-        .fingerprint = "cd" ** 32,
+        .fingerprint = repeat("cd", 32),
     });
     p.eng.dispatch(.{ .tag = .ev_cert_error, .payload = other.items });
     try std.testing.expect(v.cert.?.verdict == .refused);
@@ -7027,7 +7028,7 @@ test "a runtime dir too long for Chromium's singleton socket fails the launch cl
     var pair = try Pair.init(std.testing.allocator);
     defer pair.deinit();
     var deep: [256:0]u8 = undefined;
-    const dir = try std.fmt.bufPrintZ(&deep, "{s}/{s}", .{ pair.stateDir(), "r" ** 40 });
+    const dir = try std.fmt.bufPrintSentinel(&deep, "{s}/{s}", .{ pair.stateDir(), &@as([40:0]u8, @splat('r')) }, 0);
     try std.testing.expectEqual(@as(c_int, 0), c.mkdir(dir.ptr, 0o700));
     var runtime: EnvSave = .{};
     try runtime.override("XDG_RUNTIME_DIR", dir.ptr);

@@ -500,7 +500,7 @@ test "screen: a prompt the app would collapse into a paste is led in by typed wo
     defer agent.deinit();
     const p = claude.spec.screen.?.paste.?;
     // Over the char threshold.
-    const long = "x" ** 801;
+    const long = &@as([801:0]u8, @splat('x'));
     for ([_][]const u8{long}) |text| {
         var plan = try agent.driver().screen.plan(t.allocator, .{ .submit = .{ .text = text } });
         defer plan.deinit();
@@ -515,7 +515,7 @@ test "screen: a prompt the app would collapse into a paste is led in by typed wo
     // Short prompts (a retry's "continue", several typed lines: measured,
     // Claude Code 2.1.288 collapses only a chunk over 800 bytes) are typed
     // as they are.
-    for ([_][]const u8{ "continue", "x" ** 800, "one\ntwo\nthree\nfour" }) |text| {
+    for ([_][]const u8{ "continue", &@as([800:0]u8, @splat('x')), "one\ntwo\nthree\nfour" }) |text| {
         var plan = try agent.driver().screen.plan(t.allocator, .{ .queue = .{ .text = text } });
         defer plan.deinit();
         for (plan.steps) |s| if (s == .text) try t.expect(!std.mem.eql(u8, s.text, p.lead_in));

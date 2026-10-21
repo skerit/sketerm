@@ -3725,7 +3725,7 @@ test "Firefox pattern: subsurface repaints composite into the window image" {
 
 test "blendLayer: premultiplied alpha, xrgb opacity, clipping" {
     const t = std.testing;
-    var dst = [_]u8{0} ** 16; // 2x2 canvas
+    var dst = @as([16]u8, @splat(0)); // 2x2 canvas
     // Opaque 1x1 at (1,1).
     const src = [_]u8{ 40, 50, 60, 255 };
     blendLayer(&dst, 2, 2, &src, 1, 1, 1, 1, 0);
@@ -3810,7 +3810,7 @@ test "moveMouseRel first contact places the pointer before the delta motion" {
     var pl: [5]u8 = undefined;
     app.handleFrame(.chan_open, testChanOpenPayload(&pl, 3));
     const ch = app.chans.get(3).?;
-    const px = [_]u8{0} ** (100 * 80 * 4);
+    const px = @as([(100 * 80 * 4)]u8, @splat(0));
     App.onFrame(ch, 5, 100, 80, 1, 100, 80, 0, &px);
 
     // First contact: base = window center (50, 40).
@@ -3880,8 +3880,8 @@ test "moveMouseRel first contact places the pointer before the delta motion" {
 test "pctDiffRegion: scoped diff, clamping, out-of-bounds rects" {
     const t = std.testing;
     // 4x4 window; base all zero, cur differs in the 2x2 top-left block.
-    var base = [_]u8{0} ** (4 * 4 * 4);
-    var cur = [_]u8{0} ** (4 * 4 * 4);
+    var base = @as([(4 * 4 * 4)]u8, @splat(0));
+    var cur = @as([(4 * 4 * 4)]u8, @splat(0));
     for (0..2) |y| for (0..2) |x| {
         cur[(y * 4 + x) * 4] = 0xff;
     };
@@ -4183,7 +4183,7 @@ test "frameBytes: degenerate and overflowing geometry has no length" {
     // 64-bit usize) — and no real buffer is ever that long.
     const huge = frameBytes(std.math.maxInt(i32), std.math.maxInt(i32)).?;
     try t.expectEqual(@as(usize, 18446744056529682436), huge);
-    const px = [_]u8{0} ** 64;
+    const px = @as([64]u8, @splat(0));
     try t.expect(geometryFits(&px, 4, 4));
     try t.expect(!geometryFits(px[0..60], 4, 4));
     try t.expect(!geometryFits(&px, 4, 0));
@@ -4191,7 +4191,7 @@ test "frameBytes: degenerate and overflowing geometry has no length" {
 
 test "blendLayer: a layer shorter than its declared geometry paints nothing" {
     const t = std.testing;
-    var dst = [_]u8{7} ** 64; // 4x4
+    var dst = @as([64]u8, @splat(7)); // 4x4
     const untouched = dst;
 
     // Declared 4x4 (64 bytes) but only 8 bytes stored: the whole
@@ -4201,15 +4201,15 @@ test "blendLayer: a layer shorter than its declared geometry paints nothing" {
     try t.expectEqualSlices(u8, &untouched, &dst);
 
     // A destination that is short for ITS geometry is equally refused.
-    var short_dst = [_]u8{7} ** 32;
-    const full = [_]u8{9} ** 64;
+    var short_dst = @as([32]u8, @splat(7));
+    const full = @as([64]u8, @splat(9));
     blendLayer(&short_dst, 4, 4, &full, 4, 4, 0, 0, 1);
-    try t.expectEqualSlices(u8, &([_]u8{7} ** 32), &short_dst);
+    try t.expectEqualSlices(u8, &(@as([32]u8, @splat(7))), &short_dst);
 
     // Control: the same call with a correctly sized layer does paint
     // (format 1 = XRGB, so alpha lands opaque).
     blendLayer(&dst, 4, 4, &full, 4, 4, 0, 0, 1);
-    var want = [_]u8{9} ** 64;
+    var want = @as([64]u8, @splat(9));
     var i: usize = 3;
     while (i < want.len) : (i += 4) want[i] = 255;
     try t.expectEqualSlices(u8, &want, &dst);
@@ -4217,13 +4217,13 @@ test "blendLayer: a layer shorter than its declared geometry paints nothing" {
 
 test "blendLayer: extreme offsets clip instead of wrapping" {
     const t = std.testing;
-    var dst = [_]u8{7} ** 64; // 4x4
-    const src = [_]u8{9} ** 16; // 2x2
+    var dst = @as([64]u8, @splat(7)); // 4x4
+    const src = @as([16]u8, @splat(9)); // 2x2
     // Negation/addition of these would wrap in 32-bit arithmetic.
     blendLayer(&dst, 4, 4, &src, 2, 2, std.math.minInt(i32), 0, 1);
     blendLayer(&dst, 4, 4, &src, 2, 2, 0, std.math.minInt(i32), 1);
     blendLayer(&dst, 4, 4, &src, 2, 2, std.math.maxInt(i32), std.math.maxInt(i32), 1);
-    try t.expectEqualSlices(u8, &([_]u8{7} ** 64), &dst);
+    try t.expectEqualSlices(u8, &(@as([64]u8, @splat(7))), &dst);
 }
 
 test "onFrame: a buffer shorter than its declared geometry is dropped whole" {
@@ -4244,7 +4244,7 @@ test "onFrame: a buffer shorter than its declared geometry is dropped whole" {
 
     // A well-formed frame is accepted, and a later short one leaves it
     // (and the geometry that matches it) untouched.
-    const good = [_]u8{9} ** 16;
+    const good = @as([16]u8, @splat(9));
     App.onFrame(ch, 1, 2, 2, 1, 2, 2, 1, &good);
     const win = app.winBySurface(3, 1).?;
     try t.expectEqual(@as(u64, 1), win.frames);

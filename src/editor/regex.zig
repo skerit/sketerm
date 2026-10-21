@@ -1165,7 +1165,7 @@ test "regex: catastrophic backtracking patterns still complete quickly" {
     // The classic exponential blowup for a backtracking engine: 30 a's
     // with no trailing b is 2^30 paths. A Thompson simulation walks it
     // in one pass, so this finishes in milliseconds.
-    const hay = "a" ** 40;
+    const hay = &@as([40:0]u8, @splat('a'));
     const t0 = monoMs();
     {
         const got = try findAllSlice(a, "(a+)+b", hay, .{});
@@ -1178,7 +1178,7 @@ test "regex: catastrophic backtracking patterns still complete quickly" {
         try testing.expectEqual(@as(usize, 0), got.len);
     }
     {
-        const got = try findAllSlice(a, "(x+x+)+y", "x" ** 40, .{});
+        const got = try findAllSlice(a, "(x+x+)+y", &@as([40:0]u8, @splat('x')), .{});
         defer a.free(got);
         try testing.expectEqual(@as(usize, 0), got.len);
     }

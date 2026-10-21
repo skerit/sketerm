@@ -93,7 +93,7 @@ test "every portable target has a distinct header identity and triple" {
 }
 
 test "portable headers resolve to their table rows" {
-    var elf = [_]u8{0} ** HEADER_LEN;
+    var elf = @as([HEADER_LEN]u8, @splat(0));
     @memcpy(elf[0..4], "\x7fELF");
     elf[4] = 2;
     elf[5] = 1;
@@ -107,7 +107,7 @@ test "portable headers resolve to their table rows" {
     std.mem.writeInt(u16, elf[18..20], 62, .little);
     try std.testing.expect(ofHeader(&elf) == null);
 
-    var macho = [_]u8{0} ** HEADER_LEN;
+    var macho = @as([HEADER_LEN]u8, @splat(0));
     std.mem.writeInt(u32, macho[0..4], MACHO_MAGIC_64, .little);
     std.mem.writeInt(u32, macho[4..8], MACHO_CPU_ARM64, .little);
     const mac = ofHeader(&macho).?;

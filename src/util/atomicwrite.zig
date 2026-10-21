@@ -821,7 +821,7 @@ test "writeFile refuses an unopenable destination" {
         error.NotFound,
         writeFile("/proc/definitely/not/writable", "x", 0o600),
     );
-    const long = [_]u8{'a'} ** MAX_PATH;
+    const long = @as([MAX_PATH]u8, @splat('a'));
     try std.testing.expectError(error.NameTooLong, writeFile(&long, "x", 0o600));
 }
 

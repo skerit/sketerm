@@ -13,6 +13,7 @@
 //! in both test roots.
 
 const std = @import("std");
+const repeat = @import("../util/repeat.zig").repeat;
 
 /// Protocol revision carried by `hello`/`hello_ack`.
 pub const PROTO_VERSION: u32 = 1;
@@ -6853,7 +6854,7 @@ test "round-trip: capture_list entries and capture_body chunks" {
     const gpa = std.testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
-    const long_url = "https://api.example/v1/items?" ++ "q=" ** 40000;
+    const long_url = "https://api.example/v1/items?" ++ repeat("q=", 40000);
     const entries = [_]CaptureEntry{.{
         .seq = 41,
         .cursor = 3,

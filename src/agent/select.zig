@@ -488,7 +488,7 @@ fn rec(id: u64, job: u32, kind: vocab.RecordKind, text: []const u8) Record {
 }
 
 fn filled(comptime n: usize, comptime ch: u8) []const u8 {
-    return &([_]u8{ch} ** n);
+    return &(@as([n]u8, @splat(ch)));
 }
 
 fn pickedIds(records: []const Record, sel: Selection) ![]u64 {

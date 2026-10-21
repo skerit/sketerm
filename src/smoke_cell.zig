@@ -532,7 +532,7 @@ pub fn main() !u8 {
                 0, 0, 255, 0, 0, 255, 0, 0, // row 0: BGR red ×2 + pad
                 0, 0, 255, 0, 0, 255, 0, 0, // row 1
             };
-            var header = [_]u8{0} ** 54;
+            var header = @as([54]u8, @splat(0));
             header[0] = 'B';
             header[1] = 'M';
             std.mem.writeInt(u32, header[2..6], 54 + px_data.len, .little);

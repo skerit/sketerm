@@ -652,7 +652,7 @@ test "an event announcing a record carries its id and a one-line preview, never 
     e.agent = ag;
     e.visible = .{ .borrowed = 4242 };
     try state.entries.append(state.allocator, e);
-    const long = "first line of a long report\n" ++ "x" ** 3000;
+    const long = "first line of a long report\n" ++ &@as([3000:0]u8, @splat('x'));
     _ = try ag.source.screen.queue.pushDone(clock.nowMs(), 0, 0, long, 42, null);
     _ = try ag.source.screen.queue.push(clock.nowMs(), .needs_input, null, "permission: rm", "1. Yes");
     const read = try mcp.expectToolResultShape(a, "agent_read", try rig.call(.agent_read, "{}"));

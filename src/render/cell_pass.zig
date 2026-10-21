@@ -326,7 +326,7 @@ pub const CellPass = struct {
     /// a full re-pack when any layer's generation differs from last
     /// frame's snapshot.
     last_atlas_generations: [@import("atlas.zig").PAGE_COUNT]u32 =
-        [_]u32{0} ** @import("atlas.zig").PAGE_COUNT,
+        @as([@import("atlas.zig").PAGE_COUNT]u32, @splat(0)),
     /// Last `screen.view_offset` we rendered against. When it changes
     /// (user scrolls scrollback in or out), every visible row sources
     /// from a different scrollback / active line — full rebuild

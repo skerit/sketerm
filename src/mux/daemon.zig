@@ -2390,7 +2390,7 @@ pub const Native = struct {
     };
 
     const DmabufPending = struct {
-        fds: [dmabuf.MAX_PLANES]c_int = .{-1} ** dmabuf.MAX_PLANES,
+        fds: [dmabuf.MAX_PLANES]c_int = @splat(-1),
 
         pub fn deinit(self: *DmabufPending) void {
             for (&self.fds) |*fd| {
@@ -2401,7 +2401,7 @@ pub const Native = struct {
 
         pub fn takeFds(self: *DmabufPending) [dmabuf.MAX_PLANES]c_int {
             const fds = self.fds;
-            self.fds = .{-1} ** dmabuf.MAX_PLANES;
+            self.fds = @splat(-1);
             return fds;
         }
     };
@@ -7993,7 +7993,7 @@ const EventIngestTestHarness = struct {
             .allocator = allocator,
             .name = @constCast("event-ingest-test"),
             .origin_name = @constCast("event-ingest-test"),
-            .origin_id = .{'0'} ** SESSION_ORIGIN_ID_LEN,
+            .origin_id = @splat('0'),
             .source = .{ .pty = .{ .master_fd = -1, .child_pid = -1 } },
             .parser = Parser.init(allocator),
             .pool = &self.pool,

@@ -161,7 +161,7 @@ test "Saved puts back a set variable and unsets one that was unset" {
 
 test "a refused take leaves the variable alone and makes restore a no-op" {
     const t = std.testing;
-    const long = "v" ** 5000;
+    const long = &@as([5000:0]u8, @splat('v'));
     _ = c.setenv("SKETERM_TEST_ENV_LONG", long, 1);
     defer _ = unset("SKETERM_TEST_ENV_LONG");
     var s: Saved = .{};
@@ -174,7 +174,7 @@ test "SavedSet puts back every variable, and a refused take undoes the earlier o
     const t = std.testing;
     _ = c.setenv("SKETERM_TEST_ENV_SET_A", "a", 1);
     _ = unset("SKETERM_TEST_ENV_SET_B");
-    _ = c.setenv("SKETERM_TEST_ENV_SET_LONG", "v" ** 5000, 1);
+    _ = c.setenv("SKETERM_TEST_ENV_SET_LONG", &@as([5000:0]u8, @splat('v')), 1);
     defer _ = unset("SKETERM_TEST_ENV_SET_A");
     defer _ = unset("SKETERM_TEST_ENV_SET_LONG");
 

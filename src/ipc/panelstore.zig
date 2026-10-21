@@ -720,7 +720,7 @@ test "panel names are validated; sessions are only length-checked" {
     try t.expect(!validName("../evil"));
     try t.expect(!validName("a/b"));
     try t.expect(!validName("a b"));
-    try t.expect(!validName("x" ** 65));
+    try t.expect(!validName(&@as([65:0]u8, @splat('x'))));
 
     // A session is inherited from the daemon, which only length-checks
     // it — so every one of these is legal and must be storable.
@@ -729,7 +729,7 @@ test "panel names are validated; sessions are only length-checked" {
     try t.expect(validSession("a/../b"));
     try t.expect(validSession(".."));
     try t.expect(!validSession(""));
-    try t.expect(!validSession("x" ** 65));
+    try t.expect(!validSession(&@as([65:0]u8, @splat('x'))));
 }
 
 test "sessions are percent-encoded into one traversal-proof directory" {
@@ -804,9 +804,9 @@ test "a hostile panel name is rejected; a hostile session is encoded" {
 
     // An over-long session is still refused, with the reason.
     diag = Diag{};
-    try t.expectError(Error.BadSession, saveJsonScoped(t.allocator, .{ .session = "x" ** 65 }, "p", DOC, &diag));
+    try t.expectError(Error.BadSession, saveJsonScoped(t.allocator, .{ .session = &@as([65:0]u8, @splat('x')) }, "p", DOC, &diag));
     try t.expect(std.mem.indexOf(u8, diag.msg(), "session") != null);
-    try t.expectError(Error.BadSession, deleteScoped(t.allocator, .{ .session = "x" ** 65 }, "p", null));
+    try t.expectError(Error.BadSession, deleteScoped(t.allocator, .{ .session = &@as([65:0]u8, @splat('x')) }, "p", null));
 }
 
 test "the sessionless bucket shares no namespace with any session" {

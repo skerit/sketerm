@@ -384,7 +384,7 @@ test "drainInto, on_push hook, and event payload accessors" {
 }
 
 test "submitted text preserves the full 4096-byte payload" {
-    const value = "x" ** MAX_TEXT;
+    const value = &@as([MAX_TEXT:0]u8, @splat('x'));
     const ev = Event.init("query", .submit, Value.fromText(value));
     try std.testing.expectEqualStrings(value, ev.value.text.slice());
     try std.testing.expectEqual(Kind.submit, ev.kind);

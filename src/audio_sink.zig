@@ -227,7 +227,7 @@ pub const AudioSink = struct {
                 }
                 // Can't decode: substitute silence so the consumed
                 // clock (raw bytes) keeps the remote app flowing.
-                const zeros = [_]u8{0} ** 512;
+                const zeros = @as([512]u8, @splat(0));
                 var left: usize = raw_len;
                 while (left > 0) {
                     const n = @min(left, zeros.len);
@@ -477,7 +477,7 @@ test "a failed voice consumes later PCM while other voices wait for the context"
     try std.testing.expectEqual(@as(usize, 0), failed.pending.items.len);
     sink.clearOut();
 
-    var pcm: [8]u8 = [_]u8{0} ** 8;
+    var pcm: [8]u8 = @as([8]u8, @splat(0));
     std.mem.writeInt(u32, pcm[0..4], 7, .little);
     for (0..3) |_| {
         sink.unit(.pcm, &pcm);
@@ -500,14 +500,14 @@ test "an invalid local sample spec marks only its voice failed" {
     const sink = try a.create(AudioSink);
     sink.* = .{ .allocator = a, .ctx_ready = true };
     defer sink.destroy();
-    var open: [10]u8 = [_]u8{0} ** 10;
+    var open: [10]u8 = @as([10]u8, @splat(0));
     std.mem.writeInt(u32, open[0..4], 7, .little);
     open[4] = 3;
     std.mem.writeInt(u32, open[6..10], 48_000, .little);
     sink.unit(.open, &open);
     try std.testing.expect(sink.voices.get(7).?.failed);
     try std.testing.expect(!sink.ctx_failed);
-    var pcm: [8]u8 = [_]u8{0} ** 8;
+    var pcm: [8]u8 = @as([8]u8, @splat(0));
     std.mem.writeInt(u32, pcm[0..4], 7, .little);
     sink.unit(.pcm, &pcm);
     try std.testing.expectEqual(@as(usize, 0), sink.voices.get(7).?.pending.items.len);

@@ -282,7 +282,7 @@ test "rpc frameInto leaves no partial header after an allocation failure" {
     try out.ensureTotalCapacity(testing.allocator, 64);
     try out.appendSlice(testing.allocator, "already queued");
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    const body = [_]u8{'x'} ** 512;
+    const body = @as([512]u8, @splat('x'));
     try testing.expectError(error.OutOfMemory, frameInto(failing.allocator(), &out, &body));
     try testing.expectEqualStrings("already queued", out.items);
 }

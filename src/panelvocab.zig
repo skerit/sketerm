@@ -61,8 +61,8 @@ pub fn validId(id: []const u8) bool {
 const t = std.testing;
 
 test "validId table" {
-    const max_id = "a" ** MAX_ID;
-    const too_long = "a" ** (MAX_ID + 1);
+    const max_id = &@as([MAX_ID:0]u8, @splat('a'));
+    const too_long = &@as([(MAX_ID + 1):0]u8, @splat('a'));
     const cases = [_]struct { id: []const u8, ok: bool }{
         .{ .id = "", .ok = false },
         .{ .id = "a", .ok = true },

@@ -560,7 +560,7 @@ pub const EditorView = struct {
     a11y_src: a11ydoc.DocSource = .{},
     /// Accessible label last pushed to the canvas, so a status refresh
     /// that did not change the document name costs no GTK call.
-    a11y_label: [260]u8 = [_]u8{0} ** 260,
+    a11y_label: [260]u8 = @as([260]u8, @splat(0)),
     status_label: *c.GtkLabel = undefined,
     /// Shared IM plumbing (compose / dead keys / IME). Severed at the
     /// first sign of teardown, and unconditionally by `deinit` — the

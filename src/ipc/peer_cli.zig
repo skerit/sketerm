@@ -1185,7 +1185,7 @@ test "arguments: a name for send and read (flag or SKETERM_PEER_NAME), none for 
     try t.expect(ask.text == null and !ask.clear);
     try t.expectError(error.ExtraArgument, Cli.parse(&.{ "subject", "--clear", "x" }, null));
     try t.expectError(error.ExtraArgument, Cli.parse(&.{ "subject", "a", "b" }, null));
-    try t.expectError(error.SubjectTooLong, Cli.parse(&.{ "subject", "x" ** (peermail.SUBJECT_MAX + 1) }, null));
+    try t.expectError(error.SubjectTooLong, Cli.parse(&.{ "subject", &@as([(peermail.SUBJECT_MAX + 1):0]u8, @splat('x')) }, null));
     try t.expectError(error.SubjectNotText, Cli.parse(&.{ "subject", "two\nlines" }, null));
     try t.expectError(error.BadName, Cli.parse(&.{ "subject", "--name", "h/w", "x" }, null));
     try t.expectError(error.NotForVerb, Cli.parse(&.{ "list", "--clear" }, null));
@@ -1208,7 +1208,7 @@ test "arguments: a name for send and read (flag or SKETERM_PEER_NAME), none for 
     try t.expect(nc.clear and nc.text == null);
     try t.expectEqualStrings("webapp", nc.name.?);
     try t.expect((try Cli.parse(&.{"note"}, null)).text == null);
-    try t.expectError(error.NoteTooLong, Cli.parse(&.{ "note", "x" ** (peermail.NOTE_MAX + 1) }, null));
+    try t.expectError(error.NoteTooLong, Cli.parse(&.{ "note", &@as([(peermail.NOTE_MAX + 1):0]u8, @splat('x')) }, null));
     try t.expectError(error.NoteNotText, Cli.parse(&.{ "note", "two\nlines" }, null));
     try t.expectError(error.ExtraArgument, Cli.parse(&.{ "note", "--clear", "x" }, null));
 }

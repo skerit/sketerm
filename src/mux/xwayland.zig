@@ -448,7 +448,7 @@ pub fn waitReady(display: []const u8, authority: []const u8, timeout_ms: i32) bo
     if (c.getsockopt(fd, c.SOL_SOCKET, c.SO_ERROR, &so_error, &so_len) != 0 or so_error != 0) return false;
 
     const auth_name = "MIT-MAGIC-COOKIE-1";
-    var setup = [_]u8{0} ** 48;
+    var setup = @as([48]u8, @splat(0));
     setup[0] = 'l';
     std.mem.writeInt(u16, setup[2..4], 11, .little);
     std.mem.writeInt(u16, setup[6..8], auth_name.len, .little);
@@ -595,7 +595,7 @@ test "xwayland authority record is accepted by xauth layout parser" {
     putBe16(&bytes, &pos, 0);
     putField(&bytes, &pos, "100");
     putField(&bytes, &pos, "MIT-MAGIC-COOKIE-1");
-    putField(&bytes, &pos, &([_]u8{0xaa} ** 16));
+    putField(&bytes, &pos, &(@as([16]u8, @splat(0xaa))));
     try std.testing.expectEqual(@as(u16, 0xffff), std.mem.readInt(u16, bytes[0..2], .big));
     try std.testing.expect(std.mem.indexOf(u8, bytes[0..pos], "MIT-MAGIC-COOKIE-1") != null);
     try std.testing.expectEqual(@as(usize, 2 + 2 + 2 + 3 + 2 + 18 + 2 + 16), pos);

@@ -1516,7 +1516,7 @@ test "the theme is the configured one, else GTK_THEME without its variant" {
     try testing.expectEqualStrings("Materia", themeName("", "Materia"));
     try testing.expectEqualStrings("", themeName("", ":dark"));
     try testing.expectEqualStrings("", themeName("", null));
-    const long = "x" ** 256;
+    const long = &@as([256:0]u8, @splat('x'));
     try testing.expectEqualStrings("", themeName("", long));
 }
 

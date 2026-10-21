@@ -78,7 +78,7 @@ test "instanceMuxSocket resolves a named instance beside the per-user socket and
     try std.testing.expect(instanceMuxSocket(&buf, "/run/user/1/sketerm/mux.sock", "../etc") == null);
     try std.testing.expect(instanceMuxSocket(&buf, "/run/user/1/sketerm/mux.sock", "a/b") == null);
     try std.testing.expect(instanceMuxSocket(&buf, "/run/user/1/sketerm/mux.sock", "") == null);
-    try std.testing.expect(!validInstance("x" ** 49));
+    try std.testing.expect(!validInstance(&@as([49:0]u8, @splat('x'))));
     try std.testing.expect(validInstance("hub_1-A"));
 }
 

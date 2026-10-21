@@ -182,7 +182,7 @@ fn paProplist(out: *std.ArrayList(u8), a: std.mem.Allocator, properties: []const
 fn paFrameSend(fd: c_int, a: std.mem.Allocator, fields: []const u8) void {
     var frame: std.ArrayList(u8) = .empty;
     defer frame.deinit(a);
-    var desc: [PA_DESC_SIZE]u8 = [_]u8{0} ** PA_DESC_SIZE;
+    var desc: [PA_DESC_SIZE]u8 = @as([PA_DESC_SIZE]u8, @splat(0));
     std.mem.writeInt(u32, desc[0..4], @intCast(fields.len), .big);
     std.mem.writeInt(u32, desc[4..8], 0xffff_ffff, .big); // control channel
     frame.appendSlice(a, &desc) catch fail("oom");
@@ -198,7 +198,7 @@ fn paFrameSend(fd: c_int, a: std.mem.Allocator, fields: []const u8) void {
 fn paDataSend(fd: c_int, a: std.mem.Allocator, channel: u32, bytes: []const u8) void {
     var frame: std.ArrayList(u8) = .empty;
     defer frame.deinit(a);
-    var desc: [PA_DESC_SIZE]u8 = [_]u8{0} ** PA_DESC_SIZE;
+    var desc: [PA_DESC_SIZE]u8 = @as([PA_DESC_SIZE]u8, @splat(0));
     std.mem.writeInt(u32, desc[0..4], @intCast(bytes.len), .big);
     std.mem.writeInt(u32, desc[4..8], channel, .big);
     frame.appendSlice(a, &desc) catch fail("oom");
@@ -263,7 +263,7 @@ fn audioStage(allocator: std.mem.Allocator, sock_path: []const u8, session_name:
         var lb: [4]u8 = undefined;
         std.mem.writeInt(u32, &lb, 256, .big);
         fields.appendSlice(a, &lb) catch fail("oom");
-        fields.appendSlice(a, &([_]u8{0} ** 256)) catch fail("oom");
+        fields.appendSlice(a, &(@as([256]u8, @splat(0)))) catch fail("oom");
         paFrameSend(fd, a, fields.items);
         fields.clearRetainingCapacity();
     }

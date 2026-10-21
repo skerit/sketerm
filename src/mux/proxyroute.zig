@@ -210,7 +210,7 @@ fn execNext(allocator: std.mem.Allocator, args: Args) Outcome {
     var route_args = plan.args(.{ .multiplex = true }) catch return refuse(.exec_failed, "cannot build the ssh options");
     // This hop's own ssh: its ControlMaster ages under this host's default policy.
     if (route_args.multiplexes()) _ = sshmaster.prepare(ssh_bin, &route_args, next, .{});
-    var argv: [sshroute.Args.MAX_OPTIONS + 8:null]?[*:0]const u8 = .{null} ** (sshroute.Args.MAX_OPTIONS + 8);
+    var argv: [sshroute.Args.MAX_OPTIONS + 8:null]?[*:0]const u8 = @splat(null);
     var n: usize = 0;
     argv[n] = ssh_bin;
     n += 1;
@@ -242,7 +242,7 @@ test "status lines round-trip and stay one line" {
     try t.expect(parseStatus("SKETERM-ROUTE err nonsense x") == null);
     try t.expect(parseStatus("\x00\x00\x00") == null);
     // An overlong message is cut, never spilled onto a second line.
-    const long = formatStatus(&buf, .{ .err = .{ .code = .bad_route, .msg = "x" ** 900 } });
+    const long = formatStatus(&buf, .{ .err = .{ .code = .bad_route, .msg = &@as([900:0]u8, @splat('x')) } });
     try t.expectEqual(@as(usize, MAX_LINE), long.len);
     try t.expectEqual(@as(?usize, long.len - 1), std.mem.indexOfScalar(u8, long, '\n'));
 }

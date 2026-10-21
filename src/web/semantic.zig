@@ -3134,8 +3134,8 @@ test "an unscoped delta leads with a changed live region too" {
 }
 
 test "liveText joins distinct names and cuts on a character boundary" {
-    var nodes = [_]Node{undefined} ** 3;
-    const names = [_][]const u8{ "Saved", "Saved", "x" ** 290 ++ "\u{00e9}\u{00e9}\u{00e9}" };
+    var nodes = @as([3]Node, @splat(undefined));
+    const names = [_][]const u8{ "Saved", "Saved", &@as([290:0]u8, @splat('x')) ++ "\u{00e9}\u{00e9}\u{00e9}" };
     for (&nodes, names) |*nd, nm| {
         nd.* = std.mem.zeroes(Node);
         nd.name = @constCast(nm);

@@ -208,7 +208,7 @@ fn rgbaToI420(rgba: []const u8, w: u32, h: u32, out: []u8) void {
 test "recorder availability matches encoding support" {
     var rec = Rec.init(std.testing.allocator, 0);
     defer rec.abort();
-    const pixels = [_]u8{128} ** (4 * 4 * 4);
+    const pixels = @as([(4 * 4 * 4)]u8, @splat(128));
     if (available) {
         try rec.addShmFrame(&pixels, 4, 4, 0, 0);
         const data = try rec.finish(100);

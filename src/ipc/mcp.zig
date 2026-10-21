@@ -2604,7 +2604,7 @@ test "instance name validation" {
     try t.expect(validInstanceName("Agent_2-b"));
     try t.expect(!validInstanceName("has space"));
     try t.expect(!validInstanceName("dot.dot"));
-    try t.expect(!validInstanceName("a" ** 49));
+    try t.expect(!validInstanceName(&@as([49:0]u8, @splat('a'))));
 }
 
 test "replaceAll substitutes every occurrence" {

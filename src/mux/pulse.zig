@@ -1403,7 +1403,7 @@ pub const Server = struct {
 
     fn beginFrame(self: *Server) Error!void {
         frame_start = self.out.items.len;
-        var desc: [DESC_SIZE]u8 = [_]u8{0} ** DESC_SIZE;
+        var desc: [DESC_SIZE]u8 = @as([DESC_SIZE]u8, @splat(0));
         std.mem.writeInt(u32, desc[4..8], CONTROL_CHANNEL, .big);
         try self.out.appendSlice(self.allocator, &desc);
     }
@@ -1458,7 +1458,7 @@ const t_ = std.testing;
 
 /// Build a client control frame from a callback that writes fields.
 fn clientFrame(a: std.mem.Allocator, out: *std.ArrayList(u8), fields: []const u8) !void {
-    var desc: [DESC_SIZE]u8 = [_]u8{0} ** DESC_SIZE;
+    var desc: [DESC_SIZE]u8 = @as([DESC_SIZE]u8, @splat(0));
     std.mem.writeInt(u32, desc[0..4], @intCast(fields.len), .big);
     std.mem.writeInt(u32, desc[4..8], CONTROL_CHANNEL, .big);
     try out.appendSlice(a, &desc);
@@ -1723,7 +1723,7 @@ test "auth + client name + create stream + pcm flows to units" {
         var lb: [4]u8 = undefined;
         std.mem.writeInt(u32, &lb, COOKIE_LEN, .big);
         try fields.appendSlice(a, &lb);
-        try fields.appendSlice(a, &([_]u8{0} ** COOKIE_LEN));
+        try fields.appendSlice(a, &(@as([COOKIE_LEN]u8, @splat(0))));
         var frame: std.ArrayList(u8) = .empty;
         defer frame.deinit(a);
         try clientFrame(a, &frame, fields.items);
@@ -1804,7 +1804,7 @@ test "auth + client name + create stream + pcm flows to units" {
     { // PCM frame on channel 0 → pcm unit; no viewer → self-CLOCKED
         var frame: std.ArrayList(u8) = .empty;
         defer frame.deinit(a);
-        var desc: [DESC_SIZE]u8 = [_]u8{0} ** DESC_SIZE;
+        var desc: [DESC_SIZE]u8 = @as([DESC_SIZE]u8, @splat(0));
         std.mem.writeInt(u32, desc[0..4], 8, .big);
         std.mem.writeInt(u32, desc[4..8], 0, .big); // stream channel
         try frame.appendSlice(a, &desc);
@@ -1882,11 +1882,11 @@ test "self-clock paces read_index and REQUESTs on real time" {
     srv.now_ms = 0;
     var frame: std.ArrayList(u8) = .empty;
     defer frame.deinit(a);
-    var desc: [DESC_SIZE]u8 = [_]u8{0} ** DESC_SIZE;
+    var desc: [DESC_SIZE]u8 = @as([DESC_SIZE]u8, @splat(0));
     std.mem.writeInt(u32, desc[0..4], 9600, .big);
     std.mem.writeInt(u32, desc[4..8], 0, .big);
     try frame.appendSlice(a, &desc);
-    try frame.appendSlice(a, &([_]u8{0} ** 9600));
+    try frame.appendSlice(a, &(@as([9600]u8, @splat(0))));
     try srv.feed(frame.items);
     srv.clearUnits();
     try t_.expectEqual(@as(usize, 0), srv.takeOut().len); // nothing played yet
@@ -1919,11 +1919,11 @@ test "drain completes on the clock, not instantly" {
     { // 100 ms of audio
         var frame: std.ArrayList(u8) = .empty;
         defer frame.deinit(a);
-        var desc: [DESC_SIZE]u8 = [_]u8{0} ** DESC_SIZE;
+        var desc: [DESC_SIZE]u8 = @as([DESC_SIZE]u8, @splat(0));
         std.mem.writeInt(u32, desc[0..4], 19200, .big);
         std.mem.writeInt(u32, desc[4..8], 0, .big);
         try frame.appendSlice(a, &desc);
-        try frame.appendSlice(a, &([_]u8{0} ** 19200));
+        try frame.appendSlice(a, &(@as([19200]u8, @splat(0))));
         try srv.feed(frame.items);
         srv.clearUnits();
     }

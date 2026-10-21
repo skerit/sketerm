@@ -15,6 +15,7 @@
 //! a wipe by its prompt text.
 
 const std = @import("std");
+const repeat = @import("../util/repeat.zig").repeat;
 const vocab = @import("vocab.zig");
 const adapter = @import("adapter.zig");
 const events = @import("events.zig");
@@ -1380,7 +1381,7 @@ test "a turn the app starts on its own extends the job; only a substantive reply
     rig.write("\x1b]0;\xe2\x9c\xb3 C\x07" ++ live);
     try rig.feed(0);
     try rig.engine.tick(1000);
-    const line = "s" ** 90;
+    const line = &@as([90:0]u8, @splat('s'));
     const summary = line ++ "\n" ++ line ++ "\n" ++ line ++ "\n" ++ line;
     rig.write("\x1b]133;A\x07\x1b]0;\xe2\x97\x90 C\x07" ++ erase ++ "you: summarize, ignore wakeups\r\ntool: Bash (sleep 20)\r\nclaude: " ++
         line ++ "\r\n" ++ line ++ "\r\n" ++ line ++ "\r\n" ++ line ++ "\r\n" ++ live ++
@@ -1415,7 +1416,7 @@ test "a turn the app starts on its own extends the job; only a substantive reply
     try t.expectEqual(@as(usize, 2), countKind(&rig.engine, .message));
 
     // A later wake with something to say wakes the caller again.
-    const more = "m" ** 80 ++ "\r\n" ++ "m" ** 80 ++ "\r\n" ++ "m" ** 80 ++ "\r\n" ++ "m" ** 80;
+    const more = &@as([80:0]u8, @splat('m')) ++ "\r\n" ++ &@as([80:0]u8, @splat('m')) ++ "\r\n" ++ &@as([80:0]u8, @splat('m')) ++ "\r\n" ++ &@as([80:0]u8, @splat('m'));
     rig.write("\x1b]0;\xe2\x97\x90 C\x07\x1b]133;A\x07" ++ erase ++ " Background command \"Build\" completed (exit code 0)\r\nIonizing\xe2\x80\xa6\r\n" ++ live ++
         "\x1b]133;C\x07\x1b]133;D\x07\x07\x1b]0;\xe2\x9c\xb3 C\x07" ++
         "\x1b[2K\x1b[1A" ++ erase ++ "claude: " ++ more ++ "\r\nBaked for 1s \xc2\xb7 done\r\n" ++ live);
@@ -1452,7 +1453,7 @@ test "a prompt queued while the app works: a preview until taken, then its own j
     try t.expectEqual(@as(usize, 2), rig.engine.records.items.len);
     // Taken: the prompt is printed below the footer as transcript, then
     // the turn mark (observed order), then the answer.
-    const erase6 = "\x1b[2K\x1b[1A" ** 5 ++ "\x1b[2K\x1b[G";
+    const erase6 = repeat("\x1b[2K\x1b[1A", 5) ++ "\x1b[2K\x1b[G";
     rig.write(erase6 ++ "Churned for 2s \xc2\xb7 done\r\nyou: then say PINEAPPLE\r\n" ++ live ++ "\x1b]133;A\x07\x1b]0;\xe2\x97\x90 C\x07");
     try rig.feed(5100);
     try t.expectEqual(@as(u32, 0), rig.engine.queued_visible);
@@ -1478,7 +1479,7 @@ test "a prompt queued while the app works: a preview until taken, then its own j
 /// The live block while a background shell runs (observed, 2.1.286: the
 /// mode line gains `·  N shell`, and loses it when the task ends).
 const live_bg = "[Haiku 4.5] repo:master\r\n[\xe2\x96\xa0\xe2\x96\xa1] 21%\r\nmanual mode on  \xc2\xb7  1 shell\r\n$";
-const summary_lines = ("s" ** 90 ++ "\r\n") ** 3 ++ "s" ** 90;
+const summary_lines = repeat(&@as([90:0]u8, @splat('s')) ++ "\r\n", 3) ++ &@as([90:0]u8, @splat('s'));
 
 /// A turn that started a background shell and answered with a summary,
 /// as claude draws it: idle again while the shell still runs.
@@ -1567,7 +1568,7 @@ test "a background task past the cap: a quiet done with the count, and the settl
 
 /// Erase `n` live rows before a redraw, as claude does.
 fn eraseRows(comptime n: usize) []const u8 {
-    return "\x1b[2K\x1b[1A" ** (n - 1) ++ "\x1b[2K\x1b[G";
+    return repeat("\x1b[2K\x1b[1A", (n - 1)) ++ "\x1b[2K\x1b[G";
 }
 const erase_6 = eraseRows(6);
 const erase_7 = eraseRows(7);

@@ -469,7 +469,7 @@ pub fn writeTar(arena: Allocator, out_path: []const u8, root: []const u8, plan: 
             else => unreachable,
         }
     }
-    try fwriteAll(f, &([_]u8{0} ** 1024));
+    try fwriteAll(f, &(@as([1024]u8, @splat(0))));
     if (c.fflush(f) != 0) return error.Unwritable;
     ok = true;
 }
@@ -500,7 +500,7 @@ fn tarLong(f: *c.FILE, kind: TarHeader.FileType, text: []const u8) !void {
 fn tarPad(f: *c.FILE, size: u64) !void {
     const rem: usize = @intCast(size % 512);
     if (rem == 0) return;
-    try fwriteAll(f, (&([_]u8{0} ** 512))[0 .. 512 - rem]);
+    try fwriteAll(f, (&(@as([512]u8, @splat(0))))[0 .. 512 - rem]);
 }
 
 fn fwriteAll(f: *c.FILE, bytes: []const u8) !void {
@@ -925,7 +925,7 @@ test "the inspect output parses states, refusals and the manifest" {
     var a = std.heap.ArenaAllocator.init(t.allocator);
     defer a.deinit();
     const ar = a.allocator();
-    const sha = "a" ** 64;
+    const sha = &@as([64:0]u8, @splat('a'));
     const out = "SKI_EXISTS\nSKM_BEGIN\nF 12 " ++ sha ++ " dir/my file.txt\nD 0 - dir\nL 3 " ++ sha ++ " ln\nF 1 " ++ sha ++ " .sketerm-sync-ab/x\nSKM_END\n";
     const r = try parseInspect(ar, out, true);
     try t.expect(r.err == null and r.refused == null and r.existed);
@@ -1018,7 +1018,7 @@ test "the tar stream round-trips through std.tar with the control file first" {
     const ar = a.allocator();
     const td = @import("../util/pathz.zig").TempDir.make("filesync") orelse return error.SkipZigTest;
     defer td.remove();
-    const long = "d/" ++ "n" ** 120 ++ ".txt";
+    const long = "d/" ++ &@as([120:0]u8, @splat('n')) ++ ".txt";
     const root = try std.fmt.allocPrint(ar, "{s}/src", .{td.path()});
     var zb: [4096]u8 = undefined;
     _ = c.mkdir(try pathZ(&zb, root), 0o755);

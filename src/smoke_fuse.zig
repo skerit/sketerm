@@ -161,7 +161,7 @@ pub fn main() u8 {
         var source_buf: [4096:0]u8 = undefined;
         const source_dir = std.fmt.bufPrintZ(&source_buf, "{s}/enumerate", .{src}) catch unreachable;
         if (c.mkdir(source_dir.ptr, 0o700) != 0) fail("enumeration fixture mkdir");
-        const padding = [_]u8{'x'} ** 96;
+        const padding = @as([96]u8, @splat('x'));
         for (0..500) |i| {
             var name_buf: [128]u8 = undefined;
             const name = std.fmt.bufPrint(&name_buf, "file-{d:0>4}-{s}", .{ i, padding }) catch unreachable;

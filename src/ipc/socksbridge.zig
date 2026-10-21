@@ -861,12 +861,12 @@ test "transport: buffered daemon frames preserve connect-data-close order" {
     var stream: std.ArrayList(u8) = .empty;
     defer stream.deinit(a);
     try wire.appendFrame(&stream, a, .stream_reply, "{\"req\":42,\"ok\":true,\"chan\":7}");
-    var first = [_]u8{0} ** (4 + 5);
+    var first = @as([(4 + 5)]u8, @splat(0));
     var first_header: [4]u8 = undefined;
     @memcpy(first[0..4], wire.putChanHeader(&first_header, 7));
     @memcpy(first[4..], "alpha");
     try wire.appendFrame(&stream, a, .chan_data, &first);
-    var second = [_]u8{0} ** (4 + 4);
+    var second = @as([(4 + 4)]u8, @splat(0));
     var second_header: [4]u8 = undefined;
     @memcpy(second[0..4], wire.putChanHeader(&second_header, 7));
     @memcpy(second[4..], "beta");
@@ -1233,7 +1233,7 @@ test "transport: stop interrupts mux-send backpressure" {
     var conn = client.Conn{ .allocator = t.allocator, .fd = pair[0] };
     defer conn.deinit();
     try conn.setNonBlockingChecked();
-    const payload = [_]u8{0x5a} ** (32 * 1024);
+    const payload = @as([(32 * 1024)]u8, @splat(0x5a));
     var attempts: usize = 0;
     while (conn.wbuf.items.len == 0 and attempts < 128) : (attempts += 1)
         try conn.queueFrame(.chan_data, &payload);

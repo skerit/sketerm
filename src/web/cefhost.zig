@@ -5543,7 +5543,7 @@ test "late bootstrap load-start retains a guarded redirect refusal until an allo
         .allow_sub = &.{},
         .navigation_guard = "{\"hosts\":[{\"host\":\"auth.openai.com\"}]}",
     });
-    const callback = "http://localhost:1455/auth/callback?state=fixture&code=" ++ "x" ** 1000;
+    const callback = "http://localhost:1455/auth/callback?state=fixture&code=" ++ &@as([1000:0]u8, @splat('x'));
     host_icpt.recordMainNavigationRefusal(v.id, callback);
     host.flushInterceptStatus();
     while (out.front()) |msg| out.advance(msg.bytes.len);

@@ -447,7 +447,7 @@ fn runSshCommand(_: ?*anyopaque, plan: *const sshroute.Plan, ssh_bin: [*:0]const
         _ = c.close(pair[1]);
         return 255;
     }
-    var argv: [sshroute.Args.MAX_OPTIONS + 8:null]?[*:0]const u8 = .{null} ** (sshroute.Args.MAX_OPTIONS + 8);
+    var argv: [sshroute.Args.MAX_OPTIONS + 8:null]?[*:0]const u8 = @splat(null);
     var n: usize = 0;
     argv[n] = ssh_bin;
     n += 1;
@@ -578,7 +578,7 @@ fn fakeArtifact(fill: u8) Artifact {
     return .{
         .path = "/tmp/mux-portable",
         .target = targetOf("x86_64-linux-musl"),
-        .hash = .{ .hex = [_]u8{fill} ** 64, .size = 1234 },
+        .hash = .{ .hex = @as([64]u8, @splat(fill)), .size = 1234 },
     };
 }
 
@@ -612,7 +612,7 @@ test "deployment picks the artifact the host's platform matched" {
     const mac = Artifact{
         .path = "/tmp/mux-portable-mac",
         .target = targetOf("aarch64-macos"),
-        .hash = .{ .hex = [_]u8{'2'} ** 64, .size = 1234 },
+        .hash = .{ .hex = @as([64]u8, @splat('2')), .size = 1234 },
     };
     const plan = testPlan("mac");
     var missing = FakeRunner{ .statuses = .{ CHECK_MISSING_BASE + 1, 0 }, .expected_arch_case = "(Darwin:arm64) i=1 h=" };
@@ -696,7 +696,7 @@ test "check and upload run through a real sh with the payload on stdin" {
     // The host's artifact sits SECOND, behind one for another platform:
     // the script must select it by the host's uname, not by position.
     const artifacts = [_]Artifact{
-        .{ .path = payload, .target = other_target, .hash = .{ .hex = [_]u8{'0'} ** 64, .size = 1 } },
+        .{ .path = payload, .target = other_target, .hash = .{ .hex = @as([64]u8, @splat('0')), .size = 1 } },
         .{ .path = payload, .target = host_target, .hash = hash },
     };
 
@@ -759,7 +759,7 @@ test "every portable target's remote guard is in the check script" {
         var result = ensureUsing(std.testing.allocator, &plan, "ssh", &.{.{
             .path = "/tmp/mux-portable",
             .target = target,
-            .hash = .{ .hex = [_]u8{'f'} ** 64, .size = 1234 },
+            .hash = .{ .hex = @as([64]u8, @splat('f')), .size = 1234 },
         }}, .{ .ctx = &fake, .run = FakeRunner.run }).?;
         result.prepared.deinit();
         try std.testing.expect(fake.arch_guard_ok);
@@ -771,7 +771,7 @@ test "classify reads the artifact header from disk" {
     var path_buf: [128:0]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-deploy-classify-{d}", .{c.getpid()}) catch unreachable;
     defer _ = c.unlink(path.ptr);
-    var header = [_]u8{0} ** 32;
+    var header = @as([32]u8, @splat(0));
     std.mem.writeInt(u32, header[0..4], 0xfeedfacf, .little);
     std.mem.writeInt(u32, header[4..8], 0x0100000c, .little);
     {

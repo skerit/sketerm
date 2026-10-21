@@ -359,7 +359,7 @@ test "writeOkFlat merges payload fields at the top level" {
 
 test "panel submit event serializes a 4096-byte value without truncation" {
     const a = std.testing.allocator;
-    const submitted = "q" ** 4096;
+    const submitted = &@as([4096:0]u8, @splat('q'));
     const evs = [_]PanelEvent{.{
         .component = "query",
         .kind = "submit",

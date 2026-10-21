@@ -953,7 +953,7 @@ fn runPutEventAllocationFailure(fail_index: ?usize) !usize {
     proto.n_intermediates = proto.intermediates.len;
     @memcpy(&proto.intermediates, "$+! ");
     proto.final = 'q';
-    var body: [256]u8 = .{'x'} ** 256;
+    var body: [256]u8 = @splat('x');
     const event: Event = .{ .dcs = .{ .proto = proto, .body = &body } };
 
     if (fail_index) |_| {
@@ -995,7 +995,7 @@ fn runAppendFrameAllocationFailure(fail_index: ?usize) !usize {
     defer out.deinit(t.allocator);
     try out.ensureTotalCapacityPrecise(t.allocator, 4);
     try out.appendSlice(t.allocator, "seed");
-    const payload = [_]u8{'p'} ** 256;
+    const payload = @as([256]u8, @splat('p'));
 
     if (fail_index) |_| {
         try t.expectError(error.OutOfMemory, appendFrame(&out, failing.allocator(), .events, &payload));
@@ -1086,7 +1086,7 @@ test "wire: simple events round-trip" {
 test "wire: csi round-trips params, sub-bits, intermediates, private" {
     const a = std.testing.allocator;
     var csi: Event.Csi = .{};
-    csi.params = .{ 38, 2, 255, 128, 0 } ++ .{0} ** 11;
+    csi.params = .{ 38, 2, 255, 128, 0 } ++ @as([11]u16, @splat(0));
     csi.n_params = 5;
     csi.setSub(1, true);
     csi.setSub(2, true);
@@ -1229,7 +1229,7 @@ test "wire: panel envelope is little-endian, opaque, and bounded" {
 
     try std.testing.expectError(error.Truncated, decodePanelEnvelope("short"));
     try std.testing.expectEqual(@as(?u64, null), decodePanelEnvelopeId("short"));
-    try std.testing.expectError(error.EmptyJson, decodePanelEnvelope(&([_]u8{0} ** 8)));
+    try std.testing.expectError(error.EmptyJson, decodePanelEnvelope(&(@as([8]u8, @splat(0)))));
     const too_large = try a.alloc(u8, PANEL_ENVELOPE_MAX + 1);
     defer a.free(too_large);
     try std.testing.expectError(error.TooLong, decodePanelEnvelope(too_large));

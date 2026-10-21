@@ -2550,7 +2550,7 @@ test "a job's later segment: its final is flagged, only a substantive one wakes 
     try rig.init();
     defer rig.deinit();
     try connectRoot(&rig);
-    const long = "s" ** 400;
+    const long = &@as([400:0]u8, @splat('s'));
     try feedPrompt(&rig, 1, 1, "summarize, ignore wakeups");
     try feedStatus(&rig, 2, "ses_root", "busy");
     try feedAssistant(&rig, 3, "msg_a1", false);
@@ -2580,7 +2580,7 @@ test "a job's later segment: its final is flagged, only a substantive one wakes 
     try t.expect(recs[1].segment_final);
 
     // A substantive later segment wakes, with itself as the answer.
-    const more = "m" ** 350;
+    const more = &@as([350:0]u8, @splat('m'));
     try feedStatus(&rig, 20, "ses_root", "busy");
     try feedAssistant(&rig, 21, "msg_a3", false);
     try feedText(&rig, 22, "msg_a3", "prt_a3", more);
@@ -2669,7 +2669,7 @@ test "reasoning parts (openai summaries streamed as text deltas) are never recor
     // Recorded 1.18 order: the answer text part ends, then reasoning parts
     // announce themselves, stream their titles and end, one only after its
     // deltas, one never before its message completes.
-    const report = "R" ** 1600;
+    const report = &@as([1600:0]u8, @splat('R'));
     const answer_ev = try std.fmt.allocPrint(t.allocator,
         \\{{"type":"message.part.updated","properties":{{"sessionID":"ses_root","part":{{"type":"text","text":"{s}","time":{{"start":4,"end":5}},"messageID":"msg_a1","sessionID":"ses_root","id":"prt_ans"}}}}}}
     , .{report});

@@ -471,7 +471,7 @@ test "a wake carries what its line cuts: a message in full, a prompt's options, 
     try t.expect(pn.answer == null);
 
     // An error the line cuts: its whole text; a short one adds nothing.
-    const long = "API Error: " ++ "x" ** 200;
+    const long = "API Error: " ++ &@as([200:0]u8, @splat('x'));
     _ = try q.push(0, .@"error", .api, long, "");
     const de = (try cur.take(&q, .{}, 2, a)).?;
     const pe = try compose(a, .{ .agent = "claude-k3f9", .state = .idle }, de, &q, &recs, &handed);

@@ -134,7 +134,7 @@ pub const DETECT_LINES: usize = 4000;
 pub fn detect(rope: *const Rope) ?Detected {
     var tab_lines: usize = 0;
     var space_lines: usize = 0;
-    var steps = [_]usize{0} ** 17;
+    var steps = @as([17]usize, @splat(0));
     var prev_spaces: usize = 0;
 
     var it = rope.iterateRange(0, @min(rope.len(), DETECT_BYTES));

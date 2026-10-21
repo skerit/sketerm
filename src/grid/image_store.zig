@@ -685,7 +685,7 @@ test "addWithId stores image_id" {
     var s = Store.init(std.testing.allocator);
     defer s.images.deinit(std.testing.allocator);
     defer s.freeAllNoGL();
-    const rgba = [_]u8{0} ** 16; // 2x2 RGBA
+    const rgba = @as([16]u8, @splat(0)); // 2x2 RGBA
     try s.addWithId(&rgba, 2, 2, 0, 0, 42);
     try std.testing.expectEqual(@as(u32, 42), s.images.items[0].image_id);
 }
@@ -693,7 +693,7 @@ test "addWithId stores image_id" {
 test "addFull rejects invalid dimensions and inconsistent pixel lengths" {
     var s = Store.init(std.testing.allocator);
     defer s.deinit();
-    const rgba = [_]u8{0} ** 17;
+    const rgba = @as([17]u8, @splat(0));
 
     try std.testing.expectError(image_size.Error.InvalidDimensions, s.addFull(.{
         .rgba = rgba[0..16],
@@ -727,7 +727,7 @@ test "addFull rejects invalid dimensions and inconsistent pixel lengths" {
 }
 
 test "addFull evicts for the configured budget instead of rejecting" {
-    const rgba = [_]u8{0} ** 16;
+    const rgba = @as([16]u8, @splat(0));
 
     var exact = Store.init(std.testing.allocator);
     defer exact.deinit();
@@ -770,7 +770,7 @@ test "addFull accepts a wide strip that fits the byte budget" {
 test "scaleForLimit downscales past the GL axis limit and leaves geometry alone" {
     const w: u32 = 8;
     const h: u32 = 4;
-    const rgba = [_]u8{0x11} ** (w * h * 4);
+    const rgba = @as([(w * h * 4)]u8, @splat(0x11));
 
     var s = Store.init(std.testing.allocator);
     defer s.deinit();
@@ -797,7 +797,7 @@ test "markByIdForDelete flags only matching images" {
     var s = Store.init(std.testing.allocator);
     defer s.images.deinit(std.testing.allocator);
     defer s.freeAllNoGL();
-    const rgba = [_]u8{0} ** 16;
+    const rgba = @as([16]u8, @splat(0));
     try s.addWithId(&rgba, 2, 2, 0, 0, 1);
     try s.addWithId(&rgba, 2, 2, 0, 0, 2);
     try s.addWithId(&rgba, 2, 2, 0, 0, 1);
@@ -814,7 +814,7 @@ test "markAllForDelete flags everything" {
     var s = Store.init(std.testing.allocator);
     defer s.images.deinit(std.testing.allocator);
     defer s.freeAllNoGL();
-    const rgba = [_]u8{0} ** 16;
+    const rgba = @as([16]u8, @splat(0));
     try s.addWithId(&rgba, 2, 2, 0, 0, 1);
     try s.addWithId(&rgba, 2, 2, 0, 0, 2);
     s.markAllForDelete();
@@ -826,7 +826,7 @@ test "addWithPlacement stores placement_id and z_index" {
     var s = Store.init(std.testing.allocator);
     defer s.images.deinit(std.testing.allocator);
     defer s.freeAllNoGL();
-    const rgba = [_]u8{0} ** 16;
+    const rgba = @as([16]u8, @splat(0));
     try s.addWithPlacement(&rgba, 2, 2, 0, 0, 7, 42, 5);
     try std.testing.expectEqual(@as(u32, 7), s.images.items[0].image_id);
     try std.testing.expectEqual(@as(u32, 42), s.images.items[0].placement_id);
@@ -837,7 +837,7 @@ test "markByPlacementForDelete: matches exact placement" {
     var s = Store.init(std.testing.allocator);
     defer s.images.deinit(std.testing.allocator);
     defer s.freeAllNoGL();
-    const rgba = [_]u8{0} ** 16;
+    const rgba = @as([16]u8, @splat(0));
     try s.addWithPlacement(&rgba, 2, 2, 0, 0, 1, 100, 0);
     try s.addWithPlacement(&rgba, 2, 2, 0, 0, 1, 200, 0);
     try s.addWithPlacement(&rgba, 2, 2, 0, 0, 2, 100, 0);
@@ -851,7 +851,7 @@ test "markByPlacementForDelete: placement_id=0 matches all placements of image" 
     var s = Store.init(std.testing.allocator);
     defer s.images.deinit(std.testing.allocator);
     defer s.freeAllNoGL();
-    const rgba = [_]u8{0} ** 16;
+    const rgba = @as([16]u8, @splat(0));
     try s.addWithPlacement(&rgba, 2, 2, 0, 0, 1, 100, 0);
     try s.addWithPlacement(&rgba, 2, 2, 0, 0, 1, 200, 0);
     try s.addWithPlacement(&rgba, 2, 2, 0, 0, 2, 100, 0);
@@ -865,7 +865,7 @@ test "a cell extent past i32 max still covers its own cell" {
     var s = Store.init(std.testing.allocator);
     defer s.images.deinit(std.testing.allocator);
     defer s.freeAllNoGL();
-    const rgba = [_]u8{0} ** 16;
+    const rgba = @as([16]u8, @splat(0));
     // `c=`/`r=` come straight off an escape sequence and saturate at u32
     // max; casting one to i32 turned the rectangle negative, so a
     // positional delete matched nothing and the placement stayed live.
@@ -892,7 +892,7 @@ test "forgetGL keeps all images, drops their GL handles" {
     var s = Store.init(std.testing.allocator);
     defer s.images.deinit(std.testing.allocator);
     defer s.freeAllNoGL();
-    const rgba = [_]u8{0} ** 16;
+    const rgba = @as([16]u8, @splat(0));
     try s.addWithId(&rgba, 2, 2, 0, 0, 1);
     try s.addWithId(&rgba, 2, 2, 0, 0, 2);
     s.images.items[0].gl_tex = 42; // simulate uploaded
@@ -960,7 +960,7 @@ test "budget evicts oldest images FIFO and bounds live_bytes" {
     var s = Store.init(std.testing.allocator);
     defer s.images.deinit(std.testing.allocator);
     defer s.freeAllNoGL();
-    const px = [_]u8{0} ** (4 * 4 * 4); // 64 bytes per image
+    const px = @as([(4 * 4 * 4)]u8, @splat(0)); // 64 bytes per image
     s.budget_bytes = 64 * 3; // room for exactly three live images
     var i: u32 = 0;
     while (i < 10) : (i += 1) {
@@ -985,7 +985,7 @@ test "replacePending stays under the budget when a frame grows" {
     var s = Store.init(std.testing.allocator);
     defer s.images.deinit(std.testing.allocator);
     defer s.freeAllNoGL();
-    const px = [_]u8{0} ** (4 * 4 * 4); // 64 bytes per placement
+    const px = @as([(4 * 4 * 4)]u8, @splat(0)); // 64 bytes per placement
     s.budget_bytes = 64 * 2; // room for two of the three placements
     var p: u32 = 1;
     while (p <= 3) : (p += 1) {
@@ -1002,7 +1002,7 @@ test "replacePending stays under the budget when a frame grows" {
     try std.testing.expect(s.live_bytes <= s.budget_bytes);
     // An animation frame refills every placement of image 9. The one
     // the budget evicted must not silently buy its bytes back.
-    const frame = [_]u8{0xAB} ** (4 * 4 * 4);
+    const frame = @as([(4 * 4 * 4)]u8, @splat(0xAB));
     try s.replacePending(9, &frame, 1);
     try std.testing.expect(s.live_bytes <= s.budget_bytes);
     try std.testing.expectEqual(@as(usize, 64 * 2), s.live_bytes);
@@ -1012,7 +1012,7 @@ test "budget = 0 means unlimited (no eviction)" {
     var s = Store.init(std.testing.allocator);
     defer s.images.deinit(std.testing.allocator);
     defer s.freeAllNoGL();
-    const px = [_]u8{0} ** 16;
+    const px = @as([16]u8, @splat(0));
     var i: u32 = 0;
     while (i < 50) : (i += 1) try s.addWithId(&px, 2, 2, 0, 0, i + 1);
     for (s.images.items) |*img| try std.testing.expect(img.pending != null);
@@ -1022,7 +1022,7 @@ test "budget = 0 means unlimited (no eviction)" {
 test "repeated replacements release pixels before any render" {
     var s = Store.init(std.testing.allocator);
     defer s.deinit();
-    const px = [_]u8{0} ** 16;
+    const px = @as([16]u8, @splat(0));
     s.budget_bytes = px.len * 2;
     try s.addWithId(&px, 2, 2, 0, 0, 2);
     for (0..128) |_| {
@@ -1047,7 +1047,7 @@ test "repeated replacements release pixels before any render" {
 test "delete and replay without renders does not retain deleted pixels" {
     var s = Store.init(std.testing.allocator);
     defer s.deinit();
-    const px = [_]u8{0} ** 16;
+    const px = @as([16]u8, @splat(0));
     s.budget_bytes = px.len;
     for (0..128) |i| {
         try s.addWithPlacement(&px, 2, 2, 0, 0, 1, 7, 0);
@@ -1073,7 +1073,7 @@ test "positional deletes use terminal rows after scrolling without a render" {
     defer screen.deinit();
     var s = Store.init(std.testing.allocator);
     defer s.deinit();
-    const px = [_]u8{0} ** 16;
+    const px = @as([16]u8, @splat(0));
     const anchor = screen.active[2].id;
     screen.row = screen.rows - 1;
     screen.lineFeed();
@@ -1144,7 +1144,7 @@ test "positional deletes use terminal rows after scrolling without a render" {
 test "unuploaded replacements reclaim tombstones while preserving uploaded handles" {
     var s = Store.init(std.testing.allocator);
     defer s.deinit();
-    const px = [_]u8{0} ** 4;
+    const px = @as([4]u8, @splat(0));
     try s.addWithId(&px, 1, 1, 0, 0, 1);
     s.images.items[0].gl_tex = 42;
     for (0..10000) |_| {
@@ -1175,7 +1175,7 @@ test "positional deletion batches missing anchors over deep history without rend
     screen.view_offset = 60000;
     var s = Store.init(std.testing.allocator);
     defer s.deinit();
-    const px = [_]u8{0} ** 4;
+    const px = @as([4]u8, @splat(0));
     const count = Screen.RETAIN_IMAGE_COUNT * 2 + 7;
     for (0..count) |i| {
         try s.addFull(.{

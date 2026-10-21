@@ -586,7 +586,7 @@ test "forwarded stream window releases an unfinished recording and backing on te
         .rec = .{ .gif = @import("util/gifrec.zig").Rec.init(a, 0) },
     };
     defer win.releaseOwned(a);
-    const pixels = [_]u8{255} ** (4 * 4 * 4);
+    const pixels = @as([(4 * 4 * 4)]u8, @splat(255));
     try win.backing.appendSlice(a, &pixels);
     try win.rec.gif.?.addShmFrame(&pixels, 4, 4, 0, 100);
     try std.testing.expect(win.rec.gif.?.pend != null);

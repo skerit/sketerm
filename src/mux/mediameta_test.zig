@@ -1012,7 +1012,7 @@ test "unrecognised content stays unknown" {
 test "values are sanitised: control characters, NULs and overlong text" {
     var body = B{};
     defer body.deinit();
-    const long = "y" ** 400;
+    const long = &@as([400:0]u8, @splat('y'));
     textFrame(&body, 3, "TIT2", 0, "Ti\x07tle\x00trailing");
     textFrame(&body, 3, "TALB", 0, long);
     textFrame(&body, 3, "TPE1", 0, "   ");

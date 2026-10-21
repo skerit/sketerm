@@ -148,9 +148,9 @@ test "a path deeper than the buffer keeps the root and the tail" {
 test "shortLabel cuts only over-long names, on a UTF-8 boundary" {
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("docs", shortLabel("docs", &buf));
-    const exact = "a" ** MAX_LABEL_CHARS;
+    const exact = &@as([MAX_LABEL_CHARS:0]u8, @splat('a'));
     try std.testing.expectEqualStrings(exact, shortLabel(exact, &buf));
-    const long = "a" ** 40;
+    const long = &@as([40:0]u8, @splat('a'));
     const cut = shortLabel(long, &buf);
     try std.testing.expectEqual(@as(usize, MAX_LABEL_CHARS), cut.len);
     try std.testing.expectEqualStrings("...", cut[cut.len - 3 ..]);

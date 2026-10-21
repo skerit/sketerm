@@ -279,6 +279,7 @@ comptime {
     _ = @import("panelvocab_drift_test.zig");
     _ = @import("util/churn.zig");
     _ = @import("util/clock.zig");
+    _ = @import("util/repeat.zig");
     _ = @import("util/backoff.zig");
     _ = @import("util/env.zig");
     _ = @import("util/strz.zig");

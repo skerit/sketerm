@@ -38,7 +38,7 @@ fn fail(comptime msg: []const u8) noreturn {
 
 const Env = struct {
     const names = [_][:0]const u8{ "XDG_RUNTIME_DIR", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "SKETERM_MUX_LOG" };
-    saved: [names.len]?[:0]u8 = .{null} ** names.len,
+    saved: [names.len]?[:0]u8 = @splat(null),
 
     fn save(self: *Env, allocator: std.mem.Allocator) void {
         for (names, 0..) |n, i| {

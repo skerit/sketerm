@@ -16,6 +16,7 @@
 //! prepare-destroy; `destroy` then frees the struct.
 
 const std = @import("std");
+const repeat = @import("../util/repeat.zig").repeat;
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const cssutil = @import("cssutil.zig");
@@ -41,7 +42,7 @@ pub const Reader = struct {
     view: *c.GtkWidget,
     links: std.ArrayList(LinkRange) = .empty,
     /// Objects whose signals carry this reader as user-data.
-    signal_objs: [4]?*c.GObject = .{null} ** 4,
+    signal_objs: [4]?*c.GObject = @splat(null),
     signal_count: usize = 0,
     widgets_dead: bool = false,
 
@@ -172,7 +173,7 @@ pub const Reader = struct {
                     const s = std.fmt.bufPrint(&buf, "{d}.  ", .{block.level}) catch "-  ";
                     insertPlain(buffer, s);
                 },
-                .rule => insertPlain(buffer, "\u{2500}" ** 24),
+                .rule => insertPlain(buffer, repeat("\u{2500}", 24)),
                 else => {},
             }
             for (block.spans) |span| {

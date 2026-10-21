@@ -894,7 +894,7 @@ test "decode accepts the V1 client frames and refuses hostile values" {
     try t.expectError(error.BadUtf8, decode(18, b[0..9]));
 
     try t.expectError(error.BadUtf8, decode(19, &.{ 0xff, 0xfe }));
-    const long = [_]u8{'a'} ** (MAX_TEXT + 1);
+    const long = @as([(MAX_TEXT + 1)]u8, @splat('a'));
     try t.expectError(error.BadLength, decode(19, &long));
     _ = try decode(19, long[0..MAX_TEXT]);
     var hdr: [5]u8 = undefined;
@@ -958,7 +958,7 @@ test "key identity pairs case variants of one key and keeps others apart" {
 }
 
 test "auth takes exactly 32 lowercase hex characters" {
-    const tok = mintToken([_]u8{ 0xde, 0xad, 0xbe, 0xef } ++ [_]u8{0} ** 12);
+    const tok = mintToken([_]u8{ 0xde, 0xad, 0xbe, 0xef } ++ @as([12]u8, @splat(0)));
     try t.expect(isToken(&tok));
     try t.expectEqualStrings("deadbeef", tok[0..8]);
     const a = (try decode(1, &tok)).auth;

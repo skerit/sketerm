@@ -259,7 +259,7 @@ test "crashlog: the log path resolves under XDG_STATE_HOME and opens" {
 
 test "crashlog: set truncates an oversized breadcrumb instead of overflowing" {
     defer clear();
-    const long = "z" ** (CRUMB_MAX * 2);
+    const long = &@as([(CRUMB_MAX * 2):0]u8, @splat('z'));
     set("{s}", .{long});
     try t.expectEqual(CRUMB_MAX, breadcrumb().len);
     set("ipc {s}", .{"list"});

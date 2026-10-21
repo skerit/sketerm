@@ -193,8 +193,8 @@ test "labels are short single lines of UTF-8" {
     try t.expect(validLabel("scan-a"));
     try t.expect(validLabel("caf\xc3\xa9 tab"));
     try t.expect(!validLabel(""));
-    try t.expect(!validLabel("a" ** (LABEL_MAX + 1)));
-    try t.expect(validLabel("a" ** LABEL_MAX));
+    try t.expect(!validLabel(&@as([(LABEL_MAX + 1):0]u8, @splat('a'))));
+    try t.expect(validLabel(&@as([LABEL_MAX:0]u8, @splat('a'))));
     try t.expect(!validLabel("two\nlines"));
     try t.expect(!validLabel("\xff"));
 }

@@ -171,7 +171,7 @@ const Ctx = struct {
     /// The rebuildable groups on that page (everything below the
     /// "Theme" group). Three is the flat layout's count; the sizing
     /// is asserted in `trackColorGroup`.
-    color_groups: [4]?*c.GtkWidget = .{null} ** 4,
+    color_groups: [4]?*c.GtkWidget = @splat(null),
     /// The two list-shaped families (`symbol_map.<name>`,
     /// `hint.<name>.*`) each own one group that is destroyed and
     /// rebuilt whenever an entry is added or removed — which is also

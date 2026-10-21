@@ -269,7 +269,7 @@ test "validUrl accepts only bounded HTTP subscription URLs with a host" {
     try t.expect(!validUrl("https://example.com:99999/list.txt"));
     try t.expect(!validUrl("https://[::1/list.txt"));
     try t.expect(!validUrl("https://example.com/list\nnext"));
-    const oversized = [_]u8{'a'} ** (std.math.maxInt(u16) + 1);
+    const oversized = @as([(std.math.maxInt(u16) + 1)]u8, @splat('a'));
     try t.expect(!validUrl(&oversized));
 }
 

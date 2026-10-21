@@ -172,7 +172,7 @@ test "evdev→CGKeyCode spot checks" {
 }
 
 test "every mapped keycode is a valid kVK (< 0x80) and letters are distinct" {
-    var seen = [_]bool{false} ** 0x80;
+    var seen = @as([0x80]bool, @splat(false));
     var mapped: usize = 0;
     var code: u32 = 0;
     while (code < 256) : (code += 1) {

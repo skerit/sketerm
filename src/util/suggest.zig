@@ -609,8 +609,8 @@ test "containsFold has no length ceiling and no fail-open" {
     // The hand-rolled versions this replaces lowercased into 256/512
     // byte stack buffers and returned "matches" on overflow. A long
     // non-matching needle must answer false, not true.
-    const long_needle = "q" ** 600;
-    const long_hay = "a" ** 900;
+    const long_needle = &@as([600:0]u8, @splat('q'));
+    const long_hay = &@as([900:0]u8, @splat('a'));
     try t.expect(!containsFold(long_hay, long_needle));
     try t.expect(containsFold(long_hay ++ long_needle, long_needle));
 }
@@ -814,7 +814,7 @@ test "a query longer than query_max is truncated, not rejected" {
     var model = Model.init(t.allocator, &sources, 10);
     defer model.deinit();
     src.model = &model;
-    const huge = "x" ** (query_max + 64);
+    const huge = &@as([(query_max + 64):0]u8, @splat('x'));
     model.setQuery(huge);
     try t.expectEqual(@as(usize, query_max), model.query().len);
 }

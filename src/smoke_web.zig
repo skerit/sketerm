@@ -51,6 +51,7 @@
 //! either.
 
 const std = @import("std");
+const repeat = @import("util/repeat.zig").repeat;
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const unsetEnv = @import("util/env.zig").unset;
@@ -3971,7 +3972,7 @@ fn runLifecycleStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8
 /// `Content-Encoding: gzip`: the capture must hold what the PAGE got,
 /// the decompressed JSON.
 const CAP_GZ = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xab\x56\xca\xce\xcc\x4b\x51\xb2\x52\x4a\xaf\xca\x2c\x28\x48\x4d\x51\xd2\x51\x2a\x29\x4a\x4c\xce\x2e\x56\xb2\x8a\xae\x56\xca\x04\xc9\x94\x18\x02\x05\xf3\x12\x73\x53\x81\x6c\xe7\xc4\xb4\xc3\x2b\x15\x52\x52\x73\x14\x7c\x13\x8b\x94\x6a\x75\x60\x4a\x8c\x10\x4a\x82\x53\x93\xf3\x81\x26\xd6\xc6\xea\x28\x15\x24\x82\x24\x13\x93\x92\x53\x52\xd3\xd2\x33\x46\xe9\x91\x49\x2b\xd5\x02\x00\xb9\x79\x4c\xbe\x65\x02\x00\x00";
-const CAP_GZ_PLAIN = "{\"kind\":\"gzipped\",\"tracks\":[{\"id\":\"t1\",\"name\":\"Caf\u{00e9} del Mar\"},{\"id\":\"t2\",\"name\":\"Second\"}],\"pad\":\"" ++ "abcdefgh" ** 64 ++ "\"}";
+const CAP_GZ_PLAIN = "{\"kind\":\"gzipped\",\"tracks\":[{\"id\":\"t1\",\"name\":\"Caf\u{00e9} del Mar\"},{\"id\":\"t2\",\"name\":\"Second\"}],\"pad\":\"" ++ repeat("abcdefgh", 64) ++ "\"}";
 const CAP_GQL_BODY = "{\"operationName\":\"fetchPlaylist\",\"variables\":{\"offset\":0,\"limit\":25}}";
 /// Bigger than the stage's per-body cap, so it must arrive truncated.
 const CAP_BIG_LEN = 3 * 1024 * 1024;
@@ -5542,7 +5543,7 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         std.mem.indexOf(u8, cl.we_err[0..cl.we_err_len], "invalid extension id") == null)
         fail("stage 40: malformed wire extension id was not rejected");
     const long_set_before = cl.we_seq;
-    cl.send(proto.WebextSet{ .id = "x" ** (extmanifest.MAX_ID_LEN + 1), .dir = popup_dir, .enabled = 1 });
+    cl.send(proto.WebextSet{ .id = &@as([(extmanifest.MAX_ID_LEN + 1):0]u8, @splat('x')), .dir = popup_dir, .enabled = 1 });
     {
         const deadline = nowMs() + 5000;
         while (cl.we_seq == long_set_before and nowMs() < deadline) cl.pump(50);
@@ -5560,7 +5561,7 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     const bad_popup_view = proto.WEBEXT_POPUP_VIEW_BASE + 30;
     cl.send(proto.WebextActionActivate{
         .view = view_id,
-        .id = "x" ** (extmanifest.MAX_ID_LEN + 1),
+        .id = &@as([(extmanifest.MAX_ID_LEN + 1):0]u8, @splat('x')),
         .popup_view = bad_popup_view,
         .w = 360,
         .h = 420,

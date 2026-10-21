@@ -223,7 +223,7 @@ test "label digits render as white-on-black" {
 }
 
 test "a buffer shorter than the declared geometry draws nothing" {
-    var px = [_]u8{7} ** 12; // one pixel short of 2x2
+    var px = @as([12]u8, @splat(7)); // one pixel short of 2x2
     draw(px[0..], 2, 2, &.{.{ .x = 0, .y = 0, .kind = .click }});
     for (px) |b| try t.expectEqual(@as(u8, 7), b);
 }

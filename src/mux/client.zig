@@ -3,6 +3,7 @@
 //! the fd to non-blocking and polls it from the GLib loop).
 
 const std = @import("std");
+const repeat = @import("../util/repeat.zig").repeat;
 const builtin = @import("builtin");
 const c = @import("../c.zig").c;
 const unsetEnv = @import("../util/env.zig").unset;
@@ -1116,7 +1117,7 @@ pub const Conn = struct {
         else
             null;
         const ArgvBuf = [sshroute.Args.MAX_OPTIONS + 8:null]?[*:0]const u8;
-        var argv: ArgvBuf = .{null} ** (sshroute.Args.MAX_OPTIONS + 8);
+        var argv: ArgvBuf = @splat(null);
         var argc: usize = 0;
         const push = struct {
             fn f(buf: *ArgvBuf, i: *usize, value: ?[*:0]const u8) void {
@@ -1430,7 +1431,7 @@ pub const Conn = struct {
         // hash, so the socket path stays well under the sun_path limit.
         var route_args = plan.args(.{ .multiplex = true }) catch return error.BadPath;
         if (route_args.multiplexes()) _ = sshmaster.prepare(ssh_bin, &route_args, plan.destination, master);
-        var argv_buf: [sshroute.Args.MAX_OPTIONS + 8:null]?[*:0]const u8 = .{null} ** (sshroute.Args.MAX_OPTIONS + 8);
+        var argv_buf: [sshroute.Args.MAX_OPTIONS + 8:null]?[*:0]const u8 = @splat(null);
         var n: usize = 0;
         argv_buf[n] = ssh_bin;
         n += 1;
@@ -1520,7 +1521,7 @@ pub const Conn = struct {
         const ssh_bin = sshroute.sshBinary();
         var route_args = plan.args(.{ .multiplex = true }) catch return error.BadRoute;
         if (route_args.multiplexes()) _ = sshmaster.prepare(ssh_bin, &route_args, plan.destination, master);
-        var argv_buf: [sshroute.Args.MAX_OPTIONS + 8:null]?[*:0]const u8 = .{null} ** (sshroute.Args.MAX_OPTIONS + 8);
+        var argv_buf: [sshroute.Args.MAX_OPTIONS + 8:null]?[*:0]const u8 = @splat(null);
         var n: usize = 0;
         argv_buf[n] = ssh_bin;
         n += 1;
@@ -3036,7 +3037,7 @@ test "UDP tickets are refused for every forced non-UDP transport" {
     try t.expect(!udpTicketEligible("tor:box"));
 
     var saved: EnvSave = .{};
-    try saved.override("SKETERM_UDP_TICKET", "box 40000 " ++ ("ab" ** rudp.KEY_LEN));
+    try saved.override("SKETERM_UDP_TICKET", "box 40000 " ++ (repeat("ab", rudp.KEY_LEN)));
     defer saved.restore();
     try t.expect(takeTicketFromEnv("ssh:box") == null);
     try t.expect(takeTicketFromEnv("tor:box") == null);

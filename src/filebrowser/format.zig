@@ -261,7 +261,7 @@ test "copyZ truncates instead of overflowing" {
     const t = std.testing;
     var buf: [256:0]u8 = undefined;
     try t.expectEqualStrings("hi", std.mem.span(copyZ(&buf, "hi")));
-    const long = "x" ** 300;
+    const long = &@as([300:0]u8, @splat('x'));
     try t.expectEqual(@as(usize, 255), std.mem.span(copyZ(&buf, long)).len);
     // copyZN takes any sentinel buffer size, not just 256.
     var wide: [512:0]u8 = undefined;

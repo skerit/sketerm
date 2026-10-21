@@ -601,7 +601,7 @@ test "win_drag round-trips rects + ref dims" {
 
     // Over-cap input is truncated to max_drag_rects on append.
     out.clearRetainingCapacity();
-    const many = [_]DragRect{.{ .x = 1, .y = 1, .w = 1, .h = 1 }} ** (max_drag_rects + 8);
+    const many = @as([(max_drag_rects + 8)]DragRect, @splat(.{ .x = 1, .y = 1, .w = 1, .h = 1 }));
     try appendWinDrag(&out, a, 1, 10, 10, &many);
     const um = (try peelUnit(out.items)).?;
     try t.expectEqual(@as(u16, max_drag_rects), decodeWinDrag(um.unit.payload).?.n);

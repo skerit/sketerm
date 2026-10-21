@@ -1822,8 +1822,8 @@ test "scene dimensions, placements, and references are validated" {
 }
 
 test "text_input accepts 4096 UTF-8 bytes and rejects larger fields" {
-    const max_text = "x" ** MAX_TEXT;
-    const too_long = "x" ** (MAX_TEXT + 1);
+    const max_text = &@as([MAX_TEXT:0]u8, @splat('x'));
+    const too_long = &@as([(MAX_TEXT + 1):0]u8, @splat('x'));
     const valid = try std.fmt.allocPrint(
         t.allocator,
         "{{\"root\":\"q\",\"components\":{{\"q\":{{\"type\":\"text_input\",\"value\":\"{s}\",\"placeholder\":\"{s}\"}}}}}}",
@@ -1845,7 +1845,7 @@ test "text_input accepts 4096 UTF-8 bytes and rejects larger fields" {
 }
 
 test "button actions retain their 128-byte bound" {
-    const max_action = "a" ** MAX_OPTION;
+    const max_action = &@as([MAX_OPTION:0]u8, @splat('a'));
     const accepted = try std.fmt.allocPrint(
         t.allocator,
         "{{\"root\":\"b\",\"components\":{{\"b\":{{\"type\":\"button\",\"text\":\"Go\",\"action\":\"{s}\"}}}}}}",
@@ -1988,7 +1988,7 @@ test "id, class, and path validators" {
     try t.expect(!validId("-lead"));
     try t.expect(!validId(".lead"));
     try t.expect(!validId("has space"));
-    try t.expect(!validId("x" ** 65));
+    try t.expect(!validId(&@as([65:0]u8, @splat('x'))));
     try t.expect(validClass("dim"));
     try t.expect(!validClass("blink"));
     try t.expect(validImagePath("/tmp/a.png"));

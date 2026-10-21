@@ -2379,7 +2379,7 @@ test "scp_put result: transfer facts structured, one prose line" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const sha = "a" ** 64;
+    const sha = &@as([64:0]u8, @splat('a'));
     const up = try xferOk(arena, "upload", "/srv/app.service", 16, sha);
     const parsed = try mcp.expectToolResultShape(arena, "scp_put", up);
     const sc = parsed.object.get("structuredContent").?.object;
@@ -2818,11 +2818,11 @@ test "stagedPartPath preserves the extension" {
 
 test "findHex64 finds standalone sha tokens" {
     const t = std.testing;
-    const sha = "a" ** 64;
+    const sha = &@as([64:0]u8, @splat('a'));
     try t.expectEqualStrings(sha, @import("mcp_term.zig").findHex64("prefix " ++ sha ++ "  /path/file").?);
     try t.expect(@import("mcp_term.zig").findHex64("short deadbeef only") == null);
     // 65 hex chars: not a standalone 64-run.
-    try t.expect(@import("mcp_term.zig").findHex64("f" ** 65) == null);
+    try t.expect(@import("mcp_term.zig").findHex64(&@as([65:0]u8, @splat('f'))) == null);
 }
 
 test "pickFreePort and tcpListening agree" {
@@ -2999,7 +2999,7 @@ test "text mode: exec, transfer, busy and ssh lines read as people write them" {
     const filed = try textModeText(arena, try execResult(arena, .{ .completed = true, .exit_status = 0, .output = &big }, null, .{ .output_file = path }));
     try expectHas(filed, try std.fmt.allocPrint(arena, "output_file: {s} (2 KiB)", .{path}));
 
-    const xfer = try textModeText(arena, try xferOk(arena, "scp_put", "/srv/app.tar", 1_536, "a" ** 64));
+    const xfer = try textModeText(arena, try xferOk(arena, "scp_put", "/srv/app.tar", 1_536, &@as([64:0]u8, @splat('a'))));
     try expectHas(xfer, "scp_put ok: /srv/app.tar (1.5 KiB)");
 
     try t.expectEqualStrings("the term_exec `make` this MCP server sent 3 minutes ago is still running", try runningSentence(arena, "term_exec", "make", 200_000));

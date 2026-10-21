@@ -1144,7 +1144,7 @@ test "manager rejects invalid and overflowing raw dimensions" {
 test "manager rejects short and long raw payloads" {
     var mgr = Manager.init(std.testing.allocator);
     defer mgr.deinit();
-    const bytes = [_]u8{0xA5} ** 17;
+    const bytes = @as([17]u8, @splat(0xA5));
     const short = try testBase64(std.testing.allocator, bytes[0..15]);
     defer std.testing.allocator.free(short);
     const long = try testBase64(std.testing.allocator, &bytes);
@@ -1172,7 +1172,7 @@ test "manager rejects short and long raw payloads" {
 test "manager rejects short and long zlib inflation" {
     var mgr = Manager.init(std.testing.allocator);
     defer mgr.deinit();
-    const bytes = [_]u8{0x5A} ** 17;
+    const bytes = @as([17]u8, @splat(0x5A));
     const short = try testZlibBase64(std.testing.allocator, bytes[0..15]);
     defer std.testing.allocator.free(short);
     const long = try testZlibBase64(std.testing.allocator, &bytes);
@@ -1220,7 +1220,7 @@ test "manager bounds high-ratio zlib inflation to metadata size" {
 }
 
 test "the configured budget evicts, it never rejects" {
-    const rgba = [_]u8{0xCC} ** 16;
+    const rgba = @as([16]u8, @splat(0xCC));
     const payload = try testBase64(std.testing.allocator, &rgba);
     defer std.testing.allocator.free(payload);
 
@@ -1634,7 +1634,7 @@ test "unterminated chunked transmission is capped, not unbounded" {
     mgr.budget_bytes = 1024;
     const cap = mgr.accumCap();
     try std.testing.expect(cap > mgr.budget_bytes);
-    const chunk = [_]u8{'A'} ** 512;
+    const chunk = @as([512]u8, @splat('A'));
     var i: usize = 0;
     while (i < 100) : (i += 1) {
         _ = mgr.ingest(.{ .action = .transmit, .image_id = 1, .payload = &chunk, .more = 1 });

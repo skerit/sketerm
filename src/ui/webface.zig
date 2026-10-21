@@ -1110,7 +1110,7 @@ pub const WebFace = struct {
     /// freed face. Count the `track` calls in `buildUi`,
     /// `buildCertOverlay`, `buildFindBar` and `wireInput` before
     /// shrinking it.
-    signal_objs: [32]?*c.GObject = .{null} ** 32,
+    signal_objs: [32]?*c.GObject = @splat(null),
     signal_count: usize = 0,
 
     /// Refcounted read-only mapping of the helper's frame memfd. Each

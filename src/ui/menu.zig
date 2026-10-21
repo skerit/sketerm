@@ -195,7 +195,7 @@ const GACTION_DETAILED = blk: {
     const fields = @typeInfo(Action).@"enum".fields;
     var names: [fields.len][:0]const u8 = undefined;
     for (fields, 0..) |f, i| {
-        var buf = [_:0]u8{0} ** (GROUP_PREFIX.len + f.name.len);
+        var buf: [GROUP_PREFIX.len + f.name.len:0]u8 = @splat(0);
         @memcpy(buf[0..GROUP_PREFIX.len], GROUP_PREFIX);
         for (f.name, 0..) |ch, j| buf[GROUP_PREFIX.len + j] = if (ch == '_') '-' else ch;
         const final = buf;

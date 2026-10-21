@@ -152,7 +152,7 @@ const Ran = struct { status: u8, len: usize };
 /// `ssh <args options> <extra> <dest>` with stdout and stderr captured into
 /// `out`, bounded by `STEP_MS`; null when it could not run or timed out.
 fn run(ssh_bin: [*:0]const u8, args: *const sshroute.Args, extra: []const [:0]const u8, dest: [:0]const u8, out: []u8) ?Ran {
-    var argv: [sshroute.Args.MAX_OPTIONS + 8:null]?[*:0]const u8 = .{null} ** (sshroute.Args.MAX_OPTIONS + 8);
+    var argv: [sshroute.Args.MAX_OPTIONS + 8:null]?[*:0]const u8 = @splat(null);
     var n: usize = 0;
     argv[n] = ssh_bin;
     n += 1;

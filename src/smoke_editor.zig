@@ -896,7 +896,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
 
         const probes = [_]syntax.Kind{ .keyword, .string, .comment, .number, .type };
-        var hits = [_]usize{0} ** probes.len;
+        var hits = @as([probes.len]usize, @splat(0));
         var distinct = std.AutoHashMap(u32, void).init(allocator);
         defer distinct.deinit();
         var i: usize = 0;

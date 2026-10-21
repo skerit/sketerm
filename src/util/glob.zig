@@ -192,9 +192,9 @@ test "glob: a literal star in the text is matchable" {
 test "glob: adversarial star runs stay linear" {
     // The recursive matcher this replaced was exponential here and
     // would not have returned.
-    try t.expect(!matchPath("/a*a*a*a*a*a*a*a*b", "/" ++ "a" ** 64));
-    try t.expect(matchPath("/a*a*a*a*a*a*a*a*b", "/" ++ "a" ** 64 ++ "b"));
-    try t.expect(!matchName("*a*a*a*a*a*a*a*a*b", "a" ** 64));
+    try t.expect(!matchPath("/a*a*a*a*a*a*a*a*b", "/" ++ &@as([64:0]u8, @splat('a'))));
+    try t.expect(matchPath("/a*a*a*a*a*a*a*a*b", "/" ++ &@as([64:0]u8, @splat('a')) ++ "b"));
+    try t.expect(!matchName("*a*a*a*a*a*a*a*a*b", &@as([64:0]u8, @splat('a'))));
 }
 
 /// The exponential reference the shared matcher must agree with: the

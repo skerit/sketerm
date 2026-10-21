@@ -282,7 +282,7 @@ test "publish rejects malformed extension ids" {
     clear();
     defer clear();
     try t.expect(!publish("bbbbbbbbbbbbbbbb", "../bad", "/one", &.{}, "en", "0123456789abcdef0123456789abcdef"));
-    try t.expect(!publish("bbbbbbbbbbbbbbbb", "x" ** (manifest.MAX_ID_LEN + 1), "/one", &.{}, "en", "0123456789abcdef0123456789abcdef"));
+    try t.expect(!publish("bbbbbbbbbbbbbbbb", &@as([(manifest.MAX_ID_LEN + 1):0]u8, @splat('x')), "/one", &.{}, "en", "0123456789abcdef0123456789abcdef"));
     try t.expect(!publish("bbbbbbbbbbbbbbbb", "x", "/one", &.{}, "en", "short"));
 }
 

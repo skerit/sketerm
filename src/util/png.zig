@@ -237,7 +237,7 @@ test "png round-trips through stb_image decode" {
     // 3x2 test card: distinct corner colors catch channel swaps.
     const w = 3;
     const h = 2;
-    var rgba = [_]u8{0} ** (w * h * 4);
+    var rgba = @as([(w * h * 4)]u8, @splat(0));
     const put = struct {
         fn px(buf: []u8, x: usize, y: usize, r: u8, g: u8, b: u8, a: u8) void {
             const o = (y * w + x) * 4;
@@ -286,7 +286,7 @@ test "decodeRgba round-trips encodeRgba output" {
 test "downscaleRgba box-averages the full source footprint" {
     const allocator = std.testing.allocator;
     // 4x2 -> 2x1: each output pixel averages a 2x2 block.
-    var src = [_]u8{0} ** (4 * 2 * 4);
+    var src = @as([(4 * 2 * 4)]u8, @splat(0));
     // Left 2x2 block: two black + two white pixels -> mid gray.
     src[0 * 4] = 255;
     src[0 * 4 + 1] = 255;
@@ -311,7 +311,7 @@ test "shmToRgba swizzles BGRA and forces xrgb opaque" {
         0, 0, 255, 255, // B G R A -> red
         0, 128, 0, 128, // premultiplied half green
         0xAA, 0xBB, 0xCC, 0xDD, // stride padding, must be ignored
-    } ++ [_]u8{0} ** 0;
+    } ++ @as([0]u8, @splat(0));
 
     const argb = try shmToRgba(allocator, &src, 2, 1, 12, @intFromEnum(ShmFormat.argb8888));
     defer allocator.free(argb);
@@ -383,7 +383,7 @@ test "jpeg round-trips through stb_image decode with its colour kept" {
 
 test "geometry that disagrees with the buffer is refused, not read past" {
     const allocator = std.testing.allocator;
-    var px = [_]u8{0} ** 16; // 2x2 tight RGBA
+    var px = @as([16]u8, @splat(0)); // 2x2 tight RGBA
 
     // Buffer one pixel short of the declared 2x2.
     try std.testing.expectError(Error.BadGeometry, encodeRgba(allocator, px[0..12], 2, 2));

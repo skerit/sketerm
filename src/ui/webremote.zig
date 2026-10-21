@@ -570,7 +570,7 @@ fn testStartAndStop(test_bridge: *TestBridge) !void {
 
 fn testFillSocket(fd: c_int) !void {
     const t = std.testing;
-    const bytes = [_]u8{0xa5} ** (16 * 1024);
+    const bytes = @as([(16 * 1024)]u8, @splat(0xa5));
     var total: usize = 0;
     while (true) {
         const n = if (comptime @hasDecl(c, "MSG_NOSIGNAL"))
@@ -650,7 +650,7 @@ test "remote bridge stop interrupts mux-send backpressure" {
     const bridge = test_bridge.bridge.?;
     const tiny: c_int = 1024;
     try t.expectEqual(@as(c_int, 0), c.setsockopt(bridge.conn.fd, c.SOL_SOCKET, c.SO_SNDBUF, &tiny, @sizeOf(c_int)));
-    const payload = [_]u8{0x5a} ** (32 * 1024);
+    const payload = @as([(32 * 1024)]u8, @splat(0x5a));
     var attempts: usize = 0;
     while (bridge.conn.wbuf.items.len == 0 and attempts < 128) : (attempts += 1)
         try bridge.conn.queueFrame(.chan_data, &payload);

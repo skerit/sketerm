@@ -3,6 +3,7 @@
 //! daemon. Referenced only from tests.
 
 const std = @import("std");
+const repeat = @import("../util/repeat.zig").repeat;
 const c = @import("../c.zig").c;
 const mcp = @import("mcp.zig");
 const termdrive = @import("termdrive.zig");
@@ -273,7 +274,7 @@ pub const FakeApp = struct {
             try self.draw(try std.fmt.bufPrint(&buf, erase ++ "you: {s}\r\nctrl+enter to send now\r\n" ++ live, .{line}));
             _ = c.usleep(300_000);
             try self.draw("\x1b]133;C\x07\x1b]133;D\x07\x07" ++ APP_IDLE);
-            try self.draw(try std.fmt.bufPrint(&buf, "\x1b[2K\x1b[1A" ** 5 ++ "\x1b[2K\x1b[G" ++ "Churned for 2s \xc2\xb7 done\r\nyou: {s}\r\n" ++ live ++ "\x1b]133;A\x07" ++ APP_BUSY, .{line}));
+            try self.draw(try std.fmt.bufPrint(&buf, repeat("\x1b[2K\x1b[1A", 5) ++ "\x1b[2K\x1b[G" ++ "Churned for 2s \xc2\xb7 done\r\nyou: {s}\r\n" ++ live ++ "\x1b]133;A\x07" ++ APP_BUSY, .{line}));
             try self.draw(try std.fmt.bufPrint(&buf, erase ++ "claude: echo: {s}\r\n" ++ live, .{line}));
             return self.draw(APP_END);
         }

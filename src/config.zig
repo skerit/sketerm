@@ -5020,13 +5020,13 @@ test "config: entry names for the prefix-keyed families" {
     try std.testing.expectError(error.NameBadChar, checkEntryName("a.b"));
     try std.testing.expectError(error.NameBadChar, checkEntryName("[sec]"));
     try std.testing.expectError(error.NameBadChar, checkEntryName("a#b"));
-    try std.testing.expectError(error.NameTooLong, checkEntryName("x" ** 65));
+    try std.testing.expectError(error.NameTooLong, checkEntryName(&@as([65:0]u8, @splat('x'))));
 }
 
 test "config: hint alphabet validation matches the hint-mode rule" {
     try checkHintAlphabet("asdf");
     try std.testing.expectError(error.AlphabetTooShort, checkHintAlphabet("a"));
-    try std.testing.expectError(error.AlphabetTooLong, checkHintAlphabet("x" ** 65));
+    try std.testing.expectError(error.AlphabetTooLong, checkHintAlphabet(&@as([65:0]u8, @splat('x'))));
     try std.testing.expectError(error.AlphabetNotPrintable, checkHintAlphabet("a b"));
     try std.testing.expectError(error.AlphabetDuplicate, checkHintAlphabet("aba"));
     try std.testing.expectEqual(@as(?[]const u8, null), validHintAlphabet("a"));

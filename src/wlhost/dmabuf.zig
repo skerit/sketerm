@@ -142,7 +142,7 @@ pub const BufferInfo = struct {
 
 /// Accumulates the single-use state of a zwp_linux_buffer_params_v1 object.
 pub const Params = struct {
-    planes: [MAX_PLANES]?Plane = .{null} ** MAX_PLANES,
+    planes: [MAX_PLANES]?Plane = @splat(null),
     modifier: ?u64 = null,
     used: bool = false,
 

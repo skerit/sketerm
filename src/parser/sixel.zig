@@ -447,7 +447,7 @@ fn scanDimensions(body: []const u8) Dims {
 
 fn parseParams(body: []const u8, i: *usize) []u32 {
     const Storage = struct {
-        var slots: [16]u32 = .{0} ** 16;
+        var slots: [16]u32 = @splat(0);
     };
     var n: usize = 0;
     var cur: u32 = 0;

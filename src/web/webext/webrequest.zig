@@ -797,5 +797,5 @@ test "clear drops every listener and the summary with it" {
 test "published registry rejects malformed and overlong extension ids" {
     var reg = Registry{};
     try t.expect(!publish("../bad", &reg));
-    try t.expect(!publish("x" ** (MAX_ID + 1), &reg));
+    try t.expect(!publish(&@as([(MAX_ID + 1):0]u8, @splat('x')), &reg));
 }

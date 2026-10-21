@@ -241,7 +241,7 @@ test "pathZ round-trips and rejects oversize" {
     var buf: [4096]u8 = undefined;
     const z = try pathZ(&buf, "/tmp/x");
     try std.testing.expectEqualStrings("/tmp/x", std.mem.span(z));
-    const big = [_]u8{'a'} ** 4096;
+    const big = @as([4096]u8, @splat('a'));
     try std.testing.expectError(error.PathTooLong, pathZ(&buf, &big));
 }
 
@@ -343,7 +343,7 @@ test "unlinkPath drops a file and shrugs at a missing one" {
     try std.testing.expect(c.stat(file.ptr, &st) != 0);
     // Absent path, oversize path and a directory: all silent.
     unlinkPath(file);
-    unlinkPath(&([_]u8{'a'} ** 5000));
+    unlinkPath(&(@as([5000]u8, @splat('a'))));
     unlinkPath(td.path());
     try std.testing.expect(c.stat(td.pathZ(), &st) == 0);
 }

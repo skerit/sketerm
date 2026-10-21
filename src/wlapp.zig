@@ -2706,7 +2706,7 @@ test "forwarded Wayland window releases an unfinished recording on teardown" {
         .rec = .{ .gif = @import("util/gifrec.zig").Rec.init(a, 0) },
     };
     defer win.releaseOwned();
-    const pixels = [_]u8{255} ** (4 * 4 * 4);
+    const pixels = @as([(4 * 4 * 4)]u8, @splat(255));
     try win.rec.gif.?.addShmFrame(&pixels, 4, 4, 0, 100);
     try std.testing.expect(win.rec.gif.?.pend != null);
     win.releaseOwned();

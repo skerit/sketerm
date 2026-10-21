@@ -642,7 +642,7 @@ test "validName accepts what the helper's sanitizer leaves untouched" {
     // Reserved: these NAME the absence of a profile in the tool vocabulary.
     try t.expect(!validName("default"));
     try t.expect(!validName("none"));
-    const too_long = [_]u8{'a'} ** (MAX_NAME + 1);
+    const too_long = @as([(MAX_NAME + 1)]u8, @splat('a'));
     try t.expect(!validName(&too_long));
     try t.expect(validName(too_long[0..MAX_NAME]));
 }

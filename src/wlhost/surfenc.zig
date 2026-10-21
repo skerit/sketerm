@@ -478,9 +478,9 @@ test "Lossless.encodeRect packs a sub-rect tight and round-trips" {
 
 test "blitRect places a rect and clips out-of-bounds" {
     // 4x3 BGRA backing, zeroed.
-    var dst = [_]u8{0} ** (4 * 3 * 4);
+    var dst = @as([(4 * 3 * 4)]u8, @splat(0));
     // 2x2 src of 0xAB bytes.
-    const src = [_]u8{0xAB} ** (2 * 2 * 4);
+    const src = @as([(2 * 2 * 4)]u8, @splat(0xAB));
 
     blitRect(&dst, 4, 3, &src, 1, 1, 2, 2);
     // (1,1) and (2,1) on row 1, (1,2)/(2,2) on row 2 are set; corners 0.

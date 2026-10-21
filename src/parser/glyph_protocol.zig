@@ -1647,7 +1647,7 @@ test "glyf: rejects hinting" {
     var tmp: [2]u8 = undefined;
     std.mem.writeInt(i16, &tmp, 1, .big);
     try out.appendSlice(a, &tmp); // numberOfContours
-    try out.appendSlice(a, &(.{0} ** 8)); // bbox
+    try out.appendSlice(a, &@as([8]u8, @splat(0))); // bbox
     std.mem.writeInt(u16, &tmp, 0, .big);
     try out.appendSlice(a, &tmp); // endPtsOfContours[0] = 0
     std.mem.writeInt(u16, &tmp, 1, .big);
@@ -1681,7 +1681,7 @@ test "glyf: handles repeat flag" {
     var tmp: [2]u8 = undefined;
     std.mem.writeInt(i16, &tmp, 1, .big);
     try out.appendSlice(a, &tmp);
-    try out.appendSlice(a, &(.{0} ** 8));
+    try out.appendSlice(a, &@as([8]u8, @splat(0)));
     std.mem.writeInt(u16, &tmp, 3, .big);
     try out.appendSlice(a, &tmp); // endPts
     std.mem.writeInt(u16, &tmp, 0, .big);
@@ -1710,7 +1710,7 @@ test "glyf: short/same coordinate encodings" {
     var tmp: [2]u8 = undefined;
     std.mem.writeInt(i16, &tmp, 1, .big);
     try out.appendSlice(a, &tmp);
-    try out.appendSlice(a, &(.{0} ** 8));
+    try out.appendSlice(a, &@as([8]u8, @splat(0)));
     std.mem.writeInt(u16, &tmp, 2, .big);
     try out.appendSlice(a, &tmp);
     std.mem.writeInt(u16, &tmp, 0, .big);
@@ -1746,7 +1746,7 @@ test "glyf: implied-midpoint contours keep off-curve flags" {
     var tmp: [2]u8 = undefined;
     std.mem.writeInt(i16, &tmp, 1, .big);
     try out.appendSlice(a, &tmp);
-    try out.appendSlice(a, &(.{0} ** 8));
+    try out.appendSlice(a, &@as([8]u8, @splat(0)));
     std.mem.writeInt(u16, &tmp, 3, .big);
     try out.appendSlice(a, &tmp);
     std.mem.writeInt(u16, &tmp, 0, .big);
@@ -1779,7 +1779,7 @@ test "glyf: non-increasing contour ends and repeat overflow are malformed" {
         var tmp: [2]u8 = undefined;
         std.mem.writeInt(i16, &tmp, 2, .big);
         try out.appendSlice(a, &tmp);
-        try out.appendSlice(a, &(.{0} ** 8));
+        try out.appendSlice(a, &@as([8]u8, @splat(0)));
         std.mem.writeInt(u16, &tmp, 3, .big);
         try out.appendSlice(a, &tmp);
         std.mem.writeInt(u16, &tmp, 3, .big); // equal — not increasing
@@ -1794,7 +1794,7 @@ test "glyf: non-increasing contour ends and repeat overflow are malformed" {
         var tmp: [2]u8 = undefined;
         std.mem.writeInt(i16, &tmp, 1, .big);
         try out.appendSlice(a, &tmp);
-        try out.appendSlice(a, &(.{0} ** 8));
+        try out.appendSlice(a, &@as([8]u8, @splat(0)));
         std.mem.writeInt(u16, &tmp, 1, .big); // 2 points
         try out.appendSlice(a, &tmp);
         std.mem.writeInt(u16, &tmp, 0, .big);
@@ -2015,7 +2015,7 @@ test "colrv0: carried composite / hinted glyph rejected through the glyf decoder
         var tmp: [2]u8 = undefined;
         std.mem.writeInt(i16, &tmp, 1, .big);
         try hinted.appendSlice(a, &tmp);
-        try hinted.appendSlice(a, &(.{0} ** 8));
+        try hinted.appendSlice(a, &@as([8]u8, @splat(0)));
         std.mem.writeInt(u16, &tmp, 0, .big);
         try hinted.appendSlice(a, &tmp); // endPts
         std.mem.writeInt(u16, &tmp, 1, .big);

@@ -158,7 +158,7 @@ test "asset names are validated" {
     try std.testing.expect(!validName(".hidden"));
     try std.testing.expect(!validName("a/b"));
     try std.testing.expect(!validName("a b"));
-    try std.testing.expect(!validName("x" ** 65));
+    try std.testing.expect(!validName(&@as([65:0]u8, @splat('x'))));
 }
 
 test "save/load/list/delete round-trip in an isolated state dir" {

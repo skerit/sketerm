@@ -508,7 +508,7 @@ test "Tor route forces the internal proxy and disables direct multiplexing" {
     const t = std.testing;
     const plan = try Plan.init("work-alias", .tor, socks5_client.DEFAULT_ENDPOINT);
     var args = try plan.args(.{ .multiplex = true });
-    var argv: [48:null]?[*:0]const u8 = .{null} ** 48;
+    var argv: [48:null]?[*:0]const u8 = @splat(null);
     var count: usize = 0;
     try args.append(&argv, &count);
     var joined: std.ArrayList(u8) = .empty;
@@ -549,7 +549,7 @@ test "the slice form carries the same options as the argv form; scp drops the ss
     const plan = try Plan.init("work-alias", .tor, socks5_client.DEFAULT_ENDPOINT);
     var args = try plan.args(.{});
 
-    var argv: [48:null]?[*:0]const u8 = .{null} ** 48;
+    var argv: [48:null]?[*:0]const u8 = @splat(null);
     var count: usize = 0;
     try args.append(&argv, &count);
 

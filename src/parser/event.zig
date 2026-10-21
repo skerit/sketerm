@@ -60,7 +60,7 @@ pub const Event = union(enum) {
     /// 65 bytes. Bumping to 128 was tried and showed no measurable
     /// throughput win while doubling Event size, so 64 stays.
     pub const PrintRun = struct {
-        bytes: [64]u8 = .{0} ** 64,
+        bytes: [64]u8 = @splat(0),
         len: u8 = 0,
     };
 
@@ -70,7 +70,7 @@ pub const Event = union(enum) {
         /// DECSET mode numbers ≤ 9999, truecolor RGB 0-255) all fit in
         /// u16 with margin. Saves 32 bytes vs the original [16]u32 —
         /// Csi 76 → 44 B, Event union 80 → 68 B.
-        params: [16]u16 = .{0} ** 16,
+        params: [16]u16 = @splat(0),
         /// Bit i = 1 iff `params[i]` was reached via a `:` (sub-parameter
         /// of `params[i-1]`) rather than `;`. Used by the SGR handler
         /// to distinguish `4:3` (curly-underline sub-param) from `4;3`
@@ -78,7 +78,7 @@ pub const Event = union(enum) {
         /// older `[16]bool` to shrink the event union (was 16 B, now 2).
         is_sub_bits: u16 = 0,
         n_params: u8 = 0,
-        intermediates: [4]u8 = .{0} ** 4,
+        intermediates: [4]u8 = @splat(0),
         n_intermediates: u8 = 0,
         /// Private parameter prefix: '?', '>', '=', '<', or 0.
         private: u8 = 0,
@@ -111,7 +111,7 @@ pub const Event = union(enum) {
     };
 
     pub const EscFinal = struct {
-        intermediates: [4]u8 = .{0} ** 4,
+        intermediates: [4]u8 = @splat(0),
         n_intermediates: u8 = 0,
         final: u8 = 0,
     };
@@ -126,9 +126,9 @@ pub const Event = union(enum) {
         /// sixel reads its own body. Shrinking from [16]u32 → [4]u16
         /// dropped DcsFull from 88 → 32 B and the whole Event union
         /// from 96 → 76 B (Csi is now the limiter).
-        params: [4]u16 = .{0} ** 4,
+        params: [4]u16 = @splat(0),
         n_params: u8 = 0,
-        intermediates: [4]u8 = .{0} ** 4,
+        intermediates: [4]u8 = @splat(0),
         n_intermediates: u8 = 0,
         final: u8 = 0,
     };

@@ -1732,7 +1732,7 @@ test "optionsHash tracks option-list identity" {
 }
 
 test "text input byte limiting preserves UTF-8 boundaries" {
-    try std.testing.expectEqual(@as(usize, 4096), utf8Prefix("x" ** 5000, 4096));
+    try std.testing.expectEqual(@as(usize, 4096), utf8Prefix(&@as([5000:0]u8, @splat('x')), 4096));
     try std.testing.expectEqual(@as(usize, 1), utf8Prefix("A\xe2\x82\xacB", 3));
     try std.testing.expectEqual(@as(usize, 4), utf8Prefix("A\xe2\x82\xacB", 4));
 }

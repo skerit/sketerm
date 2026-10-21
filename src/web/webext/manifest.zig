@@ -420,7 +420,7 @@ test "idValid rejects malformed and overlong ids" {
     try t.expect(!idValid("../escape"));
     try t.expect(!idValid("bad\\path"));
     try t.expect(!idValid("bad\x00id"));
-    try t.expect(!idValid("x" ** (MAX_ID_LEN + 1)));
+    try t.expect(!idValid(&@as([(MAX_ID_LEN + 1):0]u8, @splat('x'))));
 }
 
 test "deriveId is stable, hex and version-independent" {

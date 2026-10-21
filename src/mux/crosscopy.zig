@@ -2339,7 +2339,7 @@ test "digest cache rejects in-place changes with restored mtime" {
         .size = 3,
         .mtime_ns = 4,
         .ctime_ns = 5,
-        .digest = [_]u8{0} ** 64,
+        .digest = @as([64]u8, @splat(0)),
     };
     var entry = fsdrive.Entry{
         .name = "file",
@@ -2366,7 +2366,7 @@ test "digest cache survives our own rename but drops foreign changes" {
         .size = 3,
         .mtime_ns = 4,
         .ctime_ns = 5,
-        .digest = [_]u8{0} ** 64,
+        .digest = @as([64]u8, @splat(0)),
     });
     // Our rename moved only ctime: the digest is restamped, not lost.
     CrossCopy.hashRestampRenamed(&list, .dst, .{

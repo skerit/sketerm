@@ -350,7 +350,7 @@ pub const GridPass = struct {
     vbo_uploaded: bool = false,
     last_snapshot: Snapshot = .{},
     last_atlas_generations: [atlas_mod.PAGE_COUNT]u32 =
-        [_]u32{0} ** atlas_mod.PAGE_COUNT,
+        @as([atlas_mod.PAGE_COUNT]u32, @splat(0)),
 
     /// Per-row caches keyed off the cell pass's `rebuilt_rows` mask.
     /// Each row owns its own `Match` slice (URL hits) and a single
@@ -400,7 +400,7 @@ pub const GridPass = struct {
         self.u_blend_mode = -1;
         self.vbuf_valid = false;
         self.vbo_uploaded = false;
-        self.last_atlas_generations = [_]u32{0} ** atlas_mod.PAGE_COUNT;
+        self.last_atlas_generations = @as([atlas_mod.PAGE_COUNT]u32, @splat(0));
         // Per-row caches don't depend on GL state, but they do hold
         // glyph-position / bidi info that's tied to the atlas. Drop
         // them so a re-realize against a fresh atlas rescans cleanly.

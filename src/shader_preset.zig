@@ -242,7 +242,7 @@ test "validName rejects path escapes" {
     try std.testing.expect(!validName(""));
     try std.testing.expect(!validName(".hidden"));
     try std.testing.expect(!validName("a/b"));
-    try std.testing.expect(!validName("x" ** 65));
+    try std.testing.expect(!validName(&@as([65:0]u8, @splat('x'))));
 }
 
 test "shader preset save is private and preserves the prior file before install" {

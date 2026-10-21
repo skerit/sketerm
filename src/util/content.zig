@@ -40,7 +40,7 @@ pub fn distinctColors(pixels: []const u8, opts: Options) u32 {
     const shift: u3 = @intCast(8 - @as(u8, opts.quant_bits));
 
     // 3 channels × quant_bits ≤ 12 bits → ≤ 4096 buckets → 512-byte set.
-    var seen = [_]u8{0} ** 512;
+    var seen = @as([512]u8, @splat(0));
     var count: u32 = 0;
     var i: usize = 0;
     while (i < npix) : (i += step) {

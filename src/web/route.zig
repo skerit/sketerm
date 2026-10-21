@@ -667,7 +667,7 @@ test "slugs are stable, distinct, and short enough for a unix socket path" {
     try t.expect(!std.mem.eql(u8, mux.slug(&a).?, (Spec{ .kind = .remote_browser, .host = "box" }).slug(&b).?));
 
     // Long inputs must not grow the slug: it lives inside a sun_path.
-    const long = Spec{ .kind = .mux, .host = "a" ** 200 };
+    const long = Spec{ .kind = .mux, .host = &@as([200:0]u8, @splat('a')) };
     try t.expect(long.slug(&a).?.len <= 24);
 }
 

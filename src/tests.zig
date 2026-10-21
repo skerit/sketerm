@@ -63,6 +63,7 @@ comptime {
     _ = @import("util/platform.zig");
     _ = @import("util/lifetime.zig");
     _ = @import("util/clock.zig");
+    _ = @import("util/repeat.zig");
     _ = @import("util/backoff.zig");
     _ = @import("util/env.zig");
     _ = @import("util/strz.zig");

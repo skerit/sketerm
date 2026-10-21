@@ -2080,7 +2080,7 @@ test "Busy.of keeps the command's first line, flattened and cut on a character b
     try std.testing.expectEqualStrings("docker logs -f web", b.preview());
     const tab = Busy.of("a\tb");
     try std.testing.expectEqualStrings("a b", tab.preview());
-    const long = Busy.of("x" ** 116 ++ "\u{00e9}\u{00e9}\u{00e9}");
+    const long = Busy.of(&@as([116:0]u8, @splat('x')) ++ "\u{00e9}\u{00e9}\u{00e9}");
     try std.testing.expect(std.mem.endsWith(u8, long.preview(), "..."));
     try std.testing.expect(long.preview().len <= Busy.PREVIEW_MAX);
     try std.testing.expect(std.unicode.utf8ValidateSlice(long.preview()));

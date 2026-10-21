@@ -119,7 +119,7 @@ pub fn handleUdpTicketReq(self: *Daemon, cl: *Client, payload: []const u8) void 
             }
             _ = c.close(pipe_fds[0]);
             _ = c.close(pipe_fds[1]);
-            var argv: [8:null]?[*:0]const u8 = .{null} ** 8;
+            var argv: [8:null]?[*:0]const u8 = @splat(null);
             var n: usize = 0;
             argv[n] = selfexec.BINARY;
             argv[n + 1] = selfexec.Mode.udp_listen.flag().?.ptr;

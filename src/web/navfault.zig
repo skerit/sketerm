@@ -8,6 +8,7 @@
 //! Std-only; in both test roots.
 
 const std = @import("std");
+const repeat = @import("../util/repeat.zig").repeat;
 const proto = @import("protocol.zig");
 const urlhost = @import("urlhost.zig");
 
@@ -188,10 +189,10 @@ pub fn validFingerprint(s: []const u8) bool {
 }
 
 test "validFingerprint accepts 64 hex digits of any case and nothing else" {
-    try std.testing.expect(validFingerprint("ab" ** 32));
-    try std.testing.expect(validFingerprint("AB" ** 32));
-    try std.testing.expect(!validFingerprint("ab" ** 31));
-    try std.testing.expect(!validFingerprint("zz" ** 32));
+    try std.testing.expect(validFingerprint(repeat("ab", 32)));
+    try std.testing.expect(validFingerprint(repeat("AB", 32)));
+    try std.testing.expect(!validFingerprint(repeat("ab", 31)));
+    try std.testing.expect(!validFingerprint(repeat("zz", 32)));
     try std.testing.expect(!validFingerprint(""));
 }
 
@@ -205,7 +206,7 @@ test "loadStarted drops failures and non-accepted verdicts, keeps an accepted on
         .msg = "CERT_AUTHORITY_INVALID",
         .subject = "CN=x",
         .issuer = "CN=x",
-        .fingerprint = "ab" ** 32,
+        .fingerprint = repeat("ab", 32),
     };
     var cert: ?CertRec = try CertRec.init(gpa, ev, .refused);
     var load_error: ?LoadErrRec = try LoadErrRec.init(gpa, .{ .view = 1, .code = -202, .url = "https://10.0.0.1/", .msg = "ERR" });

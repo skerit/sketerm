@@ -1167,7 +1167,7 @@ test "stream: a flood of input is served a bounded share per turn" {
     // Text is budgeted exactly: four 4096-byte frames fill a turn's 16KiB
     // and a fifth waits, it is not let through 4095 bytes over.
     fake.texts.clearRetainingCapacity();
-    const big = [_]u8{'x'} ** st.MAX_TEXT;
+    const big = @as([st.MAX_TEXT]u8, @splat('x'));
     for (0..5) |_| try sendFrame(fd, .text, &big);
     s.service(fake.source(), 5);
     try t.expectEqual(@as(usize, TEXT_BYTES_PER_TURN), fake.texts.items.len);
@@ -1227,7 +1227,7 @@ test "stream: input before auth and hostile frames end the stream" {
     const fd3 = try connectTo(s3.path());
     defer _ = c.close(fd3);
     try sendFrame(fd3, .auth, &s3.token);
-    try sendFrame(fd3, .surface, &([_]u8{0} ** 17));
+    try sendFrame(fd3, .surface, &(@as([17]u8, @splat(0))));
     s3.service(fake.source(), 1);
     try t.expectEqualStrings("unknown stream frame", s3.closed.?);
 }

@@ -126,8 +126,8 @@ fn writeRedRgba(path: []const u8) !void {
     const p = try @import("util/pathz.zig").pathZ(&z_buf, path);
     const fp = c.fopen(p, "wb") orelse return error.OpenFailed;
     defer _ = c.fclose(fp);
-    const px = [_]u8{ 0xff, 0, 0, 0xff } ** 4;
-    if (c.fwrite(&px, 1, px.len, fp) != px.len) return error.WriteFailed;
+    const px = std.mem.asBytes(&@as([4][4]u8, @splat(.{ 0xff, 0, 0, 0xff })));
+    if (c.fwrite(px, 1, px.len, fp) != px.len) return error.WriteFailed;
 }
 
 const Mirror = muxrig.Mirror;
@@ -1107,7 +1107,7 @@ fn dmabufStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_path: 
 
     // A damage-only commit after release must not reread producer storage.
     // Poison the source and require the relayed commit to carry no pixels.
-    const early_poison = [_]u8{0xdd} ** source.len;
+    const early_poison = @as([source.len]u8, @splat(0xdd));
     if (c.lseek(pool_fd, 0, c.SEEK_SET) != 0 or
         c.write(pool_fd, &early_poison, early_poison.len) != early_poison.len)
         fail("dmabuf no-attach poison");
@@ -1194,7 +1194,7 @@ fn dmabufStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_path: 
     if (c.write(app_fd, stream.items.ptr, stream.items.len) != @as(isize, @intCast(stream.items.len)))
         fail("dmabuf headless commit");
     awaitWaylandEvent(allocator, app_fd, 6, 0);
-    const poison = [_]u8{0xee} ** replay_source.len;
+    const poison = @as([replay_source.len]u8, @splat(0xee));
     if (c.lseek(pool_fd, 0, c.SEEK_SET) != 0 or
         c.write(pool_fd, &poison, poison.len) != poison.len)
         fail("dmabuf post-release overwrite");

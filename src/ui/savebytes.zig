@@ -65,5 +65,5 @@ test "capture save replaces bytes and reports unavailable or invalid destination
     const absent = try std.fmt.bufPrint(&buf, "{s}/missing/capture.png", .{td.path()});
     try t.expectError(error.SaveFailed, replace(absent, bytes, c.G_FILE_CREATE_NONE, &gerr));
     try t.expect(gerr != null);
-    try t.expectError(error.PathTooLong, replace(&([_]u8{'x'} ** 4096), bytes, c.G_FILE_CREATE_NONE, &gerr));
+    try t.expectError(error.PathTooLong, replace(&(@as([4096]u8, @splat('x'))), bytes, c.G_FILE_CREATE_NONE, &gerr));
 }

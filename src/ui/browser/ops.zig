@@ -3423,7 +3423,7 @@ test "paste complete admission retains external GNOME cut unless every item is a
 
 test "paste complete admission counts self-copy refusal and overlong destination construction" {
     const t = std.testing;
-    const long_base = [_]u8{'x'} ** 4090;
+    const long_base = @as([4090]u8, @splat('x'));
     const long_source = try std.fmt.allocPrint(t.allocator, "/{s}", .{&long_base});
     defer t.allocator.free(long_source);
     for ([_]bool{ true, false }) |self_copy| {

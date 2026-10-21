@@ -113,7 +113,7 @@ pub const Rec = struct {
 test "records shm frames into a valid GIF" {
     const a = std.testing.allocator;
     var rec = Rec.init(a, 0);
-    var frame = [_]u8{0} ** (8 * 6 * 4);
+    var frame = @as([(8 * 6 * 4)]u8, @splat(0));
     // Two distinct frames (solid red, then solid green in BGRA).
     for (0..48) |i| {
         frame[i * 4 + 2] = 255; // R (BGRA layout)
@@ -135,7 +135,7 @@ test "records shm frames into a valid GIF" {
 test "downscales and skips resized frames" {
     const a = std.testing.allocator;
     var rec = Rec.init(a, 4);
-    var big = [_]u8{128} ** (16 * 8 * 4);
+    var big = @as([(16 * 8 * 4)]u8, @splat(128));
     try rec.addShmFrame(&big, 16, 8, 1, 0);
     try std.testing.expectEqual(@as(u32, 4), rec.w);
     try std.testing.expectEqual(@as(u32, 2), rec.h);

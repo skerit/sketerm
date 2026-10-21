@@ -252,9 +252,9 @@ test "refused addresses name what is wrong" {
     try t.expectError(error.BadChar, Address.parse("caf\xc3\xa9"));
     try t.expectError(error.LeadingDot, Address.parse(".."));
     try t.expectError(error.LeadingDot, Address.parse(".hidden"));
-    try t.expectError(error.TooLong, Address.parse("a" ** (NAME_MAX + 1)));
-    _ = try Address.parse("a" ** NAME_MAX);
-    try t.expectError(error.TooLong, validName("x" ** 65));
+    try t.expectError(error.TooLong, Address.parse(&@as([(NAME_MAX + 1):0]u8, @splat('a'))));
+    _ = try Address.parse(&@as([NAME_MAX:0]u8, @splat('a')));
+    try t.expectError(error.TooLong, validName(&@as([65:0]u8, @splat('x'))));
 }
 
 test "the hub qualifies what arrives and localizes what leaves" {
@@ -303,12 +303,12 @@ test "slugs: lowercase alphanumerics, one dash per run, trimmed, cut, never rese
     try t.expect(slugify(&b, "Anon-x") == null);
     try t.expect(slugify(&b, "n-1") == null);
     // Cut to SLUG_MAX, never ending in a dash.
-    const long = slugify(&b, "a" ** 47 ++ " bcd").?;
+    const long = slugify(&b, &@as([47:0]u8, @splat('a')) ++ " bcd").?;
     try t.expectEqual(@as(usize, 47), long.len);
-    try t.expectEqual(@as(usize, SLUG_MAX), slugify(&b, "x" ** 80).?.len);
+    try t.expectEqual(@as(usize, SLUG_MAX), slugify(&b, &@as([80:0]u8, @splat('x'))).?.len);
     // Every slug is a valid alias and a valid name.
     try t.expect(validAlias("template-links"));
-    try validName(slugify(&b, "x" ** 80).?);
+    try validName(slugify(&b, &@as([80:0]u8, @splat('x'))).?);
     try t.expect(!validAlias("Zenit") and !validAlias("a--b") and !validAlias("-a") and !validAlias("p-1") and !validAlias(""));
 }
 
@@ -317,8 +317,8 @@ test "alias candidates suffix from the base; the base strips a suffix again" {
     try t.expectEqualStrings("zenit", aliasCandidate(&b, "zenit", 0));
     try t.expectEqualStrings("zenit-1", aliasCandidate(&b, "zenit", 1));
     try t.expectEqualStrings("zenit-12", aliasCandidate(&b, "zenit", 12));
-    try t.expect(validAlias(aliasCandidate(&b, "x" ** SLUG_MAX, ALIAS_SUFFIX_MAX)));
-    try validName(aliasCandidate(&b, "x" ** SLUG_MAX, ALIAS_SUFFIX_MAX));
+    try t.expect(validAlias(aliasCandidate(&b, &@as([SLUG_MAX:0]u8, @splat('x')), ALIAS_SUFFIX_MAX)));
+    try validName(aliasCandidate(&b, &@as([SLUG_MAX:0]u8, @splat('x')), ALIAS_SUFFIX_MAX));
     try t.expectEqualStrings("zenit", aliasBase("zenit-1"));
     try t.expectEqualStrings("zenit", aliasBase("zenit-999"));
     try t.expectEqualStrings("build-2024", aliasBase("build-2024"));

@@ -13,6 +13,7 @@
 //! headers lie about sizes when a data descriptor follows).
 
 const std = @import("std");
+const repeat = @import("../../util/repeat.zig").repeat;
 
 pub const Error = error{
     NotZip,
@@ -472,7 +473,7 @@ fn testLocalOffset(zip: []const u8, central: usize) usize {
 
 test "reads store and deflate entries" {
     const gpa = t.allocator;
-    const long = "manifest content " ** 40; // compressible payload
+    const long = repeat("manifest content ", 40); // compressible payload
     const zip = try buildZip(gpa, &.{
         .{ .name = "manifest.json", .data = "{\"name\":\"x\"}", .deflate = false },
         .{ .name = "bg.js", .data = long, .deflate = true },

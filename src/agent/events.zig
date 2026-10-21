@@ -31,6 +31,7 @@
 //! can be a `message` for one consumer and a `match` for another.
 
 const std = @import("std");
+const repeat = @import("../util/repeat.zig").repeat;
 const vocab = @import("vocab.zig");
 const TokenBucket = @import("../util/tokenbucket.zig").TokenBucket;
 
@@ -633,7 +634,7 @@ test "a done fired at the background cap wakes only a consumer that opted in, an
 
 test "a preview is the first line, cut on a UTF-8 boundary at PREVIEW_MAX bytes" {
     try t.expectEqualStrings("first line", preview("  first line \nsecond"));
-    const long = "\xc3\xa9" ** 100;
+    const long = repeat("\xc3\xa9", 100);
     const p = preview(long);
     try t.expect(p.len <= PREVIEW_MAX);
     try t.expect(std.unicode.utf8ValidateSlice(p));

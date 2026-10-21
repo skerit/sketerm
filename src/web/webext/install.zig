@@ -697,7 +697,7 @@ test "archive write ENOSPC permission flush and close failures preserve old vers
 }
 
 test "archive install rejects overlong paths before touching a destination" {
-    const long = [_]u8{'x'} ** MAX_PATH;
+    const long = @as([MAX_PATH]u8, @splat('x'));
     var ops: PosixWriteOps = .{};
     var entries = [_]zip.Entry{
         .{ .name = "manifest.json", .data = @constCast(manifest_v2), .is_dir = false },

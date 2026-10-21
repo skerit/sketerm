@@ -21,6 +21,7 @@
 //! and the real-input stage is skipped (documented gap).
 
 const std = @import("std");
+const repeat = @import("util/repeat.zig").repeat;
 const bindir = @import("smoke/bindir.zig");
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
@@ -2425,7 +2426,7 @@ fn sidebarChipBounds(app: *appdrive.App, win_id: u32) ?ChipBounds {
         // border TOP line and merge into one run reaching the scan
         // limit — a max let those few rows inflate the chip edge by
         // ~90px and the divider stage then grabbed inside the pane.
-        var end_hist = [_]u16{0} ** 4096;
+        var end_hist = @as([4096]u16, @splat(0));
         var y: usize = 0;
         while (y < height) : (y += 1) {
             const row = y * width * 4;
@@ -6934,7 +6935,7 @@ fn expectOffload(allocator: std.mem.Allocator, app: *appdrive.App, mapped: u32, 
     const request = std.fmt.bufPrintZ(&req_buf, "{s}/offload-request", .{g_rt}) catch return "offload request path";
     const result = std.fmt.bufPrintZ(&result_buf, "{s}/offload-result", .{g_rt}) catch return "offload result path";
     _ = allocator;
-    var counts: [4]c_uint = .{0} ** 4;
+    var counts: [4]c_uint = @splat(0);
     const deadline = clock.nowMs() + 10_000;
     while (clock.nowMs() < deadline) {
         _ = c.unlink(result.ptr);
@@ -8259,7 +8260,7 @@ fn viewerCastStage(
     var txt_path_buf: [512:0]u8 = undefined;
     const txt_path = std.fmt.bufPrintZ(&txt_path_buf, "{s}/viewer-e2e-note.txt", .{rt}) catch return "text path too long";
     {
-        const body = "SKETERM VIEWER TEXTMODE QUILL\n" ** 12;
+        const body = repeat("SKETERM VIEWER TEXTMODE QUILL\n", 12);
         const f = c.fopen(txt_path.ptr, "wb") orelse return "could not write the text file";
         const ok = c.fwrite(body.ptr, 1, body.len, f) == body.len;
         _ = c.fclose(f);
@@ -10937,16 +10938,16 @@ fn quickLookStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const 
     _ = c.mkdir(dir.ptr, 0o700);
     var path_buf: [560:0]u8 = undefined;
     {
-        const first = std.fmt.bufPrintZ(&path_buf, "{s}/aaa-first.txt", .{dir}) catch return "quick look path too long";
-        const body = "SKETERM QUICKLOOK QLALPHA\n" ** 10;
+        const first = std.fmt.bufPrintSentinel(&path_buf, "{s}/aaa-first.txt", .{dir}, 0) catch return "quick look path too long";
+        const body = repeat("SKETERM QUICKLOOK QLALPHA\n", 10);
         const f = c.fopen(first.ptr, "wb") orelse return "could not write the first quick-look file";
         const ok = c.fwrite(body.ptr, 1, body.len, f) == body.len;
         _ = c.fclose(f);
         if (!ok) return "short write on the first quick-look file";
     }
     {
-        const second = std.fmt.bufPrintZ(&path_buf, "{s}/bbb-second.txt", .{dir}) catch return "quick look path too long";
-        const body = "SKETERM QUICKLOOK QLBRAVO\n" ** 10;
+        const second = std.fmt.bufPrintSentinel(&path_buf, "{s}/bbb-second.txt", .{dir}, 0) catch return "quick look path too long";
+        const body = repeat("SKETERM QUICKLOOK QLBRAVO\n", 10);
         const f = c.fopen(second.ptr, "wb") orelse return "could not write the second quick-look file";
         const ok = c.fwrite(body.ptr, 1, body.len, f) == body.len;
         _ = c.fclose(f);

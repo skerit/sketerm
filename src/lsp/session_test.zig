@@ -489,7 +489,7 @@ test "session: document notifications preserve queued messages on every allocati
                 try fx.s.out.appendSlice(testing.allocator, "previous frame");
                 fx.s.alloc = allocator;
                 defer fx.s.alloc = testing.allocator;
-                const text = [_]u8{'x'} ** 512;
+                const text = @as([512]u8, @splat('x'));
                 const sent = if (opening)
                     fx.s.didOpen("file:///a.zig", "zig", 1, &text)
                 else

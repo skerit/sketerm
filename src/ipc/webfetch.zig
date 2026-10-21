@@ -199,7 +199,7 @@ test "the instance cap holds across calls and free tabs rotate fairly" {
     for (0..10) |i| try big.addCall(t.allocator, i, 4);
     var many: [64]Queue.Admitted = undefined;
     try t.expectEqual(@as(usize, 8), drain(&big, &many));
-    var seen = [_]u8{0} ** 10;
+    var seen = @as([10]u8, @splat(0));
     for (many[0..8]) |a| seen[@intCast(a.call)] += 1;
     for (seen) |s| try t.expect(s <= 1);
 }

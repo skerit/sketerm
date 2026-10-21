@@ -143,8 +143,8 @@ test "offload age counts toplevel paints, not elapsed time or pane renders" {
 }
 
 test "staggered renewal does not starve siblings" {
-    var ages = [_]Age{.{}} ** 129;
-    var renewals = [_]usize{0} ** ages.len;
+    var ages = @as([129]Age, @splat(.{}));
+    var renewals = @as([ages.len]usize, @splat(0));
     for (0..1024) |value| {
         const frame: i64 = @intCast(value);
         var oldest: ?usize = null;

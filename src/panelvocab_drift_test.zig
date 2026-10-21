@@ -34,8 +34,8 @@ test "GUI and daemon share one text bound" {
 }
 
 test "GUI and daemon answer identically on every id shape" {
-    const max_id = "a" ** vocab.MAX_ID;
-    const too_long = "a" ** (vocab.MAX_ID + 1);
+    const max_id = &@as([vocab.MAX_ID:0]u8, @splat('a'));
+    const too_long = &@as([(vocab.MAX_ID + 1):0]u8, @splat('a'));
     const ids = [_][]const u8{
         "",       "a",     "_",       "9",      "ok.button-2",
         "A_b.c-D9", max_id, too_long,  "-lead",  ".lead",

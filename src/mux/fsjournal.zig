@@ -315,7 +315,7 @@ test "job journal save/load is atomic and complete" {
     try std.testing.expectError(error.WriteFailed, save(base, .{
         .id = 42,
         .op = "copy",
-        .message = "x" ** (17 * 1024),
+        .message = &@as([(17 * 1024):0]u8, @splat('x')),
     }));
     const parsed = try load(arena.allocator(), path);
     defer parsed.deinit();

@@ -229,7 +229,7 @@ pub const Screen = struct {
     /// xterm window-title stack (CSI 22/23 t). tmux + screen use it
     /// to swap titles when nested. Cap of 8 entries; older pushes
     /// drop. Each entry is an owned UTF-8 byte slice.
-    title_stack: [8]?[]u8 = [_]?[]u8{null} ** 8,
+    title_stack: [8]?[]u8 = @as([8]?[]u8, @splat(null)),
     title_stack_depth: u8 = 0,
     /// Most recently set title (via OSC 0/2). Owned. Used by the
     /// title-stack save/restore.
@@ -432,7 +432,7 @@ pub const Screen = struct {
     /// scroll, scrollback push, alt-screen swap, reflow). prompt_marks
     /// stores IDs (not display rows) so they survive scrolling.
     next_line_id: u64 = 1,
-    prompt_marks: [256]u64 = [_]u64{0} ** 256,
+    prompt_marks: [256]u64 = @as([256]u64, @splat(0)),
     prompt_marks_len: u16 = 0,
     prompt_marks_head: u16 = 0,
 
@@ -460,7 +460,7 @@ pub const Screen = struct {
     /// renderer can hash the raw bytes without padding UB. Zone rows
     /// have line IDs in [start_id, end_id) — IDs are birth-ordered,
     /// so display-row membership is an ID range check.
-    cmd_zones: [CMD_ZONE_CAP]CmdZone = [_]CmdZone{.{}} ** CMD_ZONE_CAP,
+    cmd_zones: [CMD_ZONE_CAP]CmdZone = @as([CMD_ZONE_CAP]CmdZone, @splat(.{})),
     cmd_zones_len: u16 = 0,
     cmd_zones_head: u16 = 0,
 
@@ -503,14 +503,14 @@ pub const Screen = struct {
     /// `CSI = N ; M u` sets/ors/clears without touching the stack.
     /// Stack depth 9.
     kitty_kbd_flags: u8 = 0,
-    kitty_kbd_stack: [9]u8 = [_]u8{0} ** 9,
+    kitty_kbd_stack: [9]u8 = @as([9]u8, @splat(0)),
     kitty_kbd_depth: u8 = 0,
     /// The same three values for the buffer that is NOT active: the
     /// protocol keeps separate stacks per screen, so a full-screen app
     /// cannot leak its flags to the shell it returns to. Swapped by
     /// `toggleAltScreen`.
     kitty_kbd_other_flags: u8 = 0,
-    kitty_kbd_other_stack: [9]u8 = [_]u8{0} ** 9,
+    kitty_kbd_other_stack: [9]u8 = @as([9]u8, @splat(0)),
     kitty_kbd_other_depth: u8 = 0,
 
     /// Custom tab stops. One bool per column, true = stop set.
@@ -8065,9 +8065,9 @@ test "XTGETTCAP: TN (Terminal Name) returns sketerm-256color" {
     var body1 = "544E".*;
     s.onDcs(.{
         .proto = .{
-            .params = [_]u16{0} ** 4,
+            .params = @as([4]u16, @splat(0)),
             .n_params = 0,
-            .intermediates = [_]u8{'+'} ++ [_]u8{0} ** 3,
+            .intermediates = [_]u8{'+'} ++ @as([3]u8, @splat(0)),
             .n_intermediates = 1,
             .final = 'q',
         },
@@ -8106,9 +8106,9 @@ test "XTGETTCAP: unknown cap replies with 0+r" {
     var body2 = "5A5A5A".*;
     s.onDcs(.{
         .proto = .{
-            .params = [_]u16{0} ** 4,
+            .params = @as([4]u16, @splat(0)),
             .n_params = 0,
-            .intermediates = [_]u8{'+'} ++ [_]u8{0} ** 3,
+            .intermediates = [_]u8{'+'} ++ @as([3]u8, @splat(0)),
             .n_intermediates = 1,
             .final = 'q',
         },
@@ -8136,9 +8136,9 @@ const ReplyCounter = struct {
 fn sendXtgettcap(s: *Screen, body: []u8) void {
     s.onDcs(.{
         .proto = .{
-            .params = [_]u16{0} ** 4,
+            .params = @as([4]u16, @splat(0)),
             .n_params = 0,
-            .intermediates = [_]u8{'+'} ++ [_]u8{0} ** 3,
+            .intermediates = [_]u8{'+'} ++ @as([3]u8, @splat(0)),
             .n_intermediates = 1,
             .final = 'q',
         },

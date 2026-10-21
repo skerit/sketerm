@@ -35,6 +35,7 @@
 //!   the page ORIGIN and says what the content is.
 
 const std = @import("std");
+const repeat = @import("../util/repeat.zig").repeat;
 const diagnostic = @import("../web/diagnostic.zig");
 const numtext = @import("../util/numtext.zig");
 const urlshort = @import("urlshort.zig");
@@ -4449,10 +4450,10 @@ fn validBrowserName(value: std.json.Value) bool {
 test "browser names reject nonstrings and Unicode line breaks without splitting UTF-8" {
     try std.testing.expect(!validBrowserName(.null));
     try std.testing.expect(!validBrowserName(.{ .integer = 42 }));
-    for ([_][]const u8{ "", "x" ** 161, "bad\xff", "a\nb", "a\r", "a\x00", "a\tb", "a\u{85}b", "a\u{2028}b", "a\u{2029}b" }) |s|
+    for ([_][]const u8{ "", &@as([161:0]u8, @splat('x')), "bad\xff", "a\nb", "a\r", "a\x00", "a\tb", "a\u{85}b", "a\u{2028}b", "a\u{2029}b" }) |s|
         try std.testing.expect(!validBrowserName(.{ .string = s }));
     try std.testing.expect(validBrowserName(.{ .string = "Login \"café\"" }));
-    try std.testing.expect(validBrowserName(.{ .string = "é" ** 80 }));
+    try std.testing.expect(validBrowserName(.{ .string = repeat("é", 80) }));
 }
 
 pub fn webTool(
@@ -8571,7 +8572,7 @@ test "a refused certificate is a fact and a sentence on every result, and web_op
         .msg = "CERT_AUTHORITY_INVALID",
         .subject = "CN=fritz.box",
         .issuer = "CN=fritz.box",
-        .fingerprint = "ab" ** 32,
+        .fingerprint = repeat("ab", 32),
     };
     v.load_error = .{ .code = -202, .url = "https://10.47.0.1/", .msg = "ERR_CERT_AUTHORITY_INVALID" };
     try t.expect(v.loadBlocked());
@@ -8582,7 +8583,7 @@ test "a refused certificate is a fact and a sentence on every result, and web_op
     try t.expect(!sc.get("settled").?.bool);
     const cert = sc.get("cert").?.object;
     try t.expectEqualStrings("refused", cert.get("state").?.string);
-    try t.expectEqualStrings("ab" ** 32, cert.get("fingerprint").?.string);
+    try t.expectEqualStrings(repeat("ab", 32), cert.get("fingerprint").?.string);
     try t.expectEqual(@as(i64, -202), sc.get("load_error").?.object.get("code").?.integer);
     const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
     try t.expect(std.mem.indexOf(u8, text, "certificate REFUSED on 10.47.0.1: CERT_AUTHORITY_INVALID") != null);
@@ -9313,7 +9314,7 @@ test "web_capture list: exchanges are facts, truncation and drops are said, urls
         .dropped = .{ 0, 5, 0, 0 },
         .entries = &.{CAP_ENTRY},
     };
-    const written = [_]?Written{.{ .path = "/tmp/x/41.json", .bytes = 1024, .sha256 = "ab" ** 32, .encoding = "utf8" }};
+    const written = [_]?Written{.{ .path = "/tmp/x/41.json", .bytes = 1024, .sha256 = repeat("ab", 32), .encoding = "utf8" }};
     const out = try captureListResult(arena, EXAMPLE, .{ .mime_prefixes = &.{"application/json"} }, list, 0, &written);
     const parsed = try mcp.expectToolResultShape(arena, "web_capture", out);
     const sc = parsed.object.get("structuredContent").?.object;
@@ -9392,7 +9393,7 @@ test "web_capture body: text inline with a flagged prefix, binary as whole base6
     try t.expectEqualStrings("iso-8859-1", sc.get("transcoded_from").?.string);
 
     // out_file: identity only, no body.
-    const f = try captureBodyResult(arena, EXAMPLE, 41, "response", body, text, .{ .path = "/tmp/b.json", .bytes = 15, .sha256 = "cd" ** 32, .encoding = "utf8" }, 1024);
+    const f = try captureBodyResult(arena, EXAMPLE, 41, "response", body, text, .{ .path = "/tmp/b.json", .bytes = 15, .sha256 = repeat("cd", 32), .encoding = "utf8" }, 1024);
     sc = (try mcp.expectToolResultShape(arena, "web_capture", f)).object.get("structuredContent").?.object;
     try t.expect(sc.get("body") == null);
     try t.expectEqualStrings("/tmp/b.json", sc.get("out_file").?.string);
@@ -9677,7 +9678,7 @@ test "web_screenshot: image block plus structured pixel facts" {
     const t = std.testing;
 
     // A PNG header is all screenshotResult reads; the rest is opaque.
-    var png = [_]u8{0} ** 32;
+    var png = @as([32]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
     @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 1280, .big);
@@ -11122,7 +11123,7 @@ test "text mode: what a web result's next call needs is in the text lane" {
         .dropped = .{ 0, 5, 0, 0 },
         .entries = &.{CAP_ENTRY},
     };
-    const written = [_]?Written{.{ .path = "/tmp/x/41.json", .bytes = 1024, .sha256 = "ab" ** 32, .encoding = "utf8" }};
+    const written = [_]?Written{.{ .path = "/tmp/x/41.json", .bytes = 1024, .sha256 = repeat("ab", 32), .encoding = "utf8" }};
     const cl = try resultText(arena, try captureListResult(arena, EXAMPLE, .{ .mime_prefixes = &.{"application/json"} }, list, 0, &written));
     try expectText(cl, "page on with since=3");
     try expectText(cl, "1 KiB TRUNCATED body_cap");
