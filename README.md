@@ -122,7 +122,7 @@ backend, so any portal-using app gets the native sketerm picker
 
 ## Build, install, run
 
-Zig **0.16** is required. The default optimize mode is `ReleaseFast`
+Zig **0.16** or **0.17** is required. The default optimize mode is `ReleaseFast`
 (`Debug` does not link on Arch + gcc 15). `zig build --help` lists every
 step with a description.
 

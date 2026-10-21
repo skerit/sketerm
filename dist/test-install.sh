@@ -112,8 +112,8 @@ INSTALL_TEST_ZIG_VERSION=0.15.2 run_installer "$work/arch-bad-zig.out" --no-inst
 status=$?
 set -e
 [ "$status" -eq 1 ] || fail "Arch path accepted Zig 0.15.2"
-[[ "$(<"$work/arch-bad-zig.out")" == *"requires Zig 0.16.x"* ]] \
-    || fail "Arch path gave no Zig 0.16.x guidance"
+[[ "$(<"$work/arch-bad-zig.out")" == *"requires Zig 0.16.x or 0.17.x"* ]] \
+    || fail "Arch path gave no Zig 0.16.x or 0.17.x guidance"
 
 for rejected in -i -cif --install --inst --insta --instal --needed --asdeps \
                 -D -D/tmp/installer-dir -cD/tmp/installer-dir -p -pfile \
@@ -631,7 +631,7 @@ BASH_ENV="$work/no-makepkg.bash" \
 [[ "$(<"$work/debian-auto-no-deps.out")" == *"building the sketerm-mux daemon only"* ]] \
     || fail "auto mode without --deps did not explain its mux fallback"
 
-for bad_zig in 0.15.2 0.17.0; do
+for bad_zig in 0.15.2 0.18.0; do
     rm -f "$INSTALL_TEST_ZIG_LOG"
     set +e
     BASH_ENV="$work/no-packager.bash" \
@@ -644,10 +644,22 @@ for bad_zig in 0.15.2 0.17.0; do
     status=$?
     set -e
     [ "$status" -eq 1 ] || fail "unsupported Zig $bad_zig was accepted"
-    [[ "$(<"$work/bad-zig.out")" == *"requires Zig 0.16.x"* ]] \
+    [[ "$(<"$work/bad-zig.out")" == *"requires Zig 0.16.x or 0.17.x"* ]] \
         || fail "unsupported Zig $bad_zig did not produce clear guidance"
     [ ! -e "$INSTALL_TEST_ZIG_LOG" ] || fail "unsupported Zig $bad_zig started a build"
 done
+
+rm -f "$INSTALL_TEST_ZIG_LOG"
+BASH_ENV="$work/no-packager.bash" \
+    PATH="$fakebin:$PATH" \
+    SKETERM_TIC="$fakebin/tic" \
+    INSTALL_TEST_ZIG_VERSION=0.17.0 \
+    INSTALL_TEST_ZIG_LOG="$INSTALL_TEST_ZIG_LOG" \
+    "$fixture/dist/install.sh" --mux-only --no-install \
+    > "$work/zig-017.out" 2>&1 \
+    || fail "supported Zig 0.17.0 was rejected"
+[[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <mux>"* ]] \
+    || fail "supported Zig 0.17.0 did not build the daemon"
 
 rm -f "$INSTALL_TEST_ZIG_LOG"
 unsafe_prefix="$work/plain-prefix"$'\n''Exec=/bin/false'
@@ -988,7 +1000,7 @@ BASH_ENV="$work/no-packager.bash" \
     [[ " ${depends[*]} " == *" glib2>=2.74 "* ]] || fail "PKGBUILD lacks GLib minimum"
     [[ " ${depends[*]} " == *" gtk4-layer-shell "* ]] || fail "PKGBUILD lacks gtk4-layer-shell (linked into the GUI for quake placement)"
     [[ " ${makedepends[*]} " == *" zig>=0.16.0 "* ]] || fail "PKGBUILD lacks Zig minimum"
-    [[ " ${makedepends[*]} " == *" zig<0.17.0 "* ]] || fail "PKGBUILD lacks Zig upper bound"
+    [[ " ${makedepends[*]} " == *" zig<0.18.0 "* ]] || fail "PKGBUILD lacks Zig upper bound"
     PATH="$fakebin:$PATH" build
     PATH="$fakebin:$PATH" package
 )

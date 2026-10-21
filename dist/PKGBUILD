@@ -79,7 +79,7 @@ optdepends=(
 )
 makedepends=(
     'zig>=0.16.0'
-    'zig<0.17.0'
+    'zig<0.18.0'
     'ncurses'  # provides tic, the terminfo compiler
     # Headers for the runtime-loaded video codec shims (-Dvideo is
     # auto-detected from these; nothing links them).

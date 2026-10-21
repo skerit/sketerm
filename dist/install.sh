@@ -38,7 +38,7 @@ GTK_MIN=4.14
 ADW_MIN=1.4
 GLIB_MIN=2.74
 ZIG_MIN=0.16.0
-ZIG_MAX=0.17.0
+ZIG_MAX=0.18.0
 CEF_INCLUDE=${CEF_INCLUDE:-/usr/include/cef}
 CEF_LIB=${CEF_LIB:-/usr/lib/cef}
 
@@ -85,7 +85,7 @@ Long-option abbreviations, positional/environment arguments, sourced --config,
 -D/--dir, and -p are rejected. The installer always selects dist/PKGBUILD.
 --no-install still uses makepkg -s, which may install missing dependencies.
 On Arch-compatible hosts --deps is redundant because makepkg always receives -s.
-On dpkg hosts --deps does not install Zig; install Zig 0.16.x separately.
+On dpkg hosts --deps does not install Zig; install Zig 0.16.x or 0.17.x separately.
 EOF
             exit 0 ;;
         --)            shift; makepkg_args+=("$@"); break ;;
@@ -138,10 +138,10 @@ version_ge() {
 check_zig() {
     local have
     command -v zig >/dev/null 2>&1 \
-        || die "zig is not installed; install Zig 0.16.x before building"
+        || die "zig is not installed; install Zig 0.16.x or 0.17.x before building"
     have=$(zig version) || die "could not determine the installed Zig version"
     if ! version_ge "$have" "$ZIG_MIN" || version_ge "$have" "$ZIG_MAX"; then
-        die "Zig $have is unsupported; this checkout requires Zig 0.16.x"
+        die "Zig $have is unsupported; this checkout requires Zig 0.16.x or 0.17.x"
     fi
 }
 
