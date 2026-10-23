@@ -1052,7 +1052,11 @@ pub const Server = struct {
             // skips an unknown frame.
             .motion_drift => if (!withheld(.motion_drift)) self.host.motionDriftSet(cn.id, try self.dec(cn, proto.MotionDrift, frame.payload)),
             .devtools_show => try self.host.devtoolsShow(try self.dec(cn, proto.DevToolsShow, frame.payload)),
-            .print_pdf => self.host.printPdf(try self.dec(cn, proto.PrintPdf, frame.payload)),
+            .print_pdf => {
+                const req = try self.dec(cn, proto.PrintPdf, frame.payload);
+                if (cefhost.untrusted.enabled and proto.untrustedRefusesPrint(req)) return refuseWithheld(cn, frame);
+                self.host.printPdf(req);
+            },
             .flush_req => {
                 const f = try proto.decode(proto.FlushReq, frame.payload);
                 self.host.flushProfileStores(f.token, cn.id);

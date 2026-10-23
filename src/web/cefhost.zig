@@ -1337,7 +1337,7 @@ pub const Host = struct {
         done: bool = false,
         failed: bool = false,
         interrupt_reason: i32 = 0,
-        staging: [128:0]u8 = @splat(0),
+        staging: [STAGING_PATH_MAX:0]u8 = @splat(0),
         staging_len: usize = 0,
         /// Counters moved since the last flush (the intercept_status
         /// coalescing pattern: one frame per poll iteration at most).
@@ -2743,7 +2743,7 @@ pub const Host = struct {
         // afterwards, so the engine writes a private file of ours and the
         // request path only correlates the answer.
         if (req.stage != 0) {
-            var buf: [64:0]u8 = undefined;
+            var buf: [STAGING_PATH_MAX:0]u8 = undefined;
             const staged = stagingFile(&buf, "webpdf") orelse {
                 self.gpa.free(owned);
                 return self.post(refuse);
@@ -6234,11 +6234,23 @@ fn browserHostInt(b: ?*cef.cef_browser_t, comptime name: []const u8) c_int {
     return f(host);
 }
 
-/// Create a private, empty file `/tmp/sketerm-<kind>-XXXXXX` in `buf`
-/// for output a client on another host fetches afterwards (a staged
-/// download or print). Null when nothing could be created.
+/// Room for a staging path: an untrusted helper's private `$TMPDIR` is at most 60 bytes (`UNTRUSTED_TMPDIR_MAX`).
+pub const STAGING_PATH_MAX = 128;
+
+/// Where staged output goes: `/tmp`, or for an untrusted helper the private `$TMPDIR` its cleanup supervisor
+/// pins inside the root it deletes, so that helper writes nothing outside that root.
+fn stagingDir() ?[]const u8 {
+    if (!untrusted.enabled) return "/tmp";
+    const dir = std.mem.span(c.getenv("TMPDIR") orelse return null);
+    return if (dir.len > 1 and dir[0] == '/') dir else null;
+}
+
+/// Create a private, empty file `<stagingDir>/sketerm-<kind>-XXXXXX` in `buf`
+/// for output a client fetches or moves afterwards (a staged download or
+/// print). Null when nothing could be created.
 pub fn stagingFile(buf: [:0]u8, comptime kind: []const u8) ?[:0]u8 {
-    const path = std.fmt.bufPrintSentinel(buf, "/tmp/sketerm-" ++ kind ++ "-XXXXXX", .{}, 0) catch return null;
+    const dir = stagingDir() orelse return null;
+    const path = std.fmt.bufPrintSentinel(buf, "{s}/sketerm-" ++ kind ++ "-XXXXXX", .{dir}, 0) catch return null;
     const fd = c.mkstemp(path.ptr);
     if (fd < 0) return null;
     _ = c.close(fd);
@@ -6246,8 +6258,8 @@ pub fn stagingFile(buf: [:0]u8, comptime kind: []const u8) ?[:0]u8 {
 }
 
 test "staging files are private, empty and never shared between two requests" {
-    var a: [64:0]u8 = undefined;
-    var b: [64:0]u8 = undefined;
+    var a: [STAGING_PATH_MAX:0]u8 = undefined;
+    var b: [STAGING_PATH_MAX:0]u8 = undefined;
     const pa = stagingFile(&a, "webpdf") orelse return error.NoStaging;
     defer _ = c.unlink(pa.ptr);
     const pb = stagingFile(&b, "webpdf") orelse return error.NoStaging;
@@ -6258,6 +6270,29 @@ test "staging files are private, empty and never shared between two requests" {
     try std.testing.expectEqual(@as(c_int, 0), c.stat(pa.ptr, &st));
     try std.testing.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode)) & 0o777);
     try std.testing.expectEqual(@as(i64, 0), @as(i64, st.st_size));
+}
+
+test "an untrusted helper stages only inside its private TMPDIR, and refuses without one" {
+    const saved_mode = untrusted.enabled;
+    defer untrusted.enabled = saved_mode;
+    var saved: @import("../util/env.zig").Saved = .{};
+    try saved.take("TMPDIR");
+    defer saved.restore();
+    var dir_buf = "/tmp/sketerm-stage-XXXXXX".*;
+    if (c.mkdtemp(&dir_buf) == null) return error.SkipZigTest;
+    const dir: [*:0]const u8 = &dir_buf;
+    defer _ = c.rmdir(dir);
+    untrusted.enabled = true;
+    _ = c.setenv("TMPDIR", dir, 1);
+    var buf: [STAGING_PATH_MAX:0]u8 = undefined;
+    const p = stagingFile(&buf, "webpdf") orelse return error.NoStaging;
+    defer _ = c.unlink(p.ptr);
+    try std.testing.expect(std.mem.startsWith(u8, p, std.mem.span(dir)));
+    try std.testing.expect(std.mem.startsWith(u8, p[std.mem.span(dir).len..], "/sketerm-webpdf-"));
+    _ = @import("../util/env.zig").unset("TMPDIR");
+    try std.testing.expect(stagingFile(&buf, "webpdf") == null);
+    _ = c.setenv("TMPDIR", "relative", 1);
+    try std.testing.expect(stagingFile(&buf, "webpdf") == null);
 }
 
 pub fn release(base: *cef.cef_base_ref_counted_t) void {

@@ -841,13 +841,15 @@ pub fn downloadCapability() struct { supported: bool, started: bool } {
 }
 
 /// What `capabilities` reports about `web_print_pdf`: a code fact before
-/// the headless helper starts, negotiated afterwards. `css_page` is null
-/// until a handshake says whether the helper honours the layout flags.
+/// the headless helper starts, negotiated afterwards for the engine that
+/// serves the current view (an untrusted one prints only staged). `css_page`
+/// is null until a handshake says whether the helper honours the layout flags.
 pub fn printCapability() struct { supported: bool, css_page: ?bool } {
     if (guiDrivesWeb() or g_headless_alloc == null) return .{ .supported = false, .css_page = false };
     const e = currentEngine() orelse headlessEngine() orelse return .{ .supported = true, .css_page = null };
     if (e.state != .ready) return .{ .supported = true, .css_page = null };
-    return .{ .supported = e.has(.print_pdf), .css_page = e.has(.print_pdf) and e.has(.print_pdf_css_page) };
+    const can = e.canPrint();
+    return .{ .supported = can, .css_page = can and e.has(.print_pdf_css_page) };
 }
 
 /// Stream support is a code fact before startup and negotiated thereafter; audio is unknown before the handshake.

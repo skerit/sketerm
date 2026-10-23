@@ -159,6 +159,60 @@ pub fn fsyncParent(path: []const u8) bool {
     return c.fsync(dfd) == 0;
 }
 
+/// Move the regular file `from` to `to`, replacing `to`; across filesystems the bytes go through a hidden
+/// `.part` sibling of `to`, so `to` is never seen half-written.
+/// @return false when nothing was moved; `from` is then left where it was.
+pub fn moveFile(from: [:0]const u8, to: [:0]const u8) bool {
+    if (c.rename(from.ptr, to.ptr) == 0) return true;
+    if (std.c._errno().* != c.EXDEV) return false;
+    return moveByCopy(from, to);
+}
+
+/// `moveFile`'s cross-filesystem branch; a symlink `from` is refused, the copy keeps `from`'s permission bits.
+fn moveByCopy(from: [:0]const u8, to: [:0]const u8) bool {
+    var part_buf: [4096]u8 = undefined;
+    const dir = std.fs.path.dirname(to) orelse ".";
+    const part = std.fmt.bufPrintSentinel(&part_buf, "{s}/.{s}.{d}.part", .{ dir, baseName(to), c.getpid() }, 0) catch
+        return false;
+    const in = c.open(from.ptr, c.O_RDONLY | c.O_NOFOLLOW | c.O_CLOEXEC);
+    if (in < 0) return false;
+    defer _ = c.close(in);
+    var st: c.struct_stat = undefined;
+    if (c.fstat(in, &st) != 0 or (st.st_mode & c.S_IFMT) != c.S_IFREG) return false;
+    _ = c.unlink(part.ptr);
+    const out = c.open(part.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC, @as(c_uint, @intCast(st.st_mode & 0o777)));
+    if (out < 0) return false;
+    var ok = copyFd(in, out);
+    if (c.close(out) != 0) ok = false;
+    if (!ok or c.rename(part.ptr, to.ptr) != 0) {
+        _ = c.unlink(part.ptr);
+        return false;
+    }
+    _ = c.unlink(from.ptr);
+    return true;
+}
+
+fn copyFd(in: c_int, out: c_int) bool {
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = c.read(in, &buf, buf.len);
+        if (n < 0) {
+            if (std.c._errno().* == c.EINTR) continue;
+            return false;
+        }
+        if (n == 0) return true;
+        var rest = buf[0..@intCast(n)];
+        while (rest.len > 0) {
+            const w = c.write(out, rest.ptr, rest.len);
+            if (w < 0) {
+                if (std.c._errno().* == c.EINTR) continue;
+                return false;
+            }
+            rest = rest[@intCast(w)..];
+        }
+    }
+}
+
 /// Whether `path` names a directory, following symlinks; an unstatable or oversize path is not one.
 pub fn isDir(path: []const u8) bool {
     var buf: [4096]u8 = undefined;
@@ -346,6 +400,47 @@ test "unlinkPath drops a file and shrugs at a missing one" {
     unlinkPath(&(@as([5000]u8, @splat('a'))));
     unlinkPath(td.path());
     try std.testing.expect(c.stat(td.pathZ(), &st) == 0);
+}
+
+test "moveFile renames within a filesystem and copies through a part file across them" {
+    const td = TempDir.make("movef") orelse return error.SkipZigTest;
+    defer td.remove();
+    var a_buf: [4096:0]u8 = undefined;
+    var b_buf: [4096:0]u8 = undefined;
+    var d_buf: [4096:0]u8 = undefined;
+    const a = try std.fmt.bufPrintSentinel(&a_buf, "{s}/a", .{td.path()}, 0);
+    const b = try std.fmt.bufPrintSentinel(&b_buf, "{s}/b", .{td.path()}, 0);
+    const d = try std.fmt.bufPrintSentinel(&d_buf, "{s}/d", .{td.path()}, 0);
+    const fd = c.open(a.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c_uint, 0o600));
+    if (fd < 0) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(isize, 5), c.write(fd, "bytes", 5));
+    _ = c.close(fd);
+    var st: c.struct_stat = undefined;
+
+    try std.testing.expect(moveFile(a, b));
+    try std.testing.expect(c.stat(a.ptr, &st) != 0);
+    // The copy branch, as EXDEV takes it: content and mode kept, source and part gone, `to` replaced.
+    const old = c.open(d.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c_uint, 0o644));
+    _ = c.close(old);
+    try std.testing.expect(moveByCopy(b, d));
+    try std.testing.expect(c.stat(b.ptr, &st) != 0);
+    try std.testing.expectEqual(@as(c_int, 0), c.stat(d.ptr, &st));
+    try std.testing.expectEqual(@as(i64, 5), @as(i64, st.st_size));
+    try std.testing.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode)) & 0o777);
+    const dir = c.opendir(td.pathZ()) orelse return error.SkipZigTest;
+    defer _ = c.closedir(dir);
+    var names: usize = 0;
+    while (c.readdir(dir)) |ent| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (!std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..")) names += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), names);
+
+    // A symlink source is never followed, and a missing one moves nothing.
+    try std.testing.expect(c.symlink(d.ptr, a.ptr) == 0);
+    try std.testing.expect(!moveByCopy(a, b));
+    try std.testing.expect(c.stat(b.ptr, &st) != 0);
+    try std.testing.expect(!moveFile(b, a));
 }
 
 test "fsyncParent syncs a real parent and reports an unopenable one" {

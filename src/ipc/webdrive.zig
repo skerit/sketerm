@@ -525,6 +525,25 @@ pub const PrintError = error{
     BadPath,
 };
 
+/// `staged` with every symlink resolved, when that lands on a regular file
+/// strictly inside `root`: a helper's answer is never trusted to name a
+/// file elsewhere for this client to move.
+fn stagedWithin(root: []const u8, staged: []const u8, out: *[4096:0]u8) ?[:0]const u8 {
+    if (staged.len == 0) return null;
+    var root_z: [4096:0]u8 = undefined;
+    var staged_z: [4096:0]u8 = undefined;
+    var root_real: [4096:0]u8 = undefined;
+    const rz = std.fmt.bufPrintSentinel(&root_z, "{s}", .{root}, 0) catch return null;
+    const sz = std.fmt.bufPrintSentinel(&staged_z, "{s}", .{staged}, 0) catch return null;
+    if (c.realpath(rz.ptr, &root_real) == null or c.realpath(sz.ptr, out) == null) return null;
+    const r = std.mem.span(@as([*:0]const u8, &root_real));
+    const s = std.mem.span(@as([*:0]const u8, out));
+    if (s.len <= r.len + 1 or !std.mem.startsWith(u8, s, r) or s[r.len] != '/') return null;
+    var st: c.struct_stat = undefined;
+    if (c.lstat(s.ptr, &st) != 0 or (st.st_mode & c.S_IFMT) != c.S_IFREG) return null;
+    return out[0..s.len :0];
+}
+
 pub const ConsoleLine = struct { id: u32, level: u8, text: []u8 };
 
 /// Console mirror bounds: entries kept per view, bytes kept per line.
@@ -3628,12 +3647,20 @@ pub const Engine = struct {
         return null;
     }
 
+    /// Whether this helper serves `startPrint`: an untrusted one prints
+    /// only staged, so it needs `print-pdf-staging` as well.
+    pub fn canPrint(self: *const Engine) bool {
+        return self.has(.print_pdf) and (!self.untrusted or self.has(.print_pdf_staging));
+    }
+
     /// Ask `view`'s browser to render its page to a PDF at `path`, which
-    /// the HELPER writes (a path on the helper's host). Poll with
-    /// `printState`, then drop the record with `takePrint`.
+    /// the HELPER writes (a path on the helper's host). An untrusted helper
+    /// writes into its private root instead and this client moves the file
+    /// to `path` when the answer arrives. Poll with `printState`, then drop
+    /// the record with `takePrint`.
     pub fn startPrint(self: *Engine, view_id: u32, path: []const u8, flags: u8, paper: u8) PrintError!void {
         if (!self.ensure()) return error.Unavailable;
-        if (!self.has(.print_pdf)) return error.Unsupported;
+        if (!self.canPrint()) return error.Unsupported;
         const layout = proto.print_flag_css_page_size | proto.print_flag_no_margins;
         if (flags & layout != 0 and !self.has(.print_pdf_css_page)) return error.UnsupportedPageLayout;
         if (self.findView(view_id) == null) return error.NoView;
@@ -3645,7 +3672,7 @@ pub const Engine = struct {
         const owned = try self.gpa.dupe(u8, path);
         errdefer self.gpa.free(owned);
         try self.prints.append(self.gpa, .{ .view = view_id, .path = owned });
-        self.send(proto.PrintPdf{ .view = view_id, .flags = flags, .paper = paper, .path = path }) catch {
+        self.send(proto.PrintPdf{ .view = view_id, .flags = flags, .paper = paper, .path = path, .stage = @intFromBool(self.untrusted) }) catch {
             _ = self.prints.pop();
             return error.Unavailable;
         };
@@ -3664,11 +3691,49 @@ pub const Engine = struct {
     }
 
     fn onPrintDone(self: *Engine, ev: proto.EvPrintPdfDone) void {
-        const i = self.printIndex(ev.path) orelse return;
+        const i = self.printIndex(ev.path) orelse return self.dropStaged(ev.staged);
         const p = &self.prints.items[i];
-        if (p.state != .pending) return;
-        p.state = if (ev.ok != 0) .done else .failed;
-        if (ev.ok == 0) p.fail_reason = "the browser engine could not write the PDF there";
+        if (p.state != .pending) return self.dropStaged(ev.staged);
+        if (ev.ok == 0) {
+            p.state = .failed;
+            p.fail_reason = "the browser engine could not write the PDF there";
+            return;
+        }
+        if (self.untrusted) {
+            if (self.deliverStaged(ev.staged, p.path)) |why| {
+                p.state = .failed;
+                p.fail_reason = why;
+                return;
+            }
+        }
+        p.state = .done;
+    }
+
+    /// Move an untrusted helper's staged print to the client's `dest`; the
+    /// staging file is gone afterwards either way.
+    /// @return why it failed, or null once `dest` holds the PDF.
+    fn deliverStaged(self: *const Engine, staged: []const u8, dest: []const u8) ?[]const u8 {
+        var real: [4096:0]u8 = undefined;
+        const root = self.private_dir orelse return "the untrusted helper has no private root to print into";
+        const from = stagedWithin(root, staged, &real) orelse
+            return "the untrusted helper named no staging file inside its private root; nothing was written";
+        var dest_z: [4096:0]u8 = undefined;
+        const to = std.fmt.bufPrintSentinel(&dest_z, "{s}", .{dest}, 0) catch {
+            _ = c.unlink(from.ptr);
+            return "'path' is too long";
+        };
+        if (pathz.moveFile(from, to)) return null;
+        _ = c.unlink(from.ptr);
+        return "the browser engine printed the PDF but it could not be moved to that path";
+    }
+
+    /// Remove an untrusted print nobody collects (its call timed out or
+    /// the helper lost); the private root's supervisor is only the backstop.
+    fn dropStaged(self: *const Engine, staged: []const u8) void {
+        if (!self.untrusted) return;
+        const root = self.private_dir orelse return;
+        var real: [4096:0]u8 = undefined;
+        if (stagedWithin(root, staged, &real)) |from| _ = c.unlink(from.ptr);
     }
 
     fn nextDownloadReq(self: *Engine) u32 {
@@ -5367,6 +5432,85 @@ test "print_pdf: layout flags need print-pdf-css-page, answers join by path, a l
     const lost = pair.eng.printState("/tmp/deck.pdf").?;
     try t.expect(lost.state == .failed);
     try t.expectEqualStrings("gone", lost.fail_reason);
+}
+
+test "an untrusted print is staged in the private root and moved to the client's path" {
+    const t = std.testing;
+    const root = pathz.TempDir.make("wd-untrusted-print") orelse return error.SkipZigTest;
+    defer root.remove();
+    const outside = pathz.TempDir.make("wd-untrusted-out") orelse return error.SkipZigTest;
+    defer outside.remove();
+    var pair = try Pair.init(t.allocator);
+    defer pair.deinit();
+    var buf: [4096]u8 = undefined;
+    const view = try pair.eng.openView("about:blank", 800, 600);
+    _ = pair.drain(&buf);
+    pair.eng.untrusted = true;
+    pair.eng.private_dir = try t.allocator.dupe(u8, root.path());
+    pair.eng.caps.insert(.print_pdf);
+    pair.eng.caps.insert(.print_pdf_css_page);
+
+    // Without staging an untrusted helper cannot print at all.
+    try t.expect(!pair.eng.canPrint());
+    try t.expectError(error.Unsupported, pair.eng.startPrint(view.id, "/x/deck.pdf", 0, 0));
+    pair.eng.caps.insert(.print_pdf_staging);
+    try t.expect(pair.eng.canPrint());
+
+    var dest_buf: [256]u8 = undefined;
+    const dest = try std.fmt.bufPrint(&dest_buf, "{s}/deck.pdf", .{outside.path()});
+    const flags = proto.print_flag_css_page_size | proto.print_flag_no_margins;
+    try pair.eng.startPrint(view.id, dest, flags, 0);
+    var reader = proto.Reader.init(pair.drain(&buf));
+    const req = try proto.decode(proto.PrintPdf, (try reader.next()).?.payload);
+    try t.expectEqual(@as(u8, 1), req.stage);
+    try t.expectEqual(flags, req.flags);
+
+    const Fixture = struct {
+        fn file(dir: []const u8, name: []const u8, out: *[256:0]u8) ![:0]const u8 {
+            const p = try std.fmt.bufPrintSentinel(out, "{s}/{s}", .{ dir, name }, 0);
+            const fd = c.open(p.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
+            if (fd < 0) return error.SkipZigTest;
+            _ = c.write(fd, "%PDF-1.4", 8);
+            _ = c.close(fd);
+            return p;
+        }
+    };
+    var st: c.struct_stat = undefined;
+    var dest_z: [256:0]u8 = undefined;
+    const dz = try std.fmt.bufPrintSentinel(&dest_z, "{s}", .{dest}, 0);
+
+    // A staged path outside the private root, or a link out of it, is never moved or touched.
+    var foreign_buf: [256:0]u8 = undefined;
+    const foreign = try Fixture.file(outside.path(), "secret", &foreign_buf);
+    pair.eng.onPrintDone(.{ .view = view.id, .ok = 1, .path = dest, .staged = foreign });
+    try t.expect(pair.eng.printState(dest).?.state == .failed);
+    try t.expect(c.stat(foreign.ptr, &st) == 0 and c.stat(dz.ptr, &st) != 0);
+    pair.eng.takePrint(dest);
+    var link_buf: [256:0]u8 = undefined;
+    const link = try std.fmt.bufPrintSentinel(&link_buf, "{s}/sketerm-webpdf-link", .{root.path()}, 0);
+    try t.expect(c.symlink(foreign.ptr, link.ptr) == 0);
+    try pair.eng.startPrint(view.id, dest, 0, 0);
+    pair.eng.onPrintDone(.{ .view = view.id, .ok = 1, .path = dest, .staged = link });
+    try t.expect(pair.eng.printState(dest).?.state == .failed);
+    try t.expect(c.stat(foreign.ptr, &st) == 0 and c.stat(dz.ptr, &st) != 0);
+    pair.eng.takePrint(dest);
+
+    // The real answer: the staged file becomes the client's file.
+    var staged_buf: [256:0]u8 = undefined;
+    const staged = try Fixture.file(root.path(), "sketerm-webpdf-abc", &staged_buf);
+    try pair.eng.startPrint(view.id, dest, flags, 0);
+    pair.eng.onPrintDone(.{ .view = view.id, .ok = 1, .path = dest, .staged = staged });
+    try t.expect(pair.eng.printState(dest).?.state == .done);
+    try t.expect(c.stat(staged.ptr, &st) != 0);
+    try t.expectEqual(@as(c_int, 0), c.stat(dz.ptr, &st));
+    try t.expectEqual(@as(i64, 8), @as(i64, st.st_size));
+    pair.eng.takePrint(dest);
+
+    // An answer nobody waits for any more leaves no staging file behind.
+    const late = try Fixture.file(root.path(), "sketerm-webpdf-late", &staged_buf);
+    pair.eng.onPrintDone(.{ .view = view.id, .ok = 1, .path = dest, .staged = late });
+    try t.expect(c.stat(late.ptr, &st) != 0);
+    try t.expect(pair.eng.printState(dest) == null);
 }
 
 test "stream timeout cancels the slot and late replies cannot satisfy another open" {

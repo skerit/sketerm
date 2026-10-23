@@ -41,6 +41,7 @@ FOCUS_GATES = {
         "test_26_proxy_http_route", "test_27_proxy_socks5h_route", "test_28_proxy_unreachable_fails_closed",
         "test_29_proxy_serves_loopback_and_refuses_private", "test_30_trusted_view_on_proxy_route",
         "test_31_tor_route_untrusted"),
+    "SKETERM_SMOKE_WEB_UNTRUSTED_PRINT_ONLY": ("test_32_print_pdf",),
 }
 
 
@@ -2299,6 +2300,50 @@ return {script:globalThis.proxy_marker===true, style:getComputedStyle(document.b
         self.assert_no_hits(self.p1, page)
         self.assertFalse(proxy.matching("127.0.0.1"), "A refused private literal reached the Tor endpoint")
 
+    def test_32_print_pdf(self):
+        """An untrusted view prints like a trusted one (css_page_size, no_margins, background), its helper
+        writes only into its private root, and the PDF lands at the client's path with nothing left behind."""
+        deck = self.path("deck.html")
+        self.p1.asset(deck, ("""<!doctype html><html><head><meta charset="utf-8">
+<title>Untrusted integration fixture</title><style>
+@page{size:1920px 1080px;margin:0} html,body{margin:0}
+section{width:1920px;height:1080px;break-after:page;background:rgb(30,60,90);color:white;font:96px sans-serif}
+section:last-child{break-after:auto}
+</style></head><body><section>One</section><section>Two</section><section>Three</section></body></html>""").encode(),
+                      "text/html; charset=utf-8")
+        staging = lambda directory: sorted(directory.glob("sketerm-webpdf-*")) if directory.is_dir() else []
+        system_before = staging(Path("/tmp"))
+        for mode in (False, True):
+            with self.subTest(untrusted=mode):
+                pane = self.open(untrusted=mode, url=self.p1.url(deck))
+                caps = self.mcp.tool("capabilities")
+                self.assertIs(caps["web_print_pdf"], True, caps)
+                self.assertIs(caps["web_print_pdf_css_page"], True, caps)
+                target = self.root / ("deck-%s.pdf" % ("untrusted" if mode else "trusted"))
+                facts = self.mcp.tool("web_print_pdf", pane=pane, path=str(target), css_page_size=True,
+                                      no_margins=True, background=True, timeout_ms=30000)
+                data = target.read_bytes()
+                self.assertEqual(facts["path"], str(target))
+                self.assertEqual(facts["bytes"], len(data))
+                self.assertEqual(facts["sha256"], hashlib.sha256(data).hexdigest())
+                self.assertTrue(data.startswith(b"%PDF-"), data[:16])
+                pages = re.findall(rb"/Type\s*/Page(?![a-zA-Z])", data)
+                boxes = re.findall(rb"/MediaBox\s*\[\s*0\s+0\s+([\d.]+)\s+([\d.]+)\s*\]", data)
+                print("Print untrusted=%s: bytes=%d pages=%d boxes=%r" % (mode, len(data), len(pages), boxes), flush=True)
+                self.assertEqual(len(pages), 3, "one page per slide")
+                self.assertEqual(len(boxes), 3, boxes)
+                for width, height in boxes:
+                    self.assertAlmostEqual(float(width), 1440, delta=1)
+                    self.assertAlmostEqual(float(height), 810, delta=1)
+                if mode:
+                    _, _, private = self.mcp.untrusted_helper()
+                    self.assertEqual([path for path in private.rglob("sketerm-webpdf-*")], [],
+                                     "A delivered print left its staging file in the private root")
+                    # Delivery moved the file whole: no part file is left beside the target.
+                    self.assertEqual(list(self.root.glob(".deck-untrusted.pdf.*.part")), [])
+                self.assertEqual(staging(Path("/tmp")), system_before, "A print staged into the shared /tmp")
+                self.mcp.tool("web_close", pane=pane)
+
 
 class PacketContext(PacketFixture):
     def __enter__(self):
@@ -2536,7 +2581,8 @@ Use dist/test-web-untrusted.c for native socket/address/loader assertions.""")
     for path in (binary, OPTIONS.helper):
         if not path.is_file() or not os.access(path, os.X_OK):
             parser.error("Built executable missing or not executable: %s" % path)
-    command_args = ([] if binary == standalone else ["mcp"]) + ["--no-record"]
+    # Browser and core tools only: the peer tools would autostart a per-user daemon that outlives the server by design.
+    command_args = ([] if binary == standalone else ["mcp"]) + ["--no-record", "--structured", "--tools", "browser,core"]
     # CEF re-execs its own path; rebuilding zig-out during a run must not delete it.
     with tempfile.TemporaryDirectory(prefix="wp-", dir="/tmp") as temporary:
         pinned_binary = Path(temporary) / binary.name

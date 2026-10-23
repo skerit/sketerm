@@ -3439,11 +3439,10 @@ pub const Daemon = struct {
     }
 
     /// One-time adoption of journals from the pre-relocation socket-sibling
-    /// directory. rename first; the runtime dir is usually a different
-    /// filesystem, so EXDEV falls back to a staged copy plus rename, which a
-    /// crash can only ever leave behind as a discardable `.part` file.
-    /// Best effort: a record that cannot move stays where the old code would
-    /// still have found nothing anyway.
+    /// directory, through `pathz.moveFile` (the runtime dir is usually a
+    /// different filesystem, and a crash there can only leave a discardable
+    /// `.part` file behind). Best effort: a record that cannot move stays
+    /// where the old code would still have found nothing anyway.
     fn migrateLegacyFsJournals(sock_dir: []const u8, new_dir: []const u8) void {
         var legacy_buf: [4096:0]u8 = undefined;
         const legacy = std.fmt.bufPrintSentinel(&legacy_buf, "{s}/fsjobs", .{sock_dir}, 0) catch return;
@@ -3460,35 +3459,10 @@ pub const Daemon = struct {
             }
             var from_buf: [4096:0]u8 = undefined;
             var to_buf: [4096:0]u8 = undefined;
-            var stage_buf: [4096:0]u8 = undefined;
             const from = std.fmt.bufPrintSentinel(&from_buf, "{s}/{s}", .{ legacy, name }, 0) catch continue;
             const to = std.fmt.bufPrintSentinel(&to_buf, "{s}/{s}", .{ new_dir, name }, 0) catch continue;
-            if (c.rename(from.ptr, to.ptr) == 0) continue;
-            const stage = std.fmt.bufPrintSentinel(&stage_buf, "{s}/.{s}.{d}.part", .{ new_dir, name, c.getpid() }, 0) catch continue;
-            if (copyJournalFile(from.ptr, stage.ptr) and c.rename(stage.ptr, to.ptr) == 0) {
-                _ = c.unlink(from.ptr);
-            } else _ = c.unlink(stage.ptr);
+            _ = pathz.moveFile(from, to);
         }
-    }
-
-    /// Byte copy into a staging path; false means nothing usable was written.
-    fn copyJournalFile(from: [*:0]const u8, stage: [*:0]const u8) bool {
-        _ = c.unlink(stage);
-        const in = c.fopen(from, "rb") orelse return false;
-        defer _ = c.fclose(in);
-        const out = c.fopen(stage, "wb") orelse return false;
-        var ok = true;
-        var buf: [16 * 1024]u8 = undefined;
-        while (true) {
-            const n = c.fread(&buf, 1, buf.len, in);
-            if (n == 0) break;
-            if (c.fwrite(&buf, 1, n, out) != n) {
-                ok = false;
-                break;
-            }
-        }
-        if (c.fclose(out) != 0) ok = false;
-        return ok;
     }
 
     pub fn init(allocator: std.mem.Allocator, sock_path: []const u8) !*Daemon {

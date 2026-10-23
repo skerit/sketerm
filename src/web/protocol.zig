@@ -46,14 +46,16 @@ pub const CAP_DISCARD = "discard";
 /// other. No remote debugging port is ever opened.
 pub const CAP_DEVTOOLS = "devtools";
 /// The helper accepts `print_pdf`: render a view to a PDF file at a
-/// path IT can write, on the helper's own host.
+/// path IT can write, on the helper's own host. An `untrusted-web`
+/// helper accepts only a staged print (`untrustedRefusesPrint`).
 pub const CAP_PRINT_PDF = "print-pdf";
 /// The helper honours `PrintPdf.stage`: it prints into a private file
 /// of its own choosing and names it in `EvPrintPdfDone.staged`, which is
 /// how a client on ANOTHER host gets the PDF (it fetches the staged file
-/// through the daemon's file service). Without it a remote helper can
-/// only write a path on its own host, so a client must not offer the
-/// verb for a remote view.
+/// through the daemon's file service) and how an untrusted helper prints
+/// at all (the file lands in its private root; the client moves it).
+/// Without it a remote helper can only write a path on its own host, so
+/// a client must not offer the verb for a remote view.
 pub const CAP_PRINT_PDF_STAGING = "print-pdf-staging";
 /// The helper honours `print_flag_css_page_size` (an `@page { size }`
 /// rule decides the sheet, `paper`/landscape apply only to a document
@@ -4359,9 +4361,15 @@ pub const EvRequestRefused = struct {
 /// Capabilities an untrusted helper leaves out of `hello_ack`; `untrustedWithheld` refuses their frames.
 pub fn untrustedWithholdsCap(cap: Cap) bool {
     return switch (cap) {
-        .devtools, .print_pdf, .print_pdf_staging, .print_pdf_css_page, .clipboard, .popup_open, .downloads, .download_start, .download_staging, .download_errors, .userscripts, .userscripts_gm, .webext, .webext_tabs, .webext_action, .webext_events, .webext_transaction, .filter_subscribe, .cookie_sync, .observe, .observe_notify => true,
+        .devtools, .clipboard, .popup_open, .downloads, .download_start, .download_staging, .download_errors, .userscripts, .userscripts_gm, .webext, .webext_tabs, .webext_action, .webext_events, .webext_transaction, .filter_subscribe, .cookie_sync, .observe, .observe_notify => true,
         else => false,
     };
+}
+
+/// Whether an untrusted helper refuses this print: it serves only a STAGED one, written into its own
+/// private root, because a client-named path would let page-driven output land anywhere its user can write.
+pub fn untrustedRefusesPrint(req: PrintPdf) bool {
+    return req.stage == 0;
 }
 
 /// Request frames an untrusted helper refuses at dispatch: the families behind
@@ -4370,7 +4378,6 @@ pub fn untrustedWithholdsCap(cap: Cap) bool {
 pub fn untrustedWithheld(tag: Tag) bool {
     return switch (tag) {
         .devtools_show,
-        .print_pdf,
         .clipboard_read,
         .popup_policy_set,
         .download_decide,
@@ -7273,7 +7280,6 @@ test "emulation frame is append-only and validates wire values" {
 test "an untrusted helper refuses the request frames of every capability it withholds" {
     const families = [_]struct { cap: Cap, tags: []const Tag }{
         .{ .cap = .devtools, .tags = &.{.devtools_show} },
-        .{ .cap = .print_pdf, .tags = &.{.print_pdf} },
         .{ .cap = .clipboard, .tags = &.{.clipboard_read} },
         .{ .cap = .popup_open, .tags = &.{.popup_policy_set} },
         .{ .cap = .downloads, .tags = &.{ .download_decide, .download_cancel } },
@@ -7290,9 +7296,13 @@ test "an untrusted helper refuses the request frames of every capability it with
         try std.testing.expect(untrustedWithholdsCap(f.cap));
         for (f.tags) |t| try std.testing.expect(untrustedWithheld(t));
     }
-    for ([_]Tag{ .hello, .view_create_url, .navigate, .net_policy_set, .net_log_req, .view_emulation, .sem_snapshot_req, .input_pointer, .context_create }) |t|
+    for ([_]Tag{ .hello, .view_create_url, .navigate, .net_policy_set, .net_log_req, .view_emulation, .sem_snapshot_req, .input_pointer, .context_create, .print_pdf }) |t|
         try std.testing.expect(!untrustedWithheld(t));
-    try std.testing.expect(!untrustedWithholdsCap(.untrusted_web) and !untrustedWithholdsCap(.net_policy));
+    for ([_]Cap{ .untrusted_web, .net_policy, .print_pdf, .print_pdf_staging, .print_pdf_css_page }) |cap|
+        try std.testing.expect(!untrustedWithholdsCap(cap));
+    // Printing is served staged only: the helper, never the client, names the file it writes.
+    try std.testing.expect(untrustedRefusesPrint(.{ .view = 1, .flags = 0, .paper = 0, .path = "/home/u/x.pdf" }));
+    try std.testing.expect(!untrustedRefusesPrint(.{ .view = 1, .flags = 0, .paper = 0, .path = "/home/u/x.pdf", .stage = 1 }));
     try roundTrip(EvRequestRefused, .{ .request = @intFromEnum(Tag.devtools_show), .reason = "refused" });
     try std.testing.expectEqual(@as(u8, 0x94), @intFromEnum(Tag.ev_request_refused));
 }

@@ -257,7 +257,7 @@ raise SystemExit(17)
 
     def test_direct_namespace_entry_is_refused_before_mounts(self):
         result = subprocess.run([sys.executable, "-B", str(Path(__file__).with_name("web_untrusted_fixtures.py")),
-                                 "_netns", "/tmp", "[]"],
+                                 "_netns", "/tmp", "[]", "[]"],
                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
         self.assertEqual(result.returncode, 1)
         self.assertIn("Refusing resolver mounts", result.stderr)
@@ -340,7 +340,7 @@ def browser_controls(options):
     for path in (binary, helper):
         if not path.is_file() or not os.access(path, os.X_OK):
             raise RuntimeError("Built executable missing: %s (this test never builds)" % path)
-    rig.OPTIONS = argparse.Namespace(command=[str(binary), "--no-record"], helper=helper,
+    rig.OPTIONS = argparse.Namespace(command=[str(binary), "--no-record", "--structured", "--tools", "browser,core"], helper=helper,
                                      timeout=60, observe=3)
 
     class BrowserControls(rig.WebUntrustedTests):

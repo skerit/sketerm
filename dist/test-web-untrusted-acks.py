@@ -406,7 +406,7 @@ def main():
         wrapper.write_text('#!/bin/sh\nexec %s "$@" 2>>"$XDG_STATE_HOME/acks-native.log"\n' %
                            shlex.quote(str(pinned_helper)), encoding="ascii")
         wrapper.chmod(0o700)
-        rig.OPTIONS = argparse.Namespace(command=[str(pinned_mcp), "--no-record"], helper=wrapper,
+        rig.OPTIONS = argparse.Namespace(command=[str(pinned_mcp), "--no-record", "--structured", "--tools", "browser,core"], helper=wrapper,
                                          timeout=options.timeout, observe=options.observe)
         print("SKETERM_WEB_BIN=" + str(wrapper), flush=True)
         print("Only ACK methods run; loopback only, isolated XDG, exact-PID cleanup, no build/install/debugging port.", flush=True)

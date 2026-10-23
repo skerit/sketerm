@@ -285,6 +285,18 @@ transfer, as a download-strip row). A failed staged print is removed
 by the helper. DevTools is refused for such a tab: CEF would open the
 inspector in a window on the remote host.
 
+The untrusted helper advertises `print-pdf`, `print-pdf-staging` and
+`print-pdf-css-page` but serves ONLY a staged print
+(`proto.untrustedRefusesPrint`; an unstaged one gets `refuseWithheld`'s
+answer at dispatch): a client-named path would let page-driven output
+land anywhere the helper's user can write. Its staging file goes into
+`$TMPDIR`, which the cleanup supervisor pins inside the private root it
+deletes (`stagingDir`; no `$TMPDIR` means no print), never `/tmp`. The
+MCP client (`webdrive.deliverStaged`) moves it to the requested path
+only when it resolves to a regular file inside that root, and deletes a
+late answer nobody collects. `dist/test-web-untrusted.py` `test_32`
+(`SKETERM_SMOKE_WEB_UNTRUSTED_PRINT_ONLY`) is the end-to-end proof.
+
 With `print-pdf-css-page` two more `PrintPdf.flags` bits exist, each
 independent and combinable with `print_flag_background` and a staged
 print: `print_flag_css_page_size` (4) sets CEF's

@@ -798,12 +798,27 @@ margins, which a document without an `@page` margin rule otherwise gets
 `capabilities`: `web_print_pdf` says the verb works, and
 `web_print_pdf_css_page` says the running helper honours both layout
 options (helper capability `print-pdf-css-page`; null before the helper
-starts). An older helper refuses them rather than print on the wrong
+starts). Both describe the engine that serves the current view, so after
+an untrusted `web_open` they are the restricted helper's answer. An older
+helper refuses the layout options rather than print on the wrong
 paper. The tool is headless only: GUI-backed web tools refuse it (the
 user prints from the page's Print to PDF menu item), and so does a view
 whose browser runs on another host (`on:<host>`), because that helper
 would write the file there. `smoke-mcp`'s `webPrintPdfStage` prints the
 deck and checks page count, MediaBox and text in the written file.
+
+An untrusted view (`policy.untrusted:true`) prints with the same options.
+Its restricted helper never writes a path the client names: it serves
+only a staged print (helper capabilities `print-pdf` plus
+`print-pdf-staging`; an unstaged request is refused at dispatch), writes
+the PDF into its private `$TMPDIR` inside the root its cleanup
+supervisor deletes, and this server moves that file to `path` once the
+helper answers. A staging path that does not resolve to a regular file
+inside that private root is refused and nothing is moved, and a print
+nobody waits for any more is deleted there. `smoke-web-untrusted`'s
+`test_32_print_pdf` prints a three-slide deck from a trusted and an
+untrusted view and checks capabilities, page count, MediaBox and that no
+staging file is left anywhere.
 
 ### Pushed binary web streams
 
@@ -1491,7 +1506,7 @@ describe the actual enforcement responsibility.
 | Popups/downloads | Page popups and both page-initiated and client-requested downloads are denied, including blob downloads. No target file is authorized. |
 | Hard loader limits | At most 16 active broker jobs; further loads wait first-in first-out, up to 256, and past that are refused `untrusted_queue_full`. 8 KiB URLs (longer: `url_too_long`), 1 MiB byte-only upload, 64 KiB headers, 16 MiB decoded response and a 15-second deadline counted from when the load was opened, queueing and blocking resolver work included (`untrusted_timeout`). These are independent of policy budgets; oversize/unsupported responses fail rather than silently returning a prefix. Each broker job confines itself with Landlock where the kernel has it (no file writes, TCP only to the target port and DNS); a kernel without Landlock still loads, a failed Landlock setup refuses the load. |
 | Cleanup/core controls | Independent supervisor owns retirement and root deletion after all descendants are reaped, including MCP-parent SIGKILL. Deletion is bounded (exit 251, swept by the next supervisor). Kernel core limits are zero; browser and renderers are nondumpable as described above. |
-| Withheld helper requests | DevTools, PDF printing, WebExtensions, userscripts, observers and cookie sync are not advertised, and a request for one is refused at dispatch (`ev_request_refused`), never served. |
+| Withheld helper requests | DevTools, WebExtensions, userscripts, observers and cookie sync are not advertised, and a request for one is refused at dispatch (`ev_request_refused`), never served. PDF printing is served STAGED only (see `web_print_pdf`): the helper writes into its private root and the MCP server moves the file; an unstaged print request is refused at dispatch. |
 
 Policy budgets and tighter-only patches still apply; no policy field can
 loosen these loader restrictions except the explicit private-address opt-in.
