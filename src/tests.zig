@@ -75,6 +75,7 @@ comptime {
     _ = @import("util/jsonnum.zig");
     _ = @import("util/numtext.zig");
     _ = @import("util/jsonstr.zig");
+    _ = @import("util/jsonclone.zig");
     _ = @import("web/resource.zig");
     _ = @import("util/spinlock.zig");
     _ = @import("util/fdcancel.zig");
@@ -304,6 +305,7 @@ comptime {
     _ = @import("ipc/webtabs.zig");
     _ = @import("ipc/webnav.zig");
     _ = @import("ipc/webfetch.zig");
+    _ = @import("ipc/webjobs.zig");
     _ = @import("ipc/webread.zig");
     _ = @import("ipc/urlshort.zig");
     _ = @import("ipc/mcp.zig");

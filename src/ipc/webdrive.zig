@@ -192,6 +192,15 @@ pub const OpReq = struct {
     motion: u8 = 0,
 };
 
+/// A started semantic op (`Engine.startOp`): which view's inbox slot its
+/// answer lands in, its request id, and when it times out.
+pub const OpTicket = struct {
+    view: u32,
+    ki: usize,
+    request: u32,
+    deadline: i64,
+};
+
 /// One finished round trip; `text` is arena-owned by the caller.
 pub const OpOut = struct {
     ok: bool = false,
@@ -4169,10 +4178,22 @@ pub const Engine = struct {
         }
     }
 
-    /// Run one semantic operation to completion under `budget_ms`.
-    /// Synchronous by design: this driver is called from the MCP
-    /// single-threaded dispatch, so nothing else could overlap it.
+    /// Run one semantic operation to completion under `budget_ms`:
+    /// `startOp` then `pollOp`, pumping between polls.
     pub fn runOp(self: *Engine, arena: std.mem.Allocator, view_id: u32, req: OpReq, budget_ms: i64) !OpOut {
+        const ticket = try self.startOp(view_id, req, budget_ms);
+        while (true) {
+            if (try self.pollOp(arena, ticket)) |out| return out;
+            self.pumpOnce(40);
+        }
+    }
+
+    /// Send one semantic operation; its answer is collected with
+    /// `pollOp`. At most ONE op of each kind may be in flight per view
+    /// (the inbox is per kind); callers on distinct views never meet.
+    /// Act preconditions (motion readiness, a first paint) still wait
+    /// here, bounded.
+    pub fn startOp(self: *Engine, view_id: u32, req: OpReq, budget_ms: i64) !OpTicket {
         if (!self.ensure()) return error.Unavailable;
         if (!self.has(.semantic)) return error.NoSemantic;
         if (self.findView(view_id) == null) return error.NoView;
@@ -4205,8 +4226,8 @@ pub const Engine = struct {
         if (req.kind == .snapshot)
             v.want_full = req.mode == @intFromEnum(proto.SnapMode.full) or
                 (req.scope != 0 and !self.has(.semantic_request_ids));
-        var timed_out = false;
-        defer self.finishWait(view_id, ki, request, timed_out);
+        const ticket: OpTicket = .{ .view = view_id, .ki = ki, .request = request, .deadline = clock.nowMs() + @max(budget_ms, 100) };
+        errdefer self.finishWait(view_id, ki, request, false);
 
         const sent: anyerror!void = switch (req.kind) {
             .snapshot => self.sendSemantic(request, proto.SemSnapshotReq{ .view = view_id, .mode = req.mode, .detail = req.detail, .scope = req.scope }),
@@ -4238,32 +4259,44 @@ pub const Engine = struct {
             }),
         };
         sent catch return error.Unavailable;
+        return ticket;
+    }
 
-        const deadline = clock.nowMs() + @max(budget_ms, 100);
-        while (true) {
-            if (self.findView(view_id)) |vv| {
-                if (vv.inbox[ki]) |sem| {
-                    vv.inbox[ki] = null;
-                    defer self.gpa.free(sem.text);
-                    return .{
-                        .ok = sem.ok,
-                        .text = try arena.dupe(u8, sem.text),
-                        .doc_gen = sem.doc_gen,
-                        .rev = sem.rev,
-                        .snap_kind = sem.snap_kind,
-                        .motion = sem.motion,
-                        .duration_ms = sem.duration_ms,
-                        .total = sem.total,
-                    };
-                }
-            } else return error.NoView;
-            if (self.state != .ready) return error.Unavailable;
-            if (clock.nowMs() >= deadline) {
-                timed_out = true;
-                return .{ .timed_out = true };
-            }
-            self.pumpOnce(40);
+    /// One look for a started op's answer, without waiting: null while
+    /// it is still out. Every non-null return (and every error) ends the
+    /// op; dispatching what the helper sent is the caller's (`pumpOnce`).
+    pub fn pollOp(self: *Engine, arena: std.mem.Allocator, t: OpTicket) !?OpOut {
+        const vv = self.findView(t.view) orelse return error.NoView;
+        if (vv.inbox[t.ki]) |sem| {
+            vv.inbox[t.ki] = null;
+            defer self.gpa.free(sem.text);
+            self.finishWait(t.view, t.ki, t.request, false);
+            return .{
+                .ok = sem.ok,
+                .text = try arena.dupe(u8, sem.text),
+                .doc_gen = sem.doc_gen,
+                .rev = sem.rev,
+                .snap_kind = sem.snap_kind,
+                .motion = sem.motion,
+                .duration_ms = sem.duration_ms,
+                .total = sem.total,
+            };
         }
+        if (self.state != .ready) {
+            self.finishWait(t.view, t.ki, t.request, false);
+            return error.Unavailable;
+        }
+        if (clock.nowMs() >= t.deadline) {
+            self.finishWait(t.view, t.ki, t.request, true);
+            return .{ .timed_out = true };
+        }
+        return null;
+    }
+
+    /// Give up on a started op (its caller went away): the view's kind is
+    /// free again, and a late answer is dropped as stale by the next op.
+    pub fn abandonOp(self: *Engine, t: OpTicket) void {
+        self.finishWait(t.view, t.ki, t.request, true);
     }
 
     fn readerGuard(v: *const View, id: u32) ?reader_guards.Entry {

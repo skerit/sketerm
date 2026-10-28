@@ -311,6 +311,25 @@ fn idleOfView(e: *webdrive.Engine, v: *const webdrive.View, now: i64) webtabs.Id
     return webtabs.idleOf(g_idle_close_ms, @max(touched, v.watch_changed_ms), now, watched);
 }
 
+/// Dispatch what every headless helper has sent, without waiting; the
+/// server loop calls it before stepping deferred web calls.
+pub fn pumpEngines() void {
+    for (g_engines.items) |re| re.engine.pumpOnce(0);
+}
+
+/// A deferred call is still working on `handle`: its tab is in use, not
+/// idle.
+pub fn touchTab(handle: u32) void {
+    g_tabs.touch(tabs_alloc, .{ .handle = handle }, clock.nowMs()) catch {};
+}
+
+/// Web calls run deferred, concurrently across tabs (`mcp_webjobs`):
+/// this server drives its own headless browser. The GUI's browser stays
+/// one call at a time.
+pub fn concurrentCalls() bool {
+    return !guiDrivesWeb() and instanceDir() != null;
+}
+
 /// Close every headless tab that went untouched and unwatched for the
 /// configured time. Called between requests by the server loop and at
 /// the start of every web call, so a due tab is gone before anything
@@ -2004,146 +2023,180 @@ pub fn runOp(drv: Driver, arena: std.mem.Allocator, handle: u32, op: Op, timeout
 }
 
 fn runOpOnce(drv: Driver, arena: std.mem.Allocator, handle: u32, op: Op, budget: i64) !OpResult {
-    switch (drv) {
-        .gui => |backend| return runOpGui(backend, arena, handle, op, budget),
-        .headless => |e| {
-            const eql = std.mem.eql;
-            var req = webdrive.OpReq{ .kind = undefined };
-            if (eql(u8, op.op, "snapshot")) {
-                req.kind = .snapshot;
-                req.mode = if (op.mode) |m|
-                    (if (eql(u8, m, "full"))
-                        @intFromEnum(web_proto.SnapMode.full)
-                    else if (eql(u8, m, "history"))
-                        @intFromEnum(web_proto.SnapMode.history)
-                    else if (eql(u8, m, "peek"))
-                        @intFromEnum(web_proto.SnapMode.peek)
-                    else
-                        @intFromEnum(web_proto.SnapMode.auto))
-                else
-                    @intFromEnum(web_proto.SnapMode.auto);
-                req.detail = @intCast(@min(op.detail, 2));
-                req.scope = op.node orelse 0;
-            } else if (eql(u8, op.op, "act")) {
-                req.kind = .act;
-                req.id = op.node orelse 0;
-                const act = op.action orelse "click";
-                const semact: web_proto.SemAct = if (eql(u8, act, "click"))
-                    .click
-                else if (eql(u8, act, "focus"))
-                    .focus
-                else if (eql(u8, act, "set_value"))
-                    .set_value
-                else if (eql(u8, act, "scroll_into_view"))
-                    .scroll_into_view
-                else if (eql(u8, act, "hover"))
-                    .hover
-                else
-                    return .{ .err = fail(.invalid_args, "unknown act action") };
-                req.action = @intFromEnum(semact);
-                req.arg = op.data orelse "";
-                req.motion = @intFromEnum(switch (op.motion) {
-                    .direct => web_proto.Motion.direct,
-                    .replay => web_proto.Motion.replay,
-                });
-            } else if (eql(u8, op.op, "expand")) {
-                req.kind = .expand;
-                req.id = op.node orelse 0;
-                req.off = op.offset;
-                req.len = op.length;
-            } else if (eql(u8, op.op, "query")) {
-                req.kind = .query;
-                const qk = web_proto.SemQuery.fromOperationName(op.action orelse "find_text") orelse
-                    return .{ .err = fail(.invalid_args, "unknown query kind") };
-                if (qk == .review and !e.has(.review)) return .{ .err = fail(.unavailable, "this browser helper does not advertise review support; rebuild/restart the helper") };
-                if (qk == .page and !e.has(.page_read)) return .{ .err = fail(.unavailable, PAGE_READ_OLD_HELPER) };
-                req.action = @intFromEnum(qk);
-                req.arg = op.data orelse "";
-            } else if (eql(u8, op.op, "read")) {
-                req.kind = .read;
-            } else if (eql(u8, op.op, "eval")) {
-                req.kind = .eval;
-                req.arg = op.data orelse "";
-                req.flags = if (op.await_promise) web_proto.eval_flag_await else 0;
-                req.timeout_ms = @intCast(@min(@max(op.timeout_ms orelse 10_000, 100), mcp.WAIT_CAP_MS));
-                req.max_str = op.max_chars;
-            } else return .{ .err = fail(.invalid_args, "unknown web-request op") };
-
-            const out = e.runOp(arena, handle, req, budget) catch |err|
-                return .{ .err = try headlessFail(arena, e, err) };
-            return .{ .done = .{
-                .ok = out.ok,
-                .payload = out.text,
-                .snapshot_kind = if (out.snap_kind == @intFromEnum(web_proto.SnapKind.delta)) "delta" else "full",
-                .doc_gen = out.doc_gen,
-                .rev = out.rev,
-                .reader_ids = req.kind == .read and e.has(.reader_ids),
-                .timed_out = out.timed_out,
-                .motion_ms = if (out.motion == @intFromEnum(web_proto.MotionResult.replayed)) out.duration_ms else null,
-                .total = if (out.total) |n| n else null,
-            } };
-        },
-    }
-}
-
-/// GUI path: `web-request` starts the op and answers with a TOKEN, and
-/// this side polls `web-result` under its own deadline (the GLib main
-/// loop must keep running for the helper's reply to arrive at all).
-fn runOpGui(backend: mcp.Backend, arena: std.mem.Allocator, pane: u32, op: Op, budget: i64) !OpResult {
-    const started = mcp.ipcParsed(arena, backend, .{
-        .cmd = "web-request",
-        .pane = pane,
-        .op = op.op,
-        .mode = op.mode,
-        .detail = op.detail,
-        .node = op.node,
-        .action = op.action,
-        .data = op.data,
-        .offset = if (op.offset != 0) op.offset else null,
-        .length = if (op.length != 4096) op.length else null,
-        .await_promise = op.await_promise,
-        .timeout_ms = if (op.timeout_ms) |t| @intCast(t) else null,
-        .max_chars = if (op.max_chars != 0) op.max_chars else null,
-    }) catch |e|
-        return .{ .err = try guiUnreachable(arena, e) };
-    if (!started.ok) return .{ .err = fail(.failed, started.err) };
-    const tok_v = started.value.object.get("token") orelse return .{ .err = fail(.io_failed, "the GUI returned no token") };
-    if (tok_v != .integer) return .{ .err = fail(.io_failed, "the GUI returned a malformed token") };
-    const token: u32 = boundedU32(tok_v.integer) orelse
-        return .{ .err = fail(.io_failed, "the GUI returned a malformed token") };
-
-    const deadline = backend.nowMs(backend.ctx) + budget;
+    const flight = switch (try OpFlight.start(drv, arena, handle, op, budget)) {
+        .flight => |f| f,
+        .err => |e| return .{ .err = e },
+    };
     while (true) {
-        const r = mcp.ipcParsed(arena, backend, .{
-            .cmd = "web-result",
-            .pane = pane,
-            .token = token,
-        }) catch |e|
-            return .{ .err = try guiUnreachable(arena, e) };
-        if (!r.ok) return .{ .err = fail(.failed, r.err) };
-        const done = r.value.object.get("done");
-        if (done != null and done.? == .bool and done.?.bool) {
-            const obj = r.value.object;
-            return .{ .done = .{
-                .ok = if (obj.get("result_ok")) |v| (v == .bool and v.bool) else false,
-                .payload = if (obj.get("payload")) |v| (if (v == .string) v.string else "") else "",
-                .snapshot_kind = if (obj.get("snapshot_kind")) |v| (if (v == .string) v.string else "") else "",
-                .doc_gen = if (obj.get("doc_gen")) |v| (if (v == .integer) v.integer else 0) else 0,
-                .rev = if (obj.get("rev")) |v| (if (v == .integer) v.integer else 0) else 0,
-                .reader_ids = if (obj.get("reader_ids")) |v| (v == .bool and v.bool) else false,
-                .total = if (obj.get("total")) |v| (if (v == .integer) v.integer else null) else null,
-            } };
-        }
-        if (backend.nowMs(backend.ctx) >= deadline) {
-            return .{ .done = .{
-                .ok = false,
-                .payload = "",
-                .timed_out = true,
-            } };
-        }
-        backend.sleepMs(backend.ctx, POLL_MS);
+        if (try flight.poll(arena)) |r| return r;
+        drv.sleep(POLL_MS);
     }
 }
+
+/// A started semantic op, polled rather than waited on: a deferred call
+/// holds one across server-loop turns, and `runOpOnce` is start + poll +
+/// sleep. Headless it is the engine's `OpTicket`; on the GUI the
+/// `web-request` token that `web-result` polls (the GLib main loop must
+/// keep running for the helper's reply to arrive at all).
+pub const OpFlight = struct {
+    drv: Driver,
+    pane: u32,
+    /// The answer is a negotiated `reader-ids` read.
+    reader_ids: bool = false,
+    at: union(enum) { headless: webdrive.OpTicket, gui: struct { token: u32, deadline: i64 } },
+
+    pub fn start(drv: Driver, arena: std.mem.Allocator, handle: u32, op: Op, budget: i64) !union(enum) { flight: OpFlight, err: Fail } {
+        switch (drv) {
+            .gui => |backend| {
+                const started = mcp.ipcParsed(arena, backend, .{
+                    .cmd = "web-request",
+                    .pane = handle,
+                    .op = op.op,
+                    .mode = op.mode,
+                    .detail = op.detail,
+                    .node = op.node,
+                    .action = op.action,
+                    .data = op.data,
+                    .offset = if (op.offset != 0) op.offset else null,
+                    .length = if (op.length != 4096) op.length else null,
+                    .await_promise = op.await_promise,
+                    .timeout_ms = if (op.timeout_ms) |t| @intCast(t) else null,
+                    .max_chars = if (op.max_chars != 0) op.max_chars else null,
+                }) catch |e|
+                    return .{ .err = try guiUnreachable(arena, e) };
+                if (!started.ok) return .{ .err = fail(.failed, started.err) };
+                const tok_v = started.value.object.get("token") orelse return .{ .err = fail(.io_failed, "the GUI returned no token") };
+                if (tok_v != .integer) return .{ .err = fail(.io_failed, "the GUI returned a malformed token") };
+                const token: u32 = boundedU32(tok_v.integer) orelse
+                    return .{ .err = fail(.io_failed, "the GUI returned a malformed token") };
+                return .{ .flight = .{ .drv = drv, .pane = handle, .at = .{ .gui = .{ .token = token, .deadline = backend.nowMs(backend.ctx) + budget } } } };
+            },
+            .headless => |e| {
+                const eql = std.mem.eql;
+                var req = webdrive.OpReq{ .kind = undefined };
+                if (eql(u8, op.op, "snapshot")) {
+                    req.kind = .snapshot;
+                    req.mode = if (op.mode) |m|
+                        (if (eql(u8, m, "full"))
+                            @intFromEnum(web_proto.SnapMode.full)
+                        else if (eql(u8, m, "history"))
+                            @intFromEnum(web_proto.SnapMode.history)
+                        else if (eql(u8, m, "peek"))
+                            @intFromEnum(web_proto.SnapMode.peek)
+                        else
+                            @intFromEnum(web_proto.SnapMode.auto))
+                    else
+                        @intFromEnum(web_proto.SnapMode.auto);
+                    req.detail = @intCast(@min(op.detail, 2));
+                    req.scope = op.node orelse 0;
+                } else if (eql(u8, op.op, "act")) {
+                    req.kind = .act;
+                    req.id = op.node orelse 0;
+                    const act = op.action orelse "click";
+                    const semact: web_proto.SemAct = if (eql(u8, act, "click"))
+                        .click
+                    else if (eql(u8, act, "focus"))
+                        .focus
+                    else if (eql(u8, act, "set_value"))
+                        .set_value
+                    else if (eql(u8, act, "scroll_into_view"))
+                        .scroll_into_view
+                    else if (eql(u8, act, "hover"))
+                        .hover
+                    else
+                        return .{ .err = fail(.invalid_args, "unknown act action") };
+                    req.action = @intFromEnum(semact);
+                    req.arg = op.data orelse "";
+                    req.motion = @intFromEnum(switch (op.motion) {
+                        .direct => web_proto.Motion.direct,
+                        .replay => web_proto.Motion.replay,
+                    });
+                } else if (eql(u8, op.op, "expand")) {
+                    req.kind = .expand;
+                    req.id = op.node orelse 0;
+                    req.off = op.offset;
+                    req.len = op.length;
+                } else if (eql(u8, op.op, "query")) {
+                    req.kind = .query;
+                    const qk = web_proto.SemQuery.fromOperationName(op.action orelse "find_text") orelse
+                        return .{ .err = fail(.invalid_args, "unknown query kind") };
+                    if (qk == .review and !e.has(.review)) return .{ .err = fail(.unavailable, "this browser helper does not advertise review support; rebuild/restart the helper") };
+                    if (qk == .page and !e.has(.page_read)) return .{ .err = fail(.unavailable, PAGE_READ_OLD_HELPER) };
+                    req.action = @intFromEnum(qk);
+                    req.arg = op.data orelse "";
+                } else if (eql(u8, op.op, "read")) {
+                    req.kind = .read;
+                } else if (eql(u8, op.op, "eval")) {
+                    req.kind = .eval;
+                    req.arg = op.data orelse "";
+                    req.flags = if (op.await_promise) web_proto.eval_flag_await else 0;
+                    req.timeout_ms = @intCast(@min(@max(op.timeout_ms orelse 10_000, 100), mcp.WAIT_CAP_MS));
+                    req.max_str = op.max_chars;
+                } else return .{ .err = fail(.invalid_args, "unknown web-request op") };
+
+                const ticket = e.startOp(handle, req, budget) catch |err|
+                    return .{ .err = try headlessFail(arena, e, err) };
+                return .{ .flight = .{ .drv = drv, .pane = handle, .reader_ids = req.kind == .read and e.has(.reader_ids), .at = .{ .headless = ticket } } };
+            },
+        }
+    }
+
+    /// One look for the answer; null while it is still out. A non-null
+    /// return ends the flight.
+    pub fn poll(self: *const OpFlight, arena: std.mem.Allocator) !?OpResult {
+        switch (self.at) {
+            .headless => |t| {
+                const e = self.drv.headless;
+                const out = (e.pollOp(arena, t) catch |err| return .{ .err = try headlessFail(arena, e, err) }) orelse return null;
+                return .{ .done = .{
+                    .ok = out.ok,
+                    .payload = out.text,
+                    .snapshot_kind = if (out.snap_kind == @intFromEnum(web_proto.SnapKind.delta)) "delta" else "full",
+                    .doc_gen = out.doc_gen,
+                    .rev = out.rev,
+                    .reader_ids = self.reader_ids,
+                    .timed_out = out.timed_out,
+                    .motion_ms = if (out.motion == @intFromEnum(web_proto.MotionResult.replayed)) out.duration_ms else null,
+                    .total = if (out.total) |n| n else null,
+                } };
+            },
+            .gui => |g| {
+                const backend = self.drv.gui;
+                const r = mcp.ipcParsed(arena, backend, .{
+                    .cmd = "web-result",
+                    .pane = self.pane,
+                    .token = g.token,
+                }) catch |e|
+                    return .{ .err = try guiUnreachable(arena, e) };
+                if (!r.ok) return .{ .err = fail(.failed, r.err) };
+                const done = r.value.object.get("done");
+                if (done != null and done.? == .bool and done.?.bool) {
+                    const obj = r.value.object;
+                    return .{ .done = .{
+                        .ok = if (obj.get("result_ok")) |v| (v == .bool and v.bool) else false,
+                        .payload = if (obj.get("payload")) |v| (if (v == .string) v.string else "") else "",
+                        .snapshot_kind = if (obj.get("snapshot_kind")) |v| (if (v == .string) v.string else "") else "",
+                        .doc_gen = if (obj.get("doc_gen")) |v| (if (v == .integer) v.integer else 0) else 0,
+                        .rev = if (obj.get("rev")) |v| (if (v == .integer) v.integer else 0) else 0,
+                        .reader_ids = if (obj.get("reader_ids")) |v| (v == .bool and v.bool) else false,
+                        .total = if (obj.get("total")) |v| (if (v == .integer) v.integer else null) else null,
+                    } };
+                }
+                if (backend.nowMs(backend.ctx) >= g.deadline) return .{ .done = .{ .ok = false, .payload = "", .timed_out = true } };
+                return null;
+            },
+        }
+    }
+
+    /// The caller went away before the answer: free the view's op slot
+    /// (headless). A GUI op simply expires there.
+    pub fn abandon(self: *const OpFlight) void {
+        switch (self.at) {
+            .headless => |t| self.drv.headless.abandonOp(t),
+            .gui => {},
+        }
+    }
+};
 
 const OpenOutcome = union(enum) { opened: u32, err: Fail };
 
@@ -2850,17 +2903,10 @@ pub fn parseNavWait(args: std.json.Value) NavWaitParse {
     return .{ .wait = out };
 }
 
-/// Run a navigating call's `wait` through `waitCore`; never an error
-/// result, because the navigation itself happened: an unmet condition
-/// is `met:false` with the reason.
 /// A finished navigating-call wait: its fact and the view it last saw.
+/// Never an error result, because the navigation itself happened: an
+/// unmet condition is `met:false` with the reason.
 pub const NavWaitDone = struct { report: WaitReport, view: View };
-
-fn runNavWait(drv: Driver, arena: std.mem.Allocator, view: View, w: NavWait) !NavWaitDone {
-    const t0 = drv.now();
-    const out = try waitCore(drv, arena, view, w.what, w.arg, w.budget);
-    return navWaitReport(w, out, view, drv.now() - t0);
-}
 
 /// A navigating call's `wait` fact from how its wait ended.
 pub fn navWaitReport(w: NavWait, out: WaitOutcome, view: View, elapsed_ms: i64) NavWaitDone {
@@ -4513,11 +4559,49 @@ test "browser names reject nonstrings and Unicode line breaks without splitting 
     try std.testing.expect(validBrowserName(.{ .string = repeat("é", 80) }));
 }
 
-pub fn webTool(
+/// A web call's answer: now, or a `Pending` to step until it answers.
+pub const Called = union(enum) { reply: []const u8, pending: Pending };
+
+/// Start a web call. The tools that wait on a page (`web_open`,
+/// `web_navigate`, `web_wait`, `web_eval`) hand back a `Pending` once
+/// their request is out instead of blocking on the answer; every other
+/// tool answers at once.
+pub fn webCall(arena: std.mem.Allocator, backend: mcp.Backend, name: []const u8, args: std.json.Value) !Called {
+    var pend: ?Pending = null;
+    const reply = try webBody(arena, backend, name, args, &pend);
+    if (pend) |p| return .{ .pending = p };
+    return .{ .reply = reply };
+}
+
+/// Run a web call to its answer, blocking: the call's own waits pump the
+/// helper (`Driver.sleep`) between steps.
+pub fn webTool(arena: std.mem.Allocator, backend: mcp.Backend, name: []const u8, args: std.json.Value) ![]const u8 {
+    var p = switch (try webCall(arena, backend, name, args)) {
+        .reply => |r| return r,
+        .pending => |p| p,
+    };
+    while (true) {
+        const r = p.step(arena) catch |err| {
+            p.abandon();
+            return err;
+        };
+        if (r) |reply| return reply;
+        p.drv.sleep(p.pollMs());
+    }
+}
+
+/// Hand a waiting call's rest to `pend`; the reply text is the Pending's.
+fn deferTo(pend: *?Pending, drv: Driver, pane: u32, run: Pending.Run) []const u8 {
+    pend.* = .{ .drv = drv, .pane = pane, .run = run };
+    return "";
+}
+
+fn webBody(
     arena: std.mem.Allocator,
     backend: mcp.Backend,
     name: []const u8,
     args: std.json.Value,
+    pend: *?Pending,
 ) ![]const u8 {
     const eql = std.mem.eql;
     // Validate before selecting a backend: invalid names must not start a
@@ -4713,170 +4797,29 @@ pub fn webTool(
             }
         }
 
-        // Settle: a fresh view needs the helper handshake plus the
-        // load, and a snapshot before the document exists is empty.
-        // With a url, the wait is for THAT navigation (see
-        // `openSettled`) — "some url is loaded and idle" was satisfied
-        // by the about:blank document a create-then-navigate mints, and
-        // web_open then returned a first snapshot of a blank page.
-        const budget = timeoutOf(args, 20_000);
-        const deadline = drv.now() + budget;
-        const wanted_blank = if (url) |u| isBlankDoc(u) else true;
-        var v: View = .{ .pane = new_handle };
-        var settled = url == null;
-        // How many views exist now that this one does: the polled list
-        // when it answered, else the pre-open count plus this view.
-        var open_views: usize = (if (views) |vs| vs.views.len else 0) + 1;
-        while (drv.now() < deadline) {
-            if (try listViews(drv, arena)) |vs| {
-                open_views = vs.views.len;
-                if (viewFor(vs, new_handle)) |found| {
-                    v = found;
-                    // The helper refused the identity context. There is
-                    // no ack for context_create, so this event is the
-                    // ONLY way that failure becomes visible — and the
-                    // view must go, un-navigated, rather than fall back
-                    // into the shared jar.
-                    if (found.create_failed.len > 0) {
-                        if (drv == .headless) drv.headless.closeView(new_handle);
-                        const why = try std.fmt.allocPrint(
-                            arena,
-                            "the browser helper refused the identity context for {s} ({s}); nothing was opened and NO page was loaded in the shared cookie jar",
-                            .{
-                                if (profile) |p| try std.fmt.allocPrint(arena, "profile '{s}'", .{p}) else "the requested throwaway identity",
-                                found.create_failed,
-                            },
-                        );
-                        return if (drv == .headless)
-                            failRes(arena, try diagnosticFail(arena, drv.headless, .io_failed, why))
-                        else
-                            mcp.errRes(arena, .io_failed, why);
-                    }
-                    // The helper answered active=0 for our policy
-                    // serial: it could not HOLD the policy (its slot
-                    // table filled). The view must go rather than run
-                    // unpoliced.
-                    if (found.policy_install_failed) {
-                        if (drv == .headless) drv.headless.closeView(new_handle);
-                        return mcp.errRes(arena, .conflict, "the browser helper could not hold the requested network policy (its policy table is full); the view was closed un-navigated — close other views with web_close and retry");
-                    }
-                    // Likewise for the capture: a view that would record
-                    // nothing must not run as if it did.
-                    if (found.capture_install_failed) {
-                        if (drv == .headless) drv.headless.closeView(new_handle);
-                        return mcp.errRes(arena, .conflict, "the browser helper could not hold the requested capture (its view table is full); the view was closed - close other views with web_close and retry");
-                    }
-                    // A held certificate or a failed load: the page is
-                    // not coming, and the reply must say so NOW rather
-                    // than after the whole timeout with "not settled".
-                    if (found.loadBlocked()) break;
-                    // A url that became a download never commits a
-                    // document: the offer IS the outcome.
-                    if (drv == .headless and downloadSince(drv.headless, new_handle, nav_started)) break;
-                    // A view created blank has load_seq 0 to start
-                    // with; anything it has already finished by the
-                    // first poll is a load this call caused.
-                    if (url == null or openSettled(found, wanted_blank)) {
-                        settled = true;
-                        break;
-                    }
-                }
-            }
-            drv.sleep(100);
-            if (drv == .headless and drv.headless.state == .unavailable)
-                return failRes(arena, try headlessFail(arena, drv.headless, error.Unavailable));
-        }
-        if (tab_label) |l| {
-            if (drv == .gui) g_tabs.setLabel(tabs_alloc, tabKey(.gui, v), l, clock.nowMs()) catch {};
-            v.label = l;
-        }
-        v.idle_drift = drift_on;
-        if (drv == .gui) g_tabs.touch(tabs_alloc, tabKey(.gui, v), clock.nowMs()) catch {};
-        var post: NavPost = .{};
-        if (nav_wait) |w| {
-            if (v.loadBlocked()) {
-                post.wait = .{ .@"for" = @tagName(w.what), .arg = if (w.arg.len > 0) w.arg else null, .met = false, .detail = "not waited: the requested page did not load", .elapsed_ms = 0 };
-            } else {
-                const r = try runNavWait(drv, arena, v, w);
-                post.wait = r.report;
-                v = r.view;
-                if (tab_label) |l| v.label = l;
-                v.idle_drift = drift_on;
-            }
-        }
-        // A fresh view's log starts with this navigation: cursor 0.
-        if (url != null) post.nav = try navOf(drv, arena, v, 0, url, nav_started);
-        const remaining = @max(deadline - drv.now(), 2000);
-        var snap: ?Snap = null;
-        var snap_err: ?[]const u8 = null;
-        if (v.loadBlocked()) {
-            // Whatever document the view holds is the engine's error
-            // page or the blank one; a tree of it reads as "the page
-            // is empty", which is the wrong conclusion.
-            snap_err = "skipped: the requested page did not load";
-            const echo: ?*const webdrive.NetPolicy = if (policy) |*p| p else if (drv == .headless and std.mem.eql(u8, policy_source, "profile_default")) drv.headless.profilePolicy(profile.?) else null;
-            return openResult(arena, drv.mode(), v, false, drv == .headless and !eql(u8, where, "tab"), null, snap_err, echo, policy_source, if (cap) |*f| f else null, open_views, post);
-        }
-        // `snapshot:"none"` skips the tree for opens that only need a
-        // view (a screenshot, a viewport): the full tree of a page the
-        // caller will not read is the single most expensive part of
-        // this reply.
-        const snap_want = mcp.argStr(args, "snapshot") orelse "full";
-        if (!(eql(u8, snap_want, "full") or eql(u8, snap_want, "none")))
-            return mcp.errRes(arena, .invalid_args, "web_open 'snapshot' must be \"full\" (default) or \"none\"");
-        if (eql(u8, snap_want, "none")) return openResult(
-            arena,
-            drv.mode(),
-            v,
-            settled,
-            drv == .headless and !eql(u8, where, "tab"),
-            null,
-            "skipped by request (snapshot:\"none\"); call web_snapshot when you need the tree",
-            if (policy) |*p| p else if (drv == .headless and std.mem.eql(u8, policy_source, "profile_default")) drv.headless.profilePolicy(profile.?) else null,
-            policy_source,
-            if (cap) |*f| f else null,
-            open_views,
-            post,
-        );
-        switch (try runOp(drv, arena, new_handle, .{
-            .op = "snapshot",
-            .mode = "full",
-            .detail = 1,
-        }, remaining)) {
-            .err => |e| snap_err = e.text,
-            .done => |r| {
-                if (r.timed_out) {
-                    snap_err = "the page did not answer a first snapshot in time (it may still be loading; call web_snapshot)";
-                } else {
-                    // `document` is the engine's per-document counter:
-                    // 1 means the view has only ever held THIS page. A
-                    // higher number on a fresh view means a document
-                    // preceded it (the GUI backend still creates a tab
-                    // blank and navigates it afterwards).
-                    snap = .{ .document = r.doc_gen, .revision = r.rev, .tree = r.payload };
-                }
-            },
-        }
-        const echo_policy: ?*const webdrive.NetPolicy = if (policy) |*p|
-            p
-        else if (drv == .headless and std.mem.eql(u8, policy_source, "profile_default"))
-            drv.headless.profilePolicy(profile.?)
-        else
-            null;
-        return openResult(
-            arena,
-            drv.mode(),
-            v,
-            settled,
-            drv == .headless and !eql(u8, where, "tab"),
-            snap,
-            snap_err,
-            echo_policy,
-            policy_source,
-            if (cap) |*f| f else null,
-            open_views,
-            post,
-        );
+        // Settle, the `wait` and the first snapshot run in `OpenRun`, a
+        // step at a time.
+        return deferTo(pend, drv, new_handle, .{ .open = .{
+            .args = args,
+            .new_handle = new_handle,
+            .url = url,
+            .profile = profile,
+            .where = where,
+            .tab_label = tab_label,
+            .drift_on = drift_on,
+            .nav_wait = nav_wait,
+            .nav_started = nav_started,
+            .policy = policy,
+            .policy_source = policy_source,
+            .cap = cap,
+            .deadline = drv.now() + timeoutOf(args, 20_000),
+            .wanted_blank = if (url) |u| isBlankDoc(u) else true,
+            .v = .{ .pane = new_handle },
+            .settled = url == null,
+            // How many views exist now that this one does: the polled
+            // list when it answered, else the pre-open count plus this.
+            .open_views = (if (views) |vs| vs.views.len else 0) + 1,
+        } });
     }
 
     // web_close resolves its own handle (it must answer for a view it
@@ -4926,67 +4869,23 @@ pub fn webTool(
         const nav_started = clock.nowMs();
         if (try navigateView(drv, arena, view.pane, url, action)) |e|
             return failRes(arena, e);
-        // Settle on the navigation asked for, exactly as web_open does
-        // (`navSettled`): a load finished since the call, none in flight.
-        // "Was loading, now is not" missed a load that finished between
-        // two polls, and a navigation to the url the view already showed
-        // then waited out the whole budget.
-        const deadline = drv.now() + timeoutOf(args, 15_000);
-        const base_seq = view.load_seq;
-        const wanted_blank = if (url) |u| isBlankDoc(u) else true;
-        var settled = view;
-        while (drv.now() < deadline) {
-            drv.sleep(100);
-            const now = try listViews(drv, arena) orelse break;
-            const found = viewFor(now, view.pane) orelse break;
-            settled = found;
-            if (found.loadBlocked()) break;
-            if (drv == .headless and downloadSince(drv.headless, view.pane, nav_started)) break;
-            if (navSettled(found, base_seq, wanted_blank)) break;
-            if (found.loading) continue;
-            // back/forward/stop may be served from the page cache with
-            // no load at all; a same-document navigation moves only the
-            // url.
-            if (url == null) break;
-            if (found.load_seq == base_seq and !std.mem.eql(u8, found.url, view.url)) break;
-        }
-        var post: NavPost = .{};
-        if (nav_wait) |w| {
-            const r = try runNavWait(drv, arena, settled, w);
-            post.wait = r.report;
-            settled = r.view;
-        }
-        if (navigates) post.nav = if (cursor) |c0|
-            try navOf(drv, arena, settled, c0, url, nav_started)
-        else
-            .{ .unavailable = "the request log was unreadable before the navigation" };
-        // `snapshot:"delta"|"full"` folds the follow-up tree the caller
-        // was about to ask for into THIS reply; the default stays
-        // "none" (the historical shape).
-        const snap_want = mcp.argStr(args, "snapshot") orelse "none";
-        if (!(eql(u8, snap_want, "none") or eql(u8, snap_want, "delta") or eql(u8, snap_want, "full")))
-            return mcp.errRes(arena, .invalid_args, "web_navigate 'snapshot' must be none|delta|full");
-        var nav_snap: ?Snap = null;
-        var nav_snap_kind: []const u8 = "";
-        var nav_snap_err: ?[]const u8 = null;
-        if (!eql(u8, snap_want, "none")) {
-            switch (try runOp(drv, arena, view.pane, .{
-                .op = "snapshot",
-                .mode = if (std.mem.eql(u8, snap_want, "full")) "full" else "auto",
-                .detail = 1,
-            }, 5000)) {
-                .err => |e| nav_snap_err = e.text,
-                .done => |r| {
-                    if (r.timed_out) {
-                        nav_snap_err = "the page did not answer the requested snapshot in time (call web_snapshot)";
-                    } else {
-                        nav_snap = .{ .document = r.doc_gen, .revision = r.rev, .tree = r.payload };
-                        nav_snap_kind = r.snapshot_kind;
-                    }
-                },
-            }
-        }
-        return navigateResult(arena, drv.mode(), settled, nav_snap, nav_snap_kind, nav_snap_err, post);
+        // Settle, the `wait` and the snapshot run in `NavigateRun`.
+        return deferTo(pend, drv, view.pane, .{ .navigate = .{
+            .args = args,
+            .view = view,
+            .url = url,
+            .navigates = navigates,
+            .cursor = cursor,
+            .nav_started = nav_started,
+            .nav_wait = nav_wait,
+            .deadline = drv.now() + timeoutOf(args, 15_000),
+            .base_seq = view.load_seq,
+            .wanted_blank = if (url) |u| isBlankDoc(u) else true,
+            .settled = view,
+            // The first look comes after the navigation had a moment to
+            // start; a stop/back is usually instant, a url is not.
+            .due = drv.now() + 100,
+        } });
     }
 
     if (eql(u8, name, "web_snapshot")) {
@@ -5336,7 +5235,7 @@ pub fn webTool(
             web_proto.MAX_EVAL_STR
         else
             @max(EVAL_PAGE_CHARS, @as(u32, @intCast(inline_limit)));
-        switch (try runOp(drv, arena, view.pane, .{
+        const flight = switch (try OpFlight.start(drv, arena, view.pane, .{
             .op = "eval",
             .data = code,
             .await_promise = want_await,
@@ -5346,32 +5245,15 @@ pub fn webTool(
             // little more so a helper-side timeout REPORT still lands.
         }, budget + 3000)) {
             .err => |e| return failRes(arena, e),
-            .done => |r| {
-                if (r.timed_out) return mcp.errRes(
-                    arena,
-                    .timeout,
-                    "the page never answered the evaluation (a blocked main thread, or a view that went away)",
-                );
-                // A thrown exception: the payload IS the description
-                // (message + stack), so it becomes the error message.
-                if (!r.ok) return mcp.errRes(arena, .failed, if (r.payload.len > 0)
-                    try std.fmt.allocPrint(arena, "the page threw: {s}", .{r.payload})
-                else
-                    "the evaluation failed with no description");
-                // strict: the caller wants the VALUE or nothing. A cut
-                // prefix would hand back a string where a list was —
-                // exactly the silent shape change strict exists to
-                // refuse. The length rides the message so the retry can
-                // size max_chars (or narrow the code) without guessing.
-                if (strict and r.payload.len > inline_limit) return mcp.errRes(
-                    arena,
-                    .invalid_args,
-                    try std.fmt.allocPrint(arena, "result too large for strict inline return: {d} chars, limit {d} (max_chars raises it up to {d}; out_file writes it to disk whole; or drop strict:true to page it with web_expand id=0; or return less from the code)", .{ r.payload.len, inline_limit, EVAL_INLINE_MAX }),
-                );
-                if (out_file) |path| return evalToFile(arena, drv.mode(), view, r.payload, path);
-                return evalResult(arena, drv.mode(), view, r.payload, inline_limit);
-            },
-        }
+            .flight => |f| f,
+        };
+        return deferTo(pend, drv, view.pane, .{ .eval = .{
+            .flight = flight,
+            .view = view,
+            .strict = strict,
+            .out_file = out_file,
+            .inline_limit = inline_limit,
+        } });
     }
 
     if (eql(u8, name, "web_scroll")) return scrollTool(drv, arena, args, view);
@@ -5383,7 +5265,7 @@ pub fn webTool(
     if (eql(u8, name, "web_console")) return consoleTool(drv, arena, args, view);
     if (eql(u8, name, "web_inspect") or eql(u8, name, "web_checkpoint"))
         return @import("mcp_web_review.zig").tool(drv, arena, name, args, view);
-    if (eql(u8, name, "web_wait")) return waitTool(drv, arena, args, view);
+    if (eql(u8, name, "web_wait")) return waitTool(drv, arena, args, view, pend);
     if (eql(u8, name, "web_capture")) return captureTool(drv, arena, args, view);
     if (eql(u8, name, "web_capture_set")) return captureSetTool(drv, arena, args, view);
     if (eql(u8, name, "web_network")) return networkTool(drv, arena, args, view);
@@ -5400,6 +5282,483 @@ pub fn webTool(
 
     return mcp.errRes(arena, .unknown_tool, "unknown web tool");
 }
+
+/// A web call that has more to wait for (see `webCall`). `step` until it
+/// answers: `webTool` sleeps `pollMs` in between, `mcp_webjobs` steps it
+/// from the server loop so calls on other tabs are served meanwhile.
+pub const Pending = struct {
+    drv: Driver,
+    /// The tab it works on.
+    pane: u32,
+    run: Run,
+
+    pub const Run = union(enum) { open: OpenRun, navigate: NavigateRun, wait: WaitRun, eval: EvalRun };
+
+    /// One step; null while it still waits. Allocates in `arena`, which
+    /// must outlive the whole call.
+    pub fn step(self: *Pending, arena: std.mem.Allocator) !?[]const u8 {
+        return switch (self.run) {
+            inline else => |*r| r.step(self.drv, arena),
+        };
+    }
+
+    /// How long until the next step has something to do.
+    pub fn pollMs(self: *const Pending) u32 {
+        const due = switch (self.run) {
+            inline else => |r| r.due,
+        };
+        return @intCast(std.math.clamp(due - self.drv.now(), 1, 100));
+    }
+
+    /// The caller went away: release what the call holds.
+    pub fn abandon(self: *Pending) void {
+        switch (self.run) {
+            inline else => |*r| r.abandon(self.drv),
+        }
+    }
+};
+
+const SettleStep = union(enum) { more, done, reply: []const u8 };
+
+/// `web_open` once its tab exists: settle on the navigation it asked
+/// for, the optional `wait`, the navigation fact, the first snapshot.
+const OpenRun = struct {
+    args: std.json.Value,
+    new_handle: u32,
+    url: ?[]const u8,
+    profile: ?[]const u8,
+    where: []const u8,
+    tab_label: ?[]const u8,
+    drift_on: bool,
+    nav_wait: ?NavWait,
+    nav_started: i64,
+    policy: ?webdrive.NetPolicy,
+    policy_source: []const u8,
+    cap: ?webdrive.CaptureFilter,
+    deadline: i64,
+    wanted_blank: bool,
+    v: View,
+    settled: bool,
+    open_views: usize,
+    post: NavPost = .{},
+    phase: enum { settle, wait, snapshot } = .settle,
+    due: i64 = 0,
+    wait_t0: i64 = 0,
+    probe: ?WaitProbe = null,
+    flight: ?OpFlight = null,
+
+    fn step(self: *OpenRun, drv: Driver, arena: std.mem.Allocator) !?[]const u8 {
+        if (drv.now() < self.due) return null;
+        switch (self.phase) {
+            .settle => {
+                if (drv.now() < self.deadline) switch (try self.settleOnce(drv, arena)) {
+                    .more => {
+                        self.due = drv.now() + 100;
+                        return null;
+                    },
+                    .done => {},
+                    .reply => |r| return r,
+                };
+                return self.afterSettle(drv, arena);
+            },
+            .wait => {
+                const p = &self.probe.?;
+                const o = (try p.step(arena)) orelse blk: {
+                    if (drv.now() < p.deadline) {
+                        self.due = drv.now() + p.pollMs();
+                        return null;
+                    }
+                    break :blk try p.expired(arena);
+                };
+                self.probe = null;
+                self.applyWait(o, drv.now() - self.wait_t0);
+                return self.finish(drv, arena);
+            },
+            .snapshot => {
+                const answer = (try self.flight.?.poll(arena)) orelse {
+                    self.due = drv.now() + POLL_MS;
+                    return null;
+                };
+                self.flight = null;
+                switch (answer) {
+                    .err => |e| return try self.result(drv, arena, self.settled, null, e.text),
+                    .done => |r| {
+                        if (r.timed_out) return try self.result(drv, arena, self.settled, null, "the page did not answer a first snapshot in time (it may still be loading; call web_snapshot)");
+                        // `document` is the engine's per-document counter:
+                        // 1 means the view has only ever held THIS page. A
+                        // higher number on a fresh view means a document
+                        // preceded it (the GUI backend still creates a tab
+                        // blank and navigates it afterwards).
+                        return try self.result(drv, arena, self.settled, .{ .document = r.doc_gen, .revision = r.rev, .tree = r.payload }, null);
+                    },
+                }
+            },
+        }
+    }
+
+    /// One look at the new view. A fresh view needs the helper handshake
+    /// plus the load, and a snapshot before the document exists is empty.
+    /// With a url, the wait is for THAT navigation (see `openSettled`):
+    /// "some url is loaded and idle" was satisfied by the about:blank
+    /// document a create-then-navigate mints, and web_open then returned
+    /// a first snapshot of a blank page.
+    fn settleOnce(self: *OpenRun, drv: Driver, arena: std.mem.Allocator) !SettleStep {
+        if (self.due != 0 and drv == .headless and drv.headless.state == .unavailable)
+            return .{ .reply = try failRes(arena, try headlessFail(arena, drv.headless, error.Unavailable)) };
+        const vs = (try listViews(drv, arena)) orelse return .more;
+        self.open_views = vs.views.len;
+        const found = viewFor(vs, self.new_handle) orelse return .more;
+        self.v = found;
+        // The helper refused the identity context. There is no ack for
+        // context_create, so this event is the ONLY way that failure
+        // becomes visible — and the view must go, un-navigated, rather
+        // than fall back into the shared jar.
+        if (found.create_failed.len > 0) {
+            if (drv == .headless) drv.headless.closeView(self.new_handle);
+            const why = try std.fmt.allocPrint(
+                arena,
+                "the browser helper refused the identity context for {s} ({s}); nothing was opened and NO page was loaded in the shared cookie jar",
+                .{
+                    if (self.profile) |p| try std.fmt.allocPrint(arena, "profile '{s}'", .{p}) else "the requested throwaway identity",
+                    found.create_failed,
+                },
+            );
+            return .{ .reply = if (drv == .headless)
+                try failRes(arena, try diagnosticFail(arena, drv.headless, .io_failed, why))
+            else
+                try mcp.errRes(arena, .io_failed, why) };
+        }
+        // The helper answered active=0 for our policy serial: it could
+        // not HOLD the policy (its slot table filled). The view must go
+        // rather than run unpoliced.
+        if (found.policy_install_failed) {
+            if (drv == .headless) drv.headless.closeView(self.new_handle);
+            return .{ .reply = try mcp.errRes(arena, .conflict, "the browser helper could not hold the requested network policy (its policy table is full); the view was closed un-navigated — close other views with web_close and retry") };
+        }
+        // Likewise for the capture: a view that would record nothing
+        // must not run as if it did.
+        if (found.capture_install_failed) {
+            if (drv == .headless) drv.headless.closeView(self.new_handle);
+            return .{ .reply = try mcp.errRes(arena, .conflict, "the browser helper could not hold the requested capture (its view table is full); the view was closed - close other views with web_close and retry") };
+        }
+        // A held certificate or a failed load: the page is not coming,
+        // and the reply must say so NOW rather than after the whole
+        // timeout with "not settled".
+        if (found.loadBlocked()) return .done;
+        // A url that became a download never commits a document: the
+        // offer IS the outcome.
+        if (drv == .headless and downloadSince(drv.headless, self.new_handle, self.nav_started)) return .done;
+        // A view created blank has load_seq 0 to start with; anything it
+        // has already finished by the first poll is a load this call
+        // caused.
+        if (self.url == null or openSettled(found, self.wanted_blank)) {
+            self.settled = true;
+            return .done;
+        }
+        return .more;
+    }
+
+    fn afterSettle(self: *OpenRun, drv: Driver, arena: std.mem.Allocator) !?[]const u8 {
+        if (self.tab_label) |l| {
+            if (drv == .gui) g_tabs.setLabel(tabs_alloc, tabKey(.gui, self.v), l, clock.nowMs()) catch {};
+            self.v.label = l;
+        }
+        self.v.idle_drift = self.drift_on;
+        if (drv == .gui) g_tabs.touch(tabs_alloc, tabKey(.gui, self.v), clock.nowMs()) catch {};
+        if (self.nav_wait) |w| {
+            if (self.v.loadBlocked()) {
+                self.post.wait = .{ .@"for" = @tagName(w.what), .arg = if (w.arg.len > 0) w.arg else null, .met = false, .detail = "not waited: the requested page did not load", .elapsed_ms = 0 };
+            } else {
+                self.wait_t0 = drv.now();
+                switch (try WaitProbe.init(drv, arena, self.v, w.what, w.arg, w.budget)) {
+                    .done => |o| self.applyWait(o, drv.now() - self.wait_t0),
+                    .probe => |p| {
+                        self.probe = p;
+                        self.phase = .wait;
+                        self.due = 0;
+                        return null;
+                    },
+                }
+            }
+        }
+        return self.finish(drv, arena);
+    }
+
+    fn applyWait(self: *OpenRun, o: WaitOutcome, elapsed_ms: i64) void {
+        const r = navWaitReport(self.nav_wait.?, o, self.v, elapsed_ms);
+        self.post.wait = r.report;
+        self.v = r.view;
+        if (self.tab_label) |l| self.v.label = l;
+        self.v.idle_drift = self.drift_on;
+    }
+
+    fn finish(self: *OpenRun, drv: Driver, arena: std.mem.Allocator) !?[]const u8 {
+        // A fresh view's log starts with this navigation: cursor 0.
+        if (self.url != null) self.post.nav = try navOf(drv, arena, self.v, 0, self.url, self.nav_started);
+        // Whatever document the view holds is the engine's error page or
+        // the blank one; a tree of it reads as "the page is empty", which
+        // is the wrong conclusion.
+        if (self.v.loadBlocked()) return try self.result(drv, arena, false, null, "skipped: the requested page did not load");
+        // `snapshot:"none"` skips the tree for opens that only need a
+        // view (a screenshot, a viewport): the full tree of a page the
+        // caller will not read is the single most expensive part of this
+        // reply.
+        const snap_want = mcp.argStr(self.args, "snapshot") orelse "full";
+        if (!(std.mem.eql(u8, snap_want, "full") or std.mem.eql(u8, snap_want, "none")))
+            return try mcp.errRes(arena, .invalid_args, "web_open 'snapshot' must be \"full\" (default) or \"none\"");
+        if (std.mem.eql(u8, snap_want, "none"))
+            return try self.result(drv, arena, self.settled, null, "skipped by request (snapshot:\"none\"); call web_snapshot when you need the tree");
+        switch (try OpFlight.start(drv, arena, self.new_handle, .{
+            .op = "snapshot",
+            .mode = "full",
+            .detail = 1,
+        }, @max(self.deadline - drv.now(), 2000))) {
+            .err => |e| return try self.result(drv, arena, self.settled, null, e.text),
+            .flight => |f| {
+                self.flight = f;
+                self.phase = .snapshot;
+                self.due = 0;
+                return null;
+            },
+        }
+    }
+
+    fn result(self: *OpenRun, drv: Driver, arena: std.mem.Allocator, settled: bool, snap: ?Snap, snap_err: ?[]const u8) ![]const u8 {
+        const echo: ?*const webdrive.NetPolicy = if (self.policy) |*p|
+            p
+        else if (drv == .headless and std.mem.eql(u8, self.policy_source, "profile_default"))
+            drv.headless.profilePolicy(self.profile.?)
+        else
+            null;
+        return openResult(arena, drv.mode(), self.v, settled, drv == .headless and !std.mem.eql(u8, self.where, "tab"), snap, snap_err, echo, self.policy_source, if (self.cap) |*f| f else null, self.open_views, self.post);
+    }
+
+    /// Cancelled: the caller never learns the new tab, so it goes.
+    fn abandon(self: *OpenRun, drv: Driver) void {
+        if (self.probe) |*p| p.abandon();
+        if (self.flight) |*f| f.abandon();
+        if (drv == .headless) drv.headless.closeView(self.new_handle);
+    }
+};
+
+/// `web_navigate` once the navigation is asked for: settle, `wait`, the
+/// navigation fact, the optional snapshot.
+const NavigateRun = struct {
+    args: std.json.Value,
+    view: View,
+    url: ?[]const u8,
+    navigates: bool,
+    cursor: ?u32,
+    nav_started: i64,
+    nav_wait: ?NavWait,
+    deadline: i64,
+    base_seq: u32,
+    wanted_blank: bool,
+    settled: View,
+    due: i64,
+    post: NavPost = .{},
+    phase: enum { settle, wait, snapshot } = .settle,
+    wait_t0: i64 = 0,
+    probe: ?WaitProbe = null,
+    flight: ?OpFlight = null,
+
+    fn step(self: *NavigateRun, drv: Driver, arena: std.mem.Allocator) !?[]const u8 {
+        if (drv.now() < self.due) return null;
+        switch (self.phase) {
+            .settle => {
+                if (drv.now() < self.deadline) switch (try self.settleOnce(drv, arena)) {
+                    .more => {
+                        self.due = drv.now() + 100;
+                        return null;
+                    },
+                    .done => {},
+                    .reply => |r| return r,
+                };
+                if (self.nav_wait) |w| {
+                    self.wait_t0 = drv.now();
+                    switch (try WaitProbe.init(drv, arena, self.settled, w.what, w.arg, w.budget)) {
+                        .done => |o| self.applyWait(o, drv.now() - self.wait_t0),
+                        .probe => |p| {
+                            self.probe = p;
+                            self.phase = .wait;
+                            self.due = 0;
+                            return null;
+                        },
+                    }
+                }
+                return self.finish(drv, arena);
+            },
+            .wait => {
+                const p = &self.probe.?;
+                const o = (try p.step(arena)) orelse blk: {
+                    if (drv.now() < p.deadline) {
+                        self.due = drv.now() + p.pollMs();
+                        return null;
+                    }
+                    break :blk try p.expired(arena);
+                };
+                self.probe = null;
+                self.applyWait(o, drv.now() - self.wait_t0);
+                return self.finish(drv, arena);
+            },
+            .snapshot => {
+                const answer = (try self.flight.?.poll(arena)) orelse {
+                    self.due = drv.now() + POLL_MS;
+                    return null;
+                };
+                self.flight = null;
+                switch (answer) {
+                    .err => |e| return try navigateResult(arena, drv.mode(), self.settled, null, "", e.text, self.post),
+                    .done => |r| {
+                        if (r.timed_out) return try navigateResult(arena, drv.mode(), self.settled, null, "", "the page did not answer the requested snapshot in time (call web_snapshot)", self.post);
+                        return try navigateResult(arena, drv.mode(), self.settled, .{ .document = r.doc_gen, .revision = r.rev, .tree = r.payload }, r.snapshot_kind, null, self.post);
+                    },
+                }
+            },
+        }
+    }
+
+    /// One look at the view. It settles exactly as web_open does
+    /// (`navSettled`): a load finished since the call, none in flight.
+    /// "Was loading, now is not" missed a load that finished between two
+    /// polls, and a navigation to the url the view already showed then
+    /// waited out the whole budget.
+    fn settleOnce(self: *NavigateRun, drv: Driver, arena: std.mem.Allocator) !SettleStep {
+        const now = (try listViews(drv, arena)) orelse return .done;
+        const found = viewFor(now, self.view.pane) orelse return .done;
+        self.settled = found;
+        if (found.loadBlocked()) return .done;
+        if (drv == .headless and downloadSince(drv.headless, self.view.pane, self.nav_started)) return .done;
+        if (navSettled(found, self.base_seq, self.wanted_blank)) return .done;
+        if (found.loading) return .more;
+        // back/forward/stop may be served from the page cache with no
+        // load at all; a same-document navigation moves only the url.
+        if (self.url == null) return .done;
+        if (found.load_seq == self.base_seq and !std.mem.eql(u8, found.url, self.view.url)) return .done;
+        return .more;
+    }
+
+    fn applyWait(self: *NavigateRun, o: WaitOutcome, elapsed_ms: i64) void {
+        const r = navWaitReport(self.nav_wait.?, o, self.settled, elapsed_ms);
+        self.post.wait = r.report;
+        self.settled = r.view;
+    }
+
+    fn finish(self: *NavigateRun, drv: Driver, arena: std.mem.Allocator) !?[]const u8 {
+        if (self.navigates) self.post.nav = if (self.cursor) |c0|
+            try navOf(drv, arena, self.settled, c0, self.url, self.nav_started)
+        else
+            .{ .unavailable = "the request log was unreadable before the navigation" };
+        // `snapshot:"delta"|"full"` folds the follow-up tree the caller
+        // was about to ask for into THIS reply; the default stays "none"
+        // (the historical shape).
+        const snap_want = mcp.argStr(self.args, "snapshot") orelse "none";
+        const eql = std.mem.eql;
+        if (!(eql(u8, snap_want, "none") or eql(u8, snap_want, "delta") or eql(u8, snap_want, "full")))
+            return try mcp.errRes(arena, .invalid_args, "web_navigate 'snapshot' must be none|delta|full");
+        if (eql(u8, snap_want, "none")) return try navigateResult(arena, drv.mode(), self.settled, null, "", null, self.post);
+        switch (try OpFlight.start(drv, arena, self.view.pane, .{
+            .op = "snapshot",
+            .mode = if (eql(u8, snap_want, "full")) "full" else "auto",
+            .detail = 1,
+        }, 5000)) {
+            .err => |e| return try navigateResult(arena, drv.mode(), self.settled, null, "", e.text, self.post),
+            .flight => |f| {
+                self.flight = f;
+                self.phase = .snapshot;
+                self.due = 0;
+                return null;
+            },
+        }
+    }
+
+    fn abandon(self: *NavigateRun, _: Driver) void {
+        if (self.probe) |*p| p.abandon();
+        if (self.flight) |*f| f.abandon();
+    }
+};
+
+/// `web_wait` for every condition but `response`.
+const WaitRun = struct {
+    probe: WaitProbe,
+    what_s: []const u8,
+    arg: []const u8,
+    due: i64 = 0,
+
+    fn step(self: *WaitRun, drv: Driver, arena: std.mem.Allocator) !?[]const u8 {
+        if (drv.now() < self.due) return null;
+        const o = (try self.probe.step(arena)) orelse blk: {
+            if (drv.now() < self.probe.deadline) {
+                self.due = drv.now() + self.probe.pollMs();
+                return null;
+            }
+            break :blk try self.probe.expired(arena);
+        };
+        return try waitReply(drv, arena, o, self.what_s, self.arg);
+    }
+
+    fn abandon(self: *WaitRun, _: Driver) void {
+        self.probe.abandon();
+    }
+};
+
+/// `web_wait`'s answer for how its wait ended.
+fn waitReply(drv: Driver, arena: std.mem.Allocator, o: WaitOutcome, what_s: []const u8, arg: []const u8) ![]const u8 {
+    return switch (o) {
+        .met => |m| waitResult(arena, drv.mode(), m.view, what_s, arg, m.detail),
+        .not_met => |n| mcp.errRes(arena, n.code, n.msg),
+        .err => |f| failRes(arena, f),
+    };
+}
+
+/// `web_eval` once its script is out.
+const EvalRun = struct {
+    flight: OpFlight,
+    view: View,
+    strict: bool,
+    out_file: ?[]const u8,
+    inline_limit: usize,
+    due: i64 = 0,
+
+    fn step(self: *EvalRun, drv: Driver, arena: std.mem.Allocator) !?[]const u8 {
+        if (drv.now() < self.due) return null;
+        const answer = (try self.flight.poll(arena)) orelse {
+            self.due = drv.now() + POLL_MS;
+            return null;
+        };
+        const r = switch (answer) {
+            .err => |e| return try failRes(arena, e),
+            .done => |d| d,
+        };
+        if (r.timed_out) return try mcp.errRes(
+            arena,
+            .timeout,
+            "the page never answered the evaluation (a blocked main thread, or a view that went away)",
+        );
+        // A thrown exception: the payload IS the description (message +
+        // stack), so it becomes the error message.
+        if (!r.ok) return try mcp.errRes(arena, .failed, if (r.payload.len > 0)
+            try std.fmt.allocPrint(arena, "the page threw: {s}", .{r.payload})
+        else
+            "the evaluation failed with no description");
+        // strict: the caller wants the VALUE or nothing. A cut prefix
+        // would hand back a string where a list was — exactly the silent
+        // shape change strict exists to refuse. The length rides the
+        // message so the retry can size max_chars (or narrow the code)
+        // without guessing.
+        if (self.strict and r.payload.len > self.inline_limit) return try mcp.errRes(
+            arena,
+            .invalid_args,
+            try std.fmt.allocPrint(arena, "result too large for strict inline return: {d} chars, limit {d} (max_chars raises it up to {d}; out_file writes it to disk whole; or drop strict:true to page it with web_expand id=0; or return less from the code)", .{ r.payload.len, self.inline_limit, EVAL_INLINE_MAX }),
+        );
+        if (self.out_file) |path| return try evalToFile(arena, drv.mode(), self.view, r.payload, path);
+        return try evalResult(arena, drv.mode(), self.view, r.payload, self.inline_limit);
+    }
+
+    fn abandon(self: *EvalRun, _: Driver) void {
+        self.flight.abandon();
+    }
+};
 
 /// `encoding` + `video_codecs`: null for a raw stream, else the codec ids
 /// (consumer preference order, possibly empty) an encoded open sends.
@@ -8168,7 +8527,7 @@ fn downloadListResult(drv: Driver, arena: std.mem.Allocator, view: View) ![]cons
     return res.finish();
 }
 
-fn waitTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {
+fn waitTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View, pend: *?Pending) ![]const u8 {
     const what_s = mcp.argStr(args, "for") orelse "load";
     const what = std.meta.stringToEnum(webnav.WaitFor, what_s) orelse
         return mcp.errRes(arena, .invalid_args, "web_wait 'for' must be " ++ WAIT_FOR_NAMES);
@@ -8181,10 +8540,9 @@ fn waitTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: V
     if (what == .load) {
         if (try policyGate(arena, view)) |f| return failRes(arena, f);
     }
-    switch (try waitCore(drv, arena, view, what, arg, timeoutOf(args, 15_000))) {
-        .met => |m| return waitResult(arena, drv.mode(), m.view, what_s, arg, m.detail),
-        .not_met => |n| return mcp.errRes(arena, n.code, n.msg),
-        .err => |f| return failRes(arena, f),
+    switch (try WaitProbe.init(drv, arena, view, what, arg, timeoutOf(args, 15_000))) {
+        .done => |o| return waitReply(drv, arena, o, what_s, arg),
+        .probe => |p| return deferTo(pend, drv, view.pane, .{ .wait = .{ .probe = p, .what_s = what_s, .arg = arg } }),
     }
 }
 
@@ -8208,25 +8566,11 @@ pub const WaitOutcome = union(enum) {
     err: Fail,
 };
 
-/// THE wait: `web_wait` and the `wait` option of `web_open` /
-/// `web_navigate` both run it, and `web_fetch` steps the same probe from
-/// the server loop. Every condition but `response` (which needs a
-/// capture cursor, `waitResponse`).
-fn waitCore(drv: Driver, arena: std.mem.Allocator, view: View, what: webnav.WaitFor, arg: []const u8, budget: i64) !WaitOutcome {
-    var probe = switch (try WaitProbe.init(drv, arena, view, what, arg, budget)) {
-        .probe => |p| p,
-        .done => |o| return o,
-    };
-    while (true) {
-        if (try probe.step(arena)) |o| return o;
-        if (drv.now() >= probe.deadline) break;
-        drv.sleep(WaitProbe.POLL_MS);
-    }
-    return probe.expired(arena);
-}
-
-/// One wait, checked one poll at a time: `step` until it answers or
-/// `deadline` passes, then `expired` says why it never held.
+/// THE wait, checked one poll at a time: `step` until it answers or
+/// `deadline` passes, then `expired` says why it never held. `web_wait`
+/// and the `wait` option of `web_open` / `web_navigate` step it through
+/// `Pending`, `web_fetch` from its own service. Every condition but
+/// `response` (which needs a capture cursor, `waitResponse`).
 pub const WaitProbe = struct {
     pub const POLL_MS: u32 = 150;
 
@@ -8250,6 +8594,24 @@ pub const WaitProbe = struct {
     /// selector: why the newest poll could not run in the page (it was
     /// between documents), for the timeout's sentence.
     eval_failed: []const u8 = "",
+    /// selector: the probe's eval, while the page has not answered it.
+    flight: ?OpFlight = null,
+
+    /// How long to wait before the next `step`: a probe in flight is
+    /// looked at again soon, a fresh one after the poll interval.
+    pub fn pollMs(self: *const WaitProbe) u32 {
+        return if (self.flight != null) FLIGHT_POLL_MS else WaitProbe.POLL_MS;
+    }
+
+    /// How soon an outstanding probe is looked at again.
+    const FLIGHT_POLL_MS: u32 = 40;
+
+    /// The caller went away: the page's answer to an outstanding probe is
+    /// no longer anyone's.
+    pub fn abandon(self: *WaitProbe) void {
+        if (self.flight) |*f| f.abandon();
+        self.flight = null;
+    }
 
     pub fn init(drv: Driver, arena: std.mem.Allocator, view: View, what: webnav.WaitFor, arg: []const u8, budget: i64) !union(enum) { probe: WaitProbe, done: WaitOutcome } {
         const now = drv.now();
@@ -8343,11 +8705,20 @@ pub const WaitProbe = struct {
                     }
                 },
             },
-            .selector => switch (try runOp(drv, arena, view.pane, .{
-                .op = "eval",
-                .data = self.selector_expr,
-                .timeout_ms = 4000,
-            }, 6000)) {
+            .selector => {
+                // Started on one step, collected on a later one: a probe
+                // never blocks the server loop on the page's answer.
+                if (self.flight == null) switch (try OpFlight.start(drv, arena, view.pane, .{
+                    .op = "eval",
+                    .data = self.selector_expr,
+                    .timeout_ms = 4000,
+                }, 6000)) {
+                    .err => |e| return .{ .err = e },
+                    .flight => |f| self.flight = f,
+                };
+                const answer = (try self.flight.?.poll(arena)) orelse return null;
+                self.flight = null;
+                switch (answer) {
                 .err => |e| return .{ .err = e },
                 .done => |r| if (!r.timed_out) {
                     // An eval that could not run says nothing about the
@@ -8371,6 +8742,7 @@ pub const WaitProbe = struct {
                         .none => self.eval_failed = "",
                     }
                 },
+                }
             },
             .network_idle => switch (try netLog(drv, arena, view.pane, 0, 128, @min(self.deadline - self.started, 5000))) {
                 .err => |e| return .{ .err = e },
@@ -8394,7 +8766,8 @@ pub const WaitProbe = struct {
     /// The deadline passed: why the condition never held. A condition
     /// that never held is an ERROR, not a settled result the caller has
     /// to re-read to notice.
-    pub fn expired(self: *const WaitProbe, arena: std.mem.Allocator) !WaitOutcome {
+    pub fn expired(self: *WaitProbe, arena: std.mem.Allocator) !WaitOutcome {
+        self.abandon();
         const drv = self.drv;
         const what_s = @tagName(self.what);
         const arg = self.arg;

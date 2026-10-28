@@ -686,6 +686,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         say("smoke-mcp: focused web_fetch ok");
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBCONC_ONLY") != null) {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the concurrent web calls stage");
+        _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+        defer _ = unsetEnv("SKETERM_WEB_BIN");
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+        defer _ = unsetEnv("SKETERM_WEB_BROKER_ENGINE");
+        webConcStage(allocator, exe);
+        say("smoke-mcp: focused concurrent web calls ok");
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBREAD_ONLY") != null) {
         var bin_buf: [4096:0]u8 = undefined;
         const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the reading stage");
@@ -7513,6 +7524,13 @@ const NavHttp = struct {
         \\<script>setTimeout(() => { const d = document.createElement("div"); d.id = "late"; d.textContent = "LATE"; document.body.appendChild(d); }, 1200);</script>
         \\</body></html>
     ;
+    /// Stage wc: an element 3s after the page loads, so two tabs waiting
+    /// for it overlap their waits or visibly do not.
+    const later =
+        \\<!doctype html><html><head><title>nav-later</title></head><body>
+        \\<script>setTimeout(() => { const d = document.createElement("div"); d.id = "later"; document.body.appendChild(d); }, 3000);</script>
+        \\</body></html>
+    ;
     const zip = "PK\x03\x04nav-download-bytes";
     /// A redirect target past the old 256-byte log cut, and one past the
     /// log's whole-url bound (`LOG_URL_MAX`, 8192).
@@ -7567,6 +7585,8 @@ const NavHttp = struct {
             tcpserver.respond(afd, "404 Not Found", "text/html", missing, "");
         } else if (eq(u8, path, "/late")) {
             tcpserver.respondOk(afd, "text/html", late, "");
+        } else if (eq(u8, path, "/later")) {
+            tcpserver.respondOk(afd, "text/html", later, "");
         } else if (eq(u8, path, "/file.zip")) {
             tcpserver.respondOk(afd, "application/zip", zip, "");
         } else {
@@ -7816,6 +7836,181 @@ fn webNavStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8)
         if (!r.get("wait").?.object.get("met").?.bool) fail("wn: web_open's wait was not met");
     }
     _ = capSc(arena, m.callTool("web_close", "{\"label\":\"wn\"}"), "wn: close", false);
+    m.closeStdinWait();
+}
+
+/// Calls answered from `m` in any order: each one's reply line by the
+/// request id it carries, and when it arrived (ms after `t0`).
+fn recvAll(m: *Mcp, arena: std.mem.Allocator, ids: []const i64, t0: i64, comptime what: []const u8) struct { lines: [][]const u8, at: []i64, order: []usize } {
+    const lines = arena.alloc([]const u8, ids.len) catch fail("oom");
+    const at = arena.alloc(i64, ids.len) catch fail("oom");
+    const order = arena.alloc(usize, ids.len) catch fail("oom");
+    for (0..ids.len) |k| {
+        const r = recvReply(m, arena, 60_000);
+        const i = std.mem.indexOfScalar(i64, ids, r.id) orelse fail(what ++ ": a reply to an unknown request id");
+        lines[i] = r.line;
+        at[i] = nowMs() - t0;
+        order[k] = i;
+    }
+    return .{ .lines = lines, .at = at, .order = order };
+}
+
+fn sayTiming(arena: std.mem.Allocator, what: []const u8, at: []const i64) void {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    aw.writer.print("smoke-mcp: wc timing: {s}:", .{what}) catch return;
+    for (at) |ms| aw.writer.print(" {d}ms", .{ms}) catch return;
+    say(aw.written());
+}
+
+/// Stage wc: web calls on DIFFERENT tabs of one connection run
+/// concurrently (two 3s waits answer in about 3s, not 6s) for web_open,
+/// web_navigate, web_wait and web_eval; calls on ONE tab keep their
+/// order; a call that times out or is cancelled holds no other call up.
+fn webConcStage(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var http = NavHttp{};
+    if (!http.start()) fail("wc: could not bind the loopback fixture");
+    defer http.lis.deinit();
+    const port = http.lis.port;
+    var args: [512]u8 = undefined;
+    // Two 3s waits one after the other take 6s; together about 3s plus
+    // the page loads.
+    const OVERLAPPED_MS: i64 = 4_800;
+
+    var m = Mcp.spawn(allocator, exe, &.{});
+    m.initialize();
+    // The engine starts here, outside every measurement.
+    _ = capSc(arena, m.callToolTimeout("web_open", "{\"url\":\"data:text/html,<title>warm</title>warm\",\"snapshot\":\"none\",\"label\":\"warm\"}", 60_000), "wc: warm-up open", false);
+    {
+        const caps = capSc(arena, m.callTool("capabilities", "{}"), "wc: capabilities", false);
+        const f = (caps.get("web_concurrent_tabs") orelse fail("wc: capabilities has no web_concurrent_tabs")).object;
+        if (!f.get("available").?.bool) fail("wc: web_concurrent_tabs is not available on the headless browser");
+    }
+
+    // (1) Two web_open calls, each waiting for its page's late element.
+    var panes: [2]i64 = undefined;
+    {
+        const t0 = nowMs();
+        var ids: [2]i64 = undefined;
+        for (&ids) |*id| {
+            m.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/later\",\"snapshot\":\"none\",\"wait\":{{\"for\":\"selector\",\"arg\":\"#later\",\"timeout_ms\":15000}}}}", .{port}) catch unreachable);
+            id.* = m.id;
+        }
+        const got = recvAll(&m, arena, &ids, t0, "wc: opens");
+        for (got.lines, 0..) |line, i| {
+            const o = capSc(arena, line, "wc: a concurrent open", false);
+            if (!o.get("wait").?.object.get("met").?.bool) fail("wc: a concurrent open's wait was not met");
+            panes[i] = capInt(o, "view");
+        }
+        sayTiming(arena, "two web_open, each waiting 3s", got.at);
+        if (@max(got.at[0], got.at[1]) > OVERLAPPED_MS) fail("wc: two web_open waits did not overlap");
+    }
+
+    // (2) web_navigate on both tabs, each waiting for the late element.
+    {
+        const t0 = nowMs();
+        var ids: [2]i64 = undefined;
+        for (&ids, panes) |*id, pane| {
+            m.sendTool("web_navigate", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"url\":\"http://127.0.0.1:{d}/later\",\"wait\":{{\"for\":\"selector\",\"arg\":\"#later\",\"timeout_ms\":15000}}}}", .{ pane, port }) catch unreachable);
+            id.* = m.id;
+        }
+        const got = recvAll(&m, arena, &ids, t0, "wc: navigates");
+        for (got.lines) |line| {
+            if (!capSc(arena, line, "wc: a concurrent navigate", false).get("wait").?.object.get("met").?.bool) fail("wc: a concurrent navigate's wait was not met");
+        }
+        sayTiming(arena, "two web_navigate, each waiting 3s", got.at);
+        if (@max(got.at[0], got.at[1]) > OVERLAPPED_MS) fail("wc: two web_navigate waits did not overlap");
+    }
+
+    // (3) web_wait on both tabs after a navigation that does not wait.
+    {
+        for (panes) |pane| _ = capSc(arena, m.callTool("web_navigate", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"url\":\"http://127.0.0.1:{d}/later\"}}", .{ pane, port }) catch unreachable), "wc: navigate without wait", false);
+        const t0 = nowMs();
+        var ids: [2]i64 = undefined;
+        for (&ids, panes) |*id, pane| {
+            m.sendTool("web_wait", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"for\":\"selector\",\"arg\":\"#later\",\"timeout_ms\":15000}}", .{pane}) catch unreachable);
+            id.* = m.id;
+        }
+        const got = recvAll(&m, arena, &ids, t0, "wc: waits");
+        for (got.lines) |line| _ = capSc(arena, line, "wc: a concurrent web_wait", false);
+        sayTiming(arena, "two web_wait for a 3s element", got.at);
+        if (@max(got.at[0], got.at[1]) > OVERLAPPED_MS) fail("wc: two web_wait calls did not overlap");
+    }
+
+    // (4) web_eval awaiting 3s on both tabs.
+    {
+        const t0 = nowMs();
+        var ids: [2]i64 = undefined;
+        for (&ids, panes) |*id, pane| {
+            m.sendTool("web_eval", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"body\":\"await new Promise(r => setTimeout(r, 3000)); return 'slept';\"}}", .{pane}) catch unreachable);
+            id.* = m.id;
+        }
+        const got = recvAll(&m, arena, &ids, t0, "wc: evals");
+        for (got.lines) |line| expectContains(line, "slept", "wc: a concurrent eval's value");
+        sayTiming(arena, "two web_eval awaiting 3s", got.at);
+        if (@max(got.at[0], got.at[1]) > OVERLAPPED_MS) fail("wc: two web_eval calls did not overlap");
+    }
+
+    // (5) One tab keeps its order: an eval sent after a wait on the same
+    // tab runs after it (and sees the element), while the other tab's
+    // quick eval answers first.
+    {
+        for (panes) |pane| _ = capSc(arena, m.callTool("web_navigate", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"url\":\"http://127.0.0.1:{d}/later\"}}", .{ pane, port }) catch unreachable), "wc: navigate for ordering", false);
+        const t0 = nowMs();
+        var ids: [3]i64 = undefined;
+        m.sendTool("web_wait", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"for\":\"selector\",\"arg\":\"#later\",\"timeout_ms\":15000}}", .{panes[0]}) catch unreachable);
+        ids[0] = m.id;
+        m.sendTool("web_eval", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"code\":\"document.querySelector('#later') ? 'present' : 'absent'\"}}", .{panes[0]}) catch unreachable);
+        ids[1] = m.id;
+        m.sendTool("web_eval", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"code\":\"'other-tab'\"}}", .{panes[1]}) catch unreachable);
+        ids[2] = m.id;
+        const got = recvAll(&m, arena, &ids, t0, "wc: ordering");
+        sayTiming(arena, "tab A wait, tab A eval, tab B eval", got.at);
+        if (got.order[0] != 2) fail("wc: the other tab's quick eval waited behind tab A");
+        if (std.mem.indexOfScalar(usize, got.order, 0).? > std.mem.indexOfScalar(usize, got.order, 1).?) fail("wc: a call on one tab overtook the call before it");
+        expectContains(got.lines[1], "present", "wc: the second call on tab A ran before the first finished");
+    }
+
+    // (6) A wait that times out answers at its own timeout while the
+    // other tab still waits; a cancelled wait releases its tab at once.
+    {
+        for (panes) |pane| _ = capSc(arena, m.callTool("web_navigate", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"url\":\"http://127.0.0.1:{d}/later\"}}", .{ pane, port }) catch unreachable), "wc: navigate for timeouts", false);
+        const t0 = nowMs();
+        var ids: [2]i64 = undefined;
+        m.sendTool("web_wait", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"for\":\"selector\",\"arg\":\"#never\",\"timeout_ms\":1000}}", .{panes[0]}) catch unreachable);
+        ids[0] = m.id;
+        m.sendTool("web_wait", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"for\":\"selector\",\"arg\":\"#later\",\"timeout_ms\":15000}}", .{panes[1]}) catch unreachable);
+        ids[1] = m.id;
+        const got = recvAll(&m, arena, &ids, t0, "wc: timeouts");
+        sayTiming(arena, "tab A 1s timeout, tab B 3s wait", got.at);
+        const timed = capSc(arena, got.lines[0], "wc: the timed-out wait", true);
+        expectFact(timed.get("error").?.object, "code", "timeout", "wc: an unmet wait is not a timeout");
+        if (got.order[0] != 0 or got.at[0] > 2_500) fail("wc: the 1s wait did not answer at its own timeout");
+        _ = capSc(arena, got.lines[1], "wc: the other tab's wait", false);
+
+        m.sendTool("web_wait", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"for\":\"selector\",\"arg\":\"#never\",\"timeout_ms\":30000}}", .{panes[0]}) catch unreachable);
+        const cancelled = m.id;
+        _ = c.usleep(300_000);
+        var nbuf: [128]u8 = undefined;
+        m.send(std.fmt.bufPrint(&nbuf, "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":{d}}}}}", .{cancelled}) catch unreachable);
+        // The next call on that tab is not held behind it.
+        const t1 = nowMs();
+        m.sendTool("web_eval", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"code\":\"'after-cancel'\"}}", .{panes[0]}) catch unreachable);
+        const after = recvReply(&m, arena, 10_000);
+        if (after.id == cancelled) fail("wc: a cancelled call was answered");
+        if (after.id != m.id) fail("wc: an unexpected reply after a cancellation");
+        expectContains(after.line, "after-cancel", "wc: the call after a cancellation");
+        const waited = nowMs() - t1;
+        sayTiming(arena, "call on a tab whose wait was cancelled", &.{waited});
+        if (waited > 2_000) fail("wc: a cancelled wait still held its tab");
+    }
+    {
+        const caps = capSc(arena, m.callTool("capabilities", "{}"), "wc: capabilities at the end", false);
+        if (capInt(caps.get("web_concurrent_tabs").?.object, "in_flight") != 0) fail("wc: a web call is still in flight at the end");
+    }
+    for (panes) |pane| _ = capSc(arena, m.callTool("web_close", std.fmt.bufPrint(&args, "{{\"pane\":{d}}}", .{pane}) catch unreachable), "wc: close", false);
     m.closeStdinWait();
 }
 
@@ -8808,6 +9003,8 @@ fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u
     say("smoke-mcp: focused navigation results ok");
     webFetchStage(allocator, exe, rt);
     say("smoke-mcp: focused web_fetch ok");
+    webConcStage(allocator, exe);
+    say("smoke-mcp: focused concurrent web calls ok");
     webReadStage(allocator, exe, rt);
     say("smoke-mcp: focused web reading ok");
     webPersistStage(allocator, exe, rt);

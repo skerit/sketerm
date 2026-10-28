@@ -752,6 +752,34 @@ with a GUI browser (`web_gui`, `--shared`): its tabs would be the user's.
 `statuses`, `background_tabs` and how many fetch tabs are `in_flight` and
 urls `queued` right now.
 
+### Several tabs at once
+
+On this server's own headless browser, web calls on DIFFERENT tabs run
+concurrently over one connection: a client may send several requests
+without waiting, and each is answered when its own page is ready. Two
+tabs each waiting 3 s for an element answer in about 3 s, not 6 s
+(measured by `smoke-mcp` stage wc for `web_open`, `web_navigate`,
+`web_wait` and `web_eval`). The rule:
+
+- Calls naming the same tab (`pane`) are answered in the order they
+  were sent; a call starts only when the calls before it on that tab
+  have answered.
+- `web_open` makes its own tab and waits for nothing but a call that
+  names no tab.
+- A call naming NO tab (the current one), or a `label`, waits for every
+  earlier web call and holds back every later one. `web_tabs` and
+  `web_diagnostic` never wait.
+- Each call keeps its own `timeout_ms`; `notifications/cancelled` drops
+  a waiting call at once (an unfinished `web_open` closes its new tab)
+  and frees its tab for the next call.
+
+The calls whose waits overlap are `web_open`, `web_navigate`,
+`web_wait` (every condition but `response`) and `web_eval`; the others
+answer at once, after the earlier calls on their tab. With the user's
+GUI browser (`web_gui`, `--shared`) every web call stays one at a time.
+`capabilities.web_concurrent_tabs` is the preflight: `available`,
+`waiting_tools`, and `in_flight` (calls waiting on a page now).
+
 ### Reading one tab: `web_read`
 
 `web_read` reads the tab it names, in one of five `mode`s. The modes and

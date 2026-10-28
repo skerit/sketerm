@@ -358,6 +358,9 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         // reading redirect hops must not have to discover by trying.
         try res.fact("web_log_url_max", @import("mcp_web.zig").logUrlMaxCapability());
         try res.fact("web_network_cursor_exact", true);
+        // Calls on different tabs overlap; a consumer driving several
+        // tabs over one connection plans on this.
+        try res.fact("web_concurrent_tabs", @import("mcp_webjobs.zig").capability());
         // Reading several urls without driving a tab: its limits are
         // what a caller plans a batch around.
         const fetch = @import("mcp_webfetch.zig").capability();

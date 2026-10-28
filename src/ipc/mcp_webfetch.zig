@@ -440,11 +440,13 @@ fn step(job: *Job, it: *Item, e: *webdrive.Engine, scratch: std.mem.Allocator) !
         },
         .waiting => {
             if (now < it.next_poll_ms) return;
-            it.next_poll_ms = now + @as(i64, web.WaitProbe.POLL_MS);
             const p = &it.probe.?;
             const w = job.opts.wait.?;
             const out = (try p.step(job.arena())) orelse blk: {
-                if (now < p.deadline) return;
+                if (now < p.deadline) {
+                    it.next_poll_ms = now + @as(i64, p.pollMs());
+                    return;
+                }
                 break :blk try p.expired(job.arena());
             };
             it.row.wait = web.navWaitReport(w, out, p.view, now - p.started).report;

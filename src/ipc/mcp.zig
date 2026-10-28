@@ -44,6 +44,7 @@ const mcp_caps = @import("mcp_caps.zig");
 const mcp_ui = @import("mcp_ui.zig");
 const mcp_agent = @import("mcp_agent.zig");
 const mcp_webfetch = @import("mcp_webfetch.zig");
+const mcp_webjobs = @import("mcp_webjobs.zig");
 const agentwait = @import("agentwait.zig");
 const agentsline = @import("agentsline.zig");
 const mcp_hook = @import("mcp_hook.zig");
@@ -1177,6 +1178,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     // Agents first: an agent may borrow a term_* terminal.
     mcp_agent.shutdown();
     mcp_webfetch.shutdown();
+    mcp_webjobs.shutdown();
     @import("mcp_web.zig").shutdownHeadless();
     mcp_term.forward_state.deinit();
     mcp_term.term_state.deinit();
@@ -1250,7 +1252,7 @@ fn waitInput(input: *std.ArrayList(u8), allocator: std.mem.Allocator) InputWait 
     var n = 1 + mcp_agent.pollFds(pfds[1..]);
     n += mcp_peer.pollFds(pfds[n..]);
     const now = clock.nowMs();
-    const due = minDue(minDue(minDue(mcp_agent.dueInMs(now), @import("mcp_web.zig").idleDueInMs(now)), mcp_webfetch.dueInMs(now)), mcp_peer.dueInMs(now));
+    const due = minDue(minDue(minDue(minDue(mcp_agent.dueInMs(now), @import("mcp_web.zig").idleDueInMs(now)), mcp_webfetch.dueInMs(now)), mcp_webjobs.dueInMs(now)), mcp_peer.dueInMs(now));
     const timeout: c_int = if (due) |d| @intCast(std.math.clamp(d, 0, 1000)) else -1;
     const rc = c.poll(&pfds, @intCast(n), timeout);
     if (rc < 0) return if (std.posix.errno(rc) == .INTR) .more else .failed;
@@ -1265,6 +1267,13 @@ fn waitInput(input: *std.ArrayList(u8), allocator: std.mem.Allocator) InputWait 
     if (mcp_webfetch.active()) {
         Watchdog.begin();
         mcp_webfetch.service();
+        Watchdog.end();
+    }
+    // Deferred web calls likewise: each step is short, and calls on other
+    // tabs advance between them.
+    if (mcp_webjobs.active()) {
+        Watchdog.begin();
+        mcp_webjobs.service();
         Watchdog.end();
     }
     if (pfds[0].revents == 0) return .more;
@@ -1404,7 +1413,10 @@ pub fn handleMessage(arena: std.mem.Allocator, backend: Backend, line: []const u
     // A client that gave up on a call: a deferred one stops and
     // releases what it holds; it is never answered (MCP cancellation).
     if (std.mem.eql(u8, method, "notifications/cancelled")) {
-        if (params == .object) if (params.object.get("requestId")) |rid| mcp_webfetch.cancel(arena, rid);
+        if (params == .object) if (params.object.get("requestId")) |rid| {
+            mcp_webfetch.cancel(arena, rid);
+            mcp_webjobs.cancel(arena, rid);
+        };
         return null;
     }
     // The client finished its handshake: its push route goes live after a
@@ -1457,9 +1469,11 @@ pub const Called = union(enum) { reply: []const u8, deferred };
 /// the request id a deferred answer must carry (null: a notification).
 fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: std.json.Value, id: ?std.json.Value) !Called {
     const routed = mcp_tools.route(name) orelse return .{ .reply = try errRes(arena, .unknown_tool, "unknown tool") };
-    // The one tool that runs across server-loop turns, so concurrent
-    // calls (and every other tool) are served while it works.
+    // The tools that run across server-loop turns, so concurrent calls
+    // (and every other tool) are served while they work: web_fetch, and
+    // the web calls of a headless browser, ordered per tab.
     if (routed == .browser and routed.browser == .web_fetch) return mcp_webfetch.start(arena, id, args);
+    if (routed == .browser and mcp_webjobs.applies(name, id)) return mcp_webjobs.start(arena, backend, name, args, id.?);
     return .{ .reply = try switch (routed) {
         .panes => |tool| mcp_panes.panesTool(arena, backend, tool, args),
         .app => |tool| mcp_app.appTool(arena, tool, args),

@@ -2551,7 +2551,7 @@ pub const Store = struct {
                 .name_taken = p.name_taken,
                 .polls = p.polls,
                 .no_mcp = p.no_mcp,
-                .facts = if (p.facts) |f| try cloneJson(a, f) else null,
+                .facts = if (p.facts) |f| try @import("../util/jsonclone.zig").clone(a, f) else null,
                 .model = try a.dupe(u8, p.model),
                 .last_notification = try a.dupe(u8, p.last_notification),
                 .subject = try a.dupe(u8, p.subject),
@@ -3491,11 +3491,6 @@ fn mintId(id_buf: *[ID_LEN]u8) Error![]const u8 {
 /// A relayed id: exactly what `mintId` makes.
 fn validId(id: []const u8) bool {
     return id.len == ID_LEN and std.mem.startsWith(u8, id, ID_PREFIX);
-}
-
-fn cloneJson(a: std.mem.Allocator, v: std.json.Value) error{OutOfMemory}!std.json.Value {
-    const text = std.json.Stringify.valueAlloc(a, v, .{}) catch return error.OutOfMemory;
-    return std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch error.OutOfMemory;
 }
 
 fn contains(list: []const []const u8, id: []const u8) bool {
