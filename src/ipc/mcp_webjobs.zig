@@ -45,7 +45,8 @@ var g_jobs: std.ArrayList(*Job) = .empty;
 /// Calls that answer from state at hand and address no tab: they never
 /// wait behind the deferred ones.
 fn unordered(name: []const u8) bool {
-    return std.mem.eql(u8, name, "web_tabs") or std.mem.eql(u8, name, "web_diagnostic");
+    return std.mem.eql(u8, name, "web_tabs") or std.mem.eql(u8, name, "web_diagnostic") or
+        std.mem.eql(u8, name, "web_route_exit");
 }
 
 /// The handle a call names (`pane`, or its synonym `view`).

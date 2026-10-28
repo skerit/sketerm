@@ -244,6 +244,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 - `web_inspect`: Compact UI review: focused control, landmarks, accessible-name approximations, disclosure wrapper/control mismatches, horizontal overflow and new page/console errors.
 - `web_checkpoint`: Without id, create a soft-navigation checkpoint.
 - `web_diagnostic` (read-only): Retrieve bounded, redacted helper failure evidence by the id returned in an error.
+- `web_route_exit`: The proxy a client OUTSIDE the browser dials so its own connections leave through a route, the way web_open route: sends a tab: via:<host> gets a loopback SOCKS5 bridge to that host's daemon (kept and shared per host for the life of this server; DNS resolves on the host), tor and proxy:<url> answer the proxy they name, direct answers proxy null.
 - `web_console` (read-only): The page's console output (console.log/warn/error, uncaught exceptions as the engine reports them), mirrored per view since it opened - the blind spot behind "no console error column".
 - `web_eval`: Evaluate JavaScript in the page — the escape hatch for everything the structured tools do not cover.
 - `web_screenshot` (read-only): PNG of a web view.
@@ -521,6 +522,20 @@ CDP: input is delivered as real engine events, so a page sees
   accepts. A refusal opens nothing: a routed tab must never silently
   browse direct.
 
+  `web_route_exit {"route":"..."}` gives a client OUTSIDE the browser
+  (curl, a script's HTTP client) the same way out, without starting a
+  browser: `proxy` is `socks5h://127.0.0.1:<port>` for `via:<host>` (a
+  loopback SOCKS5 bridge to that host's daemon, kept per host for the
+  life of the server and shared by every caller; `reused` says so), the
+  named proxy for `tor` and `proxy:<url>`, and null for `direct`. `on:`
+  has no exit and is refused. A `via:` bridge connects in the
+  background, so an unreachable host shows up as refused CONNECTs; the
+  next call replaces a bridge that stopped serving. The bridge is
+  loopback-only and takes no credentials, like the browser's own: any
+  local process can use it while the server runs. At most 16 hosts are
+  bridged at once. `capabilities.web_route_exit` lists the kinds it
+  answers.
+
 - `web_snapshot` returns the page as roles, names and stable ids. The
   FIRST snapshot of a document is complete; every later one is a
   **delta** against what was already sent, so an unchanged page answers
@@ -767,8 +782,8 @@ tabs each waiting 3 s for an element answer in about 3 s, not 6 s
 - `web_open` makes its own tab and waits for nothing but a call that
   names no tab.
 - A call naming NO tab (the current one), or a `label`, waits for every
-  earlier web call and holds back every later one. `web_tabs` and
-  `web_diagnostic` never wait.
+  earlier web call and holds back every later one. `web_tabs`,
+  `web_diagnostic` and `web_route_exit` never wait.
 - Each call keeps its own `timeout_ms`; `notifications/cancelled` drops
   a waiting call at once (an unfinished `web_open` closes its new tab)
   and frees its tab for the next call.

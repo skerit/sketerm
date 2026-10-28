@@ -2377,6 +2377,20 @@ const TOOL_DECLS = [_]ToolDef{
         ,
     },
     .{
+        .name = "web_route_exit",
+        .group = .browser,
+        .mutates = true,
+        .description = "The proxy a client OUTSIDE the browser dials so its own connections leave through a route, the way web_open route: sends a tab: via:<host> gets a loopback SOCKS5 bridge to that host's daemon (kept and shared per host for the life of this server; DNS resolves on the host), tor and proxy:<url> answer the proxy they name, direct answers proxy null. on:<host> has no exit and is refused. Never starts a browser. A via: bridge connects in the background: an unreachable host refuses every CONNECT, and the next call makes a new bridge (reused false). The bridge is loopback-only and takes no credentials.",
+        .input_schema =
+        \\{"type":"object","properties":{"route":{"type":"string","description":"direct | tor | via:<host> | proxy:socks5h://HOST:PORT | proxy:http://HOST:PORT"}},"required":["route"]}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"route":{"type":"string"},"kind":{"type":"string","enum":[
+        ++ ROUTE_WORD_ITEMS ++
+        \\]},"proxy":{"type":["string","null"],"description":"socks5h://HOST:PORT or http://HOST:PORT; null for direct"},"reused":{"type":"boolean","description":"A via: bridge an earlier call made and that still serves"}},"required":["route","kind","proxy","reused"]}
+        ,
+    },
+    .{
         .name = "web_console",
         .group = .browser,
         .mutates = false,
@@ -2559,7 +2573,9 @@ const WEB_ROUTE_PROXY_CAP =
 ++ enumItems(webroute.ProxyScheme) ++
     \\]}},"untrusted":{"type":"boolean","description":"policy.untrusted:true views may take this route: the restricted loader dials the proxy and nothing else"}},"required":["available","grammar","schemes","untrusted"]},"web_untrusted_routes":{"type":"array","description":"Route kinds an untrusted (policy.untrusted) open accepts; empty where untrusted views cannot open","items":{"type":"string","enum":[
 ++ ROUTE_WORD_ITEMS ++
-    \\]}}
+    \\]}},"web_route_exit":{"type":"object","description":"web_route_exit hands a client outside the browser the proxy a route's connections leave through","properties":{"available":{"type":"boolean"},"kinds":{"type":"array","items":{"type":"string","enum":[
+++ ROUTE_WORD_ITEMS ++
+    \\]}}},"required":["available","kinds"]}
 ;
 
 /// Tools whose writer echoes the tab (`mcp_web.tabEcho`) without opening

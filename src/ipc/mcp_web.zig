@@ -62,6 +62,7 @@ const reader_model = @import("../web/reader.zig");
 const webkeys = @import("../web/webkeys.zig");
 const semantic = @import("../web/semantic.zig");
 const webroute = @import("../web/route.zig");
+const routeexit = @import("routeexit.zig");
 const clock = @import("../util/clock.zig");
 const png_codec = @import("../util/png.zig");
 const atomicwrite = @import("../util/atomicwrite.zig");
@@ -2296,6 +2297,51 @@ fn headlessRouteEngine(arena: std.mem.Allocator, text: []const u8, untrusted: bo
     const e = headlessEngineForMode(spec, untrusted) orelse
         return .{ .err = fail(.unavailable, "the headless browser backend could not start an engine for that route") };
     return .{ .engine = e };
+}
+
+/// `web_route_exit`: the proxy a client OUTSIDE the browser dials so its
+/// connections leave through a route (`routeexit.zig`). Never starts a
+/// browser: it answers from config and this process's bridges alone.
+fn routeExitTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
+    const text = mcp.argStr(args, "route") orelse
+        return mcp.errRes(arena, .invalid_args, "requires 'route': " ++ webroute.GRAMMAR);
+    const probe = webroute.Spec.parse(text, "0.0.0.0:1") orelse
+        return mcp.errRes(arena, .invalid_args, webroute.Spec.proxyRefusal(text) orelse "'route' is not a route: use " ++ webroute.GRAMMAR);
+    if (!routeexit.hasExit(probe.kind))
+        return mcp.errRes(arena, .unavailable, "on:<host> places a browser on that host; it has no exit for other clients. Use via:<host> to leave from that host");
+    var proxy_buf: [webroute.MAX_TEXT + 16]u8 = undefined;
+    var proxy: ?[]const u8 = null;
+    var reused = false;
+    switch (probe.kind) {
+        .direct => {},
+        .remote_browser => unreachable,
+        .tor => {
+            const spec = webroute.Spec.parse(text, torEndpoint(arena)) orelse
+                return mcp.errRes(arena, .unavailable, "this machine has no usable Tor SOCKS5 endpoint (config 'mux_tor_socks_endpoint'), so a tor route has no exit");
+            proxy = routeexit.namedProxy(spec, &proxy_buf);
+        },
+        .proxy => proxy = routeexit.namedProxy(probe, &proxy_buf),
+        .mux => {
+            const bridged = routeexit.bridgeFor(probe.host, @import("mux_cli.zig").muxConnect) catch |err| return switch (err) {
+                error.TooManyExits => mcp.errRes(arena, .conflict, std.fmt.comptimePrint("this server already keeps {d} serving route exits; nothing was opened", .{routeexit.MAX_EXITS})),
+                error.BridgeFailed => mcp.errRes(arena, .unavailable, "could not bind this route's loopback bridge; nothing was opened"),
+            };
+            proxy = try std.fmt.bufPrint(&proxy_buf, "socks5h://127.0.0.1:{d}", .{bridged.port});
+            reused = bridged.reused;
+        },
+    }
+    var res = mcp.Res.init(arena);
+    try res.fact("route", text);
+    try res.fact("kind", probe.kind.word());
+    try res.fact("proxy", proxy);
+    try res.fact("reused", reused);
+    if (proxy) |p| {
+        try res.textf("route {s} leaves through {s}; the proxy resolves every host", .{ text, p });
+        if (probe.kind == .mux) try res.text("the bridge connects to the host's daemon in the background: a host that cannot be reached refuses every CONNECT, and the next web_route_exit makes a new bridge");
+    } else {
+        try res.text("direct: connect yourself, no proxy is involved");
+    }
+    return res.finish();
 }
 
 /// Why an untrusted open refuses a route kind: its HTTP broker dials one
@@ -4629,6 +4675,7 @@ fn webBody(
     // Diagnostics must remain readable after helper death, without spawning a
     // replacement (which would overwrite precisely the evidence requested).
     if (eql(u8, name, "web_diagnostic")) return diagnosticTool(arena, args);
+    if (eql(u8, name, "web_route_exit")) return routeExitTool(arena, args);
     if (eql(u8, name, "web_stream")) {
         if (mcp.argValue(args, "audio")) |value| if (value != .bool)
             return mcp.errRes(arena, .invalid_args, "web_stream audio must be a boolean when present");
@@ -11301,7 +11348,7 @@ test "every tool this module serves declares an output schema" {
             return error.MissingOutputSchema;
         }
     }
-    try std.testing.expectEqual(@as(usize, 33), seen);
+    try std.testing.expectEqual(@as(usize, 34), seen);
 }
 
 test "parsePolicy fails closed on unknown names and invalid host authorities" {

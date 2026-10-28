@@ -520,6 +520,14 @@ pub const Egress = struct {
     /// Owner reference plus one per running worker. Whoever drops the
     /// last one frees; see `close` for why this is not a join.
     refs: std.atomic.Value(u32) = .init(1),
+    /// False once the worker stopped serving: its connect failed or the
+    /// mux connection dropped. A dead egress never serves again, so a
+    /// holder that hands its port out replaces it instead.
+    serving: std.atomic.Value(bool) = .init(true),
+    /// The loopback port `create` bound. The worker zeroes `bridge.port`
+    /// when it stops, possibly before the caller reads it, so the port a
+    /// holder hands out is this copy.
+    bound_port: u16 = 0,
 
     /// How the worker reaches the egress host's daemon. Mirrors the mux
     /// host-string convention: null = local autostart socket.
@@ -541,11 +549,18 @@ pub const Egress = struct {
             allocator.destroy(self);
             return null;
         };
+        self.bound_port = self.bridge.port;
         return self;
     }
 
+    /// The port bound at `create`; unchanged once the worker stops.
     pub fn port(self: *const Egress) u16 {
-        return self.bridge.port;
+        return self.bound_port;
+    }
+
+    /// Whether the worker still serves (or is still connecting).
+    pub fn isServing(self: *const Egress) bool {
+        return self.serving.load(.acquire);
     }
 
     pub fn spawn(self: *Egress) bool {
@@ -562,6 +577,7 @@ pub const Egress = struct {
     fn worker(self: *Egress) void {
         defer self.release();
         defer self.bridge.closeServing();
+        defer self.serving.store(false, .release);
         const h: ?[]const u8 = if (self.host_len == 0) null else self.host[0..self.host_len];
         if (self.connectFn(self.allocator, h)) |conn| {
             self.conn = conn;

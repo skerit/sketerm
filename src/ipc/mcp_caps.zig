@@ -322,6 +322,8 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         const proxy = @import("mcp_web.zig").routeProxyCapability(web_ok);
         try res.fact("web_route_proxy", proxy);
         try res.fact("web_untrusted_routes", @import("mcp_web.zig").untrustedRouteWords());
+        try res.fact("web_route_exit", .{ .available = true, .kinds = @import("routeexit.zig").EXIT_WORDS });
+        try res.text("web_route_exit hands a client outside the browser the proxy a route leaves through (direct, tor, via:<host>, proxy:<url>)");
         if (proxy.available) try res.textf("route {s} sends a tab's every request through your own forward proxy, which resolves every host; untrusted views {s}", .{
             proxy.grammar,
             if (proxy.untrusted) "may take it (their loader then dials that proxy and nothing else)" else "cannot open here",

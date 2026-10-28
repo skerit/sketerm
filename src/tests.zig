@@ -296,6 +296,7 @@ comptime {
     _ = @import("ipc/keys.zig");
     _ = @import("ipc/socks5.zig");
     _ = @import("ipc/socksbridge.zig");
+    _ = @import("ipc/routeexit.zig");
     _ = @import("ipc/termdrive.zig");
     _ = @import("ipc/appdrive.zig");
     _ = @import("ipc/launch_cleanup.zig");

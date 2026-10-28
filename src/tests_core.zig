@@ -121,6 +121,7 @@ comptime {
     _ = @import("mux/channel_pump.zig");
     _ = @import("ipc/socks5.zig");
     _ = @import("ipc/socksbridge.zig");
+    _ = @import("ipc/routeexit.zig");
     _ = @import("ipc/mcpassets.zig");
     _ = @import("ipc/mcpfilter.zig");
     _ = @import("ipc/mcp_tools.zig");

@@ -9259,6 +9259,69 @@ fn readBanner(port: u16, out: []u8) []const u8 {
     return out[0..got];
 }
 
+/// The banner on `target_port`, read through a SOCKS5 proxy on the loopback
+/// (no auth, CONNECT to 127.0.0.1); empty when the proxy refused.
+fn socksBanner(proxy_port: u16, target_port: u16, out: []u8) []const u8 {
+    const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    if (fd < 0) return "";
+    defer _ = c.close(fd);
+    var addr = loopbackAddr(proxy_port);
+    if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_in)) != 0) return "";
+    const request = [_]u8{ 5, 1, 0, 5, 1, 0, 1, 127, 0, 0, 1, @intCast(target_port >> 8), @intCast(target_port & 0xff) };
+    if (c.write(fd, &request, request.len) != request.len) return "";
+    var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
+    var got: usize = 0;
+    while (got < out.len and c.poll(&pfd, 1, 10_000) > 0) {
+        const n = c.read(fd, out[got..].ptr, out.len - got);
+        if (n <= 0) break;
+        got += @intCast(n);
+        if (got > 12 and std.mem.indexOfScalar(u8, out[12..got], '\n') != null) break;
+    }
+    // Method choice (2 bytes), then the CONNECT reply (10 bytes) with status 0, then the service.
+    if (got < 12 or out[0] != 5 or out[1] != 0 or out[2] != 5 or out[3] != 0) return "";
+    return out[12..got];
+}
+
+/// web_route_exit: a client outside the browser leaves through a via: host's
+/// daemon, shares one bridge per host, gets a new bridge once a host's
+/// connect failed, and is refused an on: route.
+fn routeExitChecks(m: *Mcp, arena: std.mem.Allocator) void {
+    const banner = Banner.start();
+    const th = std.Thread.spawn(.{}, Banner.serve, .{banner.fd}) catch fail("route exit: banner thread");
+    th.detach();
+    const prefix = "socks5h://127.0.0.1:";
+
+    const via = agentCall(m, arena, "web_route_exit", "{\"route\":\"via:hosta\"}", "route exit: via:hosta", false, 30_000);
+    expectFact(via, "kind", "via", "route exit: the via: kind");
+    const proxy = scStr(via, "proxy", "route exit: the bridge");
+    if (!std.mem.startsWith(u8, proxy, prefix)) fail("route exit: a via: route did not get a loopback socks5h bridge");
+    const port = std.fmt.parseInt(u16, proxy[prefix.len..], 10) catch fail("route exit: the bridge port");
+    var buf: [64]u8 = undefined;
+    if (std.mem.indexOf(u8, socksBanner(port, banner.port, &buf), "SK-FWD-OK") == null)
+        fail("route exit: a CONNECT through the via: bridge did not reach the service on the host");
+    const again = agentCall(m, arena, "web_route_exit", "{\"route\":\"via:hosta\"}", "route exit: via:hosta again", false, 30_000);
+    if (!std.mem.eql(u8, scStr(again, "proxy", "route exit: the shared bridge"), proxy)) fail("route exit: a second ask did not share the serving bridge");
+    if (again.get("reused").? != .bool or !again.get("reused").?.bool) fail("route exit: the shared bridge is not reported reused");
+
+    // A host ssh cannot reach: its bridge refuses, and a later ask makes a new one.
+    const dead = agentCall(m, arena, "web_route_exit", "{\"route\":\"via:nohost\"}", "route exit: via:nohost", false, 30_000);
+    const dead_port = std.fmt.parseInt(u16, scStr(dead, "proxy", "route exit: the dead bridge")[prefix.len..], 10) catch fail("route exit: the dead bridge port");
+    if (socksBanner(dead_port, banner.port, &buf).len != 0) fail("route exit: an unreachable host's bridge let a CONNECT through");
+    const deadline = nowMs() + 15_000;
+    while (true) {
+        const next = agentCall(m, arena, "web_route_exit", "{\"route\":\"via:nohost\"}", "route exit: via:nohost again", false, 30_000);
+        if (!next.get("reused").?.bool) break;
+        if (nowMs() > deadline) fail("route exit: a bridge whose host never answered was never replaced");
+        _ = c.usleep(100_000);
+    }
+
+    const direct = agentCall(m, arena, "web_route_exit", "{\"route\":\"direct\"}", "route exit: direct", false, 10_000);
+    if (direct.get("proxy").? != .null) fail("route exit: direct named a proxy");
+    _ = agentCall(m, arena, "web_route_exit", "{\"route\":\"on:hosta\"}", "route exit: on: is refused", true, 10_000);
+    _ = agentCall(m, arena, "web_route_exit", "{\"route\":\"proxy:socks5://127.0.0.1:1080\"}", "route exit: a local-DNS proxy is refused", true, 10_000);
+    say("smoke-mcp: route stage: web_route_exit bridges via: hosts for outside clients, shares and replaces them");
+}
+
 /// scp_get / scp_put with a host, and the port_forward_* lifecycle,
 /// through the real tool paths (a daemon terminal running `ssh`/`scp`),
 /// with THIS binary standing in for both on PATH.
@@ -11863,6 +11926,7 @@ fn routeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
     dead.initialize();
     dead.closeStdinWait();
     m.initialize();
+    routeExitChecks(&m, arena);
     const bin_json = std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(self_exe, .{})}) catch fail("oom");
     const local = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"binary\":{s},\"timeout_ms\":30000}}", .{bin_json}) catch fail("oom"), "route stage: agent_open on hosta", false, 45_000);
     expectFact(local, "transport", "local", "route stage: the hosta agent is local");
