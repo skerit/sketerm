@@ -237,6 +237,19 @@ pub fn navResultCapability() struct {
     return .{ .helper_detail = detail };
 }
 
+/// What `capabilities` reports as `web_log_url_max`: the longest url the
+/// request log keeps whole (longer ones are flagged url_truncated); null
+/// while no headless helper runs or with a GUI, whose helper this
+/// server cannot ask.
+pub fn logUrlMaxCapability() ?u32 {
+    if (guiDrivesWeb()) return null;
+    for (g_engines.items) |re| {
+        if (re.engine.state == .ready)
+            return if (re.engine.has(.net_log_long_urls)) web_proto.LOG_URL_MAX else web_proto.LEGACY_LOG_URL_MAX;
+    }
+    return null;
+}
+
 /// What `capabilities` reports as `web_read`: its modes and caps, and
 /// whether the running helper reads pages (`page-read`) and keeps tree
 /// queries current itself (`query-live`); null while no headless helper
@@ -1925,7 +1938,16 @@ pub fn isBlankDoc(url: []const u8) bool {
 /// against the requested url: redirects and normalisation make the
 /// settled url legitimately different.
 pub fn openSettled(v: View, wanted_blank: bool) bool {
-    if (v.load_seq == 0) return false;
+    return navSettled(v, 0, wanted_blank);
+}
+
+/// `openSettled` for a view that already had loads: a load finished
+/// since `base_seq` (the view's `load_seq` before the navigation was
+/// asked for), nothing is in flight, and the document is not the blank
+/// one. A load a page script replaced is followed the same way, since
+/// the replacing load keeps `loading` up until it finishes.
+pub fn navSettled(v: View, base_seq: u32, wanted_blank: bool) bool {
+    if (v.load_seq == base_seq) return false;
     if (v.loading) return false;
     if (wanted_blank) return true;
     return !isBlankDoc(v.url);
@@ -4305,12 +4327,48 @@ fn waitResult(
     return res.finish();
 }
 
+/// Which part of a pulled log a `web_network` reply lists.
+pub const LogPage = struct {
+    /// The caller's cursor; null lists the newest `max`.
+    since: ?u32 = null,
+    max: usize = 50,
+};
+
+/// The rows a log page lists and the cursor that continues after them.
+/// `rows` are every entry above the cursor, ascending by seq; `head` is
+/// the newest seq the log ever assigned (0: none). With a cursor the
+/// OLDEST `max` are listed, so paging forward never skips a row; without
+/// one the newest `max`. `dropped` counts seqs above the cursor the ring
+/// no longer holds (seqs are contiguous per view).
+pub fn pageLog(rows: []const std.json.Value, head_seq: u32, page: LogPage) struct { first: usize, end: usize, next: u32, more: bool, dropped: u32 } {
+    const since = page.since orelse 0;
+    const max = @max(page.max, 1);
+    const newest = @max(since, head_seq);
+    if (page.since == null) {
+        const first = rows.len -| max;
+        return .{ .first = first, .end = rows.len, .next = newest, .more = false, .dropped = 0 };
+    }
+    const end = @min(rows.len, max);
+    const more = end < rows.len;
+    const next: u32 = if (more) seqOf(rows[end - 1]) else newest;
+    const span = newest - since;
+    const dropped: u32 = if (span > rows.len) @intCast(span - rows.len) else 0;
+    return .{ .first = 0, .end = end, .next = next, .more = more, .dropped = dropped };
+}
+
+fn seqOf(row: std.json.Value) u32 {
+    if (row != .object) return 0;
+    const s = row.object.get("seq") orelse return 0;
+    return if (s == .integer) boundedU32(s.integer) orelse 0 else 0;
+}
+
 fn networkResult(
     arena: std.mem.Allocator,
     mode: Mode,
     v: View,
     counters: NetCounters,
     log_json: ?[]const u8,
+    page: LogPage,
 ) ![]const u8 {
     var res = mcp.Res.init(arena);
     try head(&res, arena, mode, v);
@@ -4326,8 +4384,10 @@ fn networkResult(
     });
     const json = log_json orelse return res.finish();
 
-    // `{"next_seq":N,"entries":[...]}` — the entries are machine data,
-    // the text lane gets a compact one-line-per-request table.
+    // `{"next_seq":N,"entries":[...]}` from the helper, N one past its
+    // newest seq and the entries every one above the asked cursor. The
+    // entries are machine data, the text lane gets a compact
+    // one-line-per-request table.
     const doc = std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{}) catch {
         try res.text("the browser helper returned a malformed request log");
         return res.finish();
@@ -4336,25 +4396,19 @@ fn networkResult(
         try res.text("the browser helper returned a malformed request log");
         return res.finish();
     };
-    var next_seq: ?i64 = null;
-    if (obj.get("next_seq")) |n| {
-        if (n == .integer) {
-            try res.fact("next_seq", n.integer);
-            next_seq = n.integer;
-        }
-    }
+    const wire_next: u32 = if (obj.get("next_seq")) |n| (if (n == .integer) boundedU32(n.integer) orelse 0 else 0) else 0;
+    const all: []const std.json.Value = if (obj.get("entries")) |e| (if (e == .array) e.array.items else &.{}) else &.{};
+    const pg = pageLog(all, wire_next -| 1, page);
+    const entries = all[pg.first..pg.end];
+    try res.fact("next_seq", pg.next);
+    try res.fact("more", pg.more);
+    if (page.since != null) try res.fact("dropped", pg.dropped);
     try res.fact("log_detail", if (obj.get("detail")) |d| d == .bool and d.bool else false);
-    var entries: []const std.json.Value = &.{};
-    var listed = false;
-    if (obj.get("entries")) |e| {
-        if (e == .array) {
-            entries = e.array.items;
-            try res.fact("requests", e);
-            listed = true;
-        }
-    }
-    if (!listed) try res.raw("requests", "[]");
-    if (next_seq) |n| try res.textf("since={d} lists only the requests after these", .{n});
+    var arr: std.json.Array = .init(arena);
+    try arr.appendSlice(entries);
+    try res.fact("requests", std.json.Value{ .array = arr });
+    try res.textf("since={d} lists only the requests after these{s}", .{ pg.next, if (pg.more) " (more are already logged: page on)" else "" });
+    if (pg.dropped > 0) try res.textf("{d} request(s) after since={d} were already overwritten in the {d}-entry log ring", .{ pg.dropped, page.since.?, web_proto.NET_LOG_ENTRIES });
     try res.textf("--- {d} requests (oldest first) ---", .{entries.len});
     for (entries) |e| {
         if (e != .object) continue;
@@ -4872,11 +4926,15 @@ pub fn webTool(
         const nav_started = clock.nowMs();
         if (try navigateView(drv, arena, view.pane, url, action)) |e|
             return failRes(arena, e);
-        // Settle the nav state rather than reporting the pre-navigation
-        // page; a stop/back is usually instant, a url is not.
+        // Settle on the navigation asked for, exactly as web_open does
+        // (`navSettled`): a load finished since the call, none in flight.
+        // "Was loading, now is not" missed a load that finished between
+        // two polls, and a navigation to the url the view already showed
+        // then waited out the whole budget.
         const deadline = drv.now() + timeoutOf(args, 15_000);
+        const base_seq = view.load_seq;
+        const wanted_blank = if (url) |u| isBlankDoc(u) else true;
         var settled = view;
-        var was_loading = false;
         while (drv.now() < deadline) {
             drv.sleep(100);
             const now = try listViews(drv, arena) orelse break;
@@ -4884,12 +4942,13 @@ pub fn webTool(
             settled = found;
             if (found.loadBlocked()) break;
             if (drv == .headless and downloadSince(drv.headless, view.pane, nav_started)) break;
-            if (found.loading) {
-                was_loading = true;
-                continue;
-            }
-            if (was_loading or url == null) break;
-            if (!std.mem.eql(u8, found.url, view.url)) break;
+            if (navSettled(found, base_seq, wanted_blank)) break;
+            if (found.loading) continue;
+            // back/forward/stop may be served from the page cache with
+            // no load at all; a same-document navigation moves only the
+            // url.
+            if (url == null) break;
+            if (found.load_seq == base_seq and !std.mem.eql(u8, found.url, view.url)) break;
         }
         var post: NavPost = .{};
         if (nav_wait) |w| {
@@ -7533,7 +7592,7 @@ fn networkTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view
             return mcp.errRes(arena, .invalid_args, "web_network action must be enable, disable, toggle or status");
         switch (try netToggle(drv, arena, view.pane, act)) {
             .err => |e| return failRes(arena, e),
-            .done => |st| return networkResult(arena, drv.mode(), view, st, null),
+            .done => |st| return networkResult(arena, drv.mode(), view, st, null, .{}),
         }
     }
 
@@ -7543,15 +7602,17 @@ fn networkTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view
         .err => |e| return failRes(arena, e),
         .done => |st| st,
     };
-    const since: u32 = switch (try argU32(arena, args, "since")) {
-        .absent => 0,
+    const since: ?u32 = switch (try argU32(arena, args, "since")) {
+        .absent => null,
         .err => |f| return failRes(arena, f),
         .value => |v| v,
     };
-    const max: u16 = @intCast(std.math.clamp(mcp.argInt(args, "max") orelse 50, 1, 128));
-    switch (try netLog(drv, arena, view.pane, since, max, timeoutOf(args, DEFAULT_TIMEOUT_MS))) {
+    const max: usize = @intCast(std.math.clamp(mcp.argInt(args, "max") orelse 50, 1, web_proto.NET_LOG_ENTRIES));
+    // The whole ring above the cursor, paged here: the helper keeps the
+    // NEWEST of a capped pull, which would skip rows when paging forward.
+    switch (try netLog(drv, arena, view.pane, since orelse 0, web_proto.NET_LOG_ENTRIES, timeoutOf(args, DEFAULT_TIMEOUT_MS))) {
         .err => |e| return failRes(arena, e),
-        .json => |json| return networkResult(arena, drv.mode(), view, counters, json),
+        .json => |json| return networkResult(arena, drv.mode(), view, counters, json, .{ .since = since, .max = max }),
     }
 }
 
@@ -8186,6 +8247,9 @@ pub const WaitProbe = struct {
     /// network_idle: the log head and in-flight count last seen.
     net_head: u32 = 0,
     net_pending: []const u8 = "",
+    /// selector: why the newest poll could not run in the page (it was
+    /// between documents), for the timeout's sentence.
+    eval_failed: []const u8 = "",
 
     pub fn init(drv: Driver, arena: std.mem.Allocator, view: View, what: webnav.WaitFor, arg: []const u8, budget: i64) !union(enum) { probe: WaitProbe, done: WaitOutcome } {
         const now = drv.now();
@@ -8211,7 +8275,7 @@ pub const WaitProbe = struct {
             .deadline = now + budget,
             .started = now,
             .selector_expr = if (what == .selector)
-                try std.fmt.allocPrint(arena, "!!document.querySelector({f})", .{std.json.fmt(arg, .{})})
+                try std.fmt.allocPrint(arena, SELECTOR_PROBE, .{std.json.fmt(arg, .{})})
             else
                 "",
             .last = view,
@@ -8286,11 +8350,26 @@ pub const WaitProbe = struct {
             }, 6000)) {
                 .err => |e| return .{ .err = e },
                 .done => |r| if (!r.timed_out) {
-                    // An invalid selector throws, and will throw on every
-                    // poll: say so now instead of after the timeout.
-                    if (!r.ok) return .{ .not_met = .{ .view = self.last, .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "the page refused the selector \"{s}\": {s}", .{ arg, firstLine(r.payload, 300) }) } };
-                    if (evalIsTrue(arena, r.payload))
-                        return .{ .met = .{ .view = self.last, .detail = "an element matches the selector" } };
+                    // An eval that could not run says nothing about the
+                    // selector: the page is between documents (a script's
+                    // redirect, a bot check passing itself), so the wait
+                    // goes on in the next document. Only the selector
+                    // engine's own SyntaxError makes a selector invalid,
+                    // and that answer is the same in any document.
+                    if (!r.ok) {
+                        self.eval_failed = firstLine(r.payload, 300);
+                        return null;
+                    }
+                    switch (selectorVerdict(arena, r.payload)) {
+                        .match => {
+                            if (try listViews(drv, arena)) |vs| if (viewFor(vs, view.pane)) |v| {
+                                self.last = v;
+                            };
+                            return .{ .met = .{ .view = self.last, .detail = "an element matches the selector" } };
+                        },
+                        .invalid => |why| return .{ .not_met = .{ .view = self.last, .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "\"{s}\" is not a valid CSS selector: {s}", .{ arg, firstLine(why, 300) }) } },
+                        .none => self.eval_failed = "",
+                    }
                 },
             },
             .network_idle => switch (try netLog(drv, arena, view.pane, 0, 128, @min(self.deadline - self.started, 5000))) {
@@ -8327,6 +8406,8 @@ pub const WaitProbe = struct {
                 .{ self.rev_changes, secs, @divTrunc((drv.now() - self.started), @as(i64, self.rev_changes)) },
             ) } };
         }
+        if (self.what == .selector and self.eval_failed.len > 0)
+            return .{ .not_met = .{ .view = self.last, .code = .timeout, .msg = try std.fmt.allocPrint(arena, "web_wait for selector \"{s}\" never held inside the timeout; the newest check could not run in the page ({s})", .{ arg, self.eval_failed }) } };
         if (self.what == .network_idle and self.net_pending.len > 0)
             return .{ .not_met = .{ .view = self.last, .code = .timeout, .msg = try std.fmt.allocPrint(arena, "web_wait for network_idle never held: still in flight: {s} (a long poll, a stream or a websocket never finishes; wait for a selector or text instead)", .{self.net_pending}) } };
         return .{ .not_met = .{ .view = self.last, .code = .timeout, .msg = if (arg.len > 0)
@@ -8335,6 +8416,43 @@ pub const WaitProbe = struct {
             try std.fmt.allocPrint(arena, "web_wait for {s} never held inside the timeout", .{what_s}) } };
     }
 };
+
+/// The selector wait's page script: 1 or 0 for a match, or the selector
+/// engine's SyntaxError as a string, so validity is decided by the
+/// engine rather than read from an eval that failed for any reason.
+const SELECTOR_PROBE =
+    "(() => {{ try {{ return document.querySelector({f}) ? 1 : 0; }} catch (e) {{ " ++
+    "if (e && e.name === \"SyntaxError\") return \"invalid: \" + e.message; throw e; }} }})()";
+
+const SelectorVerdict = union(enum) { match, none, invalid: []const u8 };
+
+/// What a `SELECTOR_PROBE` answered; anything unrecognised is no match
+/// yet (a page that rebinds querySelector owns its own answers).
+fn selectorVerdict(arena: std.mem.Allocator, payload: []const u8) SelectorVerdict {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, payload, .{}) catch return .none;
+    const inner = if (v == .object) v.object.get("value") orelse return .none else v;
+    return switch (inner) {
+        .integer => |n| if (n == 1) .match else .none,
+        .bool => |b| if (b) .match else .none,
+        .string => |s| if (std.mem.startsWith(u8, s, "invalid: ")) .{ .invalid = s["invalid: ".len..] } else .none,
+        else => .none,
+    };
+}
+
+test "the selector probe tells a match, no match and an invalid selector apart" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    try std.testing.expectEqual(SelectorVerdict.match, selectorVerdict(ar, "{\"value\":1}"));
+    try std.testing.expectEqual(SelectorVerdict.none, selectorVerdict(ar, "{\"value\":0}"));
+    const bad = selectorVerdict(ar, "{\"value\":\"invalid: '[[[' is not a valid selector.\"}");
+    try std.testing.expectEqualStrings("'[[[' is not a valid selector.", bad.invalid);
+    // An eval the page could not run is NOT a verdict on the selector:
+    // the probe step keeps waiting on !ok and never reaches this.
+    try std.testing.expectEqual(SelectorVerdict.none, selectorVerdict(ar, "{\"error\":\"semantic evaluation unavailable while the page is navigating\"}"));
+    const expr = try std.fmt.allocPrint(ar, SELECTOR_PROBE, .{std.json.fmt("a[href=\"x\"]", .{})});
+    try std.testing.expect(std.mem.indexOf(u8, expr, "document.querySelector(\"a[href=\\\"x\\\"]\")") != null);
+}
 
 /// An eval answered `true`: the helper wraps a value as `{"value":...}`;
 /// a bare `true` is accepted too.
@@ -9644,7 +9762,7 @@ test "web_network: counters plus a compact request table" {
     const t = std.testing;
 
     const counters = NetCounters{ .enabled = true, .blocked = 3, .total = 11, .rules = 4200 };
-    const status = try networkResult(arena, .headless, EXAMPLE, counters, null);
+    const status = try networkResult(arena, .headless, EXAMPLE, counters, null, .{});
     const ssc = (try mcp.expectToolResultShape(arena, "web_network", status)).object.get("structuredContent").?.object;
     try t.expect(ssc.get("blocking_enabled").?.bool);
     try t.expectEqual(@as(i64, 3), ssc.get("blocked").?.integer);
@@ -9655,10 +9773,11 @@ test "web_network: counters plus a compact request table" {
         "{\"next_seq\":7,\"entries\":[" ++
         "{\"seq\":5,\"blocked\":false,\"type\":\"document\",\"method\":\"GET\",\"url\":\"https://example.com/\",\"status\":200,\"duration_ms\":41,\"size\":900}," ++
         "{\"seq\":6,\"blocked\":true,\"type\":\"script\",\"method\":\"GET\",\"url\":\"https://ads.test/t.js\"}]}";
-    const listed = try networkResult(arena, .headless, EXAMPLE, counters, log);
+    const listed = try networkResult(arena, .headless, EXAMPLE, counters, log, .{});
     const lp = try mcp.expectToolResultShape(arena, "web_network", listed);
     const lsc = lp.object.get("structuredContent").?.object;
-    try t.expectEqual(@as(i64, 7), lsc.get("next_seq").?.integer);
+    // The newest seq: since=next_seq lists exactly what comes after it.
+    try t.expectEqual(@as(i64, 6), lsc.get("next_seq").?.integer);
     try t.expectEqual(@as(usize, 2), lsc.get("requests").?.array.items.len);
     const ltext = lp.object.get("content").?.array.items[0].object.get("text").?.string;
     try t.expect(std.mem.indexOf(u8, ltext, "blocking on: 3 blocked of 11 requests, 4200 rules loaded") != null);
@@ -9666,12 +9785,60 @@ test "web_network: counters plus a compact request table" {
     try t.expect(std.mem.indexOf(u8, ltext, "6 GET BLOCKED script https://ads.test/t.js") != null);
 
     // A helper that answers garbage says so instead of crashing.
-    const bad = try networkResult(arena, .headless, EXAMPLE, counters, "not json");
+    const bad = try networkResult(arena, .headless, EXAMPLE, counters, "not json", .{});
     try t.expect(std.mem.indexOf(
         u8,
         (try mcp.expectToolResultShape(arena, "web_network", bad)).object.get("content").?.array.items[0].object.get("text").?.string,
         "malformed request log",
     ) != null);
+}
+
+test "web_network cursor: since=next_seq lists exactly the rows logged after the previous reply" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+    const counters = NetCounters{ .enabled = true, .blocked = 0, .total = 6, .rules = 1 };
+    const row = "{{\"seq\":{d},\"blocked\":false,\"type\":\"xhr\",\"method\":\"GET\",\"url\":\"https://e.test/{d}\",\"status\":200,\"duration_ms\":1,\"size\":1}}";
+    // The helper answers every entry above the cursor, next_seq one past
+    // its newest.
+    const Log = struct {
+        fn of(ar: std.mem.Allocator, first: u32, last: u32) ![]const u8 {
+            var aw: std.Io.Writer.Allocating = .init(ar);
+            try aw.writer.print("{{\"next_seq\":{d},\"detail\":true,\"entries\":[", .{last + 1});
+            var s = first;
+            while (s <= last) : (s += 1) try aw.writer.print("{s}" ++ row, .{ if (s > first) "," else "", s, s });
+            try aw.writer.writeAll("]}");
+            return aw.written();
+        }
+    };
+    const seqs = struct {
+        fn of(ar: std.mem.Allocator, reply: []const u8) !struct { next: i64, more: bool, rows: []const i64 } {
+            const sc = (try mcp.expectToolResultShape(ar, "web_network", reply)).object.get("structuredContent").?.object;
+            var out: std.ArrayList(i64) = .empty;
+            for (sc.get("requests").?.array.items) |r| try out.append(ar, r.object.get("seq").?.integer);
+            return .{ .next = sc.get("next_seq").?.integer, .more = sc.get("more").?.bool, .rows = out.items };
+        }
+    };
+    // First page: no cursor, rows 1..3 logged.
+    const p1 = try seqs.of(arena, try networkResult(arena, .headless, EXAMPLE, counters, try Log.of(arena, 1, 3), .{}));
+    try t.expectEqualSlices(i64, &.{ 1, 2, 3 }, p1.rows);
+    try t.expectEqual(@as(i64, 3), p1.next);
+    // Rows 4..6 arrive; since = the returned next_seq starts at 4.
+    const p2 = try seqs.of(arena, try networkResult(arena, .headless, EXAMPLE, counters, try Log.of(arena, 4, 6), .{ .since = 3, .max = 2 }));
+    try t.expectEqualSlices(i64, &.{ 4, 5 }, p2.rows);
+    try t.expect(p2.more);
+    const p3 = try seqs.of(arena, try networkResult(arena, .headless, EXAMPLE, counters, try Log.of(arena, @intCast(p2.next + 1), 6), .{ .since = @intCast(p2.next), .max = 2 }));
+    try t.expectEqualSlices(i64, &.{6}, p3.rows);
+    try t.expect(!p3.more);
+    try t.expectEqual(@as(i64, 6), p3.next);
+    // Nothing new: the cursor stays put.
+    const p4 = try seqs.of(arena, try networkResult(arena, .headless, EXAMPLE, counters, "{\"next_seq\":7,\"detail\":true,\"entries\":[]}", .{ .since = 6 }));
+    try t.expectEqual(@as(usize, 0), p4.rows.len);
+    try t.expectEqual(@as(i64, 6), p4.next);
+    // Rows the ring overwrote are counted, not silently skipped.
+    const sc = (try mcp.expectToolResultShape(arena, "web_network", try networkResult(arena, .headless, EXAMPLE, counters, try Log.of(arena, 9, 10), .{ .since = 6 }))).object.get("structuredContent").?.object;
+    try t.expectEqual(@as(i64, 2), sc.get("dropped").?.integer);
 }
 
 test "web_screenshot: image block plus structured pixel facts" {
@@ -11154,8 +11321,8 @@ test "text mode: what a web result's next call needs is in the text lane" {
     try expectText(try resultText(arena, try waitResponseResult(arena, EXAMPLE, CAP_ENTRY, 3)), "since=3 waits for the next one");
     const counters = NetCounters{ .enabled = true, .blocked = 0, .total = 1, .rules = 1 };
     const log = "{\"next_seq\":7,\"entries\":[{\"seq\":6,\"blocked\":false,\"type\":\"document\",\"method\":\"GET\",\"url\":\"https://example.com/\",\"status\":200,\"duration_ms\":4,\"size\":3000}]}";
-    const net = try resultText(arena, try networkResult(arena, .headless, EXAMPLE, counters, log));
-    try expectText(net, "since=7 lists only the requests after these");
+    const net = try resultText(arena, try networkResult(arena, .headless, EXAMPLE, counters, log, .{}));
+    try expectText(net, "since=6 lists only the requests after these");
     try expectText(net, "6 GET 200 2.9 KiB 4ms");
 
     // web_open names what it means instead of a field the text lacks.

@@ -4718,7 +4718,7 @@ pub const Engine = struct {
                 defer ev.freeDecoded(self.gpa);
                 const v = self.findView(ev.view) orelse return;
                 v.net_next_seq = ev.next_seq;
-                const json = proto.netLogJson(self.gpa, ev) catch return;
+                const json = proto.netLogJson(self.gpa, ev, self.has(.net_log_long_urls)) catch return;
                 if (v.net_log) |old| self.gpa.free(old);
                 v.net_log = json;
                 v.net_log_waiting = false;
@@ -4728,7 +4728,7 @@ pub const Engine = struct {
                 defer ev.freeDecoded(self.gpa);
                 const v = self.findView(ev.view) orelse return;
                 v.net_next_seq = ev.next_seq;
-                const json = proto.netLogJson2(self.gpa, ev) catch return;
+                const json = proto.netLogJson2(self.gpa, ev, self.has(.net_log_long_urls)) catch return;
                 if (v.net_log) |old| self.gpa.free(old);
                 v.net_log = json;
                 v.net_log_waiting = false;

@@ -159,6 +159,7 @@ const unconditional_caps = [_]proto.Cap{
     .observe,
     .observe_notify,
     .net_log_detail,
+    .net_log_long_urls,
     .load_retry,
     .web_emulation,
     .web_stream,

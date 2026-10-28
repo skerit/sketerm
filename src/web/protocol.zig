@@ -112,6 +112,17 @@ pub const CAP_NAVIGATION_GUARD = "navigation-guard";
 /// the previous hop of the same request. Without it a client knows
 /// status/size only and cannot tell a redirect chain from separate loads.
 pub const CAP_NET_LOG_DETAIL = "net-log-detail";
+/// Log entries keep urls whole up to `LOG_URL_MAX` bytes and flag a
+/// longer one (`NetDetail.URL_TRUNCATED`); without it a helper cut every
+/// url at `LEGACY_LOG_URL_MAX` bytes and said nothing.
+pub const CAP_NET_LOG_LONG_URLS = "net-log-long-urls";
+/// The longest url a `net-log-long-urls` helper logs whole.
+pub const LOG_URL_MAX = UNTRUSTED_URL_CAP;
+/// What an older helper cut every logged url to, silently.
+pub const LEGACY_LOG_URL_MAX = 256;
+/// Entries one view's request log ring holds (the helper's `NLOG`): a
+/// pull with this `max` returns every entry above its cursor.
+pub const NET_LOG_ENTRIES = 128;
 /// The helper captures response BODIES per view (0x8B block): a
 /// `capture_set` installs a filter (hosts, url substring/regex,
 /// resource types, methods, mime prefixes) and byte caps, and matching
@@ -549,6 +560,7 @@ pub const Cap = enum {
     web_emulation,
     net_policy_ack,
     net_log_detail,
+    net_log_long_urls,
     web_stream,
     stream_audio,
     stream_encoded,
@@ -611,7 +623,7 @@ fn capConstName(comptime tag: []const u8) []const u8 {
 comptime {
     // Every `CAP_*` constant is a member: a new capability that skips
     // the enum fails the build here instead of never being parsed.
-    @setEvalBranchQuota(100_000);
+    @setEvalBranchQuota(200_000);
     var n: usize = 0;
     for (reflect.declNames(protocol)) |decl| {
         if (!std.mem.startsWith(u8, decl, "CAP_")) continue;
@@ -3245,6 +3257,8 @@ pub const NetDetail = struct {
     status_text: []const u8 = "",
 
     pub const REDIRECT: u8 = 1;
+    /// The url was longer than `LOG_URL_MAX`; the entry holds its head.
+    pub const URL_TRUNCATED: u8 = 2;
 
     pub fn redirect(self: NetDetail) bool {
         return self.flags & REDIRECT != 0;
@@ -3373,7 +3387,9 @@ fn readNetEntry(cur: *Cur) !NetEntry {
 /// the headless webdrive) hand to the `web_network` MCP tool. Kept
 /// here because both already depend on this module and a third copy of
 /// the format is how the two would drift. Caller frees.
-pub fn netLogJson(gpa: std.mem.Allocator, log: InterceptLog) ![]u8 {
+/// `long_urls`: the helper advertised `net-log-long-urls`; false marks
+/// every url at the legacy cut as possibly truncated.
+pub fn netLogJson(gpa: std.mem.Allocator, log: InterceptLog, long_urls: bool) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     errdefer aw.deinit();
     const w = &aw.writer;
@@ -3382,27 +3398,27 @@ pub fn netLogJson(gpa: std.mem.Allocator, log: InterceptLog) ![]u8 {
         if (i != 0) try w.writeByte(',');
         // The legacy frame carries no reason byte; the only thing that
         // could block one of its entries is the filter engine.
-        try writeNetEntryJson(w, e, if (e.blocked != 0) .filter_list else .none, if (log.details) |d| d[i] else null);
+        try writeNetEntryJson(w, e, if (e.blocked != 0) .filter_list else .none, if (log.details) |d| d[i] else null, long_urls);
     }
     try w.writeAll("]}");
     return aw.toOwnedSlice();
 }
 
 /// `netLogJson` over reason-carrying entries (the `net_log` frame).
-pub fn netLogJson2(gpa: std.mem.Allocator, log: NetLog) ![]u8 {
+pub fn netLogJson2(gpa: std.mem.Allocator, log: NetLog, long_urls: bool) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     errdefer aw.deinit();
     const w = &aw.writer;
     try w.print("{{\"next_seq\":{d},\"detail\":{},\"entries\":[", .{ log.next_seq, log.details != null });
     for (log.entries, 0..) |e, i| {
         if (i != 0) try w.writeByte(',');
-        try writeNetEntryJson(w, e.entry, @enumFromInt(e.reason), if (log.details) |d| d[i] else null);
+        try writeNetEntryJson(w, e.entry, @enumFromInt(e.reason), if (log.details) |d| d[i] else null, long_urls);
     }
     try w.writeAll("]}");
     return aw.toOwnedSlice();
 }
 
-fn writeNetEntryJson(w: *std.Io.Writer, e: NetEntry, reason: NetReason, detail: ?NetDetail) !void {
+fn writeNetEntryJson(w: *std.Io.Writer, e: NetEntry, reason: NetReason, detail: ?NetDetail, long_urls: bool) !void {
     const rt_name = @tagName(NetResource.fromWire(e.rtype));
     try w.print("{{\"seq\":{d},\"blocked\":{s},\"type\":\"{s}\",\"method\":", .{
         e.seq,
@@ -3412,6 +3428,11 @@ fn writeNetEntryJson(w: *std.Io.Writer, e: NetEntry, reason: NetReason, detail: 
     try std.json.Stringify.value(e.method, .{}, w);
     try w.writeAll(",\"url\":");
     try std.json.Stringify.value(e.url, .{}, w);
+    const cut = if (long_urls)
+        (if (detail) |d| d.flags & NetDetail.URL_TRUNCATED != 0 else false)
+    else
+        e.url.len >= LEGACY_LOG_URL_MAX;
+    if (cut) try w.writeAll(",\"url_truncated\":true");
     if (e.blocked == 0) {
         if (e.done != 0) {
             try w.print(",\"status\":{d},\"duration_ms\":{d},\"size\":{d}", .{ e.status, e.dur_ms, e.size });
@@ -6659,7 +6680,7 @@ test "netLogJson is one newline-free JSON object" {
         .{ .seq = 2, .blocked = 0, .rtype = @intFromEnum(NetResource.script), .done = 0, .status = 0, .dur_ms = 0, .size = 0, .method = "GET", .url = "https://site.example/a\njs" },
         .{ .seq = 3, .blocked = 0, .rtype = 99, .done = 1, .status = 404, .dur_ms = 7, .size = 11, .method = "POST", .url = "https://site.example/api" },
     };
-    const json = try netLogJson(gpa, .{ .view = 1, .next_seq = 4, .entries = &entries });
+    const json = try netLogJson(gpa, .{ .view = 1, .next_seq = 4, .entries = &entries }, true);
     defer gpa.free(json);
     try std.testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, json, '\n'));
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
@@ -6757,12 +6778,12 @@ test "round-trip: net_log carries the reason the old frame cannot" {
 
     // The one JSON renderer names the reason; a lifted legacy entry can
     // only ever say filter_list.
-    const json = try netLogJson2(gpa, .{ .view = 4, .next_seq = 3, .entries = &entries });
+    const json = try netLogJson2(gpa, .{ .view = 4, .next_seq = 3, .entries = &entries }, true);
     defer gpa.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"reason\":\"sub_host\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"detail\":false") != null);
     const legacy = [_]NetEntry{entries[0].entry};
-    const lifted = try netLogJson(gpa, .{ .view = 4, .next_seq = 2, .entries = &legacy });
+    const lifted = try netLogJson(gpa, .{ .view = 4, .next_seq = 2, .entries = &legacy }, true);
     defer gpa.free(lifted);
     try std.testing.expect(std.mem.indexOf(u8, lifted, "\"reason\":\"filter_list\"") != null);
 }
@@ -6791,7 +6812,7 @@ test "round-trip: net-log-detail rides after the entries and an older peer never
     try std.testing.expectEqual(@as(u32, 5), d[1].prev_seq);
     try std.testing.expectEqualStrings("Moved Permanently", d[0].status_text);
     try std.testing.expectEqual(@as(i32, -102), d[2].err);
-    const json = try netLogJson2(gpa, got);
+    const json = try netLogJson2(gpa, got, true);
     defer gpa.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"redirect\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"prev_seq\":5") != null);
@@ -6820,6 +6841,36 @@ test "round-trip: net-log-detail rides after the entries and an older peer never
     var nb: [48]u8 = undefined;
     try std.testing.expectEqualStrings("net::ERR_ABORTED", netErrorName(&nb, -3));
     try std.testing.expectEqualStrings("net::ERROR_-999", netErrorName(&nb, -999));
+}
+
+test "a url past the log bound is marked url_truncated; an older helper's cut is suspect" {
+    const gpa = std.testing.allocator;
+    const head = &@as([LOG_URL_MAX]u8, @splat('a'));
+    const entries = [_]NetEntry2{
+        .{ .entry = .{ .seq = 1, .blocked = 0, .rtype = @intFromEnum(NetResource.document), .done = 1, .status = 302, .dur_ms = 1, .size = 0, .method = "GET", .url = head }, .reason = 0 },
+        .{ .entry = .{ .seq = 2, .blocked = 0, .rtype = @intFromEnum(NetResource.document), .done = 1, .status = 200, .dur_ms = 1, .size = 0, .method = "GET", .url = head[0..3000] }, .reason = 0 },
+    };
+    const details = [_]NetDetail{ .{ .flags = NetDetail.REDIRECT | NetDetail.URL_TRUNCATED }, .{} };
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try encode(gpa, &buf, NetLog{ .view = 1, .next_seq = 3, .entries = &entries, .details = &details });
+    var r = Reader.init(buf.items);
+    const got = try NetLog.decodeAlloc((try r.next()).?.payload, gpa);
+    defer got.freeDecoded(gpa);
+    try std.testing.expectEqual(@as(usize, LOG_URL_MAX), got.entries[0].entry.url.len);
+    const json = try netLogJson2(gpa, got, true);
+    defer gpa.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.object.get("entries").?.array.items;
+    try std.testing.expect(arr[0].object.get("url_truncated").?.bool);
+    try std.testing.expect(arr[0].object.get("redirect").?.bool);
+    try std.testing.expect(arr[1].object.get("url_truncated") == null);
+    try std.testing.expectEqual(@as(usize, 3000), arr[1].object.get("url").?.string.len);
+    // An older helper cut at 256 bytes and flagged nothing.
+    const legacy = try netLogJson2(gpa, got, false);
+    defer gpa.free(legacy);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, legacy, "\"url_truncated\":true"));
 }
 
 test "round-trip: capture_set carries the whole filter, lists clamped not wrapped" {

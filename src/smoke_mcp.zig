@@ -78,6 +78,7 @@ fn fail(comptime msg: []const u8) noreturn {
 }
 
 const nowMs = @import("util/clock.zig").nowMs;
+const repeat = @import("util/repeat.zig").repeat;
 
 /// A running `sketerm mcp` subprocess plus its stdio pipes.
 const Mcp = @import("smoke/mcpproc.zig").Mcp(fail);
@@ -7513,13 +7514,27 @@ const NavHttp = struct {
         \\</body></html>
     ;
     const zip = "PK\x03\x04nav-download-bytes";
+    /// A redirect target past the old 256-byte log cut, and one past the
+    /// log's whole-url bound (`LOG_URL_MAX`, 8192).
+    const long_query = repeat("a", 3000);
+    const huge_query = repeat("b", 9000);
+    const js_redirect = "<!doctype html><html><head><title>nav-js</title><script>location.replace('/final')</script></head><body>JS</body></html>";
+    const challenge = "<!doctype html><html><head><title>nav-check</title></head><body>CHECKING<script>document.cookie = 'bc=1; path=/'; setTimeout(() => { location.replace('/botcheck'); }, 800);</script></body></html>";
+    const passed = "<!doctype html><html><head><title>nav-passed</title></head><body><div id=\"passed\">BOT-PASSED</div><img src=\"/slowimg\"></body></html>";
+
+    /// A 302 whose Location `respond`'s 512-byte header buffer cannot hold.
+    fn respondLocation(afd: c_int, loc: []const u8) void {
+        var head: [16384]u8 = undefined;
+        const hdr = std.fmt.bufPrint(&head, "HTTP/1.1 302 Found\r\nLocation: {s}\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", .{loc}) catch return;
+        _ = c.write(afd, hdr.ptr, hdr.len);
+    }
 
     fn start(self: *NavHttp) bool {
         return self.lis.start(self, &onConn);
     }
 
     fn onConn(_: ?*anyopaque, afd: c_int) bool {
-        var buf: [4096]u8 = undefined;
+        var buf: [16384]u8 = undefined;
         const raw = tcpserver.readRequest(afd, &buf, 3000);
         const path_start = (std.mem.indexOfScalar(u8, raw, ' ') orelse return false) + 1;
         const path_end = std.mem.indexOfScalarPos(u8, raw, path_start, ' ') orelse return false;
@@ -7531,8 +7546,23 @@ const NavHttp = struct {
             tcpserver.respond(afd, "301 Moved Permanently", "text/plain", "", "Location: /r2\r\n");
         } else if (eq(u8, path, "/r2")) {
             tcpserver.respond(afd, "302 Found", "text/plain", "", "Location: /final\r\n");
-        } else if (eq(u8, path, "/final")) {
+        } else if (eq(u8, path, "/final") or std.mem.startsWith(u8, path, "/final?")) {
             tcpserver.respondOk(afd, "text/html", final, "");
+        } else if (eq(u8, path, "/long")) {
+            respondLocation(afd, "/final?q=" ++ long_query);
+        } else if (eq(u8, path, "/huge")) {
+            respondLocation(afd, "/final?q=" ++ huge_query);
+        } else if (eq(u8, path, "/jsredir")) {
+            tcpserver.respondOk(afd, "text/html", js_redirect, "");
+        } else if (eq(u8, path, "/botcheck")) {
+            // The challenge passes itself into a second load whose
+            // document answers at once but whose image keeps it loading
+            // for 2s: a selector wait asked meanwhile polls a page the
+            // helper refuses evaluations on ("navigating").
+            tcpserver.respondOk(afd, "text/html", if (std.mem.indexOf(u8, raw, "bc=1") != null) passed else challenge, "");
+        } else if (eq(u8, path, "/slowimg")) {
+            _ = c.usleep(2_000_000);
+            tcpserver.respond(afd, "404 Not Found", "image/png", "", "");
         } else if (eq(u8, path, "/missing")) {
             tcpserver.respond(afd, "404 Not Found", "text/html", missing, "");
         } else if (eq(u8, path, "/late")) {
@@ -7701,6 +7731,84 @@ fn webNavStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8)
         const bad = capSc(arena, m.callTool("web_wait", "{\"for\":\"selector\",\"arg\":\"[[[\",\"timeout_ms\":3000}"), "wn: invalid selector", true);
         expectFact(bad.get("error").?.object, "code", "invalid_args", "wn: an invalid selector is not invalid_args");
     }
+    // (8) Urls past the old 256-byte log cut stay whole; past the log's
+    // own bound they are marked. The cursor: since = the previous
+    // reply's next_seq lists exactly what came after it.
+    {
+        const port = http.lis.port;
+        const cursor = capInt(capSc(arena, m.callTool("web_network", "{\"max\":1}"), "wn: log head", false), "next_seq");
+        m.sendTool("web_navigate", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/long\"}}", .{port}) catch unreachable);
+        const n = navOf(capSc(arena, m.recvLine(40_000), "wn: long redirect", false), "wn: long redirect");
+        if (!std.mem.endsWith(u8, scStr(n, "url", "wn: long url"),  NavHttp.long_query)) fail("wn: the navigation's final url is not whole");
+        var sb: [96]u8 = undefined;
+        const net = capSc(arena, m.callTool("web_network", std.fmt.bufPrint(&sb, "{{\"since\":{d}}}", .{cursor}) catch unreachable), "wn: log since", false);
+        const rows = net.get("requests").?.array.items;
+        if (rows.len == 0) fail("wn: the log since the cursor is empty");
+        if (capInt(rows[0].object, "seq") != cursor + 1 or !std.mem.endsWith(u8, scStr(rows[0].object, "url", "wn: first row"), "/long")) {
+            say(m.callTool("web_network", "{\"max\":10}"));
+            fail("wn: since=next_seq does not start at the next entry (the /long hop)");
+        }
+        var whole = false;
+        for (rows) |row| {
+            if (capInt(row.object, "seq") <= cursor) fail("wn: since listed an entry at or below the cursor");
+            if (std.mem.endsWith(u8, scStr(row.object, "url", "wn: row url"),  NavHttp.long_query)) whole = true;
+            if (row.object.get("url_truncated") != null) fail("wn: a 3 KB url is marked truncated");
+        }
+        if (!whole) fail("wn: the 3 KB redirect target is cut in the log");
+        const again = capSc(arena, m.callTool("web_network", std.fmt.bufPrint(&sb, "{{\"since\":{d}}}", .{capInt(net, "next_seq")}) catch unreachable), "wn: log since next_seq", false);
+        for (again.get("requests").?.array.items) |row| {
+            if (capInt(row.object, "seq") <= capInt(net, "next_seq")) fail("wn: a second page repeats an entry");
+        }
+        const cursor2 = capInt(again, "next_seq");
+        m.sendTool("web_navigate", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/huge\"}}", .{port}) catch unreachable);
+        _ = capSc(arena, m.recvLine(40_000), "wn: huge redirect", false);
+        const hnet = capSc(arena, m.callTool("web_network", std.fmt.bufPrint(&sb, "{{\"since\":{d}}}", .{cursor2}) catch unreachable), "wn: huge log", false);
+        var marked = false;
+        for (hnet.get("requests").?.array.items) |row| {
+            const u = scStr(row.object, "url", "wn: huge row");
+            if (std.mem.indexOf(u8, u, "bbbb") == null) continue;
+            const t = row.object.get("url_truncated") orelse fail("wn: a url past the log bound is not marked url_truncated");
+            if (t != .bool or !t.bool) fail("wn: url_truncated is not true");
+            if (u.len != 8192) fail("wn: a truncated url is not cut at the 8192-byte bound");
+            marked = true;
+        }
+        if (!marked) fail("wn: the 9 KB redirect target is not in the log");
+    }
+    // (9) A navigation that finishes before the first poll, to the url
+    // the view already shows, settles at once (it used to wait out its
+    // whole budget: no loading seen, url unchanged).
+    _ = capSc(arena, m.callTool("web_navigate", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/page\"}}", .{http.lis.port}) catch unreachable), "wn: page", false);
+    {
+        const t0 = nowMs();
+        m.sendTool("web_navigate", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/page\",\"timeout_ms\":10000}}", .{http.lis.port}) catch unreachable);
+        const r = capSc(arena, m.recvLine(40_000), "wn: same url", false);
+        if (nowMs() - t0 > 5000) fail("wn: navigating to the url the view shows waited out its budget");
+        expectFact(navOf(r, "wn: same url"), "outcome", "page", "wn: the same-url navigation is not outcome page");
+    }
+    // A page script that replaces the navigation at once: the reply is
+    // the replacement's, reported as replaced (web_open's reporting).
+    m.sendTool("web_navigate", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/jsredir\",\"timeout_ms\":10000}}", .{http.lis.port}) catch unreachable);
+    {
+        const n = navOf(capSc(arena, m.recvLine(40_000), "wn: js redirect", false), "wn: js redirect");
+        expectFact(n, "outcome", "replaced", "wn: a script-replaced navigation is not outcome replaced");
+        if (!std.mem.endsWith(u8, scStr(n, "replaced_url", "wn: replaced_url"), "/jsredir")) fail("wn: replaced_url is not the page the script left");
+        if (!std.mem.endsWith(u8, scStr(n, "url", "wn: replaced final url"), "/final")) fail("wn: the replaced navigation does not report the replacement's url");
+    }
+    // (10) A bot check that passes itself: a selector wait outlasts the
+    // navigation instead of being refused as invalid_args.
+    {
+        const t0 = nowMs();
+        m.sendTool("web_navigate", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/botcheck\",\"timeout_ms\":10000}}", .{http.lis.port}) catch unreachable);
+        _ = capSc(arena, m.recvLine(40_000), "wn: botcheck", false);
+        if (nowMs() - t0 > 5000) fail("wn: the challenge page did not settle");
+        const w = capSc(arena, m.callTool("web_wait", "{\"for\":\"selector\",\"arg\":\"#passed\",\"timeout_ms\":10000}"), "wn: selector across a navigation", false);
+        expectFact(w, "title", "nav-passed", "wn: the wait did not end in the passed page");
+        _ = m.callTool("web_eval", "{\"code\":\"document.cookie = 'bc=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/'\"}");
+        m.sendTool("web_navigate", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/botcheck\",\"wait\":{{\"for\":\"selector\",\"arg\":\"#passed\",\"timeout_ms\":10000}}}}", .{http.lis.port}) catch unreachable);
+        const r = capSc(arena, m.recvLine(40_000), "wn: botcheck with wait", false);
+        if (!r.get("wait").?.object.get("met").?.bool) fail("wn: web_navigate's selector wait did not outlast the challenge's navigation");
+        _ = m.callTool("web_eval", "{\"code\":\"document.cookie = 'bc=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/'\"}");
+    }
     // web_open's wait too.
     m.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/late\",\"snapshot\":\"none\",\"label\":\"wn\",\"wait\":{{\"for\":\"selector\",\"arg\":\"#late\"}}}}", .{http.lis.port}) catch unreachable);
     {
@@ -7800,7 +7908,9 @@ const FetchHttp = struct {
             tcpserver.respond(afd, "404 Not Found", "text/html", missing, "");
         } else if (eq(u8, path, "/redir")) {
             tcpserver.respond(afd, "302 Found", "text/plain", "", "Location: /target\r\n");
-        } else if (eq(u8, path, "/target")) {
+        } else if (eq(u8, path, "/redir-long")) {
+            NavHttp.respondLocation(afd, "/target?q=" ++ NavHttp.long_query);
+        } else if (eq(u8, path, "/target") or std.mem.startsWith(u8, path, "/target?")) {
             _ = target_hits.fetchAdd(1, .acq_rel);
             tcpserver.respondOk(afd, "text/html", "<title>target</title>TARGET", "");
         } else if (eq(u8, path, "/robots.txt")) {
@@ -8013,14 +8123,22 @@ fn webFetchStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         if (capInt(row, "match_count") != 1) fail("wf: regex_in raw did not search the source");
     }
 
-    // (4) An unfollowed redirect never reaches its target.
+    // (4) An unfollowed redirect never reaches its target, and the call
+    // answers as soon as the redirect is known (it used to sit out the
+    // whole per-url timeout), with the whole Location.
     {
-        const reply = m.callToolTimeout("web_fetch", std.fmt.bufPrint(&args, "{{\"urls\":[\"http://127.0.0.1:{d}/redir\"],\"follow_redirects\":false}}", .{port}) catch unreachable, 60_000);
-        const row = fetchResults(capSc(arena, reply, "wf: no redirect", false), "wf: no redirect")[0].object;
-        const n = navOf(row, "wf: redirect nav");
-        expectFact(n, "outcome", "redirect", "wf: an unfollowed redirect is not outcome redirect");
-        if (capInt(n, "status") != 302) fail("wf: the unfollowed redirect's status");
-        if (!std.mem.endsWith(u8, scStr(n, "location", "wf: location"), "/target")) fail("wf: the unfollowed redirect's location");
+        const t0 = nowMs();
+        const reply = m.callToolTimeout("web_fetch", std.fmt.bufPrint(&args, "{{\"urls\":[\"http://127.0.0.1:{d}/redir\",\"http://127.0.0.1:{d}/redir-long\"],\"follow_redirects\":false,\"timeout_ms\":30000}}", .{ port, port }) catch unreachable, 60_000);
+        if (nowMs() - t0 > 10_000) fail("wf: an unfollowed redirect waited out its timeout");
+        const rows = fetchResults(capSc(arena, reply, "wf: no redirect", false), "wf: no redirect");
+        for (rows, 0..) |row, i| {
+            expectFact(row.object, "status", "done", "wf: an unfollowed redirect is not status done");
+            const n = navOf(row.object, "wf: redirect nav");
+            expectFact(n, "outcome", "redirect", "wf: an unfollowed redirect is not outcome redirect");
+            if (capInt(n, "status") != 302) fail("wf: the unfollowed redirect's status");
+            const loc = scStr(n, "location", "wf: location");
+            if (!std.mem.endsWith(u8, loc, if (i == 0) "/target" else "/target?q=" ++ NavHttp.long_query)) fail("wf: the unfollowed redirect's location is not whole");
+        }
         if (FetchHttp.target_hits.load(.acquire) != 0) fail("wf: the redirect target was requested");
     }
 

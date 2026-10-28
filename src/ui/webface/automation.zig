@@ -311,7 +311,7 @@ pub fn onInterceptStatus(self: *WebFace, ev: proto.InterceptStatus) void {
 
 pub fn onInterceptLog(self: *WebFace, ev: proto.InterceptLog) void {
     self.net_next_seq = ev.next_seq;
-    const json = proto.netLogJson(self.allocator, ev) catch return;
+    const json = proto.netLogJson(self.allocator, ev, self.cl.has(.net_log_long_urls)) catch return;
     defer self.allocator.free(json);
     self.completeOp(.network, 0, true, json, .{});
 }

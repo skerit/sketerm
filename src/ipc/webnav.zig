@@ -89,6 +89,8 @@ pub const Entry = struct {
     status_text: []const u8 = "",
     err: i32 = 0,
     err_name: []const u8 = "",
+    /// The log keeps the url's head only (`url_truncated`).
+    url_truncated: bool = false,
 };
 
 pub const Log = struct {
@@ -147,6 +149,7 @@ pub fn parseLog(arena: std.mem.Allocator, json: []const u8) !Log {
             .status_text = getStr(e, "status_text"),
             .err = @intCast(std.math.clamp(getInt(e, "error_code") orelse 0, std.math.minInt(i32), std.math.maxInt(i32))),
             .err_name = getStr(e, "error"),
+            .url_truncated = getBool(e, "url_truncated"),
         });
     }
     out.entries = list.items;
@@ -186,13 +189,14 @@ fn isHttp(url: []const u8) bool {
     return std.ascii.eqlIgnoreCase(s, "http") or std.ascii.eqlIgnoreCase(s, "https");
 }
 
-pub const Hop = struct { url: []const u8, status: u16 };
+pub const Hop = struct { url: []const u8, status: u16, url_truncated: bool = false };
 
 /// What the caller knows besides the log.
 pub const Input = struct {
     /// The url the call asked for; null for back/forward/reload.
     requested: ?[]const u8 = null,
-    /// The view's url now (full length; log urls are cut at 256 bytes).
+    /// The view's url now (full length; a log url past the helper's
+    /// bound is cut and flagged `url_truncated`).
     view_url: []const u8 = "",
     /// The view's main-frame load failure record, if any.
     load_error: ?struct { code: i64, msg: []const u8 } = null,
@@ -220,6 +224,10 @@ pub const Nav = struct {
     replaced_url: ?[]const u8 = null,
     /// Where an unfollowed redirect pointed (`redirect` only).
     location: ?[]const u8 = null,
+    /// `url` is a log url cut at the helper's bound.
+    url_truncated: bool = false,
+    /// `location` is a log url cut at the helper's bound.
+    location_truncated: bool = false,
     download_path: ?[]const u8 = null,
     /// `net-log-detail` was available: redirects, content type, status
     /// text and net errors are measured; false = they are unknown.
@@ -301,10 +309,12 @@ pub fn derive(arena: std.mem.Allocator, log: Log, in: Input) !Nav {
     const superseded = log.detail and chain[0].seq != earliest.seq;
 
     var hops: std.ArrayList(Hop) = .empty;
-    for (chain[0 .. chain.len - 1]) |h| try hops.append(arena, .{ .url = h.url, .status = h.status });
+    for (chain[0 .. chain.len - 1]) |h| try hops.append(arena, .{ .url = h.url, .status = h.status, .url_truncated = h.url_truncated });
     nav.redirects = hops.items;
-    // The log keeps 256 bytes of a url; the view knows the whole one.
-    nav.url = if ((!log.detail and in.view_url.len > 0) or (in.view_url.len > last.url.len and std.mem.startsWith(u8, in.view_url, last.url))) in.view_url else last.url;
+    // A log url past the helper's bound is cut; the view knows the whole one.
+    const view_whole = (!log.detail and in.view_url.len > 0) or (in.view_url.len > last.url.len and std.mem.startsWith(u8, in.view_url, last.url));
+    nav.url = if (view_whole) in.view_url else last.url;
+    nav.url_truncated = !view_whole and last.url_truncated;
     nav.scheme = schemeOf(last.url);
     if (last.mime.len > 0) nav.content_type = last.mime;
     if (last.done and !last.blocked) nav.size = last.size;
@@ -324,6 +334,7 @@ pub fn derive(arena: std.mem.Allocator, log: Log, in: Input) !Nav {
         const r = chain[chain.len - 2];
         nav.redirects = hops.items[0 .. hops.items.len - 1];
         nav.url = r.url;
+        nav.url_truncated = r.url_truncated;
         nav.scheme = schemeOf(r.url);
         nav.status = r.status;
         nav.status_text = if (r.status_text.len > 0) r.status_text else null;
@@ -332,6 +343,7 @@ pub fn derive(arena: std.mem.Allocator, log: Log, in: Input) !Nav {
         nav.error_code = null;
         nav.@"error" = null;
         nav.location = last.url;
+        nav.location_truncated = last.url_truncated;
         nav.outcome = .redirect;
         return nav;
     }
@@ -516,6 +528,31 @@ test "an unfollowed redirect reports the 3xx and where it pointed" {
     try t.expectEqual(@as(usize, 0), n.redirects.len);
     try t.expect(n.@"error" == null);
     try t.expect(std.mem.indexOf(u8, try sentence(ar, n), "not followed") != null);
+}
+
+test "a location or hop the log had to cut is flagged, never passed off as whole" {
+    var a = std.heap.ArenaAllocator.init(t.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const log = testLog(ar,
+        \\{"next_seq":3,"detail":true,"entries":[
+        \\{"seq":1,"blocked":false,"type":"document","method":"GET","url":"http://h/r","status":302,"duration_ms":1,"size":0,"redirect":true},
+        \\{"seq":2,"blocked":true,"type":"document","method":"GET","url":"http://h/tbbbb","url_truncated":true,"reason":"redirect_refused","prev_seq":1}]}
+    );
+    const n = try derive(ar, log, .{ .requested = "http://h/r", .view_url = "http://h/r" });
+    try t.expectEqual(Outcome.redirect, n.outcome);
+    try t.expect(n.location_truncated and !n.url_truncated);
+    // A followed chain: the view's whole url wins over the cut log row.
+    const followed = testLog(ar,
+        \\{"next_seq":3,"detail":true,"entries":[
+        \\{"seq":1,"blocked":false,"type":"document","method":"GET","url":"http://h/r","status":302,"duration_ms":1,"size":0,"redirect":true},
+        \\{"seq":2,"blocked":false,"type":"document","method":"GET","url":"http://h/tbbbb","url_truncated":true,"status":200,"duration_ms":1,"size":5,"prev_seq":1,"mime":"text/html"}]}
+    );
+    const f = try derive(ar, followed, .{ .requested = "http://h/r", .view_url = "http://h/tbbbbbbbbb" });
+    try t.expectEqualStrings("http://h/tbbbbbbbbb", f.url);
+    try t.expect(!f.url_truncated);
+    const g = try derive(ar, followed, .{ .requested = "http://h/r", .view_url = "http://elsewhere/" });
+    try t.expect(g.url_truncated);
 }
 
 test "wait conditions: a navigation takes every one but response" {

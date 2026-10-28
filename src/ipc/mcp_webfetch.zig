@@ -403,6 +403,17 @@ fn step(job: *Job, it: *Item, e: *webdrive.Engine, scratch: std.mem.Allocator) !
             }
             const rec = try web.viewRecord(scratch, e, v, false);
             if (rec.loadBlocked()) return finish(job, it, e);
+            // An unfollowed redirect ends the navigation without a load
+            // ever settling (the refused hop commits nothing), so the
+            // request log is what says it is over: answer it now rather
+            // than after the whole per-url timeout.
+            if (!job.opts.follow and now >= it.next_poll_ms) {
+                it.next_poll_ms = now + @as(i64, web.WaitProbe.POLL_MS);
+                switch (try web.navOf(.{ .headless = e }, scratch, rec, 0, it.row.url, it.started_ms)) {
+                    .nav => |n| if (n.outcome == .redirect) return finish(job, it, e),
+                    .unavailable => {},
+                }
+            }
             if (web.openSettled(rec, false)) {
                 if (job.opts.wait) |w| {
                     // The wait reads the view through the job's arena:

@@ -2517,7 +2517,7 @@ const Client = struct {
                 const l = proto.InterceptLog.decodeAlloc(frame.payload, self.gpa) catch fail("intercept_log decode");
                 defer l.freeDecoded(self.gpa);
                 self.int_log_next = l.next_seq;
-                const json = proto.netLogJson(self.gpa, l) catch fail("intercept_log json");
+                const json = proto.netLogJson(self.gpa, l, true) catch fail("intercept_log json");
                 defer self.gpa.free(json);
                 self.int_log_len = @min(json.len, self.int_log.len);
                 @memcpy(self.int_log[0..self.int_log_len], json[0..self.int_log_len]);

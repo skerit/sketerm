@@ -622,7 +622,23 @@ first. The helper links each redirect hop to the next in its request log
 browser-helper capability `net-log-detail`; with an older helper
 `navigation.detail` is false and `redirects`, `content_type`,
 `status_text` and `error` are empty or null: unknown, never guessed.
-Log urls are cut at 256 bytes (the final `url` is the view's whole one).
+Log urls are whole up to 8192 bytes (helper capability
+`net-log-long-urls`, reported as `capabilities.web_log_url_max`); a
+longer one keeps its head and is flagged: `url_truncated:true` on a
+`web_network` row or a redirect hop, `navigation.url_truncated` /
+`navigation.location_truncated` on the navigation (the final `url` is
+the view's whole one whenever the view still shows it). An older helper
+cut every url at 256 bytes silently; with one, `web_log_url_max` is 256
+and every row that long is flagged as possibly cut.
+
+`web_network` pages with `since`: pass the previous reply's `next_seq`
+(the newest seq that reply covered) and the reply lists exactly the
+entries logged after it, oldest first, none twice and none skipped;
+`more:true` means further entries are already logged (call again), and
+`dropped` counts entries after `since` the 128-row ring overwrote before
+they were read. Without `since` it lists the newest `max`.
+(`capabilities.web_network_cursor_exact`; older servers answered
+`next_seq` = newest + 1, which skipped one entry per page.)
 The helper never overwrites a view's 8 newest main-document rows, so a
 page that loads hundreds of subresources cannot push the navigation's
 own row out of the 128-row log. If the log cannot be read at all,
@@ -639,6 +655,17 @@ an error, because the navigation itself happened (`detail` says why it
 did not hold). An invalid `wait` is refused before anything navigates.
 `web_wait` gained the same two conditions; there an unmet one is the
 usual `timeout` error, and an invalid selector is `invalid_args` at once.
+A selector is invalid only when the page's selector engine rejects it
+(a `SyntaxError`); a check the page cannot run because it is between
+documents (a script's redirect, a bot check passing itself) keeps the
+wait going in the next document, and a wait that runs out that way is a
+`timeout` naming the last refusal, never `invalid_args`.
+
+`web_navigate` settles exactly as `web_open` does: on a load that
+FINISHED after the call (the view's load counter moved) with nothing in
+flight, so a navigation that completes between two polls, or one a page
+script replaces, is answered at once (`replaced`/`replaced_url` as on
+`web_open`) instead of after the whole budget.
 
 `capabilities.web_nav_result` is the preflight: `outcomes`, the `wait`
 conditions, and `helper_detail` (whether the running helper sends
@@ -706,8 +733,11 @@ JavaScript runs, a JS challenge passes), read, and closed:
   which an ephemeral server removes when it exits.
 - **`follow_redirects: false`** stops at the first server redirect:
   `navigation.outcome` is `redirect`, `status` the 3xx, `location` where
-  it pointed, and the target is never requested (the helper refuses the
-  re-issued request; `view-flags` again).
+  it pointed (whole up to 8192 bytes, else `location_truncated`), and
+  the target is never requested (the helper refuses the re-issued
+  request; `view-flags` again). The url's result is `done` as soon as
+  the request log shows the refused hop; it does not wait for a load
+  that the refusal means never comes.
 - **`timeout_ms`** is per url, from its tab opening (queueing excluded),
   default 30000, at most 120000. **`wait`** is `web_open`'s.
 - **Partial failure never fails the call.** Each url has a `status`:

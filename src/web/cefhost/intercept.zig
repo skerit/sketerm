@@ -135,7 +135,8 @@ pub fn statusFrame(self: *Host, view_id: u32) proto.InterceptStatus {
 /// `since`, the NEWEST `max` of them, oldest first, each with its
 /// `net-log-detail` and the string storage both borrow (a ring entry's
 /// own storage is free to change the moment the lock drops). Shared by
-/// `intercept_log` and `net_log`, which differ only in the frame.
+/// `intercept_log` and `net_log`, which differ only in the frame. About
+/// 1 MiB with whole urls, so it lives on the heap (`LogSnap.create`).
 const LogSnap = struct {
     rows: [NLOG]proto.NetEntry2 = undefined,
     details: [NLOG]proto.NetDetail = undefined,
@@ -146,13 +147,20 @@ const LogSnap = struct {
     n: usize = 0,
     next_seq: u32 = 0,
 
+    fn create(gpa: std.mem.Allocator) ?*LogSnap {
+        const snap = gpa.create(LogSnap) catch return null;
+        snap.n = 0;
+        snap.next_seq = 0;
+        return snap;
+    }
+
     fn put(self: *LogSnap, i: usize, e: *const LogEntry) void {
         fillEntry(&self.rows[i].entry, &self.url[i], &self.method[i], e);
         self.rows[i].reason = e.reason;
         @memcpy(self.mime[i][0..e.mime_len], e.mime[0..e.mime_len]);
         @memcpy(self.stext[i][0..e.stext_len], e.stext[0..e.stext_len]);
         self.details[i] = .{
-            .flags = if (e.redirect) proto.NetDetail.REDIRECT else 0,
+            .flags = (if (e.redirect) proto.NetDetail.REDIRECT else 0) | (if (e.url_cut) proto.NetDetail.URL_TRUNCATED else 0),
             .err = e.err,
             .prev_seq = e.prev_seq,
             .mime = self.mime[i][0..e.mime_len],
@@ -205,8 +213,11 @@ const LogSnap = struct {
 };
 
 /// Answer a log pull (`intercept_log`, the frame the GUI face reads).
+/// Out of memory answers an empty page at the asked cursor, never none.
 pub fn interceptLog(self: *Host, req: proto.InterceptLogReq) void {
-    var snap: LogSnap = .{};
+    const snap = LogSnap.create(self.gpa) orelse
+        return self.post(proto.InterceptLog{ .view = req.view, .next_seq = req.since, .entries = &.{}, .details = &.{} });
+    defer self.gpa.destroy(snap);
     snap.take(req.view, req.since, req.max);
     var entries: [NLOG]proto.NetEntry = undefined;
     for (snap.rows[0..snap.n], 0..) |r, i| entries[i] = r.entry;
@@ -815,7 +826,9 @@ test "navigation preflight leaves subframes and unrelated views outside the main
 /// Answer a reason-carrying log pull; the `intercept_log` shape
 /// with the policy verdict per entry.
 pub fn netLog(self: *Host, req: proto.NetLogReq) void {
-    var snap: LogSnap = .{};
+    const snap = LogSnap.create(self.gpa) orelse
+        return self.post(proto.NetLog{ .view = req.view, .next_seq = req.since, .entries = &.{}, .details = &.{} });
+    defer self.gpa.destroy(snap);
     snap.take(req.view, req.since, req.max);
     self.post(proto.NetLog{ .view = req.view, .next_seq = snap.next_seq, .entries = snap.rows[0..snap.n], .details = snap.details[0..snap.n] });
 }
@@ -1582,9 +1595,11 @@ pub const seed_filter_list =
     \\
 ;
 
-/// Log-ring depth per view. At ~300 bytes per entry a view costs
-/// ~38KB, allocated only while the view lives.
-pub const NLOG = 128;
+/// Log-ring depth per view. With whole urls an entry is ~8.5 KB, so a
+/// view's ring is ~1.1 MB, allocated only while the view lives: at the
+/// `MAX_ISLOTS` (32) cap ~35 MB, against a renderer process per view
+/// that costs tens of MB on its own.
+pub const NLOG = proto.NET_LOG_ENTRIES;
 
 /// Main-document rows per view kept out of the ring's overwrite order.
 pub const DOC_PINS = 8;
@@ -1595,9 +1610,12 @@ pub const DOC_PINS = 8;
 /// open past it (the constant is wire-adjacent and lives in protocol).
 pub const MAX_ISLOTS = proto.MAX_POLICY_VIEWS;
 
-/// Longest URL kept in a log entry; the tail is truncated, the
-/// VERDICT always sees the full url.
-pub const LOG_URL_MAX = 256;
+/// Longest URL kept in a log entry: the gate's own read bound and the
+/// untrusted broker's cap, so every url a request could be refused on
+/// is logged whole (OAuth/SAML and tracking redirects run to several
+/// KB). A longer one keeps its head and is flagged `url_cut`, reported
+/// as `url_truncated`; the VERDICT always sees the full url.
+pub const LOG_URL_MAX = proto.LOG_URL_MAX;
 /// Longest content type / status text a log entry keeps (`net-log-detail`).
 pub const LOG_MIME_MAX = 64;
 pub const LOG_STEXT_MAX = 48;
@@ -1625,7 +1643,9 @@ pub const LogEntry = struct {
     method_len: u8 = 0,
     method: [8]u8 = @splat(0),
     url_len: u16 = 0,
-    url: [LOG_URL_MAX]u8 = @splat(0),
+    /// The url was longer than `LOG_URL_MAX`; `url` holds its head.
+    url_cut: bool = false,
+    url: [LOG_URL_MAX]u8 = undefined,
     mime_len: u8 = 0,
     mime: [LOG_MIME_MAX]u8 = @splat(0),
     stext_len: u8 = 0,
@@ -2271,6 +2291,7 @@ fn logRequest(s: *ISlot, req_id: u64, now: i64, rtype: filter.RType, reason: pro
     @memcpy(e.method[0..e.method_len], method[0..e.method_len]);
     e.url_len = @intCast(@min(url.len, e.url.len));
     @memcpy(e.url[0..e.url_len], url[0..e.url_len]);
+    e.url_cut = url.len > e.url.len;
 }
 
 fn pinned(s: *const ISlot, e: *const LogEntry) bool {
@@ -2900,4 +2921,28 @@ test "a redirect re-issue links to the hop it continues, and document rows outli
     // A finished request is no hop: a new request with an old id starts afresh.
     last.done = true;
     try std.testing.expect(hopOf(ring, 77) == null);
+}
+
+test "a long url is logged whole up to LOG_URL_MAX, and a longer one is flagged, not silently cut" {
+    const gpa = std.testing.allocator;
+    const ring = try gpa.create([NLOG]LogEntry);
+    defer gpa.destroy(ring);
+    ring.* = @splat(.{});
+    var s = ISlot{ .used = true, .ring = ring };
+    const long = "http://h/?q=" ++ &@as([3000]u8, @splat('a'));
+    const huge = "http://h/?q=" ++ &@as([LOG_URL_MAX]u8, @splat('b'));
+    logRequest(&s, 1, 0, .document, .none, "GET", long);
+    logRequest(&s, 2, 0, .document, .none, "GET", huge);
+    try std.testing.expectEqualStrings(long, ring[0].url[0..ring[0].url_len]);
+    try std.testing.expect(!ring[0].url_cut);
+    try std.testing.expectEqual(@as(u16, LOG_URL_MAX), ring[1].url_len);
+    try std.testing.expect(ring[1].url_cut);
+    const snap = LogSnap.create(gpa).?;
+    defer gpa.destroy(snap);
+    snap.n = 0;
+    snap.put(0, &ring[0]);
+    snap.put(1, &ring[1]);
+    try std.testing.expectEqual(@as(usize, long.len), snap.rows[0].entry.url.len);
+    try std.testing.expect(snap.details[0].flags & proto.NetDetail.URL_TRUNCATED == 0);
+    try std.testing.expect(snap.details[1].flags & proto.NetDetail.URL_TRUNCATED != 0);
 }
