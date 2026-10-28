@@ -23370,3 +23370,21 @@ the virtual package exists for). 0.17 also surfaced two real test bugs: the
 `line()` freed it (0.16's allocator left the freed bytes readable), and a
 non-`pub` `encodeTo` that `@hasDecl` no longer sees. Installer, PKGBUILD and
 their test accept 0.16.x and 0.17.x.
+
+## 2026-10-28: web calls on different tabs run concurrently
+
+On the MCP server's own headless browser, one connection can now have several
+web calls waiting at once: two tabs each waiting 3 s for an element answer in
+about 3 s instead of 6 s. `web_open`, `web_navigate`, `web_wait` (all but
+`response`) and `web_eval` became step machines (`mcp_web.Pending`:
+`OpenRun`/`NavigateRun`/`WaitRun`/`EvalRun`) over a split semantic op
+(`webdrive.Engine.startOp`/`pollOp`/`abandonOp`, `mcp_web.OpFlight`); the
+blocking `webTool` is the same machines stepped with a sleep, so GUI mode and
+the old path share one implementation. `mcp_webjobs.zig` defers each call
+and steps it from the server loop; `webjobs.zig` holds the one ordering rule
+(same tab or no tab named: in order; `web_open` makes a fresh tab;
+`web_tabs`/`web_diagnostic` never wait). Cancellation, and a step that fails,
+abandon the machine, so an unfinished `web_open` closes its tab. Fact
+`web_concurrent_tabs`; `smoke-mcp` stage wc measures the overlap, the
+per-tab order, independent timeouts and cancellation. `peermail`'s JSON clone
+moved to `src/util/jsonclone.zig` so both use one copy.
