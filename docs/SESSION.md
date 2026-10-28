@@ -23388,3 +23388,16 @@ abandon the machine, so an unfinished `web_open` closes its tab. Fact
 `web_concurrent_tabs`; `smoke-mcp` stage wc measures the overlap, the
 per-tab order, independent timeouts and cancellation. `peermail`'s JSON clone
 moved to `src/util/jsonclone.zig` so both use one copy.
+
+## 2026-10-28: web_route_exit hands a route's proxy to clients outside the browser
+
+New MCP tool `web_route_exit {"route"}`: a script's own HTTP client can leave
+the same way a routed tab does without starting a browser. `via:<host>` gets
+a loopback SOCKS5 bridge to that host's daemon (`src/ipc/routeexit.zig`, one
+`socksbridge.Egress` per host for the server's life, at most 16, a stopped one
+replaced on the next ask through the new `Egress.isServing`); `tor` and
+`proxy:<url>` answer their named proxy as `socks5h://`/`http://`; `direct`
+answers null; `on:` is refused. Fact `web_route_exit`. `Egress.port()` now
+returns the port bound at create: the worker zeroes `bridge.port` when its
+connect fails, and a fast refusal used to let a caller read port 0 (the
+browser's own `routeProxy` read it the same way).
