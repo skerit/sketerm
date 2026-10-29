@@ -81,6 +81,7 @@ const Allocator = std.mem.Allocator;
 const c = @import("../c.zig").c;
 const pathz = @import("../util/pathz.zig");
 const atomicwrite = @import("../util/atomicwrite.zig");
+const textenc = @import("../util/textenc.zig");
 const doc_mod = @import("document.zig");
 const Document = doc_mod.Document;
 const reload = @import("reload.zig");
@@ -127,6 +128,12 @@ pub const Header = struct {
     /// `.crlf` documents are stored LF-normalized, exactly as they live
     /// in memory; this is what a save must re-apply.
     crlf: bool = false,
+    /// `textenc.Encoding` tag of the file the buffer saves to, and
+    /// whether it carries a BOM; the content itself is always UTF-8.
+    /// A string, not the enum, so a tag a newer sketerm adds reads back
+    /// as UTF-8 here instead of failing the whole header.
+    encoding: []const u8 = "utf8",
+    bom: bool = false,
     /// Document revision the snapshot was taken at, and the revision
     /// that was last saved to disk. Unequal is what "unsaved" means.
     revision: u64 = 0,
@@ -171,6 +178,12 @@ pub const Header = struct {
         self.disk_size = st.size;
         self.disk_ino = st.ino;
         self.disk_mode = st.mode;
+    }
+
+    /// The recorded file encoding; an unknown tag reads as UTF-8.
+    pub fn textEncoding(self: Header) textenc.Detected {
+        const enc = std.meta.stringToEnum(textenc.Encoding, self.encoding) orelse return .{};
+        return .{ .encoding = enc, .bom = self.bom and enc != .utf8 };
     }
 };
 
@@ -298,6 +311,8 @@ pub const Handle = struct {
         h.revision = doc.revision;
         h.saved_revision = doc.saved_revision;
         h.crlf = doc.line_ending == .crlf;
+        h.encoding = @tagName(doc.encoding.encoding);
+        h.bom = doc.encoding.bom;
         const content = try doc.textAlloc(alloc);
         errdefer alloc.free(content);
         return Snapshot.init(alloc, self.rec_path, h, content);
@@ -928,7 +943,7 @@ test "journal: a truncated record is refused, not handed back as work" {
     try testing.expectError(Error.RecordCorrupt, read(alloc, key));
 }
 
-test "journal: CRLF style and disk baseline survive the round trip" {
+test "journal: CRLF style, encoding and disk baseline survive the round trip" {
     const alloc = testing.allocator;
     var scope = try ScopedDir.init(alloc, "crlf");
     defer scope.deinit();
@@ -936,6 +951,7 @@ test "journal: CRLF style and disk baseline survive the round trip" {
     var doc = try dirtyDoc(alloc, "a\r\nb\r\nc\r\n");
     defer doc.deinit();
     try testing.expectEqual(doc_mod.LineEnding.crlf, doc.line_ending);
+    doc.encoding = .{ .encoding = .utf16be, .bom = true };
 
     var header = Header{ .spec = "box:/etc/hosts", .remote = true };
     header.setBaseline(.{
@@ -957,6 +973,8 @@ test "journal: CRLF style and disk baseline survive the round trip" {
     defer rec.deinit(alloc);
     try testing.expect(rec.header.crlf);
     try testing.expect(rec.header.remote);
+    try testing.expectEqual(textenc.Detected{ .encoding = .utf16be, .bom = true }, rec.header.textEncoding());
+    try testing.expectEqual(textenc.Detected{}, (Header{ .encoding = "utf32", .bom = true }).textEncoding());
     try testing.expectEqualStrings("box:/etc/hosts", rec.header.spec);
     const base = rec.baseline();
     try testing.expectEqual(@as(u64, 4242), base.ino);

@@ -41,7 +41,9 @@ const ev = @import("editorview.zig");
 const EditorView = ev.EditorView;
 const ETab = ev.ETab;
 const Fence = ev.Fence;
-const Document = @import("../editor/document.zig").Document;
+const doc_mod = @import("../editor/document.zig");
+const Document = doc_mod.Document;
+const textenc = @import("../util/textenc.zig");
 const reload = @import("../editor/reload.zig");
 const ediff = @import("../editor/diff.zig");
 const sel_mod = @import("../editor/selection.zig");
@@ -385,6 +387,8 @@ const IoJob = struct {
     keep_position: bool = false,
     /// `.editorconfig` properties for the loaded path.
     ec: @import("../editor/editorconfig.zig").Props = .{},
+    /// On-disk encoding of the loaded file; `bytes` is already UTF-8.
+    encoding: textenc.Detected = .{},
 
     fn setErr(self: *IoJob, text: []const u8) void {
         self.err_len = @min(text.len, self.err_buf.len);
@@ -423,17 +427,29 @@ const IoJob = struct {
             }
             return;
         };
-        if (@import("../editor/document.zig").looksBinary(out.items)) {
+        const text = doc_mod.decodeFile(allocator, out.items) catch |err| {
             out.deinit(allocator);
-            self.binary = true;
-            self.setErr("binary file (NUL bytes near the start) \u{2014} refusing to edit");
-            return;
-        }
-        self.bytes = out.toOwnedSlice(allocator) catch {
-            out.deinit(allocator);
-            self.setErr("OutOfMemory");
+            switch (err) {
+                error.Binary => {
+                    self.binary = true;
+                    self.setErr("binary file (NUL bytes near the start) \u{2014} refusing to edit");
+                },
+                error.InvalidUtf16 => self.setErr("malformed UTF-16 (unpaired surrogate or odd length)"),
+                error.OutOfMemory => self.setErr("OutOfMemory"),
+            }
             return;
         };
+        self.encoding = text.encoding;
+        if (text.owned) {
+            out.deinit(allocator);
+            self.bytes = @constCast(text.bytes);
+        } else {
+            self.bytes = out.toOwnedSlice(allocator) catch {
+                out.deinit(allocator);
+                self.setErr("OutOfMemory");
+                return;
+            };
+        }
         // Identity from the FD the bytes came through (never a separate
         // stat, which could see a newer file than the one just read) —
         // with the permission bits filled in from a follow-stat, since a
@@ -568,7 +584,11 @@ pub fn saveTab(view: *EditorView, tab: *ETab) void {
 pub fn startSave(view: *EditorView, tab: *ETab, expected_mtime: ?i64) void {
     const spec = tab.spec orelse return;
     const a = std.heap.c_allocator;
-    const bytes = tab.doc.materialize(a) catch return;
+    const bytes = tab.doc.materializeFile(a) catch |err| {
+        if (err == error.InvalidUtf8) errorDialog(view, "Save failed", "the buffer holds bytes that are not UTF-8, which " ++
+            "cannot be written as UTF-16");
+        return;
+    };
     const job = a.create(IoJob) catch {
         a.free(bytes);
         return;
@@ -660,11 +680,12 @@ fn onLoadDone(view: *EditorView, tab: *ETab, job: *IoJob) void {
         view.deliverDeferredEdits(tab, job.gen);
         return;
     }
-    const new_doc = Document.initFromBytes(view.allocator, job.bytes) catch {
+    var new_doc = Document.initFromBytes(view.allocator, job.bytes) catch {
         errorDialog(view, "Could not open file", "OutOfMemory");
         view.closeTabForce(tab);
         return;
     };
+    new_doc.encoding = job.encoding;
     view.replaceDocument(tab, new_doc);
     editorlang.onLoaded(view, tab, job.ec);
     tab.layout.invalidateAll();
@@ -711,6 +732,20 @@ fn onLoadDone(view: *EditorView, tab: *ETab, job: *IoJob) void {
     editorproj.refreshGit(view, tab);
     editoroutline.refresh(view, tab, true);
     view.refresh(tab);
+    noteEncoding(view, tab);
+}
+
+/// Say so when a file is not UTF-8: nothing else in the editor shows it,
+/// and the save writes that encoding back.
+fn noteEncoding(view: *EditorView, tab: *ETab) void {
+    const enc = tab.doc.encoding;
+    if (enc.encoding == .utf8) return;
+    var buf: [96:0]u8 = undefined;
+    const text = std.fmt.bufPrintSentinel(&buf, "{s}{s} file: saving keeps that encoding.", .{
+        enc.encoding.label(),
+        if (enc.bom) " (with BOM)" else "",
+    }, 0) catch return;
+    view.setStatusText(text.ptr);
 }
 
 fn onSaveDone(view: *EditorView, tab: *ETab, job: *IoJob) void {
@@ -767,6 +802,7 @@ fn finishReloadInPlace(view: *EditorView, tab: *ETab, job: *IoJob) void {
         view.setStatusText("Reload failed: out of memory.");
         return;
     };
+    tab.doc.encoding = job.encoding;
     tab.disk = job.disk;
     tab.seen = job.disk;
     clearAlert(view, tab);

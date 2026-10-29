@@ -8,6 +8,10 @@
 //! rewrite the file. All offsets in the public API are LF-normalized
 //! bytes for a CRLF document and raw file bytes for an LF one.
 //!
+//! Encoding: the rope is always UTF-8. A UTF-16 file is transcoded on
+//! the way in (`decodeFile`) and `materializeFile` re-encodes it, BOM
+//! included, on the way out; `encoding` records which.
+//!
 //! Undo grouping: consecutive single-codepoint pure insertions typed at
 //! the end of the previous one coalesce into one undo unit; the group
 //! breaks when a whitespace character follows a non-whitespace one, on
@@ -25,6 +29,7 @@ const Rope = rope_mod.Rope;
 const tr = @import("transaction.zig");
 const sel_mod = @import("selection.zig");
 const Selection = sel_mod.Selection;
+const textenc = @import("../util/textenc.zig");
 
 pub const LineEnding = enum { lf, crlf };
 
@@ -105,13 +110,54 @@ pub const EditObserver = struct {
 /// within the first 8000 bytes makes a file binary, a NUL past that
 /// does not. A text log with one embedded environment dump deep inside
 /// was refused as binary under a whole-file scan.
-pub const BINARY_PROBE_BYTES: usize = 8000;
+pub const BINARY_PROBE_BYTES: usize = textenc.PROBE_BYTES;
 
-/// Is this content something the editor should refuse to open? The
-/// one predicate shared by the open path and the project search.
+/// Is this content something the editor should refuse to open? UTF-16
+/// text holds NULs but is not binary; `decodeFile` reads it.
 pub fn looksBinary(bytes: []const u8) bool {
+    if (textenc.detect(bytes, true).encoding != .utf8) return false;
     const probe = bytes[0..@min(bytes.len, BINARY_PROBE_BYTES)];
     return std.mem.indexOfScalar(u8, probe, 0) != null;
+}
+
+/// A file's content as document text, transcoded when it is not UTF-8.
+pub const FileText = struct {
+    /// UTF-8; the caller's raw bytes when no transcoding was needed.
+    bytes: []const u8,
+    owned: bool,
+    encoding: textenc.Detected,
+
+    pub fn deinit(self: FileText, alloc: Allocator) void {
+        if (self.owned) alloc.free(self.bytes);
+    }
+};
+
+/// The one predicate shared by the open path and the project search:
+/// `raw` as editable text, or why it is not.
+/// @return `error.Binary` for binary content, `error.InvalidUtf16` for a
+/// file that sniffs as UTF-16 but is malformed past the probe window.
+pub fn decodeFile(alloc: Allocator, raw: []const u8) (textenc.DecodeError || error{Binary})!FileText {
+    const enc = textenc.detect(raw, true);
+    if (enc.encoding == .utf8) {
+        if (looksBinary(raw)) return error.Binary;
+        return .{ .bytes = raw, .owned = false, .encoding = enc };
+    }
+    const text = try textenc.decodeAlloc(alloc, raw, enc.encoding, false);
+    return .{ .bytes = text, .owned = true, .encoding = enc };
+}
+
+test "decodeFile: UTF-8 borrows, UTF-16 transcodes, binary refuses" {
+    const alloc = std.testing.allocator;
+    const plain = try decodeFile(alloc, "abc\n");
+    defer plain.deinit(alloc);
+    try std.testing.expect(!plain.owned);
+    try std.testing.expectEqualStrings("abc\n", plain.bytes);
+    const wide = try decodeFile(alloc, "a\x00\xA7\x00\n\x00");
+    defer wide.deinit(alloc);
+    try std.testing.expectEqual(textenc.Encoding.utf16le, wide.encoding.encoding);
+    try std.testing.expectEqualStrings("a\u{A7}\n", wide.bytes);
+    try std.testing.expectError(error.Binary, decodeFile(alloc, "ab\x00\x01cd"));
+    try std.testing.expect(!looksBinary("a\x00b\x00"));
 }
 
 test "looksBinary: NUL in the probe window is binary, past it is text" {
@@ -141,6 +187,8 @@ pub const Document = struct {
     /// Content state that is on disk, or `NEVER_SAVED`.
     saved_state: u64 = 0,
     line_ending: LineEnding,
+    /// On-disk encoding, applied by `materializeFile`.
+    encoding: textenc.Detected = .{},
     undo_stack: std.ArrayList(HistEntry),
     redo_stack: std.ArrayList(HistEntry),
     typing: ?Typing,
@@ -361,6 +409,7 @@ pub const Document = struct {
     }
 
     /// Caller-owned bytes in the document's on-disk line-ending style.
+    /// Still UTF-8; `materializeFile` is what a save writes.
     pub fn materialize(self: *const Document, alloc: Allocator) ![]u8 {
         const n = self.rope.len();
         switch (self.line_ending) {
@@ -375,6 +424,17 @@ pub const Document = struct {
                 return out;
             },
         }
+    }
+
+    /// Caller-owned bytes exactly as a save writes them: on-disk line
+    /// endings in the on-disk encoding.
+    /// @throws error.InvalidUtf8 when a UTF-16 document holds bytes that
+    /// are not UTF-8 and so have no UTF-16 form.
+    pub fn materializeFile(self: *const Document, alloc: Allocator) textenc.EncodeError![]u8 {
+        const text = try self.materialize(alloc);
+        if (self.encoding.encoding == .utf8) return text;
+        defer alloc.free(text);
+        return textenc.encodeAlloc(alloc, text, self.encoding.encoding, self.encoding.bom);
     }
 
     /// Write `bytes` (document form, so LF) into `dest` in `style`,

@@ -416,6 +416,7 @@ comptime {
     _ = @import("util/template.zig");
     _ = @import("util/titlefmt.zig");
     _ = @import("util/utf8.zig");
+    _ = @import("util/textenc.zig");
     _ = @import("util/videorec.zig");
     _ = @import("util/webm.zig");
     _ = @import("util/yuv.zig");

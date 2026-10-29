@@ -422,6 +422,7 @@ fn recoverOne(view: *EditorView, entry: journal.Entry) bool {
         rec.content,
         if (rec.header.crlf) .crlf else .lf,
     ) catch return false;
+    new_doc.encoding = rec.header.textEncoding();
     new_doc.markUnsaved();
     view.replaceDocument(tab, new_doc);
     if (view.lsp) |m| m.onDocumentReplaced(tab) else view.attachLsp(tab);

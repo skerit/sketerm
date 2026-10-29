@@ -216,14 +216,23 @@ pub const Results = struct {
     /// Scan ONE candidate's content with the editor's own engine and
     /// record its hits. `content` is the file's real bytes.
     ///
-    /// Returns the number of hits recorded. A file `looksBinary` is
-    /// skipped, matching exactly what the editor refuses to open.
-    pub fn scanContent(self: *Results, file: u32, content: []const u8) !usize {
+    /// Returns the number of hits recorded. A file `decodeFile` refuses
+    /// is skipped, matching exactly what the editor refuses to open; a
+    /// UTF-16 one is searched as the text the editor shows.
+    pub fn scanContent(self: *Results, file: u32, raw: []const u8) !usize {
         self.scanned += 1;
-        if (doc_mod.looksBinary(content)) {
-            try self.setNote(file, "binary", .failed);
+        const decoded = doc_mod.decodeFile(self.allocator, raw) catch |err| {
+            try self.setNote(file, switch (err) {
+                error.Binary => "binary",
+                error.InvalidUtf16 => "malformed UTF-16",
+                error.OutOfMemory => "out of memory",
+            }, .failed);
             return 0;
-        }
+        };
+        defer decoded.deinit(self.allocator);
+        // From here on the "file's bytes" are the decoded text: hits are
+        // document offsets, and previews must be cut from the same text.
+        const content = decoded.bytes;
         var doc = Document.initFromBytes(self.allocator, content) catch {
             try self.setNote(file, "out of memory", .failed);
             return 0;
@@ -494,6 +503,18 @@ test "psearch: binary candidates are refused, not scanned" {
     try testing.expectEqual(@as(usize, 0), try r.scanContent(f, "a\x00x"));
     try testing.expectEqual(FileState.failed, r.files.items[f].state);
     try testing.expectEqualStrings("binary", r.note(f));
+}
+
+test "psearch: a UTF-16 file is searched as its decoded text" {
+    var r = Results.init(testing.allocator);
+    defer r.deinit();
+    try r.reset("/p", "needle", .{});
+    const f = try r.addFile("/p/wide.txt");
+    const raw = "\xFF\xFEa\x00\n\x00 \x00n\x00e\x00e\x00d\x00l\x00e\x00\r\x00\n\x00";
+    try testing.expectEqual(@as(usize, 1), try r.scanContent(f, raw));
+    try testing.expectEqual(@as(u32, 1), r.hits.items[0].line);
+    try testing.expectEqual(@as(u32, 1), r.hits.items[0].col);
+    try testing.expectEqualStrings("needle", r.preview(r.hits.items[0]));
 }
 
 test "psearch: files are deduplicated by spec" {

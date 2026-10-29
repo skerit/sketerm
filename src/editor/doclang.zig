@@ -195,7 +195,9 @@ pub const DocLang = struct {
 
     /// Apply the `.editorconfig` save-time properties to `doc` as ONE
     /// undoable transaction: trailing whitespace, the final newline and
-    /// the UTF-8 BOM. @return true when the document changed.
+    /// the UTF-8 BOM. A UTF-16 document keeps its own encoding and BOM,
+    /// so `charset` is not applied to it. @return true when the
+    /// document changed.
     pub fn applySaveRules(self: *const DocLang, doc: *Document, sels: *SelectionSet) !bool {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -206,10 +208,10 @@ pub const DocLang = struct {
         const bom = "\xEF\xBB\xBF";
         var head: [3]u8 = undefined;
         const has_bom = std.mem.eql(u8, headOf(doc, &head), bom);
-        if (self.ec.charset) |cs| switch (cs) {
+        if (doc.encoding.encoding == .utf8) if (self.ec.charset) |cs| switch (cs) {
             .utf_8_bom => if (!has_bom and n > 0) try tx.addInsert(self.alloc, 0, bom),
             .utf_8 => if (has_bom) try tx.addDelete(self.alloc, 0, 3),
-            // The editor reads and writes UTF-8 only.
+            // Transcoding a UTF-8 file on save is not done.
             .latin1, .utf_16be, .utf_16le => {},
         };
         if (self.ec.trim_trailing_whitespace == true) try commands.appendTrimEdits(self.alloc, a, doc, &tx);
@@ -350,4 +352,16 @@ test "doclang: save rules trim, fix the final newline and the BOM in one step" {
     const stripped = try extra.textAlloc(testing.allocator);
     defer testing.allocator.free(stripped);
     try testing.expectEqualStrings("x", stripped);
+}
+
+test "doclang: a UTF-16 document never gets a UTF-8 BOM" {
+    var doc = try docOf("x\n");
+    defer doc.deinit();
+    doc.encoding = .{ .encoding = .utf16le, .bom = true };
+    var sels = try SelectionSet.initSingle(testing.allocator, .{ .anchor = 0, .head = 0 });
+    defer sels.deinit(testing.allocator);
+    var dl = DocLang.init(testing.allocator);
+    defer dl.deinit();
+    dl.ec = .{ .charset = .utf_8_bom };
+    try testing.expect(!try dl.applySaveRules(&doc, &sels));
 }

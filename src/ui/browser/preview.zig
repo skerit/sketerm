@@ -33,6 +33,7 @@ const wire = @import("../../mux/wire.zig");
 const colkeys = @import("../../filebrowser/colkeys.zig");
 const iconload = @import("../iconload.zig");
 const hexdump = @import("../../filebrowser/hexdump.zig");
+const textenc = @import("../../util/textenc.zig");
 const mediacols = @import("mediacols.zig");
 const previewers = @import("../../filebrowser/previewers.zig");
 const thumbs_mod = @import("../../filebrowser/thumbs.zig");
@@ -2503,8 +2504,8 @@ fn deliverRead(self: *BrowserView, pr: *PreviewRead) void {
 }
 
 /// Text preview bytes as the user should see them: as text when they
-/// read as text, as a bounded hex dump otherwise. This is what makes
-/// hex the fallback for any type without a handler.
+/// read as text (UTF-16 included), as a bounded hex dump otherwise.
+/// This is what makes hex the fallback for any type without a handler.
 const RenderedText = struct { text: []u8, hex: bool };
 
 fn renderText(allocator: std.mem.Allocator, bytes: []const u8, force_hex: bool) ?RenderedText {
@@ -2512,10 +2513,18 @@ fn renderText(allocator: std.mem.Allocator, bytes: []const u8, force_hex: bool) 
         const empty = allocator.dupe(u8, "(empty file)") catch return null;
         return .{ .text = empty, .hex = false };
     }
-    if (!force_hex and !hexdump.looksBinary(bytes)) {
-        const n = @min(bytes.len, PREVIEW_TEXT_CAP);
+    // The read may be a head, so a split unit at the end is not an error.
+    const enc = if (force_hex) textenc.Detected{} else textenc.detect(bytes, false);
+    const wide: ?[]u8 = if (enc.encoding == .utf8)
+        null
+    else
+        textenc.decodeAlloc(allocator, bytes, enc.encoding, true) catch null;
+    defer if (wide) |w| allocator.free(w);
+    if (wide != null or (!force_hex and !hexdump.looksBinary(bytes))) {
+        const src = wide orelse bytes;
+        const n = @min(src.len, PREVIEW_TEXT_CAP);
         var z: [PREVIEW_TEXT_CAP + 1:0]u8 = undefined;
-        @memcpy(z[0..n], bytes[0..n]);
+        @memcpy(z[0..n], src[0..n]);
         z[n] = 0;
         const valid = c.g_utf8_make_valid(&z, @intCast(n));
         defer c.g_free(valid);

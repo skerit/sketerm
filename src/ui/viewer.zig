@@ -8,6 +8,7 @@ const decoder = @import("image_decoder.zig");
 const image_canvas = @import("image_canvas.zig");
 const hostmount = @import("hostmount.zig");
 const hexdump = @import("../filebrowser/hexdump.zig");
+const textenc = @import("../util/textenc.zig");
 const cast = @import("../util/cast.zig");
 const fsdrive = @import("../ipc/fsdrive.zig");
 const muxclient = @import("../mux/client.zig");
@@ -1800,7 +1801,7 @@ fn setTextViewContent(self: *ViewerWindow, text: []const u8) void {
 }
 
 /// Head bytes arrived for text content: classify (same heuristic as
-/// the Files preview) and render on the main thread.
+/// the Files preview, UTF-16 included) and render on the main thread.
 fn onHeadLoaded(self: *ViewerWindow, result: *LoadResult) void {
     // The generation fence already dropped stale deliveries; this only
     // guards a head that raced a same-item mode change.
@@ -1813,14 +1814,22 @@ fn onHeadLoaded(self: *ViewerWindow, result: *LoadResult) void {
         return;
     };
     if (result.head_kind != .bytes) return onListingLoaded(self, result, head);
-    const binary = hexdump.looksBinary(head);
-    if (head.len == 0) {
+    // A UTF-16 head is text even though half its bytes are NUL.
+    const enc = textenc.detect(head, result.source_bytes <= head.len);
+    const wide: ?[]u8 = if (enc.encoding == .utf8)
+        null
+    else
+        textenc.decodeAlloc(std.heap.c_allocator, head, enc.encoding, true) catch null;
+    defer if (wide) |w| std.heap.c_allocator.free(w);
+    const text_bytes = wide orelse head;
+    const binary = wide == null and hexdump.looksBinary(head);
+    if (text_bytes.len == 0) {
         // An empty slice's pointer is not safe to hand to C.
         setTextViewContent(self, "");
     } else if (!binary) {
         // Truncation can split a UTF-8 sequence; make_valid patches it
         // (and stray invalid bytes) with U+FFFD, as Files does.
-        const valid = c.g_utf8_make_valid(head.ptr, @intCast(head.len));
+        const valid = c.g_utf8_make_valid(text_bytes.ptr, @intCast(text_bytes.len));
         defer c.g_free(valid);
         setTextViewContent(self, std.mem.span(@as([*:0]const u8, @ptrCast(valid))));
     } else {
@@ -1838,7 +1847,11 @@ fn onHeadLoaded(self: *ViewerWindow, result: *LoadResult) void {
         setTextViewContent(self, dump);
     }
     self.setMetadata(if (binary) "Binary file (hex dump of the head)" else "Plain text file");
-    const kind: []const u8 = if (binary) "Binary (hex dump)" else "UTF-8 text";
+    var kind_buf: [32]u8 = undefined;
+    const kind: []const u8 = if (binary)
+        "Binary (hex dump)"
+    else
+        std.fmt.bufPrint(&kind_buf, "{s} text", .{(if (wide != null) enc.encoding else textenc.Encoding.utf8).label()}) catch "Text";
     var status_buf: [256:0]u8 = undefined;
     var head_buf: [48:0]u8 = undefined;
     var total_buf: [48:0]u8 = undefined;
