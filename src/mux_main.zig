@@ -258,6 +258,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // SIGTERM/SIGINT → clean shutdown (socket unlink, child reap).
     installSignalHandlers();
 
+    // The per-user daemon only: an explicit --socket or a fence means a rig
+    // or a private instance owned by whoever started it. Before d.run(),
+    // whose first fork would otherwise stay behind in the launcher's unit.
+    if (sock_path == null and lifetime_fd < 0) {
+        log.init();
+        @import("mux/ownunit.zig").ensure();
+    }
+
     d.run() catch |err| {
         std.debug.print("sketerm-mux: fatal: {s}\n", .{@errorName(err)});
         return 1;

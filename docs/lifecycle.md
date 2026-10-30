@@ -45,6 +45,17 @@ from `list`); a worker that crashes takes only its own session with it.
 that long. There is no single-process mode any more; `--broker` is
 accepted for older clients that still pass it and changes nothing.
 
+On systemd the per-user daemon moves itself out of whatever unit started
+it, before its first fork, into `sketerm-mux-<pid>.scope` with
+`OOMPolicy=continue` (`src/mux/ownunit.zig`). Left in the launcher's unit
+it shared that cgroup with the GUI, and the unit default `OOMPolicy=stop`
+answered one kernel OOM kill in any pane by stopping the daemon, every
+session and the GUI. A scope with the default policy is no better: both
+halves are needed. A daemon with `--socket` or a lifetime fence stays put,
+as does one in a login session's scope (an ssh autostart), and a failed
+move only logs a warning. `dist/test-mux-oom-unit.sh` proves it against a
+real user manager.
+
 ## Broker restarts: workers are adopted, not killed
 
 A worker does NOT die with its broker. Replacing the broker binary (an
@@ -649,6 +660,10 @@ auto-loaded when no flag is given. `--no-save` suppresses the exit save;
   sent kill or detach. Reattach restores screen and scrollback exactly.
 - The last clean layout save is on disk; `--restore` brings the tabs
   back.
+- An OOM kill in a pane costs that program only: the daemon's own scope
+  does not stop for it (see "Daemon processes"). The GUI's unit is a
+  separate matter, and a CEF renderer killed there still stops the GUI on
+  systemd's default policy; sessions survive that like any GUI crash.
 - A BROKER death is not a session boundary: workers outlive it and the
   next broker adopts them. A WORKER death (or an explicit daemon stop)
   is: its PTY is gone and the children get SIGHUP.
