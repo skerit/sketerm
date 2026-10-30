@@ -23401,3 +23401,15 @@ answers null; `on:` is refused. Fact `web_route_exit`. `Egress.port()` now
 returns the port bound at create: the worker zeroes `bridge.port` when its
 connect fails, and a fast refusal used to let a caller read port 0 (the
 browser's own `routeProxy` read it the same way).
+
+## 2026-10-30: an OOM kill in a pane no longer takes everything with it
+
+The "crashes" of Oct 1, Oct 19 and Oct 30 left no core dump: a program in a
+pane (python 16.7 GB, java 34 GB, python 34 GB) hit the kernel OOM killer, and
+systemd then stopped the whole `app-dev.sker.sketerm@*.service` the GUI was
+launched in, because the daemon and all sessions live in that cgroup and units
+default to `OOMPolicy=stop`. New `src/mux/ownunit.zig`: at startup the per-user
+daemon moves itself into `sketerm-mux-<pid>.scope` with `OOMPolicy=continue`,
+over `busctl` to stay libc-only, and waits for the asynchronous move to land
+before its first fork. `--socket` and fenced daemons stay put; failure only
+warns. `dist/test-mux-oom-unit.sh` runs it under a real user manager.
