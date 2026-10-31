@@ -256,6 +256,8 @@ sketerm_stage() {
                  dev.sker.sketerm.editor dev.sker.sketerm.web; do
             install -Dm644 "data/$i.desktop" \
                 "$dest/usr/share/applications/$i.desktop"
+            install -Dm644 data/systemd/10-sketerm-oom.conf \
+                "$dest/usr/lib/systemd/user/app-$i@.service.d/10-sketerm-oom.conf"
         done
         # Icons are staged by glob, never by a hand-written list: a list is how
         # the bookmark button shipped as the text "Bookmark" for two releases.

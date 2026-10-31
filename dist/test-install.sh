@@ -720,6 +720,8 @@ for path in \
     usr/bin/sketerm-web usr/bin/sketerm-webengine \
     usr/share/icons/hicolor/scalable/actions/sketerm-reader-symbolic.svg \
     usr/share/xdg-desktop-portal/portals/sketerm.portal \
+    usr/lib/systemd/user/app-dev.sker.sketerm@.service.d/10-sketerm-oom.conf \
+    usr/lib/systemd/user/app-dev.sker.sketerm.files@.service.d/10-sketerm-oom.conf \
     usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.sketerm.service; do
     [ -e "${plain_stage[0]}/$path" ] || fail "plain GUI stage omitted $path"
 done
