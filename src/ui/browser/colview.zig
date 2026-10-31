@@ -1138,7 +1138,36 @@ fn onNameBind(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque
     }
 
     // Live lookup for thumbnails and inline rename.
-    tab.name_cells.put(self.allocator, d.path, root) catch {};
+    noteNameCell(&tab.name_cells, self.allocator, d.path, root) catch {};
+}
+
+/// Record the cell now showing `key`, re-aiming the stored key at it.
+///
+/// Keys borrow the bound item's path, and a re-splice binds a row's new
+/// item before its old one unbinds. `put` would keep the old item's key, and
+/// that unbind leaves an entry naming another cell alone, so the key would
+/// dangle once the old item is finalized and the next probe of that slot
+/// faults (the 2026-10 sketerm-files SIGSEGVs, on git overlay refreshes).
+fn noteNameCell(map: *std.StringHashMapUnmanaged(*c.GtkWidget), allocator: std.mem.Allocator, key: []const u8, cell: *c.GtkWidget) !void {
+    const slot = try map.getOrPut(allocator, key);
+    slot.key_ptr.* = key;
+    slot.value_ptr.* = cell;
+}
+
+test "a rebound name cell's key survives the old item being freed" {
+    const t = std.testing;
+    var map: std.StringHashMapUnmanaged(*c.GtkWidget) = .empty;
+    defer map.deinit(t.allocator);
+    var old_item = "/repo/file".*;
+    const new_item = "/repo/file".*;
+    const old_cell: *c.GtkWidget = @ptrFromInt(0x1000);
+    const new_cell: *c.GtkWidget = @ptrFromInt(0x2000);
+    try noteNameCell(&map, t.allocator, &old_item, old_cell);
+    try noteNameCell(&map, t.allocator, &new_item, new_cell);
+    // The old item's unbind sees another cell and leaves the entry; then it is freed.
+    @memset(&old_item, 0xAA);
+    try t.expectEqual(new_cell, map.get("/repo/file").?);
+    try t.expectEqual(@as(usize, @intFromPtr(&new_item)), @intFromPtr(map.getKey("/repo/file").?.ptr));
 }
 
 /// Paint (or clear) the version-control chip of a name cell.

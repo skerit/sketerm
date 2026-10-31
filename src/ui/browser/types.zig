@@ -776,7 +776,8 @@ pub const BTab = struct {
     selmodel: *c.GtkSelectionModel = undefined,
     /// Live path → bound-name-cell map (colview.zig): thumbnails land
     /// in place and inline rename finds its label through it. Keys
-    /// borrow the bound item's owned path.
+    /// borrow the bound item's owned path, re-aimed on every bind
+    /// (`colview.noteNameCell`).
     name_cells: std.StringHashMapUnmanaged(*c.GtkWidget) = .empty,
     /// Signature of the column set the view currently shows;
     /// syncColumns rebuilds the columns only when it changes.
