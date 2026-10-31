@@ -23413,3 +23413,28 @@ daemon moves itself into `sketerm-mux-<pid>.scope` with `OOMPolicy=continue`,
 over `busctl` to stay libc-only, and waits for the asynchronous move to land
 before its first fork. `--socket` and fenced daemons stay put; failure only
 warns. `dist/test-mux-oom-unit.sh` runs it under a real user manager.
+
+## 2026-10-31: remote video plays the original, buffered; sketerm-files git-refresh SIGSEGV
+
+Remote video on a Wi-Fi VPN (0.5-3.6 MiB/s, RTT 9-340 ms) started slowly and paused
+for three separate reasons, all measured. `.auto` judged the link from one 1 MiB
+sample, which read anywhere from 2.5 to 29 Mbit/s, and sent a 6.6 Mbit/s film to the
+host encoder in most runs. It now plays the original unless the sample is under a
+quarter of the bitrate, and `StarveMeter` moves to a transcode only after a 30 s window
+with the reader starved and the link averaging under the bitrate. The one 4 MiB window
+was thrown away on every miss, and a demuxer's open hops head, tail, head (`strace` on
+`playbin3`), so opening fetched 12-20 MiB. `filebrowser/rangecache.zig` is a page-cache
+shaped block cache: a jump costs one 256 KiB block, sequential runs earn up to 64 MiB
+of read-ahead, 128 MiB in all. Refills blocked the demuxer; a detached thread now
+fetches ahead with pipelined reads and reconnects on a lost link. A bare host streams
+over ssh, faster to connect and free of the UDP window cap. `zig build bench-stream`
+replays the open and plays at a bitrate against a real host.
+
+`sketerm-files` SIGSEGVs (2026-10-22, -24) symbolicated by rebuilding the crashing
+commit unstripped and matching instruction sequences: git overlay refresh, re-splice,
+bind, `eqlBytes` on a `name_cells` key. A re-splice binds the new item before the old
+one unbinds, `put` keeps the old key, the unbind leaves an entry naming another cell,
+and the key dangles once the old item is finalized. `colview.noteNameCell` re-aims it.
+
+The OOM drop-in now ships for all five identities (`data/systemd/`), covering browser
+helpers in the GUI's unit, which `ownunit.zig` leaves behind.
