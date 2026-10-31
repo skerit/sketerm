@@ -652,6 +652,18 @@ pub fn build(b: *std.Build) void {
     const smoke_stream_step = b.step("smoke-stream", "Remote video playback stream smoke: daemon transcode spool + GIO stream (headless)");
     smoke_stream_step.dependOn(&smoke_stream_run.step);
 
+    // Remote-playback throughput over a real link -- `zig build bench-stream --
+    // <host-spec> <path> [mebibytes] [policy]`. Same dependency set as smoke-stream.
+    const bench_stream_mod = dev.module(b, target, "src/bench_stream.zig");
+    configureSysDeps(b, bench_stream_mod, cbindings_mod);
+    bench_stream_mod.addImport("build_options", dev.glib_opts);
+    addVideo(b, bench_stream_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
+    const bench_stream = dev.executable(b, "sketerm-bench-stream", bench_stream_mod);
+    const bench_stream_run = b.addRunArtifact(bench_stream);
+    compat.passthruArgs(bench_stream_run);
+    const bench_stream_step = b.step("bench-stream", "Remote video stream throughput over a real host link");
+    bench_stream_step.dependOn(&bench_stream_run.step);
+
     // Browser measurement rig — `zig build measure-web`. Same display-
     // session recipe as smoke-e2e, plus a fractional viewer scale, for
     // the hover-latency and sharpness numbers (src/web_measure.zig).

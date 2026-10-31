@@ -1,17 +1,19 @@
 //! A `GFileInputStream` over the daemon, so GtkMediaFile can play a REMOTE
 //! file: `giostreamsrc` reads, seeks and sizes it from the GStreamer
 //! streaming thread. Two routes, the Jellyfin ladder minus remux. `.direct`
-//! is seekable range reads of the ORIGINAL with a read-ahead window (a
-//! demuxer's small reads do not each cost a round trip); the local
-//! GStreamer decodes, the host serves bytes and nothing else. `.transcode`
-//! asks the remote daemon for a `preview_stream` job -- a capped-width,
-//! low-bitrate fragmented MP4 spool that grows while ffmpeg encodes -- and
-//! reads that sequentially (non-seekable, size unknown: push mode), so a
-//! 4K original never crosses a link that cannot carry it. Which route a
-//! `.auto` policy takes is DECIDED HERE, on the streaming thread, from two
-//! measurements: the file's bitrate (the host's ffprobe, via media_meta)
-//! and the link's throughput (the first megabyte, timed). A host without
-//! ffmpeg falls back to `.direct` transparently. The connection is made
+//! is seekable range reads of the ORIGINAL through a `RangeCache` a background
+//! thread keeps filled, so a demuxer's jumps cost one small read and its sequential
+//! reads run ahead of the link; the local GStreamer decodes, the host serves
+//! bytes and nothing else. `.transcode` asks the remote daemon for a
+//! `preview_stream` job -- a capped-width, low-bitrate fragmented MP4 spool
+//! that grows while ffmpeg encodes -- and reads that sequentially
+//! (non-seekable, size unknown: push mode), so a 4K original never crosses a
+//! link that cannot carry it. Which route a `.auto` policy takes is DECIDED
+//! HERE: the original, unless the file's bitrate (the host's ffprobe, via
+//! media_meta) hopelessly exceeds the link's throughput (the first blocks, timed).
+//! The viewer moves a stream to a transcode later if playback proves the link too
+//! slow (`wantsTranscode`). A host without ffmpeg falls back to `.direct`
+//! transparently. A bare host streams over ssh (`bulkSpec`). The connection is made
 //! lazily on the streaming thread (never the GUI's -- a remote connect can
 //! block on SSH), and every failure surfaces as a `G_IO_ERROR` the media
 //! stream reports instead of a hang.
@@ -20,13 +22,14 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const fsdrive = @import("../ipc/fsdrive.zig");
 const viewer = @import("viewer.zig");
+const rangecache = @import("../filebrowser/rangecache.zig");
+const muxclient = @import("../mux/client.zig");
 const t = std.testing;
 
 const nowMs = @import("../util/clock.zig").nowMs;
 const nowUs = @import("../util/clock.zig").nowUs;
 
-/// Bytes fetched per window; two `MAX_READ` requests, so a demuxer that
-/// walks a file linearly costs one round trip per megabyte pair.
+/// Bytes fetched per refill of a transcoded spool, read while it grows.
 pub const READ_AHEAD: usize = 4 << 20;
 
 /// What the caller asks for. `.auto` measures; the others force a rung.
@@ -37,32 +40,40 @@ pub const Policy = @import("../config.zig").RemoteVideo;
 /// What the stream settled on.
 pub const Route = enum { direct, transcode };
 
-/// The link must carry the file's bitrate with this much to spare
-/// before the original is played over it: a link exactly at the
-/// bitrate stalls on every burst.
-const LINK_HEADROOM_PCT: u64 = 150;
+/// A sample this far under the bitrate cannot be the link's noise, so the original is
+/// not even tried. Anything closer plays it: one look at a Wi-Fi VPN read from 4 to
+/// 29 Mbit/s here, and judging on that sent a 6.6 Mbit/s film to the host encoder
+/// on a link averaging 15. `RangeCache` rides out the dips, `StarveMeter` catches
+/// what it cannot.
+const LINK_HOPELESS_FACTOR: u64 = 4;
 
-/// How much of the original the `.auto` measurement reads (and keeps,
-/// as the first window, when the decision is direct). Half a `MAX_READ`:
-/// enough to average out per-request latency on a LAN, cheap enough to
-/// throw away on a 20 Mbit/s link (400ms).
-const LINK_SAMPLE_BYTES: usize = 1 << 20;
+/// Blocks the `.auto` measurement reads, kept as the first of the cache when
+/// the decision is direct. The first only opens the transport's window, so it is
+/// not timed: it would make every fresh ssh connection read as a slow link.
+const LINK_SAMPLE_BLOCKS: u64 = 5;
+
+/// How long a host's ffprobe may hold up the start of playback. Unknown bitrate plays the original.
+const PROBE_LIMIT_MS: i64 = 4_000;
+
+/// No byte for this long is a dead connection, whatever the socket says.
+const FETCH_IDLE_LIMIT_MS: i64 = 20_000;
+
+/// Reconnects after a lost connection before playback reports the failure.
+const FETCH_RECONNECTS: u32 = 3;
 
 /// How long a transcoded read waits for the spool to grow before it is
 /// a failure rather than a stall (progress events arrive every 250ms
 /// while the encoder runs; a stopped encoder is woken by our reads).
 const SPOOL_WAIT_MS: i64 = 30_000;
 
-/// Direct play needs a link with headroom over the bitrate; an unknown
-/// bitrate (no ffprobe on the host) or an unmeasurable link gets the
-/// original, since a host that cannot probe cannot transcode either and
+/// An unknown bitrate (no ffprobe on the host) or an unmeasurable link gets
+/// the original, since a host that cannot probe cannot transcode either and
 /// the local decoder is the one that can say no.
 pub fn chooseRoute(bitrate_kbps: ?u64, link_kbps: ?u64) Route {
     const bitrate = bitrate_kbps orelse return .direct;
     const link = link_kbps orelse return .direct;
     if (bitrate == 0) return .direct;
-    const need = std.math.mulWide(u64, bitrate, LINK_HEADROOM_PCT) / 100;
-    return if (link >= need) .direct else .transcode;
+    return if (std.math.mulWide(u64, link, LINK_HOPELESS_FACTOR) < bitrate) .transcode else .direct;
 }
 
 /// Throughput of `bytes` moved in `elapsed_us`, in kbit/s; a sub-
@@ -119,14 +130,6 @@ pub const Window = struct {
         return self.bytes[@intCast(off)..];
     }
 
-    pub const Fetch = struct { off: u64, len: usize };
-
-    /// The next fetch: `[pos, pos + len)` clamped to the file.
-    pub fn nextFetch(self: *const Window) Fetch {
-        const remaining = self.size -| self.pos;
-        return .{ .off = self.pos, .len = @intCast(@min(remaining, READ_AHEAD)) };
-    }
-
     pub fn resolveSeek(self: *const Window, offset: i64, kind: c_int) ?u64 {
         const base: i64 = switch (kind) {
             c.G_SEEK_SET => 0,
@@ -137,6 +140,226 @@ pub const Window = struct {
         const target = std.math.add(i64, base, offset) catch return null;
         if (target < 0) return null;
         return @intCast(target);
+    }
+};
+
+/// What the fetch thread and the stream share. Refcounted so a stream can go
+/// (`gtk_media_file_clear` on the GUI thread) without waiting out a blocked socket:
+/// the thread notices `stop`, and the last of the two to leave frees it.
+const Fetch = struct {
+    allocator: std.mem.Allocator,
+    host: ?[]u8,
+    path: []u8,
+    mutex: c.GMutex = undefined,
+    /// Wakes the thread: a new demand, or `stop`.
+    work: c.GCond = undefined,
+    /// Wakes the reader: a block landed, or `stop`/`failed`.
+    ready: c.GCond = undefined,
+    refs: std.atomic.Value(u8) = std.atomic.Value(u8).init(1),
+    cache: rangecache.RangeCache,
+    stop: bool = false,
+    failed: bool = false,
+    err: [200]u8 = undefined,
+    err_len: usize = 0,
+    /// Link estimate for the pipeline depth: smoothed rate between replies, fastest reply seen.
+    bytes_per_ms: u64 = 0,
+    rtt_ms: u64 = std.math.maxInt(u64),
+    last_landed_ms: i64 = 0,
+    /// Null when the policy is not `.auto`: nothing may then be switched.
+    meter: ?rangecache.StarveMeter = null,
+    /// Set on the reader's thread, read there after `read` returns.
+    starved: bool = false,
+    /// Counters for bench-stream and smoke-stream.
+    fetched_bytes: u64 = 0,
+    reconnects: u32 = 0,
+
+    fn create(allocator: std.mem.Allocator, host: ?[]const u8, path: []const u8, size: u64) ?*Fetch {
+        const self = allocator.create(Fetch) catch return null;
+        const host_copy = if (host) |h| (allocator.dupe(u8, h) catch {
+            allocator.destroy(self);
+            return null;
+        }) else null;
+        const path_copy = allocator.dupe(u8, path) catch {
+            if (host_copy) |h| allocator.free(h);
+            allocator.destroy(self);
+            return null;
+        };
+        self.* = .{
+            .allocator = allocator,
+            .host = host_copy,
+            .path = path_copy,
+            .cache = rangecache.RangeCache.init(allocator, size),
+        };
+        c.g_mutex_init(&self.mutex);
+        c.g_cond_init(&self.work);
+        c.g_cond_init(&self.ready);
+        return self;
+    }
+
+    fn release(self: *Fetch) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        self.cache.deinit();
+        c.g_mutex_clear(&self.mutex);
+        c.g_cond_clear(&self.work);
+        c.g_cond_clear(&self.ready);
+        if (self.host) |h| self.allocator.free(h);
+        self.allocator.free(self.path);
+        self.allocator.destroy(self);
+    }
+
+    /// Tells the thread to leave; a reader blocked on it gets an error.
+    fn requestStop(self: *Fetch) void {
+        c.g_mutex_lock(&self.mutex);
+        self.stop = true;
+        c.g_cond_broadcast(&self.work);
+        c.g_cond_broadcast(&self.ready);
+        c.g_mutex_unlock(&self.mutex);
+    }
+
+    fn fail(self: *Fetch, comptime fmt: []const u8, args: anytype) void {
+        c.g_mutex_lock(&self.mutex);
+        defer c.g_mutex_unlock(&self.mutex);
+        self.failLocked(fmt, args);
+    }
+
+    fn failLocked(self: *Fetch, comptime fmt: []const u8, args: anytype) void {
+        const msg = std.fmt.bufPrint(&self.err, fmt, args) catch self.err[0..];
+        self.err_len = msg.len;
+        self.failed = true;
+        c.g_cond_broadcast(&self.ready);
+    }
+
+    /// Blocks only until the block holding `off` has landed.
+    fn read(self: *Fetch, off: u64, out: []u8) error{Failed}!usize {
+        c.g_mutex_lock(&self.mutex);
+        defer c.g_mutex_unlock(&self.mutex);
+        while (true) {
+            if (self.failed or self.stop) return error.Failed;
+            const got = self.cache.read(off, out);
+            // Moving through a file is also what opens more read-ahead.
+            c.g_cond_signal(&self.work);
+            if (got) |n| {
+                if (self.meter) |*meter| {
+                    if (meter.check(nowMs())) self.starved = true;
+                }
+                return n;
+            }
+            const blocked_at = nowMs();
+            c.g_cond_wait(&self.ready, &self.mutex);
+            if (self.meter) |*meter| meter.blocked_ms += nowMs() - blocked_at;
+        }
+    }
+
+    const Queued = struct { req: u32, block: u64, sent_ms: i64 };
+
+    /// The thread's body: requests as deep as the link rewards, oldest reply first.
+    fn main(self: *Fetch, fs_in: fsdrive.Fs) void {
+        defer self.release();
+        var fs = fs_in;
+        var queue: [16]Queued = undefined;
+        var queued: usize = 0;
+        var last_progress = nowMs();
+        var reconnects_left = FETCH_RECONNECTS;
+        while (true) {
+            var batch: [16]u64 = undefined;
+            var batch_n: usize = 0;
+            c.g_mutex_lock(&self.mutex);
+            self.pickRequests(&batch, &batch_n, queued);
+            while (!self.stop and !self.failed and queued == 0 and batch_n == 0) {
+                c.g_cond_wait(&self.work, &self.mutex);
+                last_progress = nowMs();
+                self.pickRequests(&batch, &batch_n, queued);
+            }
+            const stopping = self.stop or self.failed;
+            c.g_mutex_unlock(&self.mutex);
+            if (stopping) break;
+
+            var lost = false;
+            for (batch[0..batch_n]) |block| {
+                const off = block * rangecache.BLOCK;
+                const req = fs.readSubmit(self.path, off, @intCast(rangecache.BLOCK)) catch {
+                    lost = true;
+                    break;
+                };
+                queue[queued] = .{ .req = req, .block = block, .sent_ms = nowMs() };
+                queued += 1;
+            }
+            if (!lost and queued > 0) {
+                // A short wait, so new demands and `stop` are seen while a slow reply crawls.
+                if (fs.awaitSubmitted(queue[0].req, 100)) |op_in| {
+                    var op = op_in;
+                    defer op.data.deinit(fs.allocator);
+                    self.landed(queue[0], op.data.items, queued >= 2);
+                    std.mem.copyForwards(Queued, queue[0 .. queued - 1], queue[1..queued]);
+                    queued -= 1;
+                    last_progress = nowMs();
+                    reconnects_left = FETCH_RECONNECTS;
+                } else |e| switch (e) {
+                    error.Timeout => lost = nowMs() - last_progress >= FETCH_IDLE_LIMIT_MS,
+                    error.FsOpFailed => {
+                        // The host answered and said no: reconnecting cannot help.
+                        self.fail("{s}", .{fs.lastErr()});
+                        break;
+                    },
+                    else => lost = true,
+                }
+            }
+            if (!lost) continue;
+
+            // Every request is a stateless range, so a new connection resumes exactly.
+            queued = 0;
+            c.g_mutex_lock(&self.mutex);
+            self.cache.abandonLoading();
+            self.reconnects += 1;
+            c.g_mutex_unlock(&self.mutex);
+            fs.deinit();
+            var replacement: ?fsdrive.Fs = null;
+            while (reconnects_left > 0 and replacement == null and !self.stopRequested()) : (reconnects_left -= 1) {
+                replacement = viewer.connectFs(self.host) catch null;
+            }
+            fs = replacement orelse {
+                if (!self.stopRequested()) self.fail("lost the connection to {s}", .{self.host orelse "local"});
+                return;
+            };
+            last_progress = nowMs();
+        }
+        fs.deinit();
+    }
+
+    fn stopRequested(self: *Fetch) bool {
+        c.g_mutex_lock(&self.mutex);
+        defer c.g_mutex_unlock(&self.mutex);
+        return self.stop;
+    }
+
+    /// Claims blocks up to the link's pipeline depth; call with the mutex held.
+    fn pickRequests(self: *Fetch, batch: *[16]u64, batch_n: *usize, queued: usize) void {
+        const rtt = if (self.rtt_ms == std.math.maxInt(u64)) 0 else self.rtt_ms;
+        const depth: usize = rangecache.pipelineDepth(self.bytes_per_ms, rtt);
+        while (queued + batch_n.* < depth) {
+            const next = self.cache.nextFetch() catch return;
+            batch[batch_n.*] = next orelse return;
+            batch_n.* += 1;
+        }
+    }
+
+    /// @param busy another reply was on the wire, so the gap since the last one measures the link rather than an idle reader.
+    fn landed(self: *Fetch, q: Queued, bytes: []const u8, busy: bool) void {
+        const now = nowMs();
+        c.g_mutex_lock(&self.mutex);
+        defer c.g_mutex_unlock(&self.mutex);
+        self.cache.complete(q.block, bytes) catch {
+            self.failLocked("out of memory buffering", .{});
+        };
+        self.fetched_bytes += bytes.len;
+        if (self.meter) |*meter| meter.bytes += bytes.len;
+        self.rtt_ms = @min(self.rtt_ms, @as(u64, @intCast(@max(now - q.sent_ms, 1))));
+        if (busy and self.last_landed_ms != 0) {
+            const rate = bytes.len / @as(u64, @intCast(@max(now - self.last_landed_ms, 1)));
+            self.bytes_per_ms = if (self.bytes_per_ms == 0) rate else (self.bytes_per_ms * 7 + rate) / 8;
+        }
+        self.last_landed_ms = now;
+        c.g_cond_broadcast(&self.ready);
     }
 };
 
@@ -154,6 +377,8 @@ const Backend = struct {
     /// until decided, else 1 + @intFromEnum(route), stored with release
     /// AFTER the other fields so an acquire load of it sees them whole.
     route_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    /// `.auto` playback proved the link too slow; the viewer polls it.
+    wants_transcode: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     link_kbps: u64 = 0,
     bitrate_kbps: u64 = 0,
     encoder: [16]u8 = undefined,
@@ -163,6 +388,8 @@ const Backend = struct {
     /// finished, after which a short read is a real EOF.
     job: u64 = 0,
     spool: ?[]u8 = null,
+    /// `.direct`: where bytes come from once the route is settled; it owns the connection then.
+    fetch: ?*Fetch = null,
     spool_done: bool = false,
     win: Window = .{ .size = 0 },
     buf: std.ArrayList(u8) = .empty,
@@ -184,8 +411,8 @@ const Backend = struct {
     }
 
     fn ensureOpen(self: *Backend) error{Failed}!void {
-        if (self.fs != null) return;
         if (self.failed) return error.Failed;
+        if (self.fs != null or self.fetch != null) return;
         var fs = viewer.connectFs(self.host) catch |e| return self.fail("cannot connect to {s}: {s}", .{ self.host orelse "local", @errorName(e) });
         var probe: std.ArrayList(u8) = .empty;
         defer probe.deinit(std.heap.c_allocator);
@@ -195,6 +422,7 @@ const Backend = struct {
         };
         self.fs = fs;
         self.win.size = info.size;
+        self.fetch = Fetch.create(self.allocator, self.host, self.path, info.size) orelse return self.fail("out of memory", .{});
         try self.decide();
     }
 
@@ -216,7 +444,25 @@ const Backend = struct {
             },
         };
         if (route == .transcode and !self.startTranscode()) route = .direct;
+        switch (route) {
+            .direct => try self.startFetch(),
+            // Whatever the sample cached is the original, not the spool.
+            .transcode => self.stopFetch(),
+        }
         self.route_state.store(1 + @as(u8, @intFromEnum(route)), .release);
+    }
+
+    /// Hands the connection to the fetch thread, which owns it from here on.
+    fn startFetch(self: *Backend) error{Failed}!void {
+        const fetch = self.fetch.?;
+        _ = fetch.refs.fetchAdd(1, .acq_rel);
+        if (self.policy == .auto and self.bitrate_kbps > 0) fetch.meter = .{ .bitrate_kbps = self.bitrate_kbps };
+        const thread = std.Thread.spawn(.{}, Fetch.main, .{ fetch, self.fs.? }) catch {
+            fetch.release();
+            return self.fail("cannot start the read-ahead thread", .{});
+        };
+        thread.detach();
+        self.fs = null;
     }
 
     /// The host's ffprobe via media_meta (daemon-cached per file), so a
@@ -226,20 +472,35 @@ const Backend = struct {
         defer arena.deinit();
         const dir = std.fs.path.dirname(self.path) orelse "/";
         const names = [_][]const u8{std.fs.path.basename(self.path)};
-        const results = self.fs.?.mediaMeta(arena.allocator(), dir, &names, 15_000) catch return null;
+        const results = self.fs.?.mediaMeta(arena.allocator(), dir, &names, PROBE_LIMIT_MS) catch return null;
         if (results.len == 0) return null;
         return bitrateFromMeta(results[0].get("media.bitrate_kbps"), results[0].get("media.duration_ms"), self.win.size);
     }
 
-    /// Time the first sample of the original; it becomes the window at
-    /// offset 0 so a direct decision has already read its first bytes.
+    /// Time the first blocks of the original, read as the fetch thread will; they
+    /// stay in the cache, so a direct decision has already read its first bytes.
     fn measureLink(self: *Backend) error{Failed}!?u64 {
-        const want: usize = @intCast(@min(self.win.size, LINK_SAMPLE_BYTES));
-        if (want == 0) return null;
-        const started = nowUs();
-        try self.fetchInto(self.path, 0, want);
-        const elapsed = nowUs() - started;
-        return throughputKbps(self.buf.items.len, elapsed);
+        const fs = &self.fs.?;
+        const cache = &self.fetch.?.cache;
+        const blocks: usize = @intCast(@min(LINK_SAMPLE_BLOCKS, std.math.divCeil(u64, self.win.size, rangecache.BLOCK) catch unreachable));
+        if (blocks == 0) return null;
+        var reqs: [LINK_SAMPLE_BLOCKS]u32 = undefined;
+        for (reqs[0..blocks], 0..) |*req, i| {
+            req.* = fs.readSubmit(self.path, i * rangecache.BLOCK, @intCast(rangecache.BLOCK)) catch |e|
+                return self.fail("read failed at {d}: {s}", .{ i * rangecache.BLOCK, @errorName(e) });
+        }
+        // A file of one block has nothing else to time.
+        var timed_from: i64 = nowUs();
+        var timed_bytes: u64 = 0;
+        for (reqs[0..blocks], 0..) |req, i| {
+            var op = fs.awaitSubmitted(req, fsdrive.OP_TIMEOUT_MS) catch |e|
+                return self.fail("read failed at {d}: {s}", .{ i * rangecache.BLOCK, @errorName(e) });
+            defer op.data.deinit(fs.allocator);
+            cache.insert(i, op.data.items) catch return self.fail("out of memory", .{});
+            if (i == 0 and blocks > 1) timed_from = nowUs() else timed_bytes += op.data.items.len;
+        }
+        if (timed_bytes == 0) return null;
+        return throughputKbps(timed_bytes, nowUs() - timed_from);
     }
 
     /// Ask the host to transcode; false on any refusal before the spool
@@ -258,8 +519,7 @@ const Backend = struct {
                 self.duration_ms.store(ev.duration_ms, .release);
                 self.encoder_len = @min(ev.encoder.len, self.encoder.len);
                 @memcpy(self.encoder[0..self.encoder_len], ev.encoder[0..self.encoder_len]);
-                // Whatever the measurement read of the original is not
-                // the spool: the window restarts at the spool's byte 0.
+                // The window restarts at the spool's byte 0.
                 self.win = .{ .size = 0 };
                 self.buf.clearRetainingCapacity();
                 return true;
@@ -309,26 +569,31 @@ const Backend = struct {
         self.win.bytes = self.buf.items;
     }
 
-    /// Fill the window from `pos`; false at EOF. A transcoded spool
-    /// has no known size: read what is there, and when that is nothing
+    /// Fill the window from the spool at `pos`; false at EOF. A transcoded
+    /// spool has no known size: read what is there, and when that is nothing
     /// wait for the encoder to add more.
     fn refill(self: *Backend) error{Failed}!bool {
         while (true) {
-            const source: []const u8 = self.spool orelse self.path;
-            const fetch: Window.Fetch = if (self.spool != null)
-                .{ .off = self.win.pos, .len = READ_AHEAD }
-            else
-                self.win.nextFetch();
-            if (fetch.len == 0) return false;
-            try self.fetchInto(source, fetch.off, fetch.len);
+            try self.fetchInto(self.spool.?, self.win.pos, READ_AHEAD);
             if (self.buf.items.len > 0) return true;
-            if (self.spool == null) return false;
             if (!try self.awaitSpoolGrowth()) return false;
         }
     }
 
     fn read(self: *Backend, out: []u8) error{Failed}!usize {
         try self.ensureOpen();
+        if (self.fetch) |fetch| {
+            const n = fetch.read(self.win.pos, out) catch {
+                const n = @min(self.err.len, fetch.err_len);
+                @memcpy(self.err[0..n], fetch.err[0..n]);
+                self.err_len = n;
+                self.failed = true;
+                return error.Failed;
+            };
+            if (fetch.starved) self.wants_transcode.store(true, .release);
+            self.win.pos += n;
+            return n;
+        }
         var cached = self.win.cached();
         if (cached.len == 0) {
             if (!try self.refill()) return 0;
@@ -340,7 +605,16 @@ const Backend = struct {
         return n;
     }
 
+    /// Lets go of the fetch thread without waiting for it, which also closes its connection.
+    fn stopFetch(self: *Backend) void {
+        const fetch = self.fetch orelse return;
+        self.fetch = null;
+        fetch.requestStop();
+        fetch.release();
+    }
+
     fn deinit(self: *Backend) void {
+        self.stopFetch();
         // Closing the connection is what stops the host encode: the job
         // is ephemeral and dies (process group and spool) with its client.
         if (self.fs) |*fs| fs.deinit();
@@ -411,6 +685,7 @@ fn readFn(stream: [*c]c.GInputStream, buffer: ?*anyopaque, count: c.gsize, _: [*
 fn closeFn(stream: [*c]c.GInputStream, _: [*c]c.GCancellable, _: [*c][*c]c.GError) callconv(.c) c.gboolean {
     const inst = instanceOf(stream);
     if (inst.backend) |backend| {
+        backend.stopFetch();
         if (backend.fs) |*fs| fs.deinit();
         backend.fs = null;
         backend.failed = true;
@@ -481,6 +756,23 @@ pub fn durationMs(stream: *c.GInputStream) u64 {
     return backend.duration_ms.load(.acquire);
 }
 
+/// Whether a `.auto` stream's playback proved the link cannot carry the original; safe from any thread.
+pub fn wantsTranscode(stream: *c.GInputStream) bool {
+    const backend = instanceOf(stream).backend orelse return false;
+    return backend.wants_transcode.load(.acquire);
+}
+
+/// Bytes the stream fetched and connections it had to replace, for the thread reading it.
+pub const Stats = struct { fetched_bytes: u64 = 0, reconnects: u32 = 0 };
+
+pub fn stats(stream: *c.GInputStream) Stats {
+    const backend = instanceOf(stream).backend orelse return .{};
+    const fetch = backend.fetch orelse return .{};
+    c.g_mutex_lock(&fetch.mutex);
+    defer c.g_mutex_unlock(&fetch.mutex);
+    return .{ .fetched_bytes = fetch.fetched_bytes, .reconnects = fetch.reconnects };
+}
+
 /// What the stream settled on, null until its first touch decided it.
 /// Safe from any thread: `route_state` is the release fence over the
 /// other fields.
@@ -497,6 +789,15 @@ pub fn decision(stream: *c.GInputStream) ?Decision {
     };
 }
 
+/// A bare host's bytes go over ssh: bulk throughput is what TCP is for, and the UDP
+/// transport's fixed window caps it at about 150 KB per round trip. An explicit
+/// `udp:`, a route or a socket is what the user asked for and stays as it is.
+fn bulkSpec(allocator: std.mem.Allocator, host: []const u8) ![]u8 {
+    const asked = muxclient.RouteSpec.isRoute(host) or std.mem.startsWith(u8, host, "sock:") or
+        muxclient.RemoteSpec.parse(host).mode != .auto;
+    return if (asked) allocator.dupe(u8, host) else std.fmt.allocPrint(allocator, "ssh:{s}", .{host});
+}
+
 /// A new stream for `path` on `host` (null = the local daemon). Nothing
 /// connects until GStreamer first touches it. `start_ms` is where a
 /// transcode encode begins. Caller owns one reference.
@@ -507,7 +808,7 @@ pub fn new(host: ?[]const u8, path: []const u8, policy: Policy, start_ms: u64) ?
         .allocator = allocator,
         .policy = policy,
         .start_ms = start_ms,
-        .host = if (host) |h| (allocator.dupe(u8, h) catch {
+        .host = if (host) |h| (bulkSpec(allocator, h) catch {
             allocator.destroy(backend);
             return null;
         }) else null,
@@ -526,11 +827,30 @@ pub fn new(host: ?[]const u8, path: []const u8, policy: Policy, start_ms: u64) ?
     return @ptrCast(@alignCast(obj));
 }
 
-test "chooseRoute: direct with headroom, transcode without, direct when nothing is known" {
-    // 20 Mbit/s file on a gigabit LAN: direct. Same file on 25 Mbit/s: not 1.5x, transcode.
+test "bulkSpec moves only a bare host onto ssh" {
+    const cases = [_][2][]const u8{
+        .{ "archdev", "ssh:archdev" },
+        .{ "me@archdev", "ssh:me@archdev" },
+        .{ "udp:archdev", "udp:archdev" },
+        .{ "ssh:archdev", "ssh:archdev" },
+        .{ "tor:archdev", "tor:archdev" },
+        .{ "sock:/tmp/x/mux.sock", "sock:/tmp/x/mux.sock" },
+        .{ "route:archdev,gateway", "route:archdev,gateway" },
+    };
+    for (cases) |case| {
+        const spec = try bulkSpec(t.allocator, case[0]);
+        defer t.allocator.free(spec);
+        try t.expectEqualStrings(case[1], spec);
+    }
+}
+
+test "chooseRoute: the original unless the link is hopeless, and when nothing is known" {
+    // 20 Mbit/s file on a gigabit LAN, and on a link that merely dipped under it: direct.
     try t.expectEqual(Route.direct, chooseRoute(20_000, 900_000));
-    try t.expectEqual(Route.transcode, chooseRoute(20_000, 25_000));
-    try t.expectEqual(Route.direct, chooseRoute(20_000, 30_000));
+    try t.expectEqual(Route.direct, chooseRoute(20_000, 5_000));
+    try t.expectEqual(Route.direct, chooseRoute(6_600, 4_000));
+    // 80 Mbit/s 4K on 10 Mbit/s: no buffer helps.
+    try t.expectEqual(Route.transcode, chooseRoute(80_000, 10_000));
     try t.expectEqual(Route.direct, chooseRoute(null, 1_000));
     try t.expectEqual(Route.direct, chooseRoute(20_000, null));
     try t.expectEqual(Route.direct, chooseRoute(0, 1));
@@ -550,7 +870,7 @@ test "bitrateFromMeta: reported bitrate wins, else size over duration, else noth
     try t.expectEqual(@as(?u64, null), bitrateFromMeta("0", "0", 1_000_000));
 }
 
-test "Window serves cached bytes, moves on a miss and clamps the fetch to the file" {
+test "Window serves cached bytes, and reports a miss" {
     const data = "0123456789";
     var w = Window{ .size = 100, .start = 20, .bytes = data };
     w.pos = 25;
@@ -559,12 +879,6 @@ test "Window serves cached bytes, moves on a miss and clamps the fetch to the fi
     try t.expectEqual(@as(usize, 0), w.cached().len);
     w.pos = 19;
     try t.expectEqual(@as(usize, 0), w.cached().len);
-    w.pos = 98;
-    const f = w.nextFetch();
-    try t.expectEqual(@as(u64, 98), f.off);
-    try t.expectEqual(@as(usize, 2), f.len);
-    w.pos = 100;
-    try t.expectEqual(@as(usize, 0), w.nextFetch().len);
 }
 
 test "Window resolves seeks from start, current and end and rejects negatives" {

@@ -224,6 +224,7 @@ comptime {
     _ = @import("mux/daemon_adopt.zig");
     _ = @import("mux/relisten.zig");
     _ = @import("mux/ownunit.zig");
+    _ = @import("filebrowser/rangecache.zig");
     _ = @import("mux/daemon_fsops.zig");
     _ = @import("mux/daemon_transfer.zig");
     _ = @import("mux/daemon_udp.zig");

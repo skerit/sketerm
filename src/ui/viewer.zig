@@ -1329,6 +1329,21 @@ pub const ViewerWindow = struct {
         self.startVideoStream(resource, policy, if (policy == .direct) 0 else position);
     }
 
+    /// An `.auto` stream whose playback proved the link cannot carry the original moves
+    /// to a host transcode from where it is. Not `switchVideoRoute`: that records a
+    /// choice for the whole window, and the next item may well fit the link.
+    /// @return true when the stream, and with it the tick calling this, was replaced.
+    fn degradeStarvedVideo(self: *ViewerWindow) bool {
+        if (self.video_policy != .auto) return false;
+        const vin = self.video_input orelse return false;
+        if (!remotestream.wantsTranscode(vin)) return false;
+        const resource = self.current() orelse return false;
+        const position = self.videoPositionMs();
+        c.gtk_label_set_text(self.status, "The link cannot carry the original; transcoding on the host...");
+        self.startVideoStream(resource, .transcode, position);
+        return true;
+    }
+
     /// Absolute time seek in source ms.
     fn seekVideoTo(self: *ViewerWindow, target_ms: u64) void {
         const stream = switch (self.content) {
@@ -2125,7 +2140,7 @@ fn onVideoTick(user: ?*anyopaque) callconv(.c) c.gboolean {
         return 0;
     }
     self.syncVideoBar();
-    return 1;
+    return @intFromBool(!self.degradeStarvedVideo());
 }
 
 fn onVideoEnded(stream: *c.GtkMediaStream, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
