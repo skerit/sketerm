@@ -23438,3 +23438,24 @@ and the key dangles once the old item is finalized. `colview.noteNameCell` re-ai
 
 The OOM drop-in now ships for all five identities (`data/systemd/`), covering browser
 helpers in the GUI's unit, which `ownunit.zig` leaves behind.
+
+## 2026-11-04: rudp timers and window; MCP payload blocks; web_eval awaits; leaner snapshots
+
+`rudp.zig` resent on a fixed 80 ms timer, so every delay spike on a Wi-Fi VPN read as
+loss and reset the congestion window, and 128 in-flight segments capped a link at
+~150 KB per round trip. The RTO is now RFC 6298 (SRTT + 4*RTTVAR, Karn's rule, 100 ms to
+2 s), the window 4096 segments with slow start and NewReno recovery. A pure ack's unused
+stream_seq field carries the receiver's first hole length, so a burst loss is resent in
+one round trip; old peers send 0 and get the resend-the-head fallback. Acks piggybacked
+on reverse data no longer count as duplicates. After an RTO the flight is resent
+go-back-N, unless the next ack jumps past the resent part (a spurious RTO). The bridge
+drains 64 datagrams per wakeup, asks for 4 MiB socket buffers, and stops reading at
+4 MiB undelivered instead of tearing the link down. Simulated 2 MB: 100 ms RTT 34.8 s ->
+0.65 s, 300 ms RTT 104 s -> 1.95 s; with 1-3 % random loss it stays AIMD-bound.
+
+MCP text-lane payloads moved from `--- name ---` dividers to `<name attrs>...</name>`
+blocks (`Res.section`/`open`/`close`, `mcp.writeBlock`); a `</name` inside page content
+is escaped. web_eval resolves a returned promise by default (`await:false` opts out); it
+used to answer `[object Promise]`. Snapshot listings leave out a text leaf repeating its
+parent, a label repeating the control after it, a container's name repeated by its only
+child, and `{n children}`; the model keeps every node and id.
