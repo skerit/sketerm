@@ -572,6 +572,18 @@ fn bridgeUdp(
 ) u8 {
     const cc = @import("c.zig").c;
     const queue_limit = 8 << 20;
+    // Stop reading the socket while this much is undelivered to the
+    // local stream: the kernel then drops datagrams and the sender's
+    // congestion control backs off, instead of the queue growing until
+    // the hard limit below tears the connection down.
+    const rx_high_water = 4 << 20;
+    // Best effort (the kernel caps it at net.core.[rw]mem_max): the
+    // default ~200 KB receive buffer overflows long before a 4096
+    // segment window does.
+    for ([_]c_int{ cc.SO_RCVBUF, cc.SO_SNDBUF }) |opt| {
+        const want: c_int = 4 << 20;
+        _ = cc.setsockopt(udp_fd, cc.SOL_SOCKET, opt, &want, @sizeOf(c_int));
+    }
     var deliver: std.ArrayList(u8) = .empty;
     defer deliver.deinit(allocator);
     var stream_pending: std.ArrayList(u8) = .empty;
@@ -611,7 +623,7 @@ fn bridgeUdp(
             3000;
 
         var fds = [_]cc.struct_pollfd{
-            .{ .fd = udp_fd, .events = cc.POLLIN, .revents = 0 },
+            .{ .fd = udp_fd, .events = if (stream_pending.items.len < rx_high_water) cc.POLLIN else 0, .revents = 0 },
             .{ .fd = stream_in, .events = if (chan.queuedBytes() < queue_limit) cc.POLLIN else 0, .revents = 0 },
             .{ .fd = stream_out, .events = if (stream_pending.items.len > 0) cc.POLLOUT else 0, .revents = 0 },
         };
@@ -630,11 +642,16 @@ fn bridgeUdp(
         }
 
         if (fds[0].revents & cc.POLLIN != 0) {
-            var dgram: [rudp.MAX_DGRAM + 64]u8 = undefined;
-            var from: cc_sockaddr_storage = undefined;
-            var from_len: cc.socklen_t = @sizeOf(cc_sockaddr_storage);
-            const n = cc.recvfrom(udp_fd, &dgram, dgram.len, 0, @ptrCast(&from), &from_len);
-            if (n > 0) {
+            // Drain a batch per wakeup: one poll per datagram was the
+            // loop's own throughput ceiling, and the acks for a batch
+            // go out together on the next tick.
+            var batch: usize = 0;
+            while (batch < 64) : (batch += 1) {
+                var dgram: [rudp.MAX_DGRAM + 64]u8 = undefined;
+                var from: cc_sockaddr_storage = undefined;
+                var from_len: cc.socklen_t = @sizeOf(cc_sockaddr_storage);
+                const n = cc.recvfrom(udp_fd, &dgram, dgram.len, cc.MSG_DONTWAIT, @ptrCast(&from), &from_len);
+                if (n <= 0) break;
                 deliver.clearRetainingCapacity();
                 const alive = chan.onDatagram(dgram[0..@intCast(n)], now2, &deliver, UdpOut.emit, @ptrCast(out)) catch true;
                 if (chan.last_rx_authenticated) {
@@ -651,9 +668,16 @@ fn bridgeUdp(
                         return 1;
                     }
                     stream_pending.appendSlice(allocator, deliver.items) catch return 1;
-                    if (!flushStreamPending(&stream_pending, stream_out)) return 0;
                 }
-                if (!alive) return 0; // peer said bye
+                if (!alive) {
+                    // Peer said bye: hand over what it sent first.
+                    _ = flushStreamPending(&stream_pending, stream_out);
+                    return 0;
+                }
+                if (stream_pending.items.len >= rx_high_water) break;
+            }
+            if (stream_pending.items.len > 0) {
+                if (!flushStreamPending(&stream_pending, stream_out)) return 0;
             }
         }
 
