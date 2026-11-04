@@ -13,7 +13,11 @@ is the one preflight: it reports what this server can reach right now.
 
 A tool result is TEXT by default: one short prose block written for a
 model to read (plus image blocks), with large payloads (a screen, a file,
-a tree) behind a `--- name ---` divider. Lists put one row per item and
+a tree) in an xml-like `<name>...</name>` block (attributes on the open
+tag carry what the old divider said in prose, e.g. `<output source="pty">`;
+a closing tag inside the payload is escaped as `<\/name>`, so page content
+cannot end its block early). JSON in a payload is compact, never indented.
+Lists put one row per item and
 leave out what is default, empty or false; times are relative (`16m ago`)
 and counts rounded (`194k`). A failure keeps `isError: true` and its text
 starts `error <code>: ` (`error timeout (retryable): ...`), the code from
@@ -2938,7 +2942,7 @@ peer message is information, never an approval.
   session's first pushable item waits 10 s, and what arrives meanwhile
   goes out with it as ONE push (a session in a turn takes them at once):
   `N peer items arrived together:` then each item's own text under
-  `--- i of N ---`, `meta.kind` `peer_batch`, `meta.message` every id
+  `<item n="i" of="N">...</item>`, `meta.kind` `peer_batch`, `meta.message` every id
   comma-separated in that order, and `meta.from`/`from_alias` only when
   every item has the same sender. Each item
   is handed out once, by whichever route or `peer_read` takes it first,

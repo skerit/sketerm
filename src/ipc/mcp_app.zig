@@ -129,14 +129,14 @@ fn wordBoxesJson(arena: std.mem.Allocator, o: OcrOut) ![]const u8 {
 /// The word boxes of an OCR pass as a text block, one `@cx,cy wxh conf% word`
 /// row per box (the centre is what app_click takes).
 fn wordBoxesText(arena: std.mem.Allocator, o: OcrOut) ![]const u8 {
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    try w.writeAll("--- words (click centre, size, confidence, text) ---");
-    for (o.words) |wd| {
-        try w.print("\n@{d},{d} {d}x{d} {d:.0}% {s}", .{
-            wd.x + wd.w / 2, wd.y + wd.h / 2, wd.w, wd.h, wd.conf, wd.text,
+    var rows: std.Io.Writer.Allocating = .init(arena);
+    for (o.words, 0..) |wd, i| {
+        try rows.writer.print("{s}@{d},{d} {d}x{d} {d:.0}% {s}", .{
+            if (i > 0) "\n" else "", wd.x + wd.w / 2, wd.y + wd.h / 2, wd.w, wd.h, wd.conf, wd.text,
         });
     }
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try mcp.writeBlock(&aw.writer, "words", "columns=\"click centre, size, confidence, text\"", rows.written());
     return aw.written();
 }
 
@@ -672,8 +672,9 @@ fn listInstalledApps(arena: std.mem.Allocator, args: std.json.Value) ![]const u8
     try res.field("count", parsed.apps.len);
     if (argStr(args, "host")) |h| try res.field("host", h);
     if (parsed.apps.len > 0) {
-        try res.text("--- installed apps (name: command) ---");
+        try res.open("installed_apps", "columns=\"name: command\"");
         for (parsed.apps) |a| try res.textf("{s}: {s}", .{ a.name, a.exec });
+        try res.close();
     }
     // Partial discovery (one directory unreadable) still lists what it
     // found, but the caller must know the list may be short.
@@ -833,12 +834,13 @@ fn appMacros(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             try std.json.Stringify.value(sv, .{}, &aw.writer);
             try aw.writer.writeAll("}");
             try res.raw("actions", aw.written());
-            try res.text("--- steps ---");
+            try res.open("steps", "");
             for (sv, 0..) |st, i| {
                 var jw: std.Io.Writer.Allocating = .init(arena);
                 try std.json.Stringify.value(st, .{}, &jw.writer);
                 try res.textf("{d}. {s}", .{ i + 1, jw.written() });
             }
+            try res.close();
         } else {
             // Show what IS stored: pointing at "app_macros show" from
             // inside app_macros show sent callers round in a circle.
@@ -846,7 +848,9 @@ fn appMacros(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             const cap = 4096;
             const head = bytes[0..@min(bytes.len, cap)];
             if (std.unicode.utf8ValidateSlice(head)) {
-                try res.textf("--- stored ({d} bytes{s}) ---\n{s}", .{ bytes.len, if (bytes.len > cap) ", first 4096 shown" else "", head });
+                try res.open("stored", try std.fmt.allocPrint(arena, "bytes=\"{d}\"{s}", .{ bytes.len, if (bytes.len > cap) " shown=\"first 4096\"" else "" }));
+                try res.text(head);
+                try res.close();
             } else try res.textf("({d} stored bytes, not UTF-8 text)", .{bytes.len});
         }
         return res.finish();
@@ -868,8 +872,9 @@ fn appMacros(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         try w.writeAll("]");
         try res.raw("journal", aw.written());
         if (entries.len > 0) {
-            try res.text("--- recorded input steps, oldest first (save the tail with app_macro_save last_steps:N) ---");
+            try res.open("recorded_steps", "order=\"oldest first\" note=\"save the tail with app_macro_save last_steps:N\"");
             for (entries, 0..) |e, i| try res.textf("{d}. {s}", .{ i + 1, e.step });
+            try res.close();
         }
         return res.finish();
     }
@@ -998,7 +1003,11 @@ fn appOutput(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *appd
     }
     try res.fact("source", source);
     try res.fact("output", body);
-    if (body.len > 0) try res.textf("--- output ({s}) ---\n{s}", .{ source, body });
+    if (body.len > 0) {
+        try res.open("output", try res.attr("source", source));
+        try res.text(body);
+        try res.close();
+    }
     return res.finish();
 }
 
@@ -1039,7 +1048,7 @@ fn appLog(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *appdriv
                     "the log path timed out even over a fresh daemon connection (app alive: {}, windows: {d}, frames committed: {d}) — serving the PTY grid mirror instead; NO line ids, wrapped at the grid width",
                     .{ !app.exited, app.windows.items.len, frames },
                 );
-                try res.textf("--- terminal grid ---\n{s}", .{grid});
+                try res.section("terminal_grid", grid);
                 return res.finish();
             } else |_| {}
             return errRes(arena, .timeout, try std.fmt.allocPrint(
@@ -1106,7 +1115,7 @@ fn appLog(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *appdriv
             age,
             if (l.truncated) ", was longer than the 4KB line cap" else "",
         });
-        try res.textf("--- line ---\n{s}", .{l.text});
+        try res.section("line", l.text);
         return res.finish();
     }
 
@@ -1173,7 +1182,7 @@ fn appLog(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *appdriv
         try w.writeAll(" — [+] = shortened, fetch one in full by its id");
         try res.text(aw.written());
         aw.clearRetainingCapacity();
-        try w.writeAll("--- log ---");
+        try res.open("log", "");
         for (lines) |l| {
             var age_buf: [32]u8 = undefined;
             const age = logAge(&age_buf, now_wall - l.t);
@@ -1190,7 +1199,8 @@ fn appLog(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *appdriv
                 });
             }
         }
-        try res.text(aw.written());
+        try res.text(std.mem.trimStart(u8, aw.written(), "\n"));
+        try res.close();
     }
     try res.fact("lines", lines);
     return res.finish();
@@ -1432,7 +1442,7 @@ fn appClipboardGet(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app:
     try res.fact("bytes", copy.len);
     try res.fact("text", copy);
     try res.textf("clipboard: {d} byte(s)", .{copy.len});
-    if (copy.len > 0) try res.textf("--- clipboard ---\n{s}", .{copy});
+    if (copy.len > 0) try res.section("clipboard", copy);
     return res.finish();
 }
 
@@ -1954,11 +1964,10 @@ fn appA11yTree(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *ap
         return appErr(arena, "malformed accessibility reply");
     try res.text("AT-SPI tree, one node per line: id role(number) \"name\" [states] value=V @x,y wxh, each part left out when empty. The id drives app_perform_action (press/activate/toggle) or app_set_value (write a text field/slider) WITHOUT coordinates, the reliable path; the role number is what app_wait_for_element takes. The @ rect is in screen coordinates and unreliable for headless apps (no screen position), so prefer perform_action/set_value over pixel clicks.");
     var ow: std.Io.Writer.Allocating = .init(arena);
-    try ow.writer.writeAll("--- tree ---");
     if (parsed == .object) {
         if (parsed.object.get("tree")) |root| try a11yOutline(arena, &ow.writer, root, 0);
     }
-    try res.text(ow.written());
+    try res.section("tree", std.mem.trimStart(u8, ow.written(), "\n"));
     return res.finish();
 }
 
@@ -2031,7 +2040,7 @@ fn appReadText(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *ap
             try res.fact("text", o.text);
             try res.raw("boxes", try wordBoxesJson(arena, o));
             try res.textf("OCR of window {d} at scale {d}: {d} word box(es)", .{ wid, o.scale, o.words.len });
-            try res.textf("--- ocr text ---\n{s}", .{o.text});
+            try res.section("ocr_text", o.text);
             if (o.words.len > 0) try res.text(try wordBoxesText(arena, o));
             return res.finish();
         },
@@ -2080,7 +2089,7 @@ fn appWaitText(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *ap
     const o = seen orelse {
         return errRes(arena, .timeout, try std.fmt.allocPrint(
             arena,
-            "text \"{s}\" not visible before timeout; last OCR read:\n--- last ocr read ---\n{s}",
+            "text \"{s}\" not visible before timeout; last OCR read:\n<last_ocr_read>\n{s}\n</last_ocr_read>",
             .{ query, last_tail[0..last_tail_len] },
         ));
     };
@@ -2344,7 +2353,7 @@ fn waitLog(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *appdri
                     "matched \"{s}\" after {d}ms — log line {d}{s}; window {d} is at frame {d}, so screenshot_app min_frame:{d} guarantees pixels committed after this line",
                     .{ pat, elapsed, l.id, if (l.marker) " [marker]" else "", wid, frame, frame },
                 );
-                try res.textf("--- line ---\n{s}", .{l.text});
+                try res.section("line", l.text);
                 if (argBool(args, "screenshot") and wid != 0) {
                     if (app.screenshotPng(wid, 1568, null, 1)) |shot| {
                         defer app_state.allocator.free(shot.png);
@@ -3010,7 +3019,7 @@ pub fn runActionSteps(
     if (pngs.items.len > 0) try res.fact("screenshots", pngs.items.len);
     if (app_stop != null or app.exited or app.presentationGone())
         try res.text(try appSummaryText(arena, app));
-    try res.textf("--- steps ---\n{s}", .{std.mem.trimEnd(u8, aw.written(), "\n")});
+    try res.section("steps", std.mem.trimEnd(u8, aw.written(), "\n"));
     if (pngs.items.len > 0) return res.finishWithImages(pngs.items, shot_tags.items);
     return res.finish();
 }
@@ -3129,11 +3138,12 @@ fn appWatch(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *appdr
     }
     if (watch.events.len > 0) {
         var tw: std.Io.Writer.Allocating = .init(arena);
-        try tw.writer.print("--- timeline (each entry measured against the previous, threshold {d:.1}%) ---", .{min_pct});
         for (watch.events, 0..) |e, i| {
-            try tw.writer.print("\n[{d}] t={d}ms changed {d:.1}% of pixels (frame {d})", .{ i + 1, e.at_ms, e.pct, e.frame });
+            try tw.writer.print("{s}[{d}] t={d}ms changed {d:.1}% of pixels (frame {d})", .{ if (i > 0) "\n" else "", i + 1, e.at_ms, e.pct, e.frame });
         }
+        try res.open("timeline", try std.fmt.allocPrint(arena, "note=\"each entry measured against the previous\" threshold_pct=\"{d:.1}\"", .{min_pct}));
         try res.text(tw.written());
+        try res.close();
     }
     if (pngs.items.len == 0) return res.finish();
     try res.fact("thumbnails", pngs.items.len);
@@ -3277,17 +3287,19 @@ fn hoverMap(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *appdr
     try addAppBrief(&res, arena, app);
 
     var mw: std.Io.Writer.Allocating = .init(arena);
-    try mw.writer.writeAll("--- map (# = responded to hover) ---");
     r = 0;
     while (r < rows) : (r += 1) {
-        try mw.writer.writeAll("\n");
+        if (r > 0) try mw.writer.writeAll("\n");
         var col: usize = 0;
         while (col < cols) : (col += 1) {
             try mw.writer.writeByte(if (map[r * cols + col] > 0) '#' else '.');
         }
     }
+    try res.open("map", "legend=\"# = responded to hover\"");
+    try res.text(mw.written());
+    try res.close();
     if (hits > 0) {
-        try mw.writer.writeAll("\nclick centres in surface coordinates:");
+        var pw: std.Io.Writer.Allocating = .init(arena);
         r = 0;
         while (r < rows) : (r += 1) {
             var col: usize = 0;
@@ -3296,11 +3308,13 @@ fn hoverMap(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *appdr
                 if (pct <= 0) continue;
                 const px = @as(f64, @floatFromInt(region.x)) + (@as(f64, @floatFromInt(col)) + 0.5) * cell_w;
                 const py = @as(f64, @floatFromInt(region.y)) + (@as(f64, @floatFromInt(r)) + 0.5) * cell_h;
-                try mw.writer.print("\n({d},{d})  {d:.2}%", .{ @as(i64, @intFromFloat(px)), @as(i64, @intFromFloat(py)), pct });
+                try pw.writer.print("\n({d},{d})  {d:.2}%", .{ @as(i64, @intFromFloat(px)), @as(i64, @intFromFloat(py)), pct });
             }
         }
+        try res.open("click_centres", "coordinates=\"surface\"");
+        try res.text(std.mem.trimStart(u8, pw.written(), "\n"));
+        try res.close();
     }
-    try res.text(mw.written());
     return res.finish();
 }
 
@@ -3353,7 +3367,7 @@ fn appBacktrace(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *a
     try res.text("The app was STOPPED while this was taken and has been resumed; wall-clock timings across this call are not meaningful.");
     if (rep.truncated) try res.text("output truncated at the daemon's cap — the head is retained");
     try addAppBrief(&res, arena, app);
-    try res.textf("--- backtrace ---\n{s}", .{std.mem.trimEnd(u8, rep.text, "\n")});
+    try res.section("backtrace", std.mem.trimEnd(u8, rep.text, "\n"));
     return res.finish();
 }
 
@@ -3552,7 +3566,7 @@ test "app_macros show prints a malformed macro's stored bytes in text mode" {
     const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
     // It used to say "inspect it with app_macros show", the call just made.
     try t.expect(std.mem.indexOf(u8, text, "inspect it with app_macros show") == null);
-    try t.expect(std.mem.indexOf(u8, text, "--- stored (13 bytes) ---\n{\"steps\":[1]}") != null);
+    try t.expect(std.mem.indexOf(u8, text, "<stored bytes=\"13\">\n{\"steps\":[1]}\n</stored>") != null);
 }
 
 test "burstMs defaults and clamps to the per-wait cap" {
@@ -4116,7 +4130,7 @@ fn recentOutput(arena: std.mem.Allocator, app: *appdrive.App) ?RecentOutput {
 
 /// Prose half of `appFacts`: identity, exit/disconnect verdict, the
 /// window list, and (for a dead app) what it last printed — the
-/// payload behind a `--- recent output ---` divider.
+/// payload in a `<recent_output>` block.
 pub fn appSummaryText(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
@@ -4149,8 +4163,10 @@ pub fn appSummaryText(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 
     }
     if (shown == 0) try w.writeAll("\nno rendered window");
     if (app.exited or app.presentationGone()) {
-        if (recentOutput(arena, app)) |out|
-            try w.print("\n--- recent output ({s}) ---\n{s}", .{ out.source, out.text });
+        if (recentOutput(arena, app)) |out| {
+            try w.writeAll("\n");
+            try mcp.writeBlock(w, "recent_output", try std.fmt.allocPrint(arena, "source=\"{s}\"", .{out.source}), out.text);
+        }
     }
     return aw.written();
 }
@@ -5320,7 +5336,7 @@ test "OCR word boxes reach the text lane with their click centres" {
     };
     const o: OcrOut = .{ .text = try arena.dupe(u8, "File Edit"), .words = &words, .scale = 1 };
     try t.expectEqualStrings(
-        "--- words (click centre, size, confidence, text) ---\n@25,10 30x12 96% File\n@64,10 28x12 88% Edit",
+        "<words columns=\"click centre, size, confidence, text\">\n@25,10 30x12 96% File\n@64,10 28x12 88% Edit\n</words>",
         try wordBoxesText(arena, o),
     );
 }

@@ -219,7 +219,8 @@ restated: `APP_STATE_PROPS` (appFacts), `SHOT_PROPS` (addShotFacts),
   a non-empty text block whose PROSE contains no `{`, and
   structuredContent matching its declared outputSchema (a test-side
   JSON-shape check, not a full validator). "Prose" is scoped:
-  everything before the first payload divider (a `--- name ---` line,
+  everything before the first payload block (a `<name>` line; until
+  2026-11 the convention was a `--- name ---` divider,
   the convention every wave uses to introduce a payload) or the first
   blank line. Screen text, step transcripts, OCR reads, a11y trees and
   an app's own log legitimately contain braces; the rule stays strict on
@@ -244,7 +245,7 @@ restated: `APP_STATE_PROPS` (appFacts), `SHOT_PROPS` (addShotFacts),
      carrying its own tab/window identity, so nothing is lost by the
      flattening and the text lane is one line per pane.
    - `file_read` splits by CONTENT: text content stays in the text
-     lane behind `--- content ---` (duplicating a multi-megabyte read
+     lane in a `<content>` block (duplicating a multi-megabyte read
      into structuredContent would serve no reader), while binary
      content is machine data and its base64 is a `base64` FACT, with
      the text lane reduced to the header plus one line saying where

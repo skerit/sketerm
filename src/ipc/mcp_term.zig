@@ -234,12 +234,10 @@ pub fn execResult(arena: std.mem.Allocator, r: termdrive.ExecOutcome, screen_tai
     }
     if (r.pending) {
         if (screen_tail) |tail| {
-            try res.text("--- screen ---");
-            try res.text(tail);
+            try res.section("screen", tail);
         }
     }
-    try res.text("--- output ---");
-    try res.text(inline_out);
+    try res.section("output", inline_out);
     return res.finish();
 }
 
@@ -882,8 +880,7 @@ fn interruptResult(
         else
             try res.text("the interrupted term_exec ended, exit status unknown");
         if (tail.len > 0) {
-            try res.text("--- exec output tail ---");
-            try res.text(tail);
+            try res.section("exec_output_tail", tail);
         }
     }
     return res.finish();
@@ -911,8 +908,7 @@ fn termWaitExit(arena: std.mem.Allocator, args: std.json.Value, t: *termdrive.Te
     }
     if (tail.len > 0) {
         try res.fact("screen_tail", tail);
-        try res.text("--- screen tail ---");
-        try res.text(tail);
+        try res.section("screen_tail", tail);
     }
     return res.finish();
 }
@@ -1710,8 +1706,7 @@ fn scpPutTargets(arena: std.mem.Allocator, local: []const u8, v: std.json.Value,
     try res.fact("all_ok", ok == targets.len);
     if (sha256File(local)) |sha| try res.fact("sha256", @as([]const u8, &sha));
     try res.textf("upload of {s} to {d} target(s): {d} ok, {d} failed", .{ local, targets.len, ok, targets.len - ok });
-    try res.textf("--- targets ---", .{});
-    try res.text(lines.written());
+    try res.section("targets", lines.written());
     return res.finish();
 }
 
@@ -2109,8 +2104,7 @@ fn syncResult(arena: std.mem.Allocator, local_dir: []const u8, targets: []SyncTa
         deleted,
         if (dry_run) "would be deleted" else "deleted",
     });
-    try res.text("--- targets ---");
-    try res.text(lines.written());
+    try res.section("targets", lines.written());
     return res.finish();
 }
 
@@ -2301,7 +2295,7 @@ test "term_exec result: exec facts structured, exit header + output in the text 
     try t.expect(!sc.get("pending").?.bool);
     try t.expectEqualStrings("EXEC-STRUCT\n", sc.get("output").?.string);
     const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
-    try t.expectEqualStrings("exit 1\n--- output ---\nEXEC-STRUCT\n", text);
+    try t.expectEqualStrings("exit 1\n<output>\nEXEC-STRUCT\n</output>", text);
 }
 
 test "term_exec_wait result: a pending command shows tracker, screen and reason without JSON" {
@@ -2327,7 +2321,7 @@ test "term_exec_wait result: a pending command shows tracker, screen and reason 
     try t.expectEqual(@as(i64, 900), sc.get("output_idle_ms").?.integer);
     const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
     try t.expect(std.mem.indexOf(u8, text, "WAITING FOR INPUT") != null);
-    try t.expect(std.mem.indexOf(u8, text, "--- screen ---") != null);
+    try t.expect(std.mem.indexOf(u8, text, "<screen>") != null);
     try t.expect(std.mem.indexOf(u8, text, "term_exec_wait picks up the completion") != null);
     // A pending exec is a soft failure: the outcome is a fact.
     try t.expect(parsed.object.get("isError") == null);
@@ -2518,7 +2512,7 @@ test "file_sync result: per-target facts, a failed target beside an ok one, pros
     try t.expectEqualStrings("refused", items[1].object.get("error").?.object.get("code").?.string);
     try t.expect(parsed.object.get("isError") == null or !parsed.object.get("isError").?.bool);
     const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
-    try t.expect(std.mem.indexOf(u8, text, "--- targets ---") != null);
+    try t.expect(std.mem.indexOf(u8, text, "<targets>") != null);
     try t.expect(std.mem.indexOf(u8, text, "ok box:docs [tar] sent 2, skipped 1") != null);
 }
 
@@ -2796,8 +2790,7 @@ pub fn commandCompletionResult(
     if (output_kind) |kind| try r.fact("output_kind", kind);
     if (output) |text| {
         try r.fact("output", text);
-        try r.textf("--- {s} ---", .{output_kind orelse "output"});
-        try r.text(text);
+        try r.section(output_kind orelse "output", text);
     }
     return r.finish();
 }
@@ -2881,7 +2874,7 @@ test "commandCompletionResult: facts in structuredContent, compact prose in the 
     try t.expectEqualStrings("shell_integration", sc.get("completion_source").?.string);
     try t.expectEqualStrings("hello world", sc.get("output").?.string);
     const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
-    try t.expectEqualStrings("completed: exit 0 (shell_integration)\n--- command ---\nhello world", text);
+    try t.expectEqualStrings("completed: exit 0 (shell_integration)\n<command>\nhello world\n</command>", text);
     // Soft outcomes are facts, never tool errors.
     try t.expect(parsed.object.get("isError") == null);
 }
@@ -2957,7 +2950,7 @@ test "text mode: term_interrupt reports the steps, the foreground and the interr
     try expectHas(stopped, "was running: term_exec `make`");
     try expectHas(stopped, "in the foreground now: bash");
     try expectHas(stopped, "the interrupted term_exec ended with exit 130");
-    try t.expect(std.mem.endsWith(u8, stopped, "--- exec output tail ---\nmake: *** [all] Interrupt"));
+    try t.expect(std.mem.endsWith(u8, stopped, "<exec_output_tail>\nmake: *** [all] Interrupt\n</exec_output_tail>"));
     try t.expect(std.mem.indexOf(u8, stopped, "tried:") == null);
 
     // Not stopped: every rung tried and each failure's reason.

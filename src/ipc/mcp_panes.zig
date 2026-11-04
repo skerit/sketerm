@@ -528,7 +528,7 @@ pub fn readScreen(arena: std.mem.Allocator, family: Family, backend: ?Backend, a
         try res.field("exit_status", lc.exit);
         if (lc.completion_seq) |seq| try res.fact("completion_seq", seq);
         try res.fact("output", lc.text);
-        try res.textf("--- command ---\n{s}", .{lc.text});
+        try res.section("command", lc.text);
         return res.finish();
     }
     // `scrollback` was a line count on the pane tool and a flag on the
@@ -558,7 +558,7 @@ pub fn readScreen(arena: std.mem.Allocator, family: Family, backend: ?Backend, a
             try res.textf("[process exited with status {d} - final rendered screen below]", .{st});
         } else try res.text("[process exited (status unknown) - final rendered screen below]");
     }
-    try res.textf("--- screen ---\n{s}", .{txt});
+    try res.section("screen", txt);
     return res.finish();
 }
 
@@ -715,7 +715,7 @@ pub fn runCommand(arena: std.mem.Allocator, family: Family, backend: ?Backend, a
                 try res.fact("output_kind", @as([]const u8, "command"));
                 try res.field("exit_status", lc.exit);
                 try res.fact("output", lc.text);
-                try res.textf("--- output ---\n{s}", .{lc.text});
+                try res.section("output", lc.text);
                 return res.finish();
             },
             .none => |why| {
@@ -732,7 +732,7 @@ pub fn runCommand(arena: std.mem.Allocator, family: Family, backend: ?Backend, a
     };
     try res.fact("output_kind", @as([]const u8, "screen"));
     try res.fact("output", txt);
-    try res.textf("--- screen ---\n{s}", .{txt});
+    try res.section("screen", txt);
     return res.finish();
 }
 
@@ -971,7 +971,7 @@ pub fn listTerminalsResult(arena: std.mem.Allocator, reply: std.json.Value) ![]c
     try res.fact("tabs", tabs);
     try res.fact("headless", false);
     try res.textf("{d} pane(s) in {d} tab(s)", .{ panes, tabs });
-    if (panes > 0) try res.textf("--- panes ---\n{s}", .{text.written()});
+    if (panes > 0) try res.section("panes", text.written());
     return res.finish();
 }
 
@@ -1049,9 +1049,9 @@ test "read_screen last_command extracts the OSC 133 zone" {
     try std.testing.expectEqual(@as(i64, 3), sc.get("exit_status").?.integer);
     try std.testing.expect(sc.get("last_command").?.bool);
     try std.testing.expectEqualStrings("hi\n", sc.get("output").?.string);
-    // The output rides the text lane behind its payload divider.
+    // The output rides the text lane in its payload block.
     const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
-    try std.testing.expectEqualStrings("exit_status: 3\n--- command ---\nhi\n", text);
+    try std.testing.expectEqualStrings("exit_status: 3\n<command>\nhi\n</command>", text);
     try std.testing.expectEqual(@as(usize, 1), fake.requests.items.len);
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "\"last_command\":true") != null);
 }
@@ -1091,7 +1091,7 @@ test "run_command settles via seq polling" {
     try std.testing.expect(!sc.get("headless").?.bool);
     try std.testing.expectEqualStrings("$ echo hi\nhi\n", sc.get("output").?.string);
     const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
-    try std.testing.expect(std.mem.indexOf(u8, text, "--- screen ---\n$ echo hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "<screen>\n$ echo hi") != null);
     try std.testing.expect(std.mem.indexOf(u8, textProse(text), "timeout") == null);
     // The baseline was read BEFORE the send, which carried a trailing CR.
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "\"cmd\":\"screen-info\"") != null);

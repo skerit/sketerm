@@ -2688,18 +2688,20 @@ fn loadErrJson(arena: std.mem.Allocator, le: LoadErrState) ![]const u8 {
     return aw.written();
 }
 
-/// A payload section: a `--- name ---` rule, then the raw text.
+/// A payload block (`mcp.Res.section`).
 pub fn section(res: *mcp.Res, name: []const u8, body: []const u8) !void {
-    try res.textf("--- {s} ---", .{name});
-    try res.text(body);
+    try res.section(name, body);
 }
 
-/// `section`, with the long URLs in `body` replaced by the user's
-/// shortener's (`[mcp] web_url_shortener`) and a line saying so. Text
-/// lane only: the facts keep every URL whole.
-pub fn shortSection(res: *mcp.Res, arena: std.mem.Allocator, name: []const u8, body: []const u8) !void {
+/// `section` with attributes on the open tag (`mcp.Res.attr`), and the
+/// long URLs in `body` replaced by the user's shortener's (`[mcp]
+/// web_url_shortener`) plus a line saying so. Text lane only: the facts
+/// keep every URL whole.
+pub fn shortSection(res: *mcp.Res, arena: std.mem.Allocator, name: []const u8, attrs: []const u8, body: []const u8) !void {
     const short = try urlshort.rewrite(arena, body, urlshort.WAIT_MS);
-    try section(res, name, short);
+    try res.open(name, attrs);
+    try res.text(short);
+    try res.close();
     if (short.ptr != body.ptr) try res.text("long URLs above are shortened by the configured URL shortener; each redirects to the original");
 }
 
@@ -3719,10 +3721,10 @@ fn readResult(arena: std.mem.Allocator, mode: Mode, v: View, r: ReadOut) ![]cons
                 if (pg.next) |n| try std.fmt.allocPrint(arena, "; more from offset {d}", .{n}) else "; the end",
             });
             if (r.note) |n| try res.text(n);
-            if (r.mode == .text) try shortSection(&res, arena, "article", pg.text) else try section(&res, "source", pg.text);
+            if (r.mode == .text) try shortSection(&res, arena, "article", "", pg.text) else try section(&res, "source", pg.text);
             // The ids already ride the facts lane in structured mode.
             if (r.mode == .text and pg.offset == 0 and mcp.result_mode == .text) if (r.model) |m| {
-                if (m.entities.len > 0) try shortSection(&res, arena, "entities", try entityLines(arena, m.entities));
+                if (m.entities.len > 0) try shortSection(&res, arena, "entities", "", try entityLines(arena, m.entities));
             };
         },
         .regex => {
@@ -3764,7 +3766,7 @@ fn readResult(arena: std.mem.Allocator, mode: Mode, v: View, r: ReadOut) ![]cons
             });
             var lines: std.Io.Writer.Allocating = .init(arena);
             for (shown) |l| try lines.writer.print("[{s}] {s} -> {s}{s}\n", .{ @tagName(l.area), if (l.text.len > 0) l.text else "(no text)", l.href, if (l.visible) "" else " (hidden)" });
-            try shortSection(&res, arena, "links", lines.written());
+            try shortSection(&res, arena, "links", "", lines.written());
         },
         .resources => {
             const p = r.page.?;
@@ -4501,7 +4503,7 @@ fn networkResult(
     try res.fact("requests", std.json.Value{ .array = arr });
     try res.textf("since={d} lists only the requests after these{s}", .{ pg.next, if (pg.more) " (more are already logged: page on)" else "" });
     if (pg.dropped > 0) try res.textf("{d} request(s) after since={d} were already overwritten in the {d}-entry log ring", .{ pg.dropped, page.since.?, web_proto.NET_LOG_ENTRIES });
-    try res.textf("--- {d} requests (oldest first) ---", .{entries.len});
+    try res.open("requests", try std.mem.concat(arena, u8, &.{ try res.attr("count", try std.fmt.allocPrint(arena, "{d}", .{entries.len})), " order=\"oldest first\"" }));
     for (entries) |e| {
         if (e != .object) continue;
         const o = e.object;
@@ -4522,6 +4524,7 @@ fn networkResult(
             "pending";
         try res.textf("{d} {s} {s} {s} {s}", .{ seq, method, state, rtype, try clip(arena, url, URL_MAX) });
     }
+    try res.close();
     if (entries.len > 0) try res.text(TRUST_LINE);
     return res.finish();
 }
@@ -5254,7 +5257,10 @@ fn webBody(
             break :blk try std.fmt.allocPrint(arena, "(async () => {{\n{s}\n}})()", .{body});
         } else mcp.argStr(args, "code") orelse
             return mcp.errRes(arena, .invalid_args, "web_eval needs 'code' (an expression) or 'body' (statements, wrapped in an async function for you)");
-        const want_await = mcp.argBool(args, "await") or body_arg != null;
+        // A returned promise is resolved by default, for 'code' too: the
+        // unawaited answer was the placeholder "[object Promise]", which
+        // is never what the caller meant. `await:false` opts out.
+        const want_await = body_arg != null or mcp.argBoolOr(args, "await", true);
         const budget = timeoutOf(args, 10_000);
         const inline_limit: usize = @intCast(std.math.clamp(
             mcp.argInt(args, "max_chars") orelse @as(i64, EVAL_INLINE_CHARS),
@@ -7271,12 +7277,12 @@ fn captureBodyResult(
     if (!binary) try res.fact("body", out);
     if (cut) try res.textf("INLINE limit: {d} of {d} bytes are in 'body'; pass out_file for the whole body, or a larger max_bytes (at most {d})", .{ out.len, shown.bytes.len, CAPTURE_INLINE_MAX });
     try res.textf("{s} body of exchange {d}: {s} as {s}", .{ part, seq, try bytesText(arena, shown.bytes.len), if (binary) "base64" else "UTF-8 text" });
-    if (binary) try res.bulk("body", out, "--- body ---\n(binary: the base64 is in structuredContent.body)") else try section(&res, "body", out);
+    if (binary) try res.bulk("body", out, "the body is binary: its base64 is in structuredContent.body") else try section(&res, "body", out);
     try res.text(TRUST_LINE);
     return res.finish();
 }
 
-/// The response headers as `name: value` lines behind a divider.
+/// The response headers as `name: value` lines in a `<headers>` block.
 fn headerSection(res: *mcp.Res, arena: std.mem.Allocator, headers_json: []const u8) !void {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, headers_json, .{}) catch return;
     if (parsed != .array or parsed.array.items.len == 0) return;
@@ -9209,7 +9215,7 @@ test "web_open: the snapshot rides both lanes, situational notes only in text" {
     try t.expect(sc.get("where_ignored") == null);
     const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
     try t.expect(std.mem.indexOf(u8, text, "document 1, revision 4") != null);
-    try t.expect(std.mem.indexOf(u8, text, "--- snapshot ---\n[1] document") != null);
+    try t.expect(std.mem.indexOf(u8, text, "<snapshot>\n[1] document") != null);
     try t.expect(std.mem.indexOf(u8, text, TRUST_LINE) != null);
     // The static hints are gone from the result entirely.
     try t.expect(std.mem.indexOf(u8, text, "reading_hint") == null);
@@ -9310,7 +9316,7 @@ test "web_act: what was acted on, then the delta" {
     const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
     try t.expect(std.mem.indexOf(u8, text, "click on 7: clicked button PressMe") != null);
     try t.expect(std.mem.indexOf(u8, text, "navigated to https://example.com/next") != null);
-    try t.expect(std.mem.indexOf(u8, text, "--- delta ---\n[9] paragraph AFTERCLICK") != null);
+    try t.expect(std.mem.indexOf(u8, text, "<delta>\n[9] paragraph AFTERCLICK") != null);
     try t.expectEqualStrings("direct", sc.get("motion").?.string);
     try t.expect(sc.get("motion_ms") == null);
 
@@ -9463,7 +9469,7 @@ test "web_read: rich model and old-helper fallback both satisfy the schema" {
     try t.expectEqualStrings("reader", rsc.get("body_source").?.string);
     const rtext = rp.object.get("content").?.array.items[0].object.get("text").?.string;
     try t.expect(std.mem.indexOf(u8, rtext, "document 3, revision 11, 0 entities") != null);
-    try t.expect(std.mem.indexOf(u8, rtext, "--- article ---\n# Heading") != null);
+    try t.expect(std.mem.indexOf(u8, rtext, "<article>\n# Heading") != null);
 
     const legacy = try readResult(arena, .headless, EXAMPLE, .{
         .body = "plain markdown",
@@ -9593,7 +9599,7 @@ test "web_eval: a JSON value stays JSON in structuredContent, a long one is page
     try t.expect(std.mem.indexOf(
         u8,
         np.object.get("content").?.array.items[0].object.get("text").?.string,
-        "--- result ---\n42",
+        "<result>\n42\n</result>",
     ) != null);
 
     // A result too long to inline: a STRING prefix (a JSON value cut in
@@ -11687,7 +11693,7 @@ test "text mode: what a web result's next call needs is in the text lane" {
             .{ .id = 5, .kind = "heading", .text = "Heading" },
         } },
     }));
-    try expectText(rd, "--- entities ---\n[4] link Story -> https://example.com/s\n[5] heading Heading");
+    try expectText(rd, "<entities>\n[4] link Story -> https://example.com/s\n[5] heading Heading");
     try expectText(rd, "; more from offset ");
     try t.expect(std.mem.indexOf(u8, rd, "next_offset") == null);
 
@@ -11735,7 +11741,7 @@ test "text mode: what a web result's next call needs is in the text lane" {
         .headers = "[{\"name\":\"content-type\",\"value\":\"application/json\"}]",
     };
     const shown = try present(arena, body.mime, body.charset, body.data);
-    try expectText(try resultText(arena, try captureBodyResult(arena, EXAMPLE, 41, "response", body, shown, null, 1024)), "--- headers ---\ncontent-type: application/json");
+    try expectText(try resultText(arena, try captureBodyResult(arena, EXAMPLE, 41, "response", body, shown, null, 1024)), "<headers>\ncontent-type: application/json");
 
     // The cursors a next call pages or waits with.
     try expectText(try resultText(arena, try waitResponseResult(arena, EXAMPLE, CAP_ENTRY, 3)), "since=3 waits for the next one");

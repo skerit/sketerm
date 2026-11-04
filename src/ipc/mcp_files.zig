@@ -327,7 +327,7 @@ fn fileList(arena: std.mem.Allocator, fs: *fsdrive.Fs, args: std.json.Value) ![]
     try res.textf("{s}: {d} entries{s}", .{
         l.path, l.entries.len, if (l.truncated) " (TRUNCATED at the listing cap)" else "",
     });
-    if (l.entries.len > 0) try res.textf("--- entries ---\n{s}", .{table.written()});
+    if (l.entries.len > 0) try res.section("entries", table.written());
     return res.finish();
 }
 
@@ -383,7 +383,7 @@ fn fileRead(arena: std.mem.Allocator, fs: *fsdrive.Fs, args: std.json.Value) ![]
         // Text content is the payload the text lane exists for;
         // duplicating it into structuredContent would double a
         // multi-megabyte read for no reader.
-        try res.textf("--- content ---\n{s}", .{data.items});
+        try res.section("content", data.items);
     } else {
         // Bytes are machine data, not prose: base64 in the facts lane
         // when there is one, else behind the text lane's divider.
@@ -527,7 +527,7 @@ fn fileMediaInfo(arena: std.mem.Allocator, fs: *fsdrive.Fs, args: std.json.Value
     try res.fact("count", rows.len);
     try res.raw("files", files.written());
     try res.textf("{d} file(s)", .{rows.len});
-    if (rows.len > 0) try res.textf("--- media ---\n{s}", .{table.written()});
+    if (rows.len > 0) try res.section("media", table.written());
     return res.finish();
 }
 
@@ -567,7 +567,10 @@ fn fileJobs(arena: std.mem.Allocator, fs: *fsdrive.Fs, _: std.json.Value) ![]con
     if (rows.len == 0)
         try res.text("no file jobs")
     else
-        try res.textf("{d} file job(s)\n--- jobs ---\n{s}", .{ rows.len, table.written() });
+    {
+        try res.textf("{d} file job(s)", .{rows.len});
+        try res.section("jobs", table.written());
+    }
     return res.finish();
 }
 

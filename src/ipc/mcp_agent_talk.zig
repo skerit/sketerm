@@ -343,9 +343,9 @@ pub fn waitAllTool(arena: std.mem.Allocator, args: std.json.Value, list: []const
             o.settled = true;
             if (try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena)) |d| {
                 o.events = try eventsJson(arena, d.items);
-                if (d.items.len > 0) try payload.append(arena, .{ .name = try std.fmt.allocPrint(arena, "{s} events", .{e.id}), .body = try mcp_agent_results.eventsBody(arena, d.items) });
+                if (d.items.len > 0) try payload.append(arena, .{ .name = "events", .attrs = try res.attr("agent", e.id), .body = try mcp_agent_results.eventsBody(arena, d.items) });
             }
-            if (e.agent.interaction()) |x| try payload.append(arena, .{ .name = try std.fmt.allocPrint(arena, "{s} prompt", .{e.id}), .body = try mcp_agent_results.promptBody(arena, x) });
+            if (e.agent.interaction()) |x| try payload.append(arena, .{ .name = "prompt", .attrs = try res.attr("agent", e.id), .body = try mcp_agent_results.promptBody(arena, x) });
         }
         try res.textf("{s}: {s}{s}{s}", .{ e.id, o.outcome, if (o.text.len > 0) ": " else "", agentwait.clip(events.firstLine(o.text), 160) });
     }

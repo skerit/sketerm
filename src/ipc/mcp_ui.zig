@@ -664,7 +664,7 @@ fn uiEventsResult(
                 else => {},
             };
         }
-        try res.textf("--- events ---\n{s}", .{aw.written()});
+        try res.section("events", aw.written());
     }
     return res.finish();
 }
@@ -1368,7 +1368,7 @@ fn uiPanels(arena: std.mem.Allocator, _: std.json.Value, transport: *UiTransport
         try res.fact("saved_error", @errorName(err));
         try res.textf("saved: unavailable ({s})", .{@errorName(err)});
     }
-    if (text.written().len > 0) try res.textf("--- panels ---{s}", .{text.written()});
+    if (text.written().len > 0) try res.section("panels", std.mem.trimStart(u8, text.written(), "\n"));
     return res.finish();
 }
 
@@ -3136,5 +3136,5 @@ test "ui_wait_event's one result shape: timeout and events, both isError:false" 
     try t.expectEqual(@as(i64, 1), sc.get("count").?.integer);
     try t.expectEqual(@as(i64, 3), sc.get("dropped").?.integer);
     const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
-    try t.expect(std.mem.indexOf(u8, text, "--- events ---\n4 change amount = 12.5") != null);
+    try t.expect(std.mem.indexOf(u8, text, "<events>\n4 change amount = 12.5") != null);
 }

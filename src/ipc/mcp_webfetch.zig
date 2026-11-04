@@ -713,10 +713,14 @@ fn answer(job: *Job) !void {
             try web.writeMatches(&res, r.matches);
         }
         if (r.body) |b| {
-            if (r.body_source == .reader)
-                try web.shortSection(&res, ar, try std.fmt.allocPrint(ar, "[{d}] {s}{s}", .{ r.index, @tagName(r.body_source.?), if (r.truncated) " (truncated)" else "" }), b)
-            else
-                try web.section(&res, try std.fmt.allocPrint(ar, "[{d}] {s}{s}", .{ r.index, @tagName(r.body_source.?), if (r.truncated) " (truncated)" else "" }), b);
+            const attrs = try std.fmt.allocPrint(ar, "index=\"{d}\" source=\"{s}\"{s}", .{ r.index, @tagName(r.body_source.?), if (r.truncated) " truncated=\"true\"" else "" });
+            if (r.body_source == .reader) {
+                try web.shortSection(&res, ar, "body", attrs, b);
+            } else {
+                try res.open("body", attrs);
+                try res.text(b);
+                try res.close();
+            }
         }
     }
     if (any_body) try res.text(web.TRUST_LINE);

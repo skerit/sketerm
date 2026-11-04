@@ -50,7 +50,7 @@ const WaitPart = struct {
 };
 
 /// A payload block of the text lane (after the prose).
-pub const Block = struct { name: []const u8, body: []const u8 };
+pub const Block = struct { name: []const u8, attrs: []const u8 = "", body: []const u8 };
 
 /// Events pending before the call plus what `wait` delivered.
 pub fn combine(arena: std.mem.Allocator, pre: ?events.Delivery, post: ?events.Delivery, waited: bool, timed_out: bool) !Delivered {
@@ -202,7 +202,7 @@ pub fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, wat
             const fresh = if (select.answerIndex(recs, j)) |i| !e.handed.has(recs[i]) else false;
             if (!fresh) message = null;
             const sel = try select.select(arena, recs, jobs.items, .{ .handed = &e.handed, .keep_empty = true });
-            job_block = .{ .name = try jobsName(arena, sel.jobs), .body = try writeSelection(arena, res, recs, sel) };
+            job_block = .{ .name = "jobs", .attrs = try jobsAttr(arena, sel.jobs), .body = try writeSelection(arena, res, recs, sel) };
             try e.handed.markSelection(e.allocator, recs, sel);
         }
         if (message) |m| try res.fact("message", m);
@@ -353,24 +353,26 @@ fn retryFacts(res: *Res, e: *const Entry) !void {
     });
 }
 
-/// A job block's header: the jobs it holds (`job 3`, `jobs 2, 4`, `jobs 2-4`).
-fn jobsName(arena: std.mem.Allocator, jobs: []const select.JobSummary) ![]const u8 {
-    if (jobs.len == 0) return "jobs";
-    if (jobs.len == 1) return std.fmt.allocPrint(arena, "job {d}", .{jobs[0].job});
+/// A job block's attribute: the jobs it holds (`ids="3"`, `ids="2, 4"`, `ids="2-4"`).
+fn jobsAttr(arena: std.mem.Allocator, jobs: []const select.JobSummary) ![]const u8 {
+    if (jobs.len == 0) return "";
+    if (jobs.len == 1) return std.fmt.allocPrint(arena, "ids=\"{d}\"", .{jobs[0].job});
     var contiguous = true;
     for (jobs[1..], 0..) |s, i| {
         if (s.job != jobs[i].job + 1) contiguous = false;
     }
-    if (contiguous) return std.fmt.allocPrint(arena, "jobs {d}-{d}", .{ jobs[0].job, jobs[jobs.len - 1].job });
+    if (contiguous) return std.fmt.allocPrint(arena, "ids=\"{d}-{d}\"", .{ jobs[0].job, jobs[jobs.len - 1].job });
     var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(arena, "jobs ");
+    try out.appendSlice(arena, "ids=\"");
     for (jobs, 0..) |s, i| try out.print(arena, "{s}{d}", .{ if (i > 0) ", " else "", s.job });
+    try out.append(arena, '"');
     return out.items;
 }
 
 pub fn block(res: *Res, b: Block) !void {
-    try res.textf("--- {s} ---", .{b.name});
+    try res.open(b.name, b.attrs);
     try res.text(b.body);
+    try res.close();
 }
 
 /// `wall_ms` as results write a time: `clock.isoLocal`, null when it has
@@ -501,7 +503,7 @@ test "a job block names exactly the jobs it holds" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    try testing.expectEqualStrings("job 2", try jobsName(a, &.{.{ .job = 2 }}));
-    try testing.expectEqualStrings("jobs 1-3", try jobsName(a, &.{ .{ .job = 1 }, .{ .job = 2 }, .{ .job = 3 } }));
-    try testing.expectEqualStrings("jobs 0, 2", try jobsName(a, &.{ .{ .job = 0 }, .{ .job = 2 } }));
+    try testing.expectEqualStrings("ids=\"2\"", try jobsAttr(a, &.{.{ .job = 2 }}));
+    try testing.expectEqualStrings("ids=\"1-3\"", try jobsAttr(a, &.{ .{ .job = 1 }, .{ .job = 2 }, .{ .job = 3 } }));
+    try testing.expectEqualStrings("ids=\"0, 2\"", try jobsAttr(a, &.{ .{ .job = 0 }, .{ .job = 2 } }));
 }

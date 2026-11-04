@@ -283,7 +283,7 @@ pub fn composePeers(arena: std.mem.Allocator, items: []const PeerItem) !Push {
     try aw.writer.print("{d} peer items arrived together:", .{items.len});
     for (items, 0..) |it, i| {
         const p = try composePeer(arena, it);
-        try aw.writer.print("\n\n--- {d} of {d} ---\n{s}", .{ i + 1, items.len, p.content });
+        try aw.writer.print("\n\n<item n=\"{d}\" of=\"{d}\">\n{s}\n</item>", .{ i + 1, items.len, p.content });
         if (i > 0) try ids.writer.writeAll(",");
         try ids.writer.writeAll(p.meta.message orelse "");
         if (i == 0) {
@@ -494,9 +494,9 @@ test "several peer items push as one, in order under a count, naming the sender 
     const both = try composePeers(a, &.{ one, two });
     try t.expectEqualStrings("peer_batch", both.meta.kind);
     try t.expectEqualStrings("m-1,m-2", both.meta.message.?);
-    try t.expect(std.mem.startsWith(u8, both.content, "2 peer items arrived together:\n\n--- 1 of 2 ---\nPeer message from Zenit"));
+    try t.expect(std.mem.startsWith(u8, both.content, "2 peer items arrived together:\n\n<item n=\"1\" of=\"2\">\nPeer message from Zenit"));
     const at1 = std.mem.indexOf(u8, both.content, "first").?;
-    const at2 = std.mem.indexOf(u8, both.content, "--- 2 of 2 ---\nPeer message from Qq").?;
+    const at2 = std.mem.indexOf(u8, both.content, "<item n=\"2\" of=\"2\">\nPeer message from Qq").?;
     try t.expect(at1 < at2);
     // Two senders: no `from` in the batch meta.
     try t.expect(both.meta.from == null);

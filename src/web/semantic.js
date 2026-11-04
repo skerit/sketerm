@@ -3778,7 +3778,7 @@
           sendEvalErr(
             m.req,
             new Error("the code did not compile as one expression"),
-            "this page's CSP blocks eval(), so only a single JavaScript EXPRESSION can run; wrap statements in (()=>{ ... })() (with await:true if it returns a promise)"
+            "this page's CSP blocks eval(), so only a single JavaScript EXPRESSION can run; wrap statements in (()=>{ ... })() (a returned promise is awaited)"
           );
         break;
       case "ext-inject":

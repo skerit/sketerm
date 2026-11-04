@@ -918,7 +918,7 @@ test "agent_templates shows the stored files that do not load in a problems bloc
     try @import("mcpassets.zig").save(a, .agent_template, "broken", "not json");
     const listed = try rig.callText(.agent_templates, "{}");
     try testing.expect(std.mem.startsWith(u8, listed, "1 template(s), and 1 stored file(s) that do not load (problems below)\ngood: variables task\n"));
-    try testing.expect(std.mem.indexOf(u8, listed, "\n--- problems ---\n") != null);
+    try testing.expect(std.mem.indexOf(u8, listed, "\n<problems>\n") != null);
     try testing.expect(std.mem.indexOf(u8, listed, "broken") != null);
 }
 
@@ -1051,7 +1051,7 @@ test "every per-agent result shape is declared: a live agent on a scripted scree
     // Text mode: a timed-out wait offers its watch_command, unless events
     // are pushed, when the one instruction is to end the turn.
     const plain_wait = try rig.callText(.agent_wait, "{\"timeout_ms\":1}");
-    try testing.expect(std.mem.indexOf(u8, plain_wait, "--- watch_command ---\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plain_wait, "<watch_command>\n") != null);
     {
         const saved_push = .{ state.push, state.push_live };
         defer {
@@ -1149,7 +1149,7 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     // and agent_list detail, which also says how long ago in words.
     const asked_id = attached.get("agent").?.string;
     const all_prompt = try rig.callText(.agent_wait, try std.fmt.allocPrint(a, "{{\"agents\":[\"{s}\"],\"all\":true,\"timeout_ms\":0}}", .{asked_id}));
-    try testing.expect(std.mem.indexOf(u8, all_prompt, try std.fmt.allocPrint(a, "--- {s} prompt ---\npermission: ", .{asked_id})) != null);
+    try testing.expect(std.mem.indexOf(u8, all_prompt, try std.fmt.allocPrint(a, "<prompt agent=\"{s}\">\npermission: ", .{asked_id})) != null);
     try testing.expect(std.mem.indexOf(u8, all_prompt, "\n1. Yes") != null and std.mem.indexOf(u8, all_prompt, "\n2. No") != null);
     const detail_text = try rig.callText(.agent_list, "{\"detail\":true}");
     try testing.expect(std.mem.indexOf(u8, detail_text, ", pending permission: ") != null);
@@ -1225,7 +1225,7 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     // Text mode: the model named, in its own words.
     const set_text = try rig.callText(.agent_set, "{\"model\":\"sonnet\",\"timeout_ms\":10000}");
     try testing.expect(std.mem.indexOf(u8, set_text, ": model sonnet set for this session only") != null);
-    try testing.expect(std.mem.indexOf(u8, set_text, "--- confirmation ---\nSet model to Sonnet 4.5 for this session only") != null);
+    try testing.expect(std.mem.indexOf(u8, set_text, "<confirmation>\nSet model to Sonnet 4.5 for this session only") != null);
     // Handed out here, so the jobs selected below hold no stray notice.
     _ = try shaped(a, "agent_read", try rig.call(.agent_read, "{}"));
 
@@ -1362,7 +1362,7 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     try expectError(a, "agent_send", try rig.call(.agent_send, try std.fmt.allocPrint(a, "{{\"agent\":\"{s}\",\"agents\":[\"{s}\"],\"text\":\"x\"}}", .{ id, id })), "invalid_args");
     const all_text = try rig.callText(.agent_wait, try std.fmt.allocPrint(a, "{{\"agents\":[\"{s}\"],\"all\":true,\"timeout_ms\":10000}}", .{id}));
     try testing.expect(std.mem.startsWith(u8, all_text, "all 1 agent(s) settled"));
-    try testing.expect(std.mem.indexOf(u8, all_text, try std.fmt.allocPrint(a, "--- {s} events ---\n", .{id})) != null);
+    try testing.expect(std.mem.indexOf(u8, all_text, try std.fmt.allocPrint(a, "<events agent=\"{s}\">\n", .{id})) != null);
     try testing.expect(std.mem.indexOf(u8, all_text, " done") != null);
     const all_done = try shaped(a, "agent_wait", try rig.call(.agent_wait, try std.fmt.allocPrint(a, "{{\"agents\":[\"{s}\"],\"all\":true,\"timeout_ms\":10000}}", .{id})));
     try testing.expectEqualStrings("all_settled", all_done.get("outcome").?.string);

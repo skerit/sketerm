@@ -1681,6 +1681,32 @@ fn textValue(w: *std.Io.Writer, value: anytype) !void {
     }
 }
 
+/// Writes `s` with every case-insensitive `</tag` turned into `<\/tag`,
+/// so page-authored payload cannot end its own block early and pose as
+/// the server's text after it.
+fn writeEscapedBody(w: *std.Io.Writer, tag: []const u8, s: []const u8) !void {
+    var from: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, s, i, "</")) |at| {
+        const rest = s[at + 2 ..];
+        if (rest.len >= tag.len and std.ascii.eqlIgnoreCase(rest[0..tag.len], tag)) {
+            try w.writeAll(s[from..at]);
+            try w.writeAll("<\\/");
+            from = at + 2;
+        }
+        i = at + 2;
+    }
+    try w.writeAll(s[from..]);
+}
+
+/// A whole payload block into a plain writer, for text built outside a
+/// `Res`: `<name attrs>`, the escaped body, `</name>`, no trailing newline.
+pub fn writeBlock(w: *std.Io.Writer, name: []const u8, attrs: []const u8, body: []const u8) !void {
+    try w.print("<{s}{s}{s}>\n", .{ name, if (attrs.len > 0) " " else "", attrs });
+    try writeEscapedBody(w, name, std.mem.trimEnd(u8, body, "\n"));
+    try w.print("\n</{s}>", .{name});
+}
+
 /// Two-lane tool-result builder: machine facts accumulate into
 /// structuredContent, token-efficient prose into ONE text content
 /// block (never JSON). NDJSON-safe: the serialized result carries no
@@ -1690,6 +1716,9 @@ pub const Res = struct {
     sc: std.Io.Writer.Allocating,
     tl: std.Io.Writer.Allocating,
     has_structured: bool = false,
+    /// The payload block `open` started and `close` has not ended;
+    /// text written meanwhile has its closing tag escaped.
+    open_tag: ?[]const u8 = null,
 
     pub fn init(arena: std.mem.Allocator) Res {
         return .{ .arena = arena, .sc = .init(arena), .tl = .init(arena) };
@@ -1733,25 +1762,67 @@ pub const Res = struct {
 
     /// Machine data that is not prose (base64 bytes): a fact, plus `note`
     /// in the text lane when the facts lane carries it, else the data
-    /// itself behind a `--- name ---` divider, since a text-mode reader
-    /// has no other lane to find it in.
+    /// itself in a `<name>` block, since a text-mode reader has no other
+    /// lane to find it in.
     pub fn bulk(self: *Res, name: []const u8, data: []const u8, note: []const u8) !void {
         try self.fact(name, data);
         switch (result_mode) {
             .structured => try self.text(note),
-            .text => try self.textf("--- {s} ---\n{s}", .{ name, data }),
+            .text => try self.section(name, data),
         }
     }
 
     /// Free-form line for the text lane only.
     pub fn text(self: *Res, line: []const u8) !void {
         const w = try self.textLine();
-        try w.writeAll(line);
+        if (self.open_tag) |tag| try writeEscapedBody(w, tag, line) else try w.writeAll(line);
     }
 
     pub fn textf(self: *Res, comptime fmt: []const u8, args: anytype) !void {
+        if (self.open_tag != null) return self.text(try std.fmt.allocPrint(self.arena, fmt, args));
         const w = try self.textLine();
         try w.print(fmt, args);
+    }
+
+    /// A payload block in the text lane: `<name>`, `body` minus its
+    /// trailing newlines (the fact keeps them), `</name>`.
+    pub fn section(self: *Res, name: []const u8, body: []const u8) !void {
+        try self.open(name, "");
+        try self.text(std.mem.trimEnd(u8, body, "\n"));
+        try self.close();
+    }
+
+    /// Start a payload block whose lines follow as text/textf calls.
+    /// `attrs` is pre-rendered (`k="v" ...`, see `attr`) or empty. Blocks
+    /// do not nest.
+    pub fn open(self: *Res, name: []const u8, attrs: []const u8) !void {
+        std.debug.assert(self.open_tag == null);
+        const w = try self.textLine();
+        try w.print("<{s}{s}{s}>", .{ name, if (attrs.len > 0) " " else "", attrs });
+        self.open_tag = name;
+    }
+
+    pub fn close(self: *Res) !void {
+        const tag = self.open_tag orelse return;
+        self.open_tag = null;
+        const w = try self.textLine();
+        try w.print("</{s}>", .{tag});
+    }
+
+    /// One `key="value"` attribute for `open`, the value with `"`, `<`,
+    /// `&` and newlines escaped.
+    pub fn attr(self: *Res, key: []const u8, value: []const u8) ![]const u8 {
+        var aw: std.Io.Writer.Allocating = .init(self.arena);
+        try aw.writer.print("{s}=\"", .{key});
+        for (value) |ch| switch (ch) {
+            '"' => try aw.writer.writeAll("&quot;"),
+            '<' => try aw.writer.writeAll("&lt;"),
+            '&' => try aw.writer.writeAll("&amp;"),
+            '\n' => try aw.writer.writeAll(" "),
+            else => try aw.writer.writeByte(ch),
+        };
+        try aw.writer.writeByte('"');
+        return aw.written();
     }
 
     pub fn finish(self: *Res) ![]const u8 {
@@ -1779,6 +1850,7 @@ pub const Res = struct {
         ext: []const u8,
         tags: ?[]const []const u8,
     ) ![]const u8 {
+        try self.close();
         var aw: std.Io.Writer.Allocating = .init(self.arena);
         const w = &aw.writer;
         const t = self.tl.written();
@@ -1846,7 +1918,7 @@ fn isToolOrArgName(name: []const u8) bool {
 }
 
 /// Whether `text` mentions `key` as a word but never gives it a value
-/// (`key: v`, `key=v`, `key v` with a digit, or a `--- key ---` block).
+/// (`key: v`, `key=v`, `key v` with a digit, or a `<key>` block).
 fn namesWithoutValue(text: []const u8, key: []const u8) bool {
     const word = struct {
         fn ch(cc: u8) bool {
@@ -1863,7 +1935,7 @@ fn namesWithoutValue(text: []const u8, key: []const u8) bool {
         mentioned = true;
         if (rest.len > 0 and (rest[0] == ':' or rest[0] == '=')) return false;
         if (rest.len > 1 and rest[0] == ' ' and std.ascii.isDigit(rest[1])) return false;
-        if (std.mem.startsWith(u8, rest, " ---") and i >= 4 and std.mem.eql(u8, text[i - 4 .. i], "--- ")) return false;
+        if (i >= 1 and text[i - 1] == '<' and rest.len > 0 and (rest[0] == '>' or rest[0] == ' ')) return false;
     }
     return mentioned;
 }
@@ -1876,7 +1948,7 @@ test "a text lane that points at a fact it does not carry is caught" {
     try t.expectEqualStrings("next_offset", (try textNamesMissingField(a, "read on with offset next_offset", "\"next_offset\":5")).?);
     try t.expectEqual(@as(?[]const u8, null), try textNamesMissingField(a, "more from next_offset 5", "\"next_offset\":5"));
     try t.expectEqual(@as(?[]const u8, null), try textNamesMissingField(a, "next_offset: 5", "\"next_offset\":5"));
-    try t.expectEqual(@as(?[]const u8, null), try textNamesMissingField(a, "--- watch_command ---\nsketerm mcp agent-wait", "\"watch_command\":\"x\""));
+    try t.expectEqual(@as(?[]const u8, null), try textNamesMissingField(a, "<watch_command>\nsketerm mcp agent-wait\n</watch_command>", "\"watch_command\":\"x\""));
     try t.expect((try textNamesMissingField(a, "see capabilities.peers.slow_mail", "")) != null);
     // Pointing at structuredContent is right only where it is sent.
     try t.expectEqual(@as(?[]const u8, null), try textNamesMissingField(a, "bytes are in structuredContent.base64", ""));
@@ -2067,6 +2139,13 @@ pub fn argBool(args: std.json.Value, key: []const u8) bool {
         .bool => v.bool,
         else => false,
     };
+}
+
+/// `argBool` for a flag whose absence means `default`; a non-bool value is `default` too.
+pub fn argBoolOr(args: std.json.Value, key: []const u8, default: bool) bool {
+    if (args != .object) return default;
+    const v = args.object.get(key) orelse return default;
+    return if (v == .bool) v.bool else default;
 }
 
 pub fn argFloat(args: std.json.Value, key: []const u8) ?f64 {
@@ -2262,13 +2341,13 @@ test "the no-JSON text rule is scoped to a result's own prose" {
     const t = std.testing;
     // Prose only: the whole lane is checked.
     try t.expectEqualStrings("window 1: 1x1", textProse("window 1: 1x1"));
-    // A payload behind a divider is exempt — screen text, transcripts
-    // and log lines legitimately carry braces.
-    try t.expectEqualStrings("2 line(s)", textProse("2 line(s)\n--- log ---\n1 {\"a\":1}\n2 }{"));
+    // A payload block is exempt: screen text, transcripts and log
+    // lines legitimately carry braces.
+    try t.expectEqualStrings("2 line(s)", textProse("2 line(s)\n<log>\n1 {\"a\":1}\n2 }{\n</log>"));
     // So is a blank-line separated payload.
     try t.expectEqualStrings("header", textProse("header\n\n{\"raw\":true}"));
     // A result that is nothing but a payload has no prose to check.
-    try t.expectEqualStrings("", textProse("--- steps ---\nstep 1: {ok}"));
+    try t.expectEqualStrings("", textProse("<steps>\nstep 1: {ok}\n</steps>"));
 }
 
 test "initialize / tools list / unknown method" {
@@ -2852,10 +2931,10 @@ test "text mode: no structuredContent, no outputSchema, the error code in the te
     try t.expectEqual(@as(usize, 2), content.len);
     try t.expectEqualStrings("3 things", content[0].object.get("text").?.string);
     try t.expectEqualStrings("image", content[1].object.get("type").?.string);
-    // Bytes the facts lane would carry ride the text lane's divider instead.
+    // Bytes the facts lane would carry ride a text-lane block instead.
     var b = Res.init(arena);
     try b.bulk("base64", "QUJD", "bytes are in structuredContent.base64");
-    try t.expect(std.mem.indexOf(u8, try b.finish(), "--- base64 ---\\nQUJD") != null);
+    try t.expect(std.mem.indexOf(u8, try b.finish(), "<base64>\\nQUJD\\n</base64>") != null);
     result_mode = .structured;
     var bs = Res.init(arena);
     try bs.bulk("base64", "QUJD", "bytes are in structuredContent.base64");
@@ -2904,18 +2983,24 @@ test "text mode: no structuredContent, no outputSchema, the error code in the te
 /// The text lane must be non-empty and newline-escaped (NDJSON).
 ///
 /// The no-JSON rule is scoped to the result's OWN prose — everything
-/// before the first payload divider (a `--- name ---` line) or blank
-/// line. A legitimate payload (screen text, a step transcript, OCR
-/// output, an app's own log) may contain braces, and refusing those
-/// would push real content out of the lane that exists to carry it.
+/// before the first payload block (a `<name>` line) or blank line. A
+/// legitimate payload (screen text, a step transcript, OCR output, an
+/// app's own log) may contain braces, and refusing those would push
+/// real content out of the lane that exists to carry it.
 /// The prose head of a text lane: everything before the first payload
-/// divider (`--- name ---`) or blank line. THE scope of the no-JSON
-/// rule — see expectToolResultShape.
+/// block or blank line. THE scope of the no-JSON rule — see
+/// expectToolResultShape.
 pub fn textProse(text: []const u8) []const u8 {
     var end = text.len;
-    if (std.mem.indexOf(u8, text, "\n--- ")) |at| end = @min(end, at);
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, "\n<")) |at| : (from = at + 2) {
+        if (at + 2 < text.len and std.ascii.isAlphabetic(text[at + 2])) {
+            end = at;
+            break;
+        }
+    }
     if (std.mem.indexOf(u8, text, "\n\n")) |at| end = @min(end, at);
-    if (std.mem.startsWith(u8, text, "--- ")) return "";
+    if (text.len > 1 and text[0] == '<' and std.ascii.isAlphabetic(text[1])) return "";
     return text[0..end];
 }
 
