@@ -10311,7 +10311,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         std.debug.print("smoke-web: grid snapshot was:\n{s}\n", .{cl.semLog()});
         fail("stage 12b grid: repeated div siblings were not listed as rows");
     }
-    if (std.mem.indexOf(u8, cl.semLog(), "] list {6 children}") == null and std.mem.indexOf(u8, cl.semLog(), "] list ") == null)
+    if (std.mem.indexOf(u8, cl.semLog(), "] list {6 children}") == null and std.mem.indexOf(u8, cl.semLog(), "] list ") == null and std.mem.indexOf(u8, cl.semLog(), "] list\n") == null)
         fail("stage 12b grid: the rows' container is not a list");
     {
         const seq = cl.md_seq;

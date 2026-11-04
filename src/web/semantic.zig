@@ -929,12 +929,7 @@ pub const View = struct {
     }
 
     fn writeSubtree(self: *const View, w: *std.Io.Writer, b: Bound) !void {
-        const top = self.nodes.items[b.lo].depth;
-        for (self.nodes.items[b.lo..b.hi]) |nd| {
-            try w.splatByteAll(' ', @as(usize, nd.depth -| top) * 2);
-            try writeNodeLine(w, nd);
-            try w.writeByte('\n');
-        }
+        try writeListing(self.gpa, w, self.nodes.items[b.lo..b.hi], self.nodes.items[b.lo].depth);
     }
 
     /// Whether a base entry sat under `root_sid` by the base's own
@@ -1176,8 +1171,10 @@ pub const View = struct {
         // already has, once per run of siblings.
         var last_parent: u32 = 0;
         var add_indent = std.AutoHashMap(u32, usize).init(arena);
+        const el = try Elision.of(self.gpa, self.nodes.items[lo..hi], false);
+        defer el.deinit(self.gpa);
         for (self.nodes.items[lo..hi], lo..) |nd, i| {
-            if (cls[i] != .add) continue;
+            if (cls[i] != .add or el.skip[i - lo]) continue;
             var indent: usize = 0;
             const parent_added = if (live_by_sid.get(nd.parent_sid)) |pi| cls[pi] == .add else false;
             if (parent_added) {
@@ -1192,7 +1189,7 @@ pub const View = struct {
             try add_indent.put(nd.sid, indent);
             try w.writeAll("+ ");
             try w.splatByteAll(' ', indent);
-            try writeNodeLine(w, nd);
+            try writeNodeLineAs(w, nd, !el.unnamed[i - lo], el.listed[i - lo]);
             try w.writeByte('\n');
         }
         if (!doc_moved) {
@@ -1456,11 +1453,7 @@ pub const View = struct {
         defer out.deinit();
         const w = &out.writer;
         try w.print("doc {d} rev {d} url {s}\n", .{ self.doc_gen, self.rev, self.url });
-        for (self.nodes.items) |nd| {
-            try w.splatByteAll(' ', @as(usize, nd.depth) * 2);
-            try writeNodeLine(w, nd);
-            try w.writeByte('\n');
-        }
+        try writeListing(self.gpa, w, self.nodes.items, 0);
         return self.gpa.dupe(u8, out.written());
     }
 
@@ -1802,8 +1795,14 @@ const Gone = struct { sid: u32, role: []u8, name: []u8 };
 /// `[id] role "name" (states) value="..." {n children}`, with the
 /// truncation marker when the script clamped the name.
 fn writeNodeLine(w: *std.Io.Writer, nd: Node) !void {
+    try writeNodeLineAs(w, nd, true, nd.nchildren);
+}
+
+/// `writeNodeLine` with the name left out when `name` is false and
+/// `children` as the count (0 prints none).
+fn writeNodeLineAs(w: *std.Io.Writer, nd: Node, name: bool, children: u32) !void {
     try w.print("[{d}] {s}", .{ nd.sid, nd.role });
-    if (nd.name.len != 0 or nd.full > nd.sent) {
+    if (name and (nd.name.len != 0 or nd.full > nd.sent)) {
         if (nd.full > nd.sent) {
             try w.print(" \"{s}...\" (+{d} chars, expand [{d}])", .{ nd.name, nd.full - nd.sent, nd.sid });
         } else {
@@ -1812,8 +1811,98 @@ fn writeNodeLine(w: *std.Io.Writer, nd: Node) !void {
     }
     if (nd.states.len != 0) try w.print(" ({s})", .{nd.states});
     if (nd.value.len != 0) try w.print(" value=\"{s}\"", .{nd.value});
-    if (nd.nchildren != 0) try w.print(" {{{d} children}}", .{nd.nchildren});
+    if (children != 0) try w.print(" {{{d} children}}", .{children});
 }
+
+/// An indented tree listing of a contiguous preorder run, `Elision`
+/// applied. No `{n children}` counts: the children are the lines below.
+fn writeListing(gpa: std.mem.Allocator, w: *std.Io.Writer, nodes: []const Node, top: u16) !void {
+    const el = try Elision.of(gpa, nodes, true);
+    defer el.deinit(gpa);
+    for (nodes, 0..) |nd, i| {
+        if (el.skip[i]) continue;
+        try w.splatByteAll(' ', @as(usize, nd.depth -| top) * 2);
+        try writeNodeLineAs(w, nd, !el.unnamed[i], 0);
+        try w.writeByte('\n');
+    }
+}
+
+/// What a tree listing leaves out because the line next to it already
+/// says it: a `text` leaf repeating its parent's name, a `label` leaf
+/// repeating the form control right after it, and the name of a
+/// non-interactive container whose one listed child carries the same
+/// name. The model keeps every node (ids stay valid for web_act); only
+/// the listing omits them. `listed` is each node's count of children
+/// still listed.
+const Elision = struct {
+    skip: []bool,
+    unnamed: []bool,
+    listed: []u32,
+
+    /// `keep_root` keeps the first node's name, which names the scope.
+    fn of(gpa: std.mem.Allocator, nodes: []const Node, keep_root: bool) !Elision {
+        const n = nodes.len;
+        const skip = try gpa.alloc(bool, n);
+        errdefer gpa.free(skip);
+        const unnamed = try gpa.alloc(bool, n);
+        errdefer gpa.free(unnamed);
+        const listed = try gpa.alloc(u32, n);
+        errdefer gpa.free(listed);
+        @memset(skip, false);
+        @memset(unnamed, false);
+        @memset(listed, 0);
+        var index = std.AutoHashMap(u32, usize).init(gpa);
+        defer index.deinit();
+        for (nodes, 0..) |nd, i| try index.put(nd.sid, i);
+
+        for (nodes, 0..) |nd, i| {
+            if (!std.mem.eql(u8, nd.role, "text") or subtreeEnd(nodes, i) != i + 1) continue;
+            const p = index.get(nd.parent_sid) orelse continue;
+            if (sameName(nodes[p], nd)) skip[i] = true;
+        }
+        for (nodes, 0..) |nd, i| {
+            if (!std.mem.eql(u8, nd.role, "label")) continue;
+            const end = subtreeEnd(nodes, i);
+            if (end >= n or std.mem.indexOfScalar(bool, skip[i + 1 .. end], false) != null) continue;
+            const control = nodes[end];
+            if (control.parent_sid != nd.parent_sid or !isFormRole(control.role) or !sameName(nd, control)) continue;
+            @memset(skip[i..end], true);
+        }
+        const only = try gpa.alloc(usize, n);
+        defer gpa.free(only);
+        for (nodes, 0..) |nd, i| {
+            if (skip[i]) continue;
+            const p = index.get(nd.parent_sid) orelse continue;
+            listed[p] += 1;
+            only[p] = i;
+        }
+        for (nodes, 0..) |nd, i| {
+            if (skip[i] or listed[i] != 1 or (keep_root and i == 0)) continue;
+            if (hintableRole(nd.role) or isFormRole(nd.role) or nd.url.len != 0 or std.mem.eql(u8, nd.role, "document")) continue;
+            if (sameName(nd, nodes[only[i]])) unnamed[i] = true;
+        }
+        return .{ .skip = skip, .unnamed = unnamed, .listed = listed };
+    }
+
+    fn deinit(self: Elision, gpa: std.mem.Allocator) void {
+        gpa.free(self.skip);
+        gpa.free(self.unnamed);
+        gpa.free(self.listed);
+    }
+
+    /// One past the last node of `i`'s subtree in a preorder run.
+    fn subtreeEnd(nodes: []const Node, i: usize) usize {
+        var end = i + 1;
+        while (end < nodes.len and nodes[end].depth > nodes[i].depth) end += 1;
+        return end;
+    }
+
+    /// Both names whole (never clamped) and equal, ignoring surrounding space.
+    fn sameName(a: Node, b: Node) bool {
+        const an = std.mem.trim(u8, a.name, " \t\n");
+        return an.len != 0 and a.full <= a.sent and b.full <= b.sent and std.mem.eql(u8, an, std.mem.trim(u8, b.name, " \t\n"));
+    }
+};
 
 /// Bottom-up fingerprints: hash(role, name, value, child fingerprints).
 /// A document-order walk lists children after their parent, so a
@@ -1972,12 +2061,67 @@ test "full snapshot renders the documented text format" {
     try std.testing.expectEqual(Kind.full, up.kind);
     try std.testing.expectEqualStrings(
         \\doc 1 rev 1 url http://x/
-        \\[1] document "Demo" {3 children}
+        \\[1] document "Demo"
         \\  [2] heading "Hello"
         \\  [3] button "Go" (focused)
         \\  [4] textbox "Name" value="abc"
         \\
     , up.text);
+}
+
+test "a listing leaves out names its neighbours already carry, and nothing else" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+
+    // The shape of a real sign-in page: every label, heading and button
+    // holds a text node repeating its own name, and the textbox is named
+    // by the label right before it.
+    const nodes = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Sign in" },
+        .{ .id = 2, .parent = 1, .role = "text", .name = "Arcana" },
+        .{ .id = 3, .parent = 1, .role = "heading", .name = "Sign in" },
+        .{ .id = 4, .parent = 3, .role = "text", .name = "Sign in" },
+        .{ .id = 5, .parent = 1, .role = "form" },
+        .{ .id = 6, .parent = 5, .role = "label", .name = "Email" },
+        .{ .id = 7, .parent = 6, .role = "text", .name = "Email" },
+        .{ .id = 8, .parent = 5, .role = "textbox", .name = "Email", .states = "required,invalid" },
+        .{ .id = 9, .parent = 5, .role = "label", .name = "Remember me" },
+        .{ .id = 10, .parent = 9, .role = "text", .name = "Remember me" },
+        .{ .id = 11, .parent = 5, .role = "button", .name = "Sign in" },
+        .{ .id = 12, .parent = 11, .role = "text", .name = "Sign in" },
+        .{ .id = 13, .parent = 1, .role = "list" },
+        .{ .id = 14, .parent = 13, .role = "listitem", .name = "Forgot your password?" },
+        .{ .id = 15, .parent = 14, .role = "link", .name = "Forgot your password?" },
+        .{ .id = 16, .parent = 15, .role = "text", .name = "Forgot your password?" },
+        .{ .id = 17, .parent = 1, .role = "paragraph", .name = "Need help? Ask" },
+        .{ .id = 18, .parent = 17, .role = "text", .name = "Need help?" },
+        .{ .id = 19, .parent = 17, .role = "link", .name = "Ask" },
+    };
+    const up = try applyConsume(&v, tree(7, "http://x/login", &nodes), .auto);
+    defer gpa.free(up.text);
+    // Kept: a label naming no control after it ("Remember me" precedes a
+    // button), a text that is only PART of its parent's name, and every
+    // control. Ids are the walk's, so web_act still reaches the hidden ones.
+    try std.testing.expectEqualStrings(
+        \\doc 1 rev 1 url http://x/login
+        \\[1] document "Sign in"
+        \\  [2] text "Arcana"
+        \\  [3] heading "Sign in"
+        \\  [5] form
+        \\    [8] textbox "Email" (required,invalid)
+        \\    [9] label "Remember me"
+        \\    [11] button "Sign in"
+        \\  [13] list
+        \\    [14] listitem
+        \\      [15] link "Forgot your password?"
+        \\  [17] paragraph "Need help? Ask"
+        \\    [18] text "Need help?"
+        \\    [19] link "Ask"
+        \\
+    , up.text);
+    try std.testing.expect(v.eidFor(7) != 0);
+    try std.testing.expect(v.eidFor(16) != 0);
 }
 
 test "reader entities use live stable ids and carry an exact revision" {
