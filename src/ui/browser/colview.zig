@@ -1789,26 +1789,31 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
         c.gtk_widget_remove_css_class(cvw, "sketerm-fb-zebra");
     }
 
-    var items: std.ArrayList(?*anyopaque) = .empty;
-    defer items.deinit(self.allocator);
+    // Rows are described first, by value in a per-render arena, and only
+    // the spliced window becomes GObjects: building all 50k of a big
+    // folder's items on every render, to drop all but a few unchanged,
+    // was most of its render cost.
+    var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena_state.deinit();
+    var rows: RowList = .{ .arena = arena_state.allocator() };
     var alt = false;
     if (tab.vs.grouped) {
-        buildGroupedItems(self, tab, &items);
+        buildGroupedItems(self, tab, &rows);
     } else {
-        buildDirItems(self, tab, tab.root, 0, &items, &alt);
+        buildDirItems(self, tab, tab.root, 0, &rows, &alt);
     }
+    const new_rows = rows.list.items;
 
     const old_n = itemCount(tab);
-    const new_n: c.guint = @intCast(items.items.len);
+    const new_n: c.guint = @intCast(new_rows.len);
 
     // Visual ranges are positional. Keep them through content refreshes,
     // but commit before a different ordered set of identities takes over.
     if (tab.sel.anchor != null) {
         const unchanged = same_order: {
             if (old_n != new_n) break :same_order false;
-            for (items.items, 0..) |it, i| {
+            for (new_rows, 0..) |*nd, i| {
                 const od = itemDataAt(tab, @intCast(i)) orelse break :same_order false;
-                const nd = itemPayload(it) orelse break :same_order false;
                 if (!sameStructuralItem(od, nd)) break :same_order false;
             }
             break :same_order true;
@@ -1829,13 +1834,11 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
         const lim = @min(old_n, new_n);
         while (prefix < lim) : (prefix += 1) {
             const od = itemDataAt(tab, prefix) orelse break;
-            const nd = itemPayload(items.items[prefix]) orelse break;
-            if (!reusableItem(tab, od, nd)) break;
+            if (!reusableItem(tab, od, &new_rows[prefix])) break;
         }
         while (suffix < lim - prefix) : (suffix += 1) {
             const od = itemDataAt(tab, old_n - 1 - suffix) orelse break;
-            const nd = itemPayload(items.items[new_n - 1 - suffix]) orelse break;
-            if (!reusableItem(tab, od, nd)) break;
+            if (!reusableItem(tab, od, &new_rows[new_n - 1 - suffix])) break;
         }
     }
     // Reused rows keep their item, but the item's borrowed pointers
@@ -1843,7 +1846,7 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
     // storage — delta application nulled them via
     // invalidateBackingRefs, and leaving them null breaks every later
     // interaction with those rows.
-    const parity_moved = rebindReused(tab, items.items, prefix, suffix, old_n, new_n);
+    const parity_moved = rebindReused(tab, new_rows, prefix, suffix, old_n, new_n);
     // The cursor's row is about to be replaced or removed.
     const focus_keep: ?FocusKeep = if (navigated) null else FocusKeep.capture(tab, prefix, old_n - suffix);
 
@@ -1854,14 +1857,21 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
         // and valid, so their map entries must survive.
         tab.name_cells.clearRetainingCapacity();
     }
+    var window: std.ArrayList(?*anyopaque) = .empty;
+    defer window.deinit(self.allocator);
+    window.ensureTotalCapacity(self.allocator, new_n - prefix - suffix) catch {};
+    for (new_rows[prefix .. new_n - suffix]) |*row| {
+        const obj = materialize(row) orelse continue;
+        window.append(self.allocator, @ptrCast(obj)) catch c.g_object_unref(@as(?*anyopaque, @ptrCast(obj)));
+    }
     c.g_list_store_splice(
         tab.store,
         prefix,
         old_n - prefix - suffix,
-        items.items.ptr + prefix,
-        new_n - prefix - suffix,
+        window.items.ptr,
+        @intCast(window.items.len),
     );
-    for (items.items) |it| {
+    for (window.items) |it| {
         if (it) |o| c.g_object_unref(@as(?*anyopaque, o));
     }
     tab.clearChanged();
@@ -2045,20 +2055,44 @@ test "visual render boundary commits structural changes but keeps content refres
 /// Re-aim reused rows' borrowed Dir/Entry pointers and zebra parity at
 /// what the matching new items carry.
 /// @return whether any reused row's parity changed.
-fn rebindReused(tab: *BTab, new_items: []?*anyopaque, prefix: c.guint, suffix: c.guint, old_n: c.guint, new_n: c.guint) bool {
+fn rebindReused(tab: *BTab, new_rows: []const ItemData, prefix: c.guint, suffix: c.guint, old_n: c.guint, new_n: c.guint) bool {
     var moved = false;
     var i: c.guint = 0;
     while (i < prefix + suffix) : (i += 1) {
         const old_pos = if (i < prefix) i else old_n - 1 - (i - prefix);
         const new_pos = if (i < prefix) i else new_n - 1 - (i - prefix);
         const od = itemDataAt(tab, old_pos) orelse continue;
-        const nd = itemPayload(new_items[new_pos]) orelse continue;
+        const nd = &new_rows[new_pos];
         od.dir = nd.dir;
         od.entry = nd.entry;
         if (od.alt != nd.alt) moved = true;
         od.alt = nd.alt;
     }
     return moved;
+}
+
+/// One render's rows, described by value before any becomes a GObject.
+/// Paths live in `arena`; `materialize` gives a row its own copy.
+const RowList = struct {
+    arena: std.mem.Allocator,
+    list: std.ArrayList(ItemData) = .empty,
+};
+
+/// A model item owning a copy of `row` (and of its path).
+fn materialize(row: *const ItemData) ?*c.GObject {
+    const d = row.allocator.create(ItemData) catch return null;
+    d.* = row.*;
+    if (row.path.len > 0) {
+        d.path = row.allocator.dupe(u8, row.path) catch {
+            row.allocator.destroy(d);
+            return null;
+        };
+    }
+    return newItem(d) orelse {
+        if (d.path.len > 0) row.allocator.free(d.path);
+        row.allocator.destroy(d);
+        return null;
+    };
 }
 
 fn appendEntryItem(
@@ -2068,32 +2102,22 @@ fn appendEntryItem(
     e: *Entry,
     depth: u32,
     alt: *bool,
-    items: *std.ArrayList(?*anyopaque),
+    rows: *RowList,
 ) void {
     var full_buf: [4096]u8 = undefined;
     const full = dir.fullPath(e.*, &full_buf) orelse return;
-    const d = self.allocator.create(ItemData) catch return;
-    d.* = .{
+    rows.list.append(rows.arena, .{
         .allocator = self.allocator,
         .tab = tab,
         .kind = .entry,
-        .path = self.allocator.dupe(u8, full) catch {
-            self.allocator.destroy(d);
-            return;
-        },
+        .path = rows.arena.dupe(u8, full) catch return,
         .dir = dir,
         .entry = e,
         .depth = @intCast(@min(depth, 64)),
         .is_dir = e.tdir,
         .alt = alt.*,
-    };
+    }) catch return;
     alt.* = !alt.*;
-    const obj = newItem(d) orelse {
-        self.allocator.free(d.path);
-        self.allocator.destroy(d);
-        return;
-    };
-    items.append(self.allocator, @ptrCast(obj)) catch c.g_object_unref(@as(?*anyopaque, @ptrCast(obj)));
 }
 
 fn buildDirItems(
@@ -2101,23 +2125,22 @@ fn buildDirItems(
     tab: *BTab,
     dir: *Dir,
     depth: u32,
-    items: *std.ArrayList(?*anyopaque),
+    rows: *RowList,
     alt: *bool,
 ) void {
     for (dir.entries.items) |*e| {
         if (!views.entryVisible(tab, e.*)) continue;
-        appendEntryItem(self, tab, dir, e, depth, alt, items);
+        appendEntryItem(self, tab, dir, e, depth, alt, rows);
         if (!e.tdir) continue;
         var buf: [4096]u8 = undefined;
         const child = dir.fullPath(e.*, &buf) orelse continue;
         const sub = tab.subdirByPath(child) orelse continue;
-        if (sub.loaded) buildDirItems(self, tab, sub, depth + 1, items, alt);
+        if (sub.loaded) buildDirItems(self, tab, sub, depth + 1, rows, alt);
     }
 }
 
-fn appendGroupItem(self: *BrowserView, tab: *BTab, g: grouping.Group, count: usize, items: *std.ArrayList(?*anyopaque)) void {
-    const d = self.allocator.create(ItemData) catch return;
-    d.* = .{
+fn appendGroupItem(self: *BrowserView, tab: *BTab, g: grouping.Group, count: usize, rows: *RowList) void {
+    var d: ItemData = .{
         .allocator = self.allocator,
         .tab = tab,
         .kind = .group,
@@ -2127,11 +2150,7 @@ fn appendGroupItem(self: *BrowserView, tab: *BTab, g: grouping.Group, count: usi
     _ = std.fmt.bufPrintSentinel(&d.group_label, "{s}", .{g.label()}, 0) catch {
         d.group_label[0] = 0;
     };
-    const obj = newItem(d) orelse {
-        self.allocator.destroy(d);
-        return;
-    };
-    items.append(self.allocator, @ptrCast(obj)) catch c.g_object_unref(@as(?*anyopaque, @ptrCast(obj)));
+    rows.list.append(rows.arena, d) catch {};
 }
 
 /// One group run of the root listing, for the header's count.
@@ -2141,7 +2160,7 @@ const GroupRun = struct { id: u64, count: usize };
 /// ROOT listing. Entries are already sorted by the bucket key, so a
 /// run ends exactly when the bucket id changes. Zebra parity resets
 /// at every header so the stripes stay in phase per group.
-fn buildGroupedItems(self: *BrowserView, tab: *BTab, items: *std.ArrayList(?*anyopaque)) void {
+fn buildGroupedItems(self: *BrowserView, tab: *BTab, rows: *RowList) void {
     const now_ms = profile.milliTimestamp();
     var runs: std.ArrayList(GroupRun) = .empty;
     defer runs.deinit(self.allocator);
@@ -2164,15 +2183,15 @@ fn buildGroupedItems(self: *BrowserView, tab: *BTab, items: *std.ArrayList(?*any
             last_id = g.id;
             const count = if (run < runs.items.len) runs.items[run].count else 0;
             run += 1;
-            appendGroupItem(self, tab, g, count, items);
+            appendGroupItem(self, tab, g, count, rows);
             alt = false;
         }
         if (views.groupCollapsed(tab, g.id)) continue;
-        appendEntryItem(self, tab, tab.root, e, 0, &alt, items);
+        appendEntryItem(self, tab, tab.root, e, 0, &alt, rows);
         if (e.tdir) {
             var buf: [4096]u8 = undefined;
             if (dirChildLoaded(tab, tab.root, e.*, &buf)) |sub|
-                buildDirItems(self, tab, sub, 1, items, &alt);
+                buildDirItems(self, tab, sub, 1, rows, &alt);
         }
     }
 }
