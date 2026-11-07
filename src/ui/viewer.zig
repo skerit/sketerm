@@ -76,7 +76,10 @@ pub const LoadResult = struct {
     }
 
     fn setError(self: *LoadResult, err: anyerror) void {
-        const text = @errorName(err);
+        self.setMessage(@errorName(err));
+    }
+
+    fn setMessage(self: *LoadResult, text: []const u8) void {
         self.message_len = @min(text.len, self.message.len);
         @memcpy(self.message[0..self.message_len], text[0..self.message_len]);
     }
@@ -598,21 +601,30 @@ fn fetchOn(work: *LoadWork, fs: *fsdrive.Fs, resource: model.Resource) !FetchPay
         try fs.startPreviewSized(resource.path, preview.codecs, preview.bound);
     if (quick_job) |quick| {
         // Best effort: a failed stand-in only means waiting for the real one.
-        if (fetchSidecar(fs, quick)) |bytes| deliverInterim(work, bytes) else |err| {
+        if (fetchSidecar(fs, quick, null)) |bytes| deliverInterim(work, bytes) else |err| {
             if (isTransportError(err)) return err;
         }
     }
-    const bytes = try fetchSidecar(fs, job);
+    const bytes = try fetchSidecar(fs, job, &work.result);
     var payload = FetchPayload{ .source_size = @intCast(source.size), .bytes = bytes };
     fetchMetadata(fs, resource, &payload);
     return payload;
 }
 
-/// Wait for a preview job and read (then release) its sidecar.
-fn fetchSidecar(fs: *fsdrive.Fs, job: u64) ![]u8 {
+/// Wait for a preview job and read (then release) its sidecar; a job
+/// that ends without one leaves the host's reason in `result`.
+fn fetchSidecar(fs: *fsdrive.Fs, job: u64, result: ?*LoadResult) ![]u8 {
     var event = try fs.waitJobTerminal(job, LOAD_TIMEOUT_MS);
     defer event.deinit();
-    if (!std.mem.eql(u8, event.ev, "done") or event.path.len == 0) return error.PreviewFailed;
+    if (!std.mem.eql(u8, event.ev, "done") or event.path.len == 0) {
+        if (result) |r| r.setMessage(if (event.message.len > 0)
+            event.message
+        else if (std.mem.eql(u8, event.ev, "done"))
+            "the host produced no preview image"
+        else
+            "the host's preview job failed");
+        return error.PreviewFailed;
+    }
     defer if (!event.keep) fs.unlink(event.path) catch {};
     return readAll(fs, event.path, PREVIEW_BYTES_MAX);
 }
@@ -654,10 +666,7 @@ fn deliverInterim(work: *LoadWork, bytes: []u8) void {
 fn fsError(work: *LoadWork, fs: *fsdrive.Fs, err: anyerror) anyerror {
     if (err == fsdrive.Error.FsOpFailed) {
         const why = fs.lastErr();
-        if (why.len > 0) {
-            work.result.message_len = @min(why.len, work.result.message.len);
-            @memcpy(work.result.message[0..work.result.message_len], why[0..work.result.message_len]);
-        }
+        if (why.len > 0) work.result.setMessage(why);
     }
     return err;
 }
@@ -2087,11 +2096,13 @@ fn onLoaded(user: ?*anyopaque, result: *LoadResult) void {
         localPreviewKind(resource)
     else
         .not_local;
-    // A local poster (video/audio/pdf) has no client-side decoder, so the
-    // full-resolution button would only ever error: hide it there.
+    // A poster (video/audio/pdf) has no client-side decoder, local OR
+    // remote: the full-resolution button would download the whole file
+    // only to fail decoding it as an image. Hide it there.
+    const poster = if (self.current()) |resource| posterOnly(resource.name()) else false;
     c.gtk_widget_set_visible(
         self.original_button,
-        @intFromBool(result.variant == .preview and local_kind != .poster_only),
+        @intFromBool(result.variant == .preview and !poster),
     );
     c.gtk_widget_set_sensitive(self.original_button, 1);
     self.updateAccessibleState();

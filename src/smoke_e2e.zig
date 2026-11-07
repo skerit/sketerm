@@ -968,7 +968,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (viewerReuseStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
         say("viewer reuse: stepping through a remote batch rode the connection the first load dialed");
         if (viewerRemoteImageStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
-        say("viewer remote images: a small original arrives at full resolution, a large one as a display-sized preview");
+        say("viewer remote images: a small original arrives at full resolution, a large one as a display-sized preview, PDFs as page-1 posters (a broken one says why)");
         teardown();
         return 0;
     }
@@ -8249,10 +8249,29 @@ fn viewerRemoteImageStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: 
         var prng = std.Random.DefaultPrng.init(7);
         prng.random().bytes(px[0 .. w2 * h2 * 3]);
         if (c.stbi_write_png(noise.ptr, @intCast(w2), @intCast(h2), 3, px.ptr, @intCast(w2 * 3)) == 0) return "viewer remote images: write noise.png";
+        // A one-page PDF: the viewer can only show its daemon poster.
+        var pdf_bytes: [2048]u8 = undefined;
+        const body = @import("util/minipdf.zig").build(&pdf_bytes);
+        var pdf_path: [600:0]u8 = undefined;
+        _ = std.fmt.bufPrintSentinel(&pdf_path, "{s}/doc.pdf", .{dir}, 0) catch return "viewer remote images: path";
+        const f = c.fopen(&pdf_path, "wb") orelse return "viewer remote images: create doc.pdf";
+        const ok = c.fwrite(body.ptr, 1, body.len, f) == body.len;
+        _ = c.fclose(f);
+        if (!ok) return "viewer remote images: write doc.pdf";
+        // Named like a PDF, not one (a macOS "._" AppleDouble sidecar).
+        var bad_path: [600:0]u8 = undefined;
+        _ = std.fmt.bufPrintSentinel(&bad_path, "{s}/._doc.pdf", .{dir}, 0) catch return "viewer remote images: path";
+        const bf = c.fopen(&bad_path, "wb") orelse return "viewer remote images: create ._doc.pdf";
+        const bad_ok = c.fwrite("\x00\x05\x16\x07\x00\x02\x00\x00Mac OS X        ", 1, 24, bf) == 24;
+        _ = c.fclose(bf);
+        if (!bad_ok) return "viewer remote images: write ._doc.pdf";
     }
-    var specs: [2][600:0]u8 = undefined;
+    var specs: [5][600:0]u8 = undefined;
     _ = std.fmt.bufPrintSentinel(&specs[0], "localhost:{s}", .{flat}, 0) catch return "viewer remote images: spec";
     _ = std.fmt.bufPrintSentinel(&specs[1], "localhost:{s}", .{noise}, 0) catch return "viewer remote images: spec";
+    _ = std.fmt.bufPrintSentinel(&specs[2], "localhost:{s}/doc.pdf", .{dir}, 0) catch return "viewer remote images: spec";
+    _ = std.fmt.bufPrintSentinel(&specs[3], "{s}/doc.pdf", .{dir}, 0) catch return "viewer remote images: spec";
+    _ = std.fmt.bufPrintSentinel(&specs[4], "localhost:{s}/._doc.pdf", .{dir}, 0) catch return "viewer remote images: spec";
 
     _ = app.drainLive(2_000);
     var known: [32]u32 = undefined;
@@ -8272,7 +8291,7 @@ fn viewerRemoteImageStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: 
         _ = unsetEnv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
-        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "view", &specs[0], &specs[1], null };
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "view", &specs[0], &specs[1], &specs[2], &specs[3], &specs[4], null };
         _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
@@ -8298,6 +8317,28 @@ fn viewerRemoteImageStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: 
         return viewerWhy("viewer remote images: the large remote image did not arrive as a display-sized preview");
     }
     viewerShot(allocator, app, vwin, "viewer-remote-noise");
+    if (!@import("util/pathz.zig").executableOnPath("pdftoppm")) {
+        say("viewer pdf: pdftoppm unavailable; skipping the PDF poster checks");
+        return null;
+    }
+    // PDF posters, over the link and from the local disk: pdftoppm's
+    // page 1 at the legacy 512 px bound (200x140 pt -> 512 x 359).
+    const pdf_steps = [_][*:0]const u8{ "viewer-remote-pdf", "viewer-local-pdf" };
+    for (pdf_steps) |tag| {
+        app.pressKey(vwin, "Right") catch return "viewer pdf: injecting Right failed";
+        if (!viewerWaitOcr(allocator, app, vwin, "Preview 512 x 359", 40_000)) {
+            viewerShot(allocator, app, vwin, tag);
+            return viewerWhy("viewer pdf: the PDF's page-1 poster was not shown");
+        }
+        viewerShot(allocator, app, vwin, tag);
+    }
+    // A PDF the host cannot render says WHY, not "PreviewFailed".
+    app.pressKey(vwin, "Right") catch return "viewer pdf: injecting Right failed";
+    if (!viewerWaitOcr(allocator, app, vwin, "pdftoppm failed", 40_000)) {
+        viewerShot(allocator, app, vwin, "viewer-broken-pdf");
+        return viewerWhy("viewer pdf: a broken PDF did not report the host's pdftoppm error");
+    }
+    viewerShot(allocator, app, vwin, "viewer-broken-pdf");
     return null;
 }
 
