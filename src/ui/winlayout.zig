@@ -69,6 +69,71 @@ pub fn splitRatioOf(paned: *c.GtkWidget) ?f32 {
     return @floatCast(ctx.tracker.ratio);
 }
 
+/// One split's live geometry, as the `split-geometry` verification
+/// command reports it.
+pub const SplitGeometry = struct {
+    vertical: bool,
+    ratio: f32,
+    position: c_int,
+    /// Allocated extents of the start and end children along the split.
+    start: c_int,
+    end: c_int,
+    /// Centre of the handle in the window surface's coordinates (what a
+    /// pointer on that surface reports), for driving a drag.
+    handle_x: f64,
+    handle_y: f64,
+};
+
+/// The splits of `pane`'s tab, depth-first, into `out`. @return how many.
+pub fn splitGeometry(self: *Window, pane: *Pane, out: []SplitGeometry) usize {
+    const page = winmod.tabPageForPane(self, pane) orelse return 0;
+    const tree = Window.tabTreeOf(page) orelse return 0;
+    const Collect = struct {
+        out: []SplitGeometry,
+        n: usize = 0,
+        fn visit(ctx: *@This(), sp: *PaneTree.Split) void {
+            if (ctx.n == ctx.out.len) return;
+            const v = sp.view orelse return;
+            const paned: *c.GtkWidget = @ptrCast(@alignCast(v));
+            const vertical = sp.orientation == .vertical;
+            const pos = c.gtk_paned_get_position(@ptrCast(paned));
+            const w: f32 = @floatFromInt(c.gtk_widget_get_width(paned));
+            const h: f32 = @floatFromInt(c.gtk_widget_get_height(paned));
+            const local: c.graphene_point_t = if (vertical)
+                .{ .x = w / 2, .y = @floatFromInt(pos) }
+            else
+                .{ .x = @floatFromInt(pos), .y = h / 2 };
+            var at: c.graphene_point_t = local;
+            var sx: f64 = 0;
+            var sy: f64 = 0;
+            if (c.gtk_widget_get_native(paned)) |native| {
+                _ = c.gtk_widget_compute_point(paned, @ptrCast(@alignCast(native)), &local, &at);
+                c.gtk_native_get_surface_transform(native, &sx, &sy);
+            }
+            // The handle starts where the start child ends; a few pixels
+            // in lands on it whatever its width.
+            const nudge: f64 = 2;
+            ctx.out[ctx.n] = .{
+                .vertical = vertical,
+                .ratio = splitRatioOf(paned) orelse sp.ratio,
+                .position = pos,
+                .start = extentOf(c.gtk_paned_get_start_child(@ptrCast(paned)), vertical),
+                .end = extentOf(c.gtk_paned_get_end_child(@ptrCast(paned)), vertical),
+                .handle_x = sx + at.x + (if (vertical) 0 else nudge),
+                .handle_y = sy + at.y + (if (vertical) nudge else 0),
+            };
+            ctx.n += 1;
+        }
+        fn extentOf(w: ?*c.GtkWidget, vertical: bool) c_int {
+            const x = w orelse return 0;
+            return if (vertical) c.gtk_widget_get_height(x) else c.gtk_widget_get_width(x);
+        }
+    };
+    var col: Collect = .{ .out = out };
+    tree.forEachSplit(&col, Collect.visit);
+    return col.n;
+}
+
 
 /// Spawn a new tab from a layout TabSpec (used on --restore). `at_end`
 /// forces an append so a multi-tab restore keeps its saved order.

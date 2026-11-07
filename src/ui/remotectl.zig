@@ -871,6 +871,16 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         try ipc_protocol.writeOk(out, allocator, "created", .{
             .pane = next_pane_id - 1,
         });
+    } else if (eql(u8, req.cmd, "split-geometry")) {
+        // Verification hook for smoke rigs: the live divider geometry
+        // of the addressed pane's tab.
+        if (c.getenv("SKETERM_VERIFY_TREE") == null)
+            return ipc_protocol.writeErr(out, allocator, .unavailable, "split geometry is reported only under SKETERM_VERIFY_TREE");
+        const pane = reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
+        const winlayout = @import("winlayout.zig");
+        var buf: [32]winlayout.SplitGeometry = undefined;
+        const n = winlayout.splitGeometry(ownerWindow(self, pane), pane, &buf);
+        try ipc_protocol.writeOk(out, allocator, "splits", buf[0..n]);
     } else if (eql(u8, req.cmd, "focus")) {
         if (req.pane != null or req.session != null) {
             const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");

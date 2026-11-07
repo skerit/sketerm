@@ -725,6 +725,20 @@ pub fn build(b: *std.Build) void {
     const smoke_agents_step = b.step("smoke-agents-gui", "Sub-agent titlebar chip, tab badge and popover on the real GUI, once per colour theme (headless, no X)");
     smoke_agents_step.dependOn(&smoke_agents_run.step);
 
+    // Split-ratio smoke — `zig build smoke-split`. A split keeps its
+    // fraction through resizes, a drag and a min-size squeeze at scale
+    // 1.3 (src/smoke_split.zig).
+    const smoke_split_mod = dev.module(b, target, "src/smoke_split.zig");
+    configureSysDeps(b, smoke_split_mod, cbindings_mod);
+    smoke_split_mod.addImport("build_options", dev.glib_opts);
+    addVideo(b, smoke_split_mod);
+    const smoke_split = dev.executable(b, "sketerm-smoke-split", smoke_split_mod);
+    const smoke_split_run = b.addRunArtifact(smoke_split);
+    dev_bins.drive(smoke_split_run, &.{ dev_bins.gui, dev_bins.mux });
+    smoke_split_run.setCwd(b.path("."));
+    const smoke_split_step = b.step("smoke-split", "A pane split keeps its proportions through resizes, a drag and a squeeze at fractional scale (headless, no X)");
+    smoke_split_step.dependOn(&smoke_split_run.step);
+
     // AT-SPI accessibility smoke — `zig build smoke-atspi` (Linux).
     // Same self-hosted rig as smoke-e2e, PLUS a private accessibility
     // bus (dbus-daemon + at-spi2-registryd via mux/a11yhub.zig): the
