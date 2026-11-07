@@ -599,6 +599,27 @@ pub fn build(b: *std.Build) void {
     const bench_ed_step = b.step("bench-editor", "Editor rope/document large-file benchmark");
     bench_ed_step.dependOn(&bench_ed_run.step);
 
+    // Image preview transport benchmark — `zig build bench-preview -- <image>...`.
+    // Core dependency set: it times the daemon's own (libc + stb) stages.
+    const bench_pv_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_preview.zig"),
+        .target = target,
+        .optimize = Optimize.ReleaseFast,
+        .link_libc = true,
+    });
+    configureCoreDeps(b, bench_pv_mod, core_cbindings_mod);
+    bench_pv_mod.addImport("build_options", noglib_opts_mod);
+    addVideo(b, bench_pv_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
+    const bench_pv = b.addExecutable(.{
+        .name = "sketerm-bench-preview",
+        .root_module = bench_pv_mod,
+        .use_lld = use_lld,
+    });
+    const bench_pv_run = b.addRunArtifact(bench_pv);
+    compat.passthruArgs(bench_pv_run);
+    const bench_pv_step = b.step("bench-preview", "Image preview stage timings and sizes per bound and codec");
+    bench_pv_step.dependOn(&bench_pv_run.step);
+
     // The headless GL harnesses below (smoke-image, smoke-cell,
     // bench-cell-upload, smoke-transparency, smoke-gl-core) drive GL
     // through EGL surfaceless contexts — there is no EGL on macOS, so
