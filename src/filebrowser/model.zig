@@ -169,9 +169,8 @@ pub const Column = enum {
 /// free-form text, so it gets one generous ellipsized slot.
 pub const ATTR_COLUMN_WIDTH: i32 = 172;
 
-/// Narrowest a column may be dragged: below this the header title is
-/// nothing but an ellipsis.
-pub const MIN_COLUMN_WIDTH: i32 = 40;
+/// Narrowest a column may be dragged (one home: colfit.zig).
+pub const MIN_COLUMN_WIDTH: i32 = @import("colfit.zig").MIN_COLUMN_WIDTH;
 
 pub const default_columns = [_]Column{ .permissions, .size, .mtime };
 

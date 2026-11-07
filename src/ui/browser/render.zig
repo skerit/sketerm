@@ -5,6 +5,7 @@
 const std = @import("std");
 const c = @import("../../c.zig").c;
 const browser_model = @import("../../filebrowser/model.zig");
+const colfit = @import("../../filebrowser/colfit.zig");
 const clock = @import("../../util/clock.zig");
 const search_job = @import("../../mux/jobs/search.zig");
 const grouping = @import("../../filebrowser/grouping.zig");
@@ -561,7 +562,7 @@ pub const ColumnRef = union(enum) {
 };
 
 /// Below this a dragged Name column is nothing but an icon stub.
-pub const MIN_NAME_WIDTH: i32 = 80;
+pub const MIN_NAME_WIDTH: i32 = colfit.MIN_NAME_WIDTH;
 
 /// The width of a column when the user has never dragged it.
 pub fn defaultColumnWidth(ref: ColumnRef) i32 {
@@ -590,19 +591,21 @@ pub fn columnWidthOf(tab: *BTab, ref: ColumnRef) i32 {
     };
     if (stored <= 0) return defaultColumnWidth(ref);
     if (ref == .name) return @max(stored, MIN_NAME_WIDTH);
-    return @max(stored, browser_model.MIN_COLUMN_WIDTH);
+    return colfit.clampStored(stored);
 }
 
-/// Record a dragged width. Growing the extra-column list here is what
-/// lets it stay shorter than `attr_columns` until someone drags.
+/// Record a dragged (or restored) width. Growing the extra-column list
+/// here is what lets it stay shorter than `attr_columns` until someone
+/// drags. Non-Name widths are bounded here, so no source -- a drag, a
+/// state file from an older build -- can store an absurd one.
 pub fn setColumnWidth(tab: *BTab, ref: ColumnRef, width: i32) void {
     switch (ref) {
         .name => tab.name_width = @max(width, MIN_NAME_WIDTH),
-        .fixed => |col| tab.col_widths.set(col, @max(width, browser_model.MIN_COLUMN_WIDTH)),
+        .fixed => |col| tab.col_widths.set(col, colfit.clampStored(@max(width, colfit.MIN_COLUMN_WIDTH))),
         .attr => |i| {
             while (tab.attr_col_widths.items.len <= i)
                 tab.attr_col_widths.append(tab.view.allocator, 0) catch return;
-            tab.attr_col_widths.items[i] = @max(width, browser_model.MIN_COLUMN_WIDTH);
+            tab.attr_col_widths.items[i] = colfit.clampStored(@max(width, colfit.MIN_COLUMN_WIDTH));
         },
     }
 }

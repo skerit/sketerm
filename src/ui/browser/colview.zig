@@ -29,6 +29,7 @@ const dnd = @import("dnd.zig");
 const cssutil = @import("../cssutil.zig");
 const profile = @import("../../util/profile.zig");
 const render_mod = @import("render.zig");
+const colfit = @import("../../filebrowser/colfit.zig");
 const selection = @import("selection.zig");
 const views = @import("views.zig");
 
@@ -653,12 +654,25 @@ fn onColumnWidthChanged(obj: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) ca
     const tab = ctx.tab;
     if (tab.col_syncing or tab.rendering) return;
     const width = c.gtk_column_view_column_get_fixed_width(@ptrCast(@alignCast(obj)));
-    if (width <= 0) {
+    // -1 is GTK's double-click reset; 0 is a drag pushed past the
+    // column's left edge (gtkcolumnview.c clamps it there), which
+    // setColumnWidth raises to the minimum rather than a reset.
+    if (width < 0) {
         render_mod.resetColumnWidth(tab, ctx.ref);
     } else {
-        render_mod.setColumnWidth(tab, ctx.ref, width);
+        // GtkColumnView's edge autoscroll widens a grip-dragged column
+        // on EVERY frame the pointer rests near the view's edge, pointer
+        // still (gtkcolumnview.c autoscroll_cb). Keep only what this
+        // viewport can show beside a usable Name column.
+        render_mod.setColumnWidth(tab, ctx.ref, @min(width, dragCap(tab, ctx.ref)));
     }
-    if (ctx.ref == .name) applyExpandPolicy(tab);
+    // Re-apply at once: the clamp must reach GTK mid-drag, a reset must
+    // land on the default (GTK's own -1 sizes the column by content),
+    // and the other columns refit around the new width.
+    tab.col_syncing = true;
+    applyWidths(tab);
+    applyExpandPolicy(tab);
+    tab.col_syncing = false;
     // Debounced: a drag emits one notify per frame.
     if (tab.width_save_src != 0) _ = c.g_source_remove(tab.width_save_src);
     tab.width_save_src = c.g_timeout_add(400, @ptrCast(&onWidthSaveTick), @ptrCast(tab));
@@ -727,27 +741,50 @@ fn applyExpandPolicy(tab: *BTab) void {
     }
 }
 
-/// Room the OTHER columns claim, in pixels. Their widths are all
-/// explicit (a dragged one or the type's default), so this is exact
-/// rather than a measurement.
-fn otherColumnsWidth(tab: *BTab) c_int {
-    const cols = c.gtk_column_view_get_columns(tab.colview);
-    const n = c.g_list_model_get_n_items(cols);
-    var total: c_int = 0;
-    var i: c.guint = 0;
-    while (i < n) : (i += 1) {
-        const obj = c.g_list_model_get_item(cols, i) orelse continue;
-        defer c.g_object_unref(obj);
-        const code = @intFromPtr(c.g_object_get_data(@ptrCast(@alignCast(obj)), "sketerm-colref"));
-        const ref = colRefFromCode(code) orelse continue;
-        if (ref == .name) continue;
-        total += render_mod.columnWidthOf(tab, ref);
-    }
-    return total;
-}
+/// Up to this many columns take part in the width fit.
+const MAX_FIT_COLUMNS = 64;
 
-/// The Name width to actually apply: -1 means "auto, take what is
-/// left".
+/// The widths the non-Name columns actually get in the current
+/// viewport (colfit.fit), in column order.
+const Fitted = struct {
+    n: usize = 0,
+    refs: [MAX_FIT_COLUMNS]ColumnRef = undefined,
+    widths: [MAX_FIT_COLUMNS]i32 = undefined,
+
+    fn of(tab: *BTab) Fitted {
+        var f: Fitted = .{};
+        var wants: [MAX_FIT_COLUMNS]colfit.Want = undefined;
+        const cols = c.gtk_column_view_get_columns(tab.colview);
+        const n = c.g_list_model_get_n_items(cols);
+        var i: c.guint = 0;
+        while (i < n and f.n < MAX_FIT_COLUMNS) : (i += 1) {
+            const obj = c.g_list_model_get_item(cols, i) orelse continue;
+            defer c.g_object_unref(obj);
+            const code = @intFromPtr(c.g_object_get_data(@ptrCast(@alignCast(obj)), "sketerm-colref"));
+            const ref = colRefFromCode(code) orelse continue;
+            if (ref == .name) continue;
+            f.refs[f.n] = ref;
+            wants[f.n] = .{ .pref = render_mod.columnWidthOf(tab, ref), .default = render_mod.defaultColumnWidth(ref) };
+            f.n += 1;
+        }
+        colfit.fit(c.gtk_widget_get_width(tab.scroller), wants[0..f.n], f.widths[0..f.n]);
+        return f;
+    }
+
+    fn widthOf(self: *const Fitted, ref: ColumnRef) ?i32 {
+        for (self.refs[0..self.n], self.widths[0..self.n]) |r, w| if (std.meta.eql(r, ref)) return w;
+        return null;
+    }
+
+    fn total(self: *const Fitted) c_int {
+        var sum: c_int = 0;
+        for (self.widths[0..self.n]) |w| sum += w;
+        return sum;
+    }
+};
+
+/// The Name width to actually apply beside `others` px of other
+/// columns: -1 means "auto, take what is left".
 ///
 /// A dragged width is a PREFERENCE, never a floor. Splitting a pane
 /// halves the listing, and honouring a width measured in the old,
@@ -755,20 +792,41 @@ fn otherColumnsWidth(tab: *BTab) c_int {
 /// a horizontal scrollbar. So the stored width is clamped to the room
 /// this viewport actually has; widening the pane again restores it,
 /// because the stored value is never rewritten from here.
-fn fittedNameWidth(tab: *BTab) c_int {
+fn nameWidthBeside(tab: *BTab, others: c_int) c_int {
     if (tab.name_width <= 0) return -1;
     const avail = c.gtk_widget_get_width(tab.scroller);
     // Before the first allocation there is nothing to fit against.
     if (avail <= 0) return tab.name_width;
-    const room = avail - otherColumnsWidth(tab);
+    const room = avail - others;
     if (room < render_mod.MIN_NAME_WIDTH) return -1;
     return @min(tab.name_width, room);
 }
 
+fn fittedNameWidth(tab: *BTab) c_int {
+    const f = Fitted.of(tab);
+    return nameWidthBeside(tab, f.total());
+}
+
+/// The widest a grip drag may make `ref` in the current viewport.
+fn dragCap(tab: *BTab, ref: ColumnRef) i32 {
+    const avail = c.gtk_widget_get_width(tab.scroller);
+    if (avail <= 0) return std.math.maxInt(i32);
+    const f = Fitted.of(tab);
+    if (ref == .name) return @max(avail - f.total(), render_mod.MIN_NAME_WIDTH);
+    // Against the others' PREFERENCES: capping there makes the fit hand
+    // this column exactly the cap, so the grip stays under the pointer.
+    var others: i32 = 0;
+    for (f.refs[0..f.n]) |r| {
+        if (!std.meta.eql(r, ref)) others += render_mod.columnWidthOf(tab, r);
+    }
+    return colfit.dragCap(avail, others, render_mod.defaultColumnWidth(ref));
+}
+
 fn applyWidths(tab: *BTab) void {
+    const f = Fitted.of(tab);
+    const name_want = nameWidthBeside(tab, f.total());
     const cols = c.gtk_column_view_get_columns(tab.colview);
     const n = c.g_list_model_get_n_items(cols);
-    const name_want = fittedNameWidth(tab);
     var i: c.guint = 0;
     while (i < n) : (i += 1) {
         const obj = c.g_list_model_get_item(cols, i) orelse continue;
@@ -779,7 +837,7 @@ fn applyWidths(tab: *BTab) void {
         const want: c_int = switch (ref) {
             // Auto: the expand column takes the leftover.
             .name => name_want,
-            else => render_mod.columnWidthOf(tab, ref),
+            else => f.widthOf(ref) orelse render_mod.columnWidthOf(tab, ref),
         };
         if (c.gtk_column_view_column_get_fixed_width(col) != want)
             c.gtk_column_view_column_set_fixed_width(col, want);
@@ -796,9 +854,9 @@ pub fn installWidthFit(tab: *BTab) void {
 
 fn onViewportWidthChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
     const tab = cast.userData(BTab, user);
-    // Only an explicit Name width can ever need re-fitting; an auto
-    // one is GTK's own leftover and already correct.
-    if (tab.name_width <= 0 or tab.width_fit_src != 0) return;
+    // Any stored width can need re-fitting: Name's against the room,
+    // the others' so Name keeps its minimum (colfit.fit).
+    if (tab.width_fit_src != 0) return;
     tab.width_fit_src = c.g_idle_add(@ptrCast(&onWidthFitTick), @ptrCast(tab));
 }
 
@@ -814,6 +872,89 @@ fn onWidthFitTick(user: ?*anyopaque) callconv(.c) c.gboolean {
     applyWidths(tab);
     applyExpandPolicy(tab);
     return 0;
+}
+
+/// One details column's live geometry, as the `browser-columns`
+/// verification command reports it.
+pub const ColumnGeometry = struct {
+    title: []const u8,
+    /// GTK's fixed-width (-1 = sized by content / expand).
+    fixed_width: c_int,
+    expand: bool,
+    /// Width the tab state records for the column (0 = default/auto).
+    stored: i32,
+    /// Allocated header extent in the window surface's coordinates.
+    x: f64,
+    width: f64,
+    /// Vertical centre of the header row, same coordinates.
+    y: f64,
+};
+
+fn collectTitles(w: *c.GtkWidget, out: []*c.GtkWidget, n: *usize) void {
+    const tn = std.mem.span(c.g_type_name_from_instance(@ptrCast(@alignCast(w))));
+    if (std.mem.eql(u8, tn, "GtkColumnViewTitle")) {
+        if (n.* < out.len) out[n.*] = w;
+        n.* += 1;
+        return;
+    }
+    var child = c.gtk_widget_get_first_child(w);
+    while (child) |ch| : (child = c.gtk_widget_get_next_sibling(ch)) {
+        // The rows below the header hold no titles; skip the listview.
+        if (c.g_type_check_instance_is_a(@ptrCast(@alignCast(ch)), c.gtk_list_view_get_type()) != 0) continue;
+        collectTitles(ch, out, n);
+    }
+}
+
+/// The current columns of `tab`, left to right, into `out`.
+/// @return how many were written.
+pub fn columnGeometry(tab: *BTab, out: []ColumnGeometry) usize {
+    var titles: [64]*c.GtkWidget = undefined;
+    var n_titles: usize = 0;
+    collectTitles(@ptrCast(@alignCast(tab.colview)), &titles, &n_titles);
+    const native = c.gtk_widget_get_native(@ptrCast(@alignCast(tab.colview)));
+    var sx: f64 = 0;
+    var sy: f64 = 0;
+    if (native) |nat| c.gtk_native_get_surface_transform(nat, &sx, &sy);
+    const cols = c.gtk_column_view_get_columns(tab.colview);
+    const n = c.g_list_model_get_n_items(cols);
+    var written: usize = 0;
+    var i: c.guint = 0;
+    while (i < n and written < out.len) : (i += 1) {
+        const obj = c.g_list_model_get_item(cols, i) orelse continue;
+        defer c.g_object_unref(obj);
+        const col: *c.GtkColumnViewColumn = @ptrCast(@alignCast(obj));
+        const code = @intFromPtr(c.g_object_get_data(@ptrCast(@alignCast(col)), "sketerm-colref"));
+        const ref = colRefFromCode(code) orelse continue;
+        const title: []const u8 = switch (ref) {
+            .name => "Name",
+            .fixed => |fc| std.mem.span(fc.title()),
+            .attr => |ai| if (ai < tab.attr_columns.items.len) tab.attr_columns.items[ai] else "?",
+        };
+        var g: ColumnGeometry = .{
+            .title = title,
+            .fixed_width = c.gtk_column_view_column_get_fixed_width(col),
+            .expand = c.gtk_column_view_column_get_expand(col) != 0,
+            .stored = switch (ref) {
+                .name => tab.name_width,
+                .fixed => |fc| tab.col_widths.get(fc),
+                .attr => |ai| if (ai < tab.attr_col_widths.items.len) tab.attr_col_widths.items[ai] else 0,
+            },
+            .x = 0,
+            .width = 0,
+            .y = 0,
+        };
+        if (i < n_titles) if (native) |nat| {
+            var b: c.graphene_rect_t = undefined;
+            if (c.gtk_widget_compute_bounds(titles[i], @ptrCast(@alignCast(nat)), &b) != 0) {
+                g.x = sx + b.origin.x;
+                g.width = b.size.width;
+                g.y = sy + b.origin.y + b.size.height / 2;
+            }
+        };
+        out[written] = g;
+        written += 1;
+    }
+    return written;
 }
 
 /// Point GTK's header arrows at the tab's current sort.

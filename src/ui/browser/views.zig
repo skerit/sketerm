@@ -560,7 +560,7 @@ pub fn applyFolderMemory(self: *BrowserView, tab: *BTab) void {
     tab.dirs_first = rec.dirs_first;
     tab.vs.grouped = rec.grouped;
     tab.vs.zoom = @min(rec.zoom, ZOOM_STEPS.len - 1);
-    tab.name_width = rec.name_width;
+    tab.name_width = if (rec.name_width > 0) @max(rec.name_width, @import("render.zig").MIN_NAME_WIDTH) else 0;
     // Widths are positional against rec.columns; a navigation reuses
     // the tab, so widths from the previous folder must not bleed into
     // this one. Neither may its column SET: an empty record means the
@@ -576,7 +576,7 @@ pub fn applyFolderMemory(self: *BrowserView, tab: *BTab) void {
     for (rec.columns) |col| tab.columns.insert(col);
     for (rec.columns, 0..) |col, i| {
         if (i >= rec.col_widths.len) break;
-        if (rec.col_widths[i] > 0) tab.col_widths.set(col, rec.col_widths[i]);
+        if (rec.col_widths[i] > 0) @import("render.zig").setColumnWidth(tab, .{ .fixed = col }, rec.col_widths[i]);
     }
 }
 
