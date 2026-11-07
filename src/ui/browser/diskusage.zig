@@ -67,7 +67,12 @@ pub const State = struct {
     allocated_check: *c.GtkCheckButton = undefined,
     apparent_check: *c.GtkCheckButton = undefined,
     chart: *c.GtkWidget = undefined,
+    /// Children of `current` by `metric`, largest first. Rebuilt only when
+    /// `children_gen` no longer matches the model (null: the folder or the
+    /// metric changed): a scan of every node per redraw made each hover
+    /// over the chart cost milliseconds at the scanner's 75k-node cap.
     children: std.ArrayList(usize) = .empty,
+    children_gen: ?u64 = null,
     hits: std.ArrayList(Hit) = .empty,
     hovered: ?usize = null,
     scroller: *c.GtkWidget = undefined,
@@ -88,6 +93,9 @@ pub const State = struct {
     external_renders: u64 = 0,
     rows_built: u64 = 0,
     rows_dropped: u64 = 0,
+    /// Child-list rebuilds and chart draws (`browser-usage`).
+    scans: u64 = 0,
+    draws: u64 = 0,
 
     fn free(user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(State, user);
@@ -120,10 +128,17 @@ pub const State = struct {
     pub fn render(self: *State) void {
         if (self.tab.view.widgets_dead) return;
         self.renders += 1;
-        self.model.directChildren(self.current, self.metric, &self.children) catch return;
+        self.refreshChildren() catch return;
         renderHeader(self);
         syncRows(self);
         c.gtk_widget_queue_draw(self.chart);
+    }
+
+    fn refreshChildren(self: *State) !void {
+        if (self.children_gen == self.model.generation) return;
+        try self.model.directChildren(self.current, self.metric, &self.children);
+        self.children_gen = self.model.generation;
+        self.scans += 1;
     }
 
     fn displayedTotal(self: *const State) u64 {
@@ -158,6 +173,7 @@ pub const State = struct {
         self.allocator.free(self.current);
         self.current = fresh;
         self.hovered = null;
+        self.children_gen = null;
         self.render();
         if (vadj) |a| {
             // The rows just changed but are not laid out yet, so the
@@ -959,6 +975,7 @@ fn onMetricToggled(button: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) vo
     if (c.gtk_check_button_get_active(button) == 0) return;
     const self = cast.userData(State, user);
     self.metric = if (button == self.apparent_check) .apparent else .allocated;
+    self.children_gen = null;
     self.render();
 }
 
@@ -1032,7 +1049,8 @@ const PALETTE = [_][3]f64{
 fn drawChart(area: *c.GtkDrawingArea, cr: *c.cairo_t, width: c_int, height: c_int, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(State, user);
     self.hits.clearRetainingCapacity();
-    self.model.directChildren(self.current, self.metric, &self.children) catch return;
+    self.draws += 1;
+    self.refreshChildren() catch return;
     const direct_count = @min(self.children.items.len, MAX_TILES - 1);
     var items: [MAX_TILES]model_mod.TreemapItem = undefined;
     var count: usize = 0;
@@ -1142,6 +1160,13 @@ pub const UsageReport = struct {
     external_renders: u64,
     rows_built: u64,
     rows_dropped: u64,
+    scans: u64,
+    draws: u64,
+    /// The treemap's box in surface coordinates (zero until laid out).
+    chart_x: f64 = 0,
+    chart_y: f64 = 0,
+    chart_w: f64 = 0,
+    chart_h: f64 = 0,
     rows: []UsageRow,
 };
 
@@ -1171,6 +1196,8 @@ pub fn report(tab: *BTab, out: []UsageRow) ?UsageReport {
         .external_renders = self.external_renders,
         .rows_built = self.rows_built,
         .rows_dropped = self.rows_dropped,
+        .scans = self.scans,
+        .draws = self.draws,
         .rows = out[0..0],
     };
     if (c.gtk_list_box_get_selected_row(self.listbox)) |row| rep.selected = rowPath(self, @ptrCast(@alignCast(row)));
@@ -1187,6 +1214,13 @@ pub fn report(tab: *BTab, out: []UsageRow) ?UsageReport {
     var sy: f64 = 0;
     c.gtk_native_get_surface_transform(native, &sx, &sy);
     var vb: c.graphene_rect_t = undefined;
+    var cb: c.graphene_rect_t = undefined;
+    if (c.gtk_widget_compute_bounds(self.chart, nat, &cb) != 0) {
+        rep.chart_x = sx + cb.origin.x;
+        rep.chart_y = sy + cb.origin.y;
+        rep.chart_w = cb.size.width;
+        rep.chart_h = cb.size.height;
+    }
     const have_viewport = c.gtk_widget_compute_bounds(self.scroller, nat, &vb) != 0;
     var n: usize = 0;
     var child = c.gtk_widget_get_first_child(lb);

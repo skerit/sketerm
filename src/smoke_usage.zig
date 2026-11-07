@@ -122,6 +122,12 @@ const Usage = struct {
     rows_built: u64 = 0,
     rows_dropped: u64 = 0,
     nodes: u64 = 0,
+    scans: u64 = 0,
+    draws: u64 = 0,
+    chart_x: f64 = 0,
+    chart_y: f64 = 0,
+    chart_w: f64 = 0,
+    chart_h: f64 = 0,
     rows: []Row = &.{},
 };
 const Reply = struct { ok: bool = false, usage: Usage = .{} };
@@ -247,6 +253,30 @@ fn selectStage(app: *appdrive.App, label: []const u8, skip: usize) ?[]const u8 {
     defer s2.deinit();
     savePng(app, "selected");
     return unchurned(s1.value.usage, s2.value.usage, path);
+}
+
+/// Sweep the pointer over the treemap: every hover change redraws it,
+/// and none of those redraws may rebuild the child list (each rebuild is
+/// a pass over every result node).
+fn hoverStage(app: *appdrive.App) ?[]const u8 {
+    const s0 = usage(app, "before hovering the chart") orelse return "no report";
+    defer s0.deinit();
+    const before = s0.value.usage;
+    if (before.chart_w < 50 or before.chart_h < 50) return "the chart has no size";
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        const fx = 0.1 + 0.8 * @as(f64, @floatFromInt(i % 4)) / 3.0;
+        const fy = 0.15 + 0.7 * @as(f64, @floatFromInt(i / 4)) / 2.0;
+        _ = app.moveMouse(g_win, before.chart_x + before.chart_w * fx, before.chart_y + before.chart_h * fy) catch return "pointer motion failed";
+        pumpFor(app, 120);
+    }
+    const s1 = usage(app, "after hovering the chart") orelse return "no report after hovering";
+    defer s1.deinit();
+    const after = s1.value.usage;
+    say("hover: {d} chart draws, {d} child-list scans (was {d} draws, {d} scans)", .{ after.draws, after.scans, before.draws, before.scans });
+    if (after.draws < before.draws + 3) return "hovering did not redraw the chart: the stage exercised nothing";
+    if (after.scans != before.scans) return "a hover redraw rebuilt the child list";
+    return null;
 }
 
 fn scrollDown(app: *appdrive.App, x: f64, y: f64, min_scroll: f64) bool {
@@ -498,6 +528,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (u.n_rows < DIRS + FILES) return fail("only {d} result rows", .{u.n_rows});
         if (u.rows.len < 5) return fail("only {d} rows on screen", .{u.rows.len});
     }
+    if (hoverStage(app)) |why| return fail("hovering the chart: {s}", .{why});
 
     if (selectStage(app, "select at the top", 2)) |why| return fail("selection at the top: {s} (zig-out/smoke-usage-selected.png)", .{why});
     {

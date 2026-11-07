@@ -38,6 +38,8 @@ pub const Model = struct {
     allocator: std.mem.Allocator,
     nodes: std.ArrayList(Node) = .empty,
     by_path: std.StringHashMapUnmanaged(usize) = .empty,
+    /// Bumped by every change, so a view can tell its derived lists are stale.
+    generation: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Model {
         return .{ .allocator = allocator };
@@ -53,9 +55,11 @@ pub const Model = struct {
         for (self.nodes.items) |node| self.allocator.free(node.path);
         self.nodes.clearRetainingCapacity();
         self.by_path.clearRetainingCapacity();
+        self.generation +%= 1;
     }
 
     pub fn upsert(self: *Model, wire: WireNode) !usize {
+        self.generation +%= 1;
         if (self.by_path.get(wire.path)) |index| {
             const path = self.nodes.items[index].path;
             self.nodes.items[index] = fromWire(path, wire);
