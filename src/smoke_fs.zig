@@ -21,6 +21,7 @@ const imagecodec = @import("util/imagecodec.zig");
 const pathz = @import("util/pathz.zig");
 const reload = @import("editor/reload.zig");
 const thumbs_mod = @import("filebrowser/thumbs.zig");
+const clock = @import("util/clock.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -1608,21 +1609,45 @@ fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: [
             // the receiver's cheapest codec (JPEG for opaque pixels).
             if (!fs.conn.caps.preview_bound) fail("daemon does not advertise preview_bound");
             {
-                const sj = fs.startPreviewSized(pic, "jpeg,png", 1024) catch failErr("start sized preview", fs.lastErr());
-                var ev = fs.waitJobTerminal(sj, 20_000) catch failErr("sized preview wait", fs.lastErr());
-                defer ev.deinit();
-                if (!std.mem.eql(u8, ev.ev, "done") or ev.path.len == 0) fail("sized preview job failed");
-                if (!std.mem.endsWith(u8, ev.path, ".jpg")) fail("opaque sized preview is not a JPEG sidecar");
-                var bytes: std.ArrayList(u8) = .empty;
-                defer bytes.deinit(allocator);
-                const info = fs.read(ev.path, 0, 2 << 20, &bytes) catch failErr("read sized sidecar", fs.lastErr());
-                if (!info.eof or bytes.items.len == 0) fail("sized sidecar read incomplete");
-                var w: c_int = 0;
-                var h: c_int = 0;
-                var n: c_int = 0;
-                if (c.stbi_info_from_memory(bytes.items.ptr, @intCast(bytes.items.len), &w, &h, &n) == 0 or w != 64 or h != 48)
-                    fail("sized preview has the wrong geometry (a bound above the source never upscales)");
-                fs.unlink(ev.path) catch failErr("unlink sized sidecar", fs.lastErr());
+                var first_buf: [4096]u8 = undefined;
+                var first: []const u8 = "";
+                // 1st: rendered and installed in the sized-preview cache;
+                // 2nd: served from it; 3rd: the source changed, rendered again.
+                for (0..3) |round| {
+                    if (round == 2) {
+                        const tv = [2]c.struct_timeval{ .{ .tv_sec = 1_000_000_000, .tv_usec = 0 }, .{ .tv_sec = 1_000_000_000, .tv_usec = 0 } };
+                        if (c.utimes(&pic_z, &tv) != 0) fail("restamp pic.png");
+                    }
+                    const t0 = clock.nowUs();
+                    const sj = fs.startPreviewSized(pic, "jpeg,png", 1024) catch failErr("start sized preview", fs.lastErr());
+                    var ev = fs.waitJobTerminal(sj, 20_000) catch failErr("sized preview wait", fs.lastErr());
+                    defer ev.deinit();
+                    const took_us = clock.nowUs() - t0;
+                    if (!std.mem.eql(u8, ev.ev, "done") or ev.path.len == 0) fail("sized preview job failed");
+                    if (!std.mem.endsWith(u8, ev.path, ".jpg")) fail("opaque sized preview is not a JPEG sidecar");
+                    if (!ev.keep or std.mem.indexOf(u8, ev.path, "/sketerm/previews/") == null)
+                        fail("a sized preview is not served from the sized-preview cache");
+                    if (round == 0) {
+                        @memcpy(first_buf[0..ev.path.len], ev.path);
+                        first = first_buf[0..ev.path.len];
+                    } else if (!std.mem.eql(u8, first, ev.path)) fail("the same sized request named another cache entry");
+                    var cz: [4096:0]u8 = undefined;
+                    _ = std.fmt.bufPrintSentinel(&cz, "{s}", .{ev.path}, 0) catch unreachable;
+                    var cst: c.struct_stat = undefined;
+                    var sst: c.struct_stat = undefined;
+                    if (c.stat(&cz, &cst) != 0 or c.stat(&pic_z, &sst) != 0) fail("stat sized preview cache entry");
+                    if (mtime(cst).tv_sec != mtime(sst).tv_sec) fail("the sized-preview cache entry is not stamped with its source's mtime");
+                    std.debug.print("smoke-fs: sized preview round {d}: {d} us\n", .{ round, took_us });
+                    var bytes: std.ArrayList(u8) = .empty;
+                    defer bytes.deinit(allocator);
+                    const info = fs.read(ev.path, 0, 2 << 20, &bytes) catch failErr("read sized sidecar", fs.lastErr());
+                    if (!info.eof or bytes.items.len == 0) fail("sized sidecar read incomplete");
+                    var w: c_int = 0;
+                    var h: c_int = 0;
+                    var n: c_int = 0;
+                    if (c.stbi_info_from_memory(bytes.items.ptr, @intCast(bytes.items.len), &w, &h, &n) == 0 or w != 64 or h != 48)
+                        fail("sized preview has the wrong geometry (a bound above the source never upscales)");
+                }
             }
 
             // PDF posters: pdftoppm renders page 1 for both the legacy

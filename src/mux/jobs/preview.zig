@@ -214,14 +214,23 @@ fn encodeFitting(allocator: std.mem.Allocator, img: ScaledRgba, codecs: []const 
 }
 
 /// A `preview_bound` image preview: one decode of the SOURCE, one scale
-/// to the requested bound, one encode. No freedesktop tier is involved
-/// (its sizes are fixed by spec) and nothing is cached: the sized
-/// request comes from a viewer showing one image at its window size.
+/// to the requested bound, one encode, installed in the sized-preview
+/// cache (`thumbs.sizedPreviewPath`) so reopening the same image in the
+/// same window serves bytes instead of redoing all three. No freedesktop
+/// tier is involved (its sizes are fixed by spec). The request comes
+/// from a viewer showing one image at its window size.
 /// Formats stb cannot read (WebP, GIF, TIFF, SVG, ...) go through the
 /// legacy generators at the same bound first.
-fn runSizedPreview(job: *const Job, source: [:0]const u8, bound: u32) u8 {
+fn runSizedPreview(job: *const Job, source: [:0]const u8, bound: u32, mtime_sec: i64, source_size: u64) u8 {
     const allocator = job.allocator;
     const spec = job.spec;
+    var cache_buf: [4096]u8 = undefined;
+    const cache_root = cacheRootDir(&cache_buf);
+    var hit_buf: [4096]u8 = undefined;
+    if (cachedSizedPreview(cache_root, spec.src, spec.image_codecs, bound, mtime_sec, source_size, &hit_buf)) |hit| {
+        job.emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = hit, .keep = true });
+        return 0;
+    }
     var raw_buf: [4096:0]u8 = undefined;
     var raw: ?[:0]const u8 = null;
     defer if (raw) |r| {
@@ -239,11 +248,104 @@ fn runSizedPreview(job: *const Job, source: [:0]const u8, bound: u32) u8 {
     const encoded = encodeFitting(allocator, img, spec.image_codecs) orelse
         return job.emitError("no accepted preview codec (jpeg/png) under the 2 MiB cap");
     defer allocator.free(encoded.bytes);
+    var dest_buf: [4096]u8 = undefined;
+    if (installSizedPreview(cache_root, spec.src, bound, mtime_sec, source_size, encoded, &dest_buf)) |dest| {
+        job.emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = dest, .keep = true });
+        return 0;
+    }
+    // An unwritable cache still previews, through a throwaway sidecar.
     var transport_buf: [4096:0]u8 = undefined;
     const transport = writeSidecar(job, encoded.bytes, encoded.ext, &transport_buf) orelse
         return job.emitError("cannot write the preview sidecar");
     job.emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = transport });
     return 0;
+}
+
+/// File extension a transport codec name is stored under.
+fn codecExt(codec: []const u8) []const u8 {
+    return if (std.mem.eql(u8, codec, "jpeg")) "jpg" else codec;
+}
+
+/// A fresh cached sized preview in one of `codecs`, if there is one.
+fn cachedSizedPreview(cache_root: []const u8, src: []const u8, codecs: []const u8, bound: u32, mtime_sec: i64, source_size: u64, buf: []u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, codecs, ',');
+    while (it.next()) |raw_codec| {
+        const codec = std.mem.trim(u8, raw_codec, " ");
+        if (codec.len == 0) continue;
+        const p = thumbs.sizedPreviewPath(cache_root, src, bound, source_size, codecExt(codec), buf) orelse continue;
+        var pz: [4096:0]u8 = undefined;
+        const path = pathz.pathZ(&pz, p) catch continue;
+        var st: c.struct_stat = undefined;
+        if (c.stat(path, &st) != 0 or st.st_size <= 0) continue;
+        const fts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
+        if (@as(i64, fts.tv_sec) != mtime_sec) continue;
+        return p;
+    }
+    return null;
+}
+
+/// Install `encoded` in the sized-preview cache, stamped with the
+/// source's mtime. @return its path, or null when the cache is unwritable.
+fn installSizedPreview(cache_root: []const u8, src: []const u8, bound: u32, mtime_sec: i64, source_size: u64, encoded: Encoded, buf: []u8) ?[]const u8 {
+    const dest = thumbs.sizedPreviewPath(cache_root, src, bound, source_size, encoded.ext, buf) orelse return null;
+    pathz.makeParentDirs(dest) catch return null;
+    if (std.fs.path.dirname(dest)) |dir| sweepSizedPreviews(dir);
+    atomicwrite.writeCacheFile(dest, encoded.bytes, 0o600) catch return null;
+    var dz: [4096:0]u8 = undefined;
+    const destz = pathz.pathZ(&dz, dest) catch return null;
+    const tv = [2]c.struct_timeval{
+        .{ .tv_sec = @intCast(mtime_sec), .tv_usec = 0 },
+        .{ .tv_sec = @intCast(mtime_sec), .tv_usec = 0 },
+    };
+    if (c.utimes(destz, &tv) != 0) {
+        _ = c.unlink(destz);
+        return null;
+    }
+    return dest;
+}
+
+/// Sized-preview cache budget. Entries run 0.1-2 MiB (the transport cap),
+/// so this holds a few hundred window-sized images.
+const SIZED_PREVIEW_CACHE_BYTES: u64 = 256 << 20;
+
+/// Prune the sized-preview cache oldest-install-first (ctime: mtime
+/// carries the source's stamp) down to 3/4 of its budget, only when over.
+fn sweepSizedPreviews(dir: []const u8) void {
+    var dz: [4096:0]u8 = undefined;
+    const dirz = pathz.pathZ(&dz, dir) catch return;
+    const Item = struct { ctime: i64, bytes: u64, name: [80]u8, name_len: usize };
+    const a = std.heap.c_allocator;
+    var items: std.ArrayList(Item) = .empty;
+    defer items.deinit(a);
+    var total: u64 = 0;
+    const d = c.opendir(dirz) orelse return;
+    defer _ = c.closedir(d);
+    while (true) {
+        const ent = c.readdir(d) orelse break;
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (name.len < 5 or name.len > 80 or name[0] == '.') continue;
+        var pz: [4200:0]u8 = undefined;
+        const p = std.fmt.bufPrintSentinel(&pz, "{s}/{s}", .{ dir, name }, 0) catch continue;
+        var st: c.struct_stat = undefined;
+        if (c.stat(p.ptr, &st) != 0) continue;
+        const cts = if (@hasField(c.struct_stat, "st_ctim")) st.st_ctim else st.st_ctimespec;
+        var item = Item{ .ctime = cts.tv_sec, .bytes = @intCast(@max(st.st_size, 0)), .name = undefined, .name_len = name.len };
+        @memcpy(item.name[0..name.len], name);
+        items.append(a, item) catch break;
+        total += item.bytes;
+    }
+    if (total <= SIZED_PREVIEW_CACHE_BYTES) return;
+    std.mem.sort(Item, items.items, {}, struct {
+        fn lt(_: void, x: Item, y: Item) bool {
+            return x.ctime < y.ctime;
+        }
+    }.lt);
+    for (items.items) |item| {
+        if (total <= SIZED_PREVIEW_CACHE_BYTES / 4 * 3) break;
+        var pz: [4200:0]u8 = undefined;
+        const p = std.fmt.bufPrintSentinel(&pz, "{s}/{s}", .{ dir, item.name[0..item.name_len] }, 0) catch continue;
+        if (c.unlink(p.ptr) == 0) total -|= item.bytes;
+    }
 }
 
 /// Resize/transcode a previewer-owned image without installing a cache entry.
@@ -872,7 +974,7 @@ pub fn runPreview(job: *const Job, thumbnail_only: bool) u8 {
     // A sized request (`preview_bound`) for an image renders straight
     // from the source; posters (video, audio, pdf) keep the tier path.
     if (spec.bound != 0 and extIs(spec.src, &image_exts))
-        return runSizedPreview(job, source, imagepolicy.jobBound(spec.bound));
+        return runSizedPreview(job, source, imagepolicy.jobBound(spec.bound), mtime_sec, @intCast(@max(st.st_size, 0)));
 
     var cache_buf: [4096]u8 = undefined;
     const cache_root = cacheRootDir(&cache_buf);

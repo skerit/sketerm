@@ -67,6 +67,29 @@ pub fn wireThumbPath(cache_dir: []const u8, path: []const u8, tier: Tier, ext: [
     return std.fmt.bufPrint(buf, "{s}/sketerm/thumbs/{s}{s}.{s}", .{ cache_dir, sub, &key, ext }) catch null;
 }
 
+/// The daemon's cache of window-sized image previews
+/// (…/sketerm/previews/<md5>-<bound>-<size>.<ext>): transport bytes as
+/// served, fresh while the file's mtime equals the SOURCE's (stamped at
+/// install). The source size in the name catches a same-second rewrite.
+pub fn sizedPreviewPath(cache_dir: []const u8, path: []const u8, bound: u32, source_size: u64, ext: []const u8, buf: []u8) ?[]const u8 {
+    const key = thumbKey(path) orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/sketerm/previews/{s}-{d}-{d}.{s}", .{ cache_dir, &key, bound, source_size, ext }) catch null;
+}
+
+test "sizedPreviewPath keys the source, bound and size beside the wire cache" {
+    const t = std.testing;
+    var buf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    const p = sizedPreviewPath("/home/u/.cache", "/data/cat.jpg", 1600, 12345, "jpg", &buf) orelse return error.TestUnexpectedResult;
+    const w = wireThumbPath("/home/u/.cache", "/data/cat.jpg", .normal, "jxl", &wbuf) orelse return error.TestUnexpectedResult;
+    const key = w["/home/u/.cache/sketerm/thumbs/".len .. w.len - ".jxl".len];
+    try t.expect(std.mem.startsWith(u8, p, "/home/u/.cache/sketerm/previews/"));
+    try t.expect(std.mem.indexOf(u8, p, key) != null);
+    try t.expect(std.mem.endsWith(u8, p, "-1600-12345.jpg"));
+    var obuf: [4096]u8 = undefined;
+    try t.expect(!std.mem.eql(u8, p, sizedPreviewPath("/home/u/.cache", "/data/cat.jpg", 2048, 12345, "jpg", &obuf).?));
+}
+
 test "wireThumbPath shares the freedesktop key but its own directory" {
     const t = std.testing;
     var buf: [4096]u8 = undefined;
