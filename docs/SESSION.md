@@ -1,5 +1,25 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-07: PDF previews say why they failed
+
+Report: previewing a PDF showed "preview failed". The viewer's status read
+"Unable to load preview: PreviewFailed" for ANY failed poster job:
+`fetchSidecar` dropped the job's error message, and the daemon's message
+was the generic "preview generator unavailable or failed" for every
+generator (`jobs/preview.zig generateThumbPng`). The render path itself
+works on this host for a generated PDF and all 58 real PDFs in
+~/Downloads, local and over the link, before and after the image-policy
+commits (posters keep the legacy request); what fails is a host without
+pdftoppm (likely on a NAS or GPU box) or a file that is not a PDF
+(macOS `._x.pdf` AppleDouble sidecars). Generators now run through
+`runGenerator`: stdin/stdout on /dev/null (stdout was the job's event
+pipe), and the error is "pdftoppm is not installed on the host (PDF
+previews need poppler-utils)" or "pdftoppm failed: <its last stderr
+line>". The viewer shows that text, and no longer offers "View full
+resolution" on a REMOTE poster (it downloaded the whole PDF and failed to
+decode it). Covered by preview.zig unit tests, smoke-fs (legacy, sized and
+wire PDF requests plus a broken one) and `viewerRemoteImageStage`.
+
 ## 2026-11-07: remote images: small originals direct, previews sized to the window
 
 A remote 2918x3508 UI PNG showed as a 425x512 preview: the viewer asked
