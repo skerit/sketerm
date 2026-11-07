@@ -774,6 +774,20 @@ pub fn build(b: *std.Build) void {
     const smoke_columns_step = b.step("smoke-columns", "A file view's columns never starve the Name column: grip drags into GTK's autoscroll edge, squeezes (headless, no X)");
     smoke_columns_step.dependOn(&smoke_columns_run.step);
 
+    // File-view tree smoke — `zig build smoke-tree`. Expanding and
+    // collapsing directory rows in a scrolled listing keeps the scroll
+    // offset and the keyboard cursor (src/smoke_tree.zig).
+    const smoke_tree_mod = dev.module(b, target, "src/smoke_tree.zig");
+    configureSysDeps(b, smoke_tree_mod, cbindings_mod);
+    smoke_tree_mod.addImport("build_options", dev.glib_opts);
+    addVideo(b, smoke_tree_mod);
+    const smoke_tree = dev.executable(b, "sketerm-smoke-tree", smoke_tree_mod);
+    const smoke_tree_run = b.addRunArtifact(smoke_tree);
+    dev_bins.drive(smoke_tree_run, &.{ dev_bins.gui, dev_bins.mux });
+    smoke_tree_run.setCwd(b.path("."));
+    const smoke_tree_step = b.step("smoke-tree", "Expanding/collapsing file-view tree rows keeps the scroll offset and the keyboard cursor (headless, no X)");
+    smoke_tree_step.dependOn(&smoke_tree_run.step);
+
     // AT-SPI accessibility smoke — `zig build smoke-atspi` (Linux).
     // Same self-hosted rig as smoke-e2e, PLUS a private accessibility
     // bus (dbus-daemon + at-spi2-registryd via mux/a11yhub.zig): the

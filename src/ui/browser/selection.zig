@@ -195,6 +195,19 @@ pub fn onListStickyPressed(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, 
     const tab = cast.userData(BTab, user);
     // Group headers collapse on a plain click regardless of modes.
     if (colview.pickItem(tab, x, y)) |p| {
+        // A tree chevron toggles on press and claims it, like a group
+        // header: the row's own press handler would otherwise move the
+        // keyboard cursor onto the clicked row, away from where Up/Down
+        // had left it.
+        if (p.data.kind == .entry and colview.pickIsExpander(tab, x, y)) {
+            _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
+            // toggleExpand re-renders (frees the item); copy the path.
+            var buf: [4096]u8 = undefined;
+            if (p.data.path.len >= buf.len) return;
+            @memcpy(buf[0..p.data.path.len], p.data.path);
+            tab.view.toggleExpand(tab, buf[0..p.data.path.len]);
+            return;
+        }
         if (p.data.kind == .entry) dnd.armSelection(tab, p.data.path);
         if (p.data.kind == .group) {
             _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);

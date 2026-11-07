@@ -535,15 +535,22 @@ pub fn goUp(self: *BrowserView, tab: *BTab) void {
 }
 
 pub fn toggleExpand(self: *BrowserView, tab: *BTab, dir_path: []const u8) void {
-    // The parent row's identity (path, depth, kind) does not change
-    // when it expands or collapses, so the windowed splice would keep
-    // its GObject and never rebind it -- and the chevron it shows is
-    // set at bind time. Name it changed so the next render re-aims it.
-    tab.noteChangedFull(dir_path);
+    // The row's identity (path, depth, kind) does not change when it
+    // expands or collapses, so the windowed splice keeps its item: only
+    // the children are inserted or removed. That is what keeps GTK's
+    // scroll anchor and keyboard focus on it -- naming the row changed
+    // here once replaced its item, which dropped both and sent the
+    // listing (and the next Up/Down) to the top. The chevron, the one
+    // thing on the row that shows the state, is flipped in place, and
+    // the row becomes GTK's scroll anchor so the children push the rows
+    // BELOW it rather than the viewport (the anchor is otherwise the
+    // last clicked row, which may sit further down).
+    colview.anchorRow(tab, dir_path);
     if (tab.subdirByPath(dir_path)) |_| {
         colview.invalidateBackingRefs(tab);
         tab.dropSubdirsUnder(dir_path);
         self.renderTab(tab);
+        colview.refreshExpander(tab, dir_path);
         return;
     }
     const d = self.makeDir(dir_path) orelse return;
@@ -551,6 +558,7 @@ pub fn toggleExpand(self: *BrowserView, tab: *BTab, dir_path: []const u8) void {
         d.deinit();
         return;
     };
+    colview.refreshExpander(tab, dir_path);
     self.openDir(tab, d);
 }
 

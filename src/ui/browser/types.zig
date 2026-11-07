@@ -779,6 +779,9 @@ pub const BTab = struct {
     /// borrow the bound item's owned path, re-aimed on every bind
     /// (`colview.noteNameCell`).
     name_cells: std.StringHashMapUnmanaged(*c.GtkWidget) = .empty,
+    /// Name cells bound over the tab's life; read only by the
+    /// `browser-rows` verification command (how much a render rebound).
+    name_binds: u64 = 0,
     /// Signature of the column set the view currently shows;
     /// syncColumns rebuilds the columns only when it changes.
     col_sig: u64 = 0,

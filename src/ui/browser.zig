@@ -18,6 +18,9 @@ pub const HostAction = @import("browser/types.zig").HostAction;
 /// Live column geometry, for the `browser-columns` verification command.
 pub const ColumnGeometry = @import("browser/colview.zig").ColumnGeometry;
 pub const columnGeometry = @import("browser/colview.zig").columnGeometry;
+/// Visible rows, scroll and focus, for the `browser-rows` verification command.
+pub const RowGeometry = @import("browser/colview.zig").RowGeometry;
+pub const rowsReport = @import("browser/colview.zig").rowsReport;
 
 /// Location specs are plain data, so the parser and the network-mount
 /// bypass live GTK-free under src/filebrowser.

@@ -257,6 +257,7 @@ pub fn refreshEntryRowAt(self: *BrowserView, tab: *BTab, pos: c.guint, dir: *Dir
     // renderList's splice: the swap must not rewrite tab.selected.
     tab.rendering = true;
     defer tab.rendering = false;
+    const focus_keep = FocusKeep.capture(tab, pos, pos + 1);
     var items = [_]?*anyopaque{@ptrCast(obj)};
     c.g_list_store_splice(tab.store, pos, 1, &items, 1);
     c.g_object_unref(@as(?*anyopaque, @ptrCast(obj)));
@@ -264,6 +265,7 @@ pub fn refreshEntryRowAt(self: *BrowserView, tab: *BTab, pos: c.guint, dir: *Dir
     // re-armed even though no full render ran.
     tab.backing_fence.rebound();
     if (was_selected) _ = c.gtk_selection_model_select_item(selModel(tab), pos, 0);
+    if (focus_keep) |*k| k.restore(tab);
 }
 
 fn selModel(tab: *BTab) *c.GtkSelectionModel {
@@ -362,6 +364,16 @@ pub fn pickIsHeader(tab: *BTab, x: f64, y: f64) bool {
         const tn = std.mem.span(c.g_type_name_from_instance(@ptrCast(@alignCast(x2))));
         if (std.mem.eql(u8, tn, "GtkColumnViewTitle")) return true;
         if (x2 == @as(*c.GtkWidget, @ptrCast(@alignCast(tab.colview)))) break;
+    }
+    return false;
+}
+
+/// True when (x, y) lands on a row's tree chevron.
+pub fn pickIsExpander(tab: *BTab, x: f64, y: f64) bool {
+    var w = c.gtk_widget_pick(@ptrCast(@alignCast(tab.colview)), x, y, c.GTK_PICK_DEFAULT);
+    while (w) |x2| : (w = c.gtk_widget_get_parent(x2)) {
+        if (c.gtk_widget_has_css_class(x2, "sketerm-fb-expander") != 0) return true;
+        if (c.g_object_get_data(@ptrCast(@alignCast(x2)), "sketerm-namecell") != null) break;
     }
     return false;
 }
@@ -957,6 +969,200 @@ pub fn columnGeometry(tab: *BTab, out: []ColumnGeometry) usize {
     return written;
 }
 
+/// One bound, on-screen details row, as the `browser-rows` verification
+/// command reports it. Coordinates are the window surface's.
+pub const RowGeometry = struct {
+    path: []const u8,
+    pos: c.guint,
+    depth: u32,
+    expanded: bool,
+    /// Vertical centre of the row.
+    y: f64,
+    /// Centre of the expander chevron; 0 when the row has none.
+    expander_x: f64,
+    expander_y: f64,
+    /// Horizontal centre of the name label (a plain row click lands here).
+    label_x: f64,
+    /// The row carries the zebra stripe class.
+    alt: bool,
+};
+
+/// Scroll, keyboard focus, selection and the visible rows of `tab`.
+pub const RowsReport = struct {
+    scroll: f64,
+    upper: f64,
+    page: f64,
+    n_items: c.guint,
+    /// Position of the row holding keyboard focus, -1 when none does.
+    focus: i64,
+    focus_path: []const u8,
+    /// Name cells bound since the tab was created (rebind cost probe).
+    binds: u64,
+    selected: []const []u8,
+    rows: []RowGeometry,
+};
+
+/// The visible rows of `tab` in surface coordinates, ordered by position.
+/// @return the report; its `rows` borrow `out` and the tab's item paths.
+pub fn rowsReport(tab: *BTab, out: []RowGeometry) RowsReport {
+    const vadj = c.gtk_scrolled_window_get_vadjustment(@ptrCast(@alignCast(tab.scroller)));
+    var rep: RowsReport = .{
+        .scroll = if (vadj) |a| c.gtk_adjustment_get_value(a) else 0,
+        .upper = if (vadj) |a| c.gtk_adjustment_get_upper(a) else 0,
+        .page = if (vadj) |a| c.gtk_adjustment_get_page_size(a) else 0,
+        .n_items = itemCount(tab),
+        .focus = -1,
+        .focus_path = "",
+        .binds = tab.name_binds,
+        .selected = tab.selected.items,
+        .rows = out[0..0],
+    };
+    if (focusedItem(tab)) |f| {
+        rep.focus = f.pos;
+        rep.focus_path = f.data.path;
+    }
+    const native = c.gtk_widget_get_native(@ptrCast(@alignCast(tab.colview))) orelse return rep;
+    const nat: *c.GtkWidget = @ptrCast(@alignCast(native));
+    var sx: f64 = 0;
+    var sy: f64 = 0;
+    c.gtk_native_get_surface_transform(native, &sx, &sy);
+    var vb: c.graphene_rect_t = undefined;
+    if (c.gtk_widget_compute_bounds(tab.scroller, nat, &vb) == 0) return rep;
+    var n: usize = 0;
+    var it = boundRows(tab);
+    while (it.next()) |br| {
+        if (n >= out.len) break;
+        const r = br.row;
+        const root = br.root;
+        const d = br.data;
+        if (c.gtk_widget_get_mapped(r) == 0 or d.kind != .entry) continue;
+        const cellobj = c.g_object_get_data(@ptrCast(@alignCast(root)), "sketerm-cellobj") orelse continue;
+        const pos = c.gtk_column_view_cell_get_position(@ptrCast(@alignCast(cellobj)));
+        if (pos == c.GTK_INVALID_LIST_POSITION) continue;
+        var rb: c.graphene_rect_t = undefined;
+        if (c.gtk_widget_compute_bounds(r, nat, &rb) == 0) continue;
+        const cy = rb.origin.y + rb.size.height / 2;
+        if (cy < vb.origin.y or cy > vb.origin.y + vb.size.height) continue;
+        const nc = nameCellOf(root) orelse continue;
+        var g: RowGeometry = .{
+            .path = d.path,
+            .pos = pos,
+            .depth = d.depth,
+            .expanded = tab.subdirByPath(d.path) != null,
+            .y = sy + cy,
+            .expander_x = 0,
+            .expander_y = 0,
+            .label_x = 0,
+            .alt = c.gtk_widget_has_css_class(r, "sketerm-fb-alt") != 0,
+        };
+        var eb: c.graphene_rect_t = undefined;
+        if (c.gtk_widget_get_visible(nc.expander) != 0 and c.gtk_widget_compute_bounds(nc.expander, nat, &eb) != 0) {
+            g.expander_x = sx + eb.origin.x + eb.size.width / 2;
+            g.expander_y = sy + eb.origin.y + eb.size.height / 2;
+        }
+        if (c.gtk_widget_compute_bounds(nc.label, nat, &eb) != 0)
+            g.label_x = sx + eb.origin.x + @min(eb.size.width / 2, 40);
+        out[n] = g;
+        n += 1;
+    }
+    std.mem.sort(RowGeometry, out[0..n], {}, struct {
+        fn lt(_: void, a: RowGeometry, b: RowGeometry) bool {
+            return a.pos < b.pos;
+        }
+    }.lt);
+    rep.rows = out[0..n];
+    return rep;
+}
+
+/// One realized row of the column view: its row widget, its name-cell
+/// root and the item that root is bound to.
+const BoundRow = struct { row: *c.GtkWidget, root: *c.GtkWidget, data: *ItemData };
+
+/// Walks the row widgets GTK currently keeps bound (a screenful plus a
+/// margin), in widget order, which is not necessarily position order.
+const BoundRows = struct {
+    next_row: ?*c.GtkWidget,
+
+    fn next(self: *BoundRows) ?BoundRow {
+        while (self.next_row) |r| {
+            self.next_row = c.gtk_widget_get_next_sibling(r);
+            const root = findNameRoot(r, 2) orelse continue;
+            const dp = c.g_object_get_data(@ptrCast(@alignCast(root)), "sketerm-item") orelse continue;
+            return .{ .row = r, .root = root, .data = @ptrCast(@alignCast(dp)) };
+        }
+        return null;
+    }
+};
+
+fn boundRows(tab: *BTab) BoundRows {
+    var list: ?*c.GtkWidget = c.gtk_widget_get_first_child(@ptrCast(@alignCast(tab.colview)));
+    while (list) |l| : (list = c.gtk_widget_get_next_sibling(l)) {
+        if (c.g_type_check_instance_is_a(@ptrCast(@alignCast(l)), c.gtk_list_view_get_type()) != 0) break;
+    }
+    return .{ .next_row = if (list) |l| c.gtk_widget_get_first_child(l) else null };
+}
+
+fn findNameRoot(w: *c.GtkWidget, depth: u32) ?*c.GtkWidget {
+    var child = c.gtk_widget_get_first_child(w);
+    while (child) |ch| : (child = c.gtk_widget_get_next_sibling(ch)) {
+        if (c.g_object_get_data(@ptrCast(@alignCast(ch)), "sketerm-namecell") != null) return ch;
+        if (depth > 0) if (findNameRoot(ch, depth - 1)) |r| return r;
+    }
+    return null;
+}
+
+/// Make `path`'s on-screen row GTK's scroll anchor, where it sits now,
+/// without scrolling or moving focus. GtkListBase derives the scroll
+/// offset from its anchor item, which is the last focused or clicked
+/// row: rows inserted between that and a toggled directory above it
+/// would otherwise push the toggled row (and the pointer's target) up.
+pub fn anchorRow(tab: *BTab, path: []const u8) void {
+    if (tab.view.widgets_dead) return;
+    var it = boundRows(tab);
+    while (it.next()) |br| {
+        if (br.data.kind != .entry or !std.mem.eql(u8, br.data.path, path)) continue;
+        const cellobj = c.g_object_get_data(@ptrCast(@alignCast(br.root)), "sketerm-cellobj") orelse return;
+        const pos = c.gtk_column_view_cell_get_position(@ptrCast(@alignCast(cellobj)));
+        if (pos == c.GTK_INVALID_LIST_POSITION) return;
+        scrollToFixed(tab, pos, c.GTK_LIST_SCROLL_NONE);
+        return;
+    }
+}
+
+/// `gtk_column_view_scroll_to` with both scroll axes disabled: the row
+/// becomes the anchor at its current place (and, with FOCUS, the
+/// keyboard cursor), and the viewport does not move.
+fn scrollToFixed(tab: *BTab, pos: c.guint, flags: c.GtkListScrollFlags) void {
+    const info = c.gtk_scroll_info_new() orelse return;
+    c.gtk_scroll_info_set_enable_horizontal(info, 0);
+    c.gtk_scroll_info_set_enable_vertical(info, 0);
+    c.gtk_column_view_scroll_to(tab.colview, pos, null, flags, info); // takes info
+}
+
+/// Point the chevron of `path`'s bound row at its current expansion
+/// state, without rebinding the row. Expanding or collapsing leaves
+/// that row's identity alone, so the windowed splice keeps its item --
+/// and replacing it instead would drop GTK's keyboard focus and scroll
+/// anchor along with the old item.
+pub fn refreshExpander(tab: *BTab, path: []const u8) void {
+    if (tab.view.widgets_dead) return;
+    const icon: [*:0]const u8 = if (tab.subdirByPath(path) != null) "pan-down-symbolic" else "pan-end-symbolic";
+    var it = boundRows(tab);
+    while (it.next()) |br| {
+        if (br.data.kind != .entry or !std.mem.eql(u8, br.data.path, path)) continue;
+        const nc = nameCellOf(br.root) orelse continue;
+        c.gtk_button_set_icon_name(@ptrCast(nc.expander), icon);
+    }
+}
+
+/// Re-stamp the zebra parity of every bound row from its item, for
+/// rows the windowed splice kept while an insertion above them flipped
+/// their parity.
+fn restampZebra(tab: *BTab) void {
+    var it = boundRows(tab);
+    while (it.next()) |br| zebraClass(br.root, br.data);
+}
+
 /// Point GTK's header arrows at the tab's current sort.
 fn applySortIndicator(tab: *BTab) void {
     const cols = c.gtk_column_view_get_columns(tab.colview);
@@ -1166,6 +1372,7 @@ fn onNameBind(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque
     const d = itemPayload(c.gtk_column_view_cell_get_item(cell)) orelse return;
     const tab = ctx.tab;
     const self = tab.view;
+    tab.name_binds +%= 1;
     c.g_object_set_data(@ptrCast(@alignCast(root)), "sketerm-item", @ptrCast(d));
     if (rowWidget(root)) |row| {
         c.g_object_set_data(@ptrCast(@alignCast(row)), "sketerm-item", @ptrCast(d));
@@ -1557,7 +1764,8 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
     if (self.inline_rename) |ir| {
         if (ir.tab == tab) @import("ops.zig").finishInlineRenameDeferred(ir, false);
     }
-    const keep_scroll = scrollToKeep(tab);
+    const navigated = listingChanged(tab);
+    const keep_scroll = if (navigated) null else scrollToKeep(tab);
     tab.rendering = true;
     defer tab.rendering = false;
 
@@ -1609,12 +1817,12 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
         while (prefix < lim) : (prefix += 1) {
             const od = itemDataAt(tab, prefix) orelse break;
             const nd = itemPayload(items.items[prefix]) orelse break;
-            if (!reusableItem(self, tab, od, nd)) break;
+            if (!reusableItem(tab, od, nd)) break;
         }
         while (suffix < lim - prefix) : (suffix += 1) {
             const od = itemDataAt(tab, old_n - 1 - suffix) orelse break;
             const nd = itemPayload(items.items[new_n - 1 - suffix]) orelse break;
-            if (!reusableItem(self, tab, od, nd)) break;
+            if (!reusableItem(tab, od, nd)) break;
         }
     }
     // Reused rows keep their item, but the item's borrowed pointers
@@ -1622,7 +1830,9 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
     // storage — delta application nulled them via
     // invalidateBackingRefs, and leaving them null breaks every later
     // interaction with those rows.
-    rebindReused(tab, items.items, prefix, suffix, old_n, new_n);
+    const parity_moved = rebindReused(tab, items.items, prefix, suffix, old_n, new_n);
+    // The cursor's row is about to be replaced or removed.
+    const focus_keep: ?FocusKeep = if (navigated) null else FocusKeep.capture(tab, prefix, old_n - suffix);
 
     if (prefix == 0 and suffix == 0) {
         // Full replacement: rebinding drops stale path→cell entries as
@@ -1649,6 +1859,10 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
 
     // Restore the path selection onto the new items.
     syncSelectionFromPaths(tab);
+    // Kept rows whose parity flipped (an odd number of rows went in or
+    // out above them) show their new stripe without being rebound.
+    if (parity_moved) restampZebra(tab);
+    if (focus_keep) |*k| k.restore(tab);
 
     if (keep_scroll) |value| restoreScroll(tab, value);
 }
@@ -1676,7 +1890,10 @@ fn sameStructuralItem(od: *const ItemData, nd: *const ItemData) bool {
 }
 
 /// Structural identity plus presentation/content decides GObject reuse.
-fn reusableItem(self: *BrowserView, tab: *BTab, od: *ItemData, nd: *ItemData) bool {
+/// Zebra parity is deliberately not part of it: a row's stripe follows
+/// from its position, and rebinding every row below an insertion of an
+/// odd number of rows just to repaint it was the expand "flash".
+fn reusableItem(tab: *BTab, od: *ItemData, nd: *ItemData) bool {
     if (!sameStructuralItem(od, nd)) return false;
     if (od.kind == .group) {
         return od.group_count == nd.group_count and
@@ -1687,7 +1904,6 @@ fn reusableItem(self: *BrowserView, tab: *BTab, od: *ItemData, nd: *ItemData) bo
             );
     }
     if (od.is_dir != nd.is_dir) return false;
-    if (self.zebra and od.alt != nd.alt) return false;
     for (tab.changed_paths.items) |chp| {
         if (std.mem.eql(u8, chp, od.path)) return false;
     }
@@ -1813,23 +2029,23 @@ test "visual render boundary commits structural changes but keeps content refres
     }
 }
 
-/// Re-aim reused rows' borrowed Dir/Entry pointers at the fresh
-/// storage the matching new items carry.
-fn rebindReused(tab: *BTab, new_items: []?*anyopaque, prefix: c.guint, suffix: c.guint, old_n: c.guint, new_n: c.guint) void {
+/// Re-aim reused rows' borrowed Dir/Entry pointers and zebra parity at
+/// what the matching new items carry.
+/// @return whether any reused row's parity changed.
+fn rebindReused(tab: *BTab, new_items: []?*anyopaque, prefix: c.guint, suffix: c.guint, old_n: c.guint, new_n: c.guint) bool {
+    var moved = false;
     var i: c.guint = 0;
-    while (i < prefix) : (i += 1) {
-        const od = itemDataAt(tab, i) orelse continue;
-        const nd = itemPayload(new_items[i]) orelse continue;
+    while (i < prefix + suffix) : (i += 1) {
+        const old_pos = if (i < prefix) i else old_n - 1 - (i - prefix);
+        const new_pos = if (i < prefix) i else new_n - 1 - (i - prefix);
+        const od = itemDataAt(tab, old_pos) orelse continue;
+        const nd = itemPayload(new_items[new_pos]) orelse continue;
         od.dir = nd.dir;
         od.entry = nd.entry;
+        if (od.alt != nd.alt) moved = true;
+        od.alt = nd.alt;
     }
-    var s: c.guint = 0;
-    while (s < suffix) : (s += 1) {
-        const od = itemDataAt(tab, old_n - 1 - s) orelse continue;
-        const nd = itemPayload(new_items[new_n - 1 - s]) orelse continue;
-        od.dir = nd.dir;
-        od.entry = nd.entry;
-    }
+    return moved;
 }
 
 fn appendEntryItem(
@@ -1956,21 +2172,112 @@ fn dirChildLoaded(tab: *BTab, dir: *Dir, e: Entry, buf: *[4096]u8) ?*Dir {
 
 // ── scroll preservation ──────────────────────────────────────────
 
-/// The scroll position to pin across the rebuild, or null when this
-/// render is a navigation (different listing → start at the top).
-fn scrollToKeep(tab: *BTab) ?f64 {
+/// Whether this render shows a different listing than the last one (a
+/// navigation: scroll and cursor start over at the top).
+fn listingChanged(tab: *BTab) bool {
     var hasher = std.hash.Wyhash.init(0);
     if (tab.hc.host) |h| hasher.update(h);
     hasher.update(":");
     hasher.update(tab.root.path);
     const hash = hasher.final();
-    if (hash != tab.scroll_path_hash) {
-        tab.scroll_path_hash = hash;
-        return null;
-    }
+    if (hash == tab.scroll_path_hash) return false;
+    tab.scroll_path_hash = hash;
+    return true;
+}
+
+/// The scroll position to pin across the rebuild.
+fn scrollToKeep(tab: *BTab) ?f64 {
     const vadj = c.gtk_scrolled_window_get_vadjustment(@ptrCast(@alignCast(tab.scroller))) orelse return null;
     const value = c.gtk_adjustment_get_value(vadj);
     return if (value > 0) value else null;
+}
+
+// ── keyboard cursor preservation ─────────────────────────────────
+
+/// GTK's keyboard cursor across a splice that replaces or removes the
+/// item of the focused row.
+///
+/// GtkListBase tracks the cursor by item. Once that item leaves the
+/// store the focused row widget goes with it, the window is left
+/// without focus, and the next grab (`refocusListingIfLost`, or GTK's
+/// own) lands on a stale tracker position -- row 0 -- and scrolls there:
+/// the "collapse/refresh sends me back to the top" bug. The cursor is
+/// put back on the same path, else its nearest surviving ancestor row
+/// (a collapsed parent), else the same position, all without scrolling.
+pub const FocusKeep = struct {
+    buf: [4096]u8 = undefined,
+    len: usize = 0,
+    pos: c.guint = 0,
+
+    /// Capture the cursor when its row lies in the replaced window
+    /// [`lo`, `hi`) of the current store; null when the splice leaves
+    /// it alone (GTK then follows it by itself) or the listing does
+    /// not hold keyboard focus.
+    pub fn capture(tab: *BTab, lo: c.guint, hi: c.guint) ?FocusKeep {
+        const f = focusedItem(tab) orelse return null;
+        if (f.pos < lo or f.pos >= hi) return null;
+        var k: FocusKeep = .{ .pos = f.pos };
+        if (f.data.kind == .entry and f.data.path.len <= k.buf.len) {
+            @memcpy(k.buf[0..f.data.path.len], f.data.path);
+            k.len = f.data.path.len;
+        }
+        return k;
+    }
+
+    pub fn restore(self: *const FocusKeep, tab: *BTab) void {
+        const n = itemCount(tab);
+        if (n == 0) return;
+        const pos = cursorTarget(self.buf[0..self.len], tab.root.path, self.pos, n, tab, positionForPath);
+        scrollToFixed(tab, pos, c.GTK_LIST_SCROLL_FOCUS);
+        // The splice took the focused widget with it; the listing held
+        // focus a moment ago, so it takes it back. GTK scrolls on a
+        // grab only when the cursor position changes, and it was just
+        // set, so the viewport stays put.
+        const cvw: *c.GtkWidget = @ptrCast(@alignCast(tab.colview));
+        if (c.gtk_widget_get_state_flags(cvw) & c.GTK_STATE_FLAG_FOCUS_WITHIN == 0)
+            _ = c.gtk_widget_grab_focus(cvw);
+    }
+};
+
+/// Where a displaced cursor goes: the row of `path`, else of its nearest
+/// ancestor below `root`, else `old_pos` clamped to the `n` rows.
+fn cursorTarget(
+    path: []const u8,
+    root: []const u8,
+    old_pos: c.guint,
+    n: c.guint,
+    ctx: anytype,
+    comptime lookup: fn (@TypeOf(ctx), []const u8) ?c.guint,
+) c.guint {
+    var p = path;
+    while (p.len > root.len and std.mem.startsWith(u8, p, root)) {
+        if (lookup(ctx, p)) |pos| return pos;
+        p = std.fs.path.dirname(p) orelse break;
+    }
+    return @min(old_pos, n - 1);
+}
+
+test "a displaced cursor goes to its path, then its nearest row ancestor, then its old position" {
+    const t = std.testing;
+    const Rows = struct {
+        names: []const []const u8,
+        fn lookup(self: *const @This(), path: []const u8) ?c.guint {
+            for (self.names, 0..) |name, i| if (std.mem.eql(u8, name, path)) return @intCast(i);
+            return null;
+        }
+    };
+    const rows = Rows{ .names = &.{ "/r/a", "/r/b", "/r/b/x", "/r/c" } };
+    try t.expectEqual(@as(c.guint, 2), cursorTarget("/r/b/x", "/r", 9, 4, &rows, Rows.lookup));
+    // A collapsed parent: the child row is gone, the directory row stays.
+    try t.expectEqual(@as(c.guint, 1), cursorTarget("/r/b/y/z", "/r", 3, 4, &rows, Rows.lookup));
+    // Gone without a row ancestor (the root itself is not a row).
+    try t.expectEqual(@as(c.guint, 3), cursorTarget("/r/zz", "/r", 7, 4, &rows, Rows.lookup));
+    try t.expectEqual(@as(c.guint, 0), cursorTarget("/r/zz", "/r", 0, 4, &rows, Rows.lookup));
+    // A group header (no path) keeps its position.
+    try t.expectEqual(@as(c.guint, 2), cursorTarget("", "/r", 2, 4, &rows, Rows.lookup));
+    // The filesystem root as the listing root.
+    const top = Rows{ .names = &.{ "/etc", "/usr" } };
+    try t.expectEqual(@as(c.guint, 1), cursorTarget("/usr/lib/x", "/", 0, 2, &top, Rows.lookup));
 }
 
 const ScrollKeep = struct {
