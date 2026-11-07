@@ -125,7 +125,9 @@ fn lap(label: []const u8, start_ns: *u64) void {
 
 /// One viewer image load over a real daemon link, stage by stage:
 /// `old` is the pre-policy request (512 px PNG preview), `new` is the
-/// sized/direct policy the viewer now runs.
+/// sized/direct policy with every request a round trip of its own, and
+/// `piped` is that policy as the viewer runs it now: job starts and the
+/// metadata request share one round trip, sidecars are released unawaited.
 fn e2e(host: []const u8, path: []const u8, mode: []const u8, bound: u32) !void {
     const allocator = std.heap.c_allocator;
     const total0 = clock.nowNs();
@@ -141,6 +143,7 @@ fn e2e(host: []const u8, path: []const u8, mode: []const u8, bound: u32) !void {
     var bytes: []u8 = undefined;
     var what: []const u8 = "preview";
     var first_ms: ?f64 = null;
+    const piped = std.mem.eql(u8, mode, "piped");
     if (std.mem.eql(u8, mode, "old")) {
         bytes = try previewOver(&fs, path, "png", 0, true, &t);
     } else {
@@ -151,32 +154,53 @@ fn e2e(host: []const u8, path: []const u8, mode: []const u8, bound: u32) !void {
             .display_bound = bound,
             .remote = true,
         });
+        const dirname = std.fs.path.dirname(path) orelse "/";
+        const names = [_][]const u8{std.fs.path.basename(path)};
         switch (plan) {
             .original => {
+                const meta: ?u32 = if (piped) try fs.mediaMetaSubmit(dirname, &names) else null;
                 bytes = try readAll(&fs, path, 128 << 20, false);
                 lap("read original", &t);
                 what = "original";
+                if (meta) |m| try pipedMeta(&fs, m, &t);
             },
-            .preview => |p| {
-                // The viewer's order: both jobs at once, quick one shown first.
-                const quick: ?u64 = if (p.quick_first) try fs.startPreviewSized(path, p.codecs, imagepolicy.DEFAULT_BOUND) else null;
-                const job = try fs.startPreviewSized(path, p.codecs, p.bound);
+            .preview => |p| if (piped) {
+                const quick_req: ?u32 = if (p.quick_first) try fs.previewSubmit(path, p.codecs, imagepolicy.DEFAULT_BOUND) else null;
+                const job_req = try fs.previewSubmit(path, p.codecs, p.bound);
+                const meta = try fs.mediaMetaSubmit(dirname, &names);
+                const quick: ?u64 = if (quick_req) |r| try fs.awaitJob(r) else null;
+                const job = try fs.awaitJob(job_req);
+                lap("job starts (one round trip)", &t);
                 if (quick) |q| {
-                    const quick_bytes = try sidecarOver(&fs, q, false, &t);
+                    const quick_bytes = try sidecarOver(&fs, q, false, true, &t);
                     defer allocator.free(quick_bytes);
                     first_ms = @as(f64, @floatFromInt(clock.nowNs() - load0)) / 1e6;
                     std.debug.print("    quick preview {d} B shown at {d:.1} ms\n", .{ quick_bytes.len, first_ms.? });
                 }
-                bytes = try sidecarOver(&fs, job, false, &t);
+                bytes = try sidecarOver(&fs, job, false, true, &t);
+                try pipedMeta(&fs, meta, &t);
+            } else {
+                // The viewer's order: both jobs at once, quick one shown first.
+                const quick: ?u64 = if (p.quick_first) try fs.startPreviewSized(path, p.codecs, imagepolicy.DEFAULT_BOUND) else null;
+                const job = try fs.startPreviewSized(path, p.codecs, p.bound);
+                if (quick) |q| {
+                    const quick_bytes = try sidecarOver(&fs, q, false, false, &t);
+                    defer allocator.free(quick_bytes);
+                    first_ms = @as(f64, @floatFromInt(clock.nowNs() - load0)) / 1e6;
+                    std.debug.print("    quick preview {d} B shown at {d:.1} ms\n", .{ quick_bytes.len, first_ms.? });
+                }
+                bytes = try sidecarOver(&fs, job, false, false, &t);
             },
         }
     }
     defer allocator.free(bytes);
-    const dirname = std.fs.path.dirname(path) orelse "/";
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    _ = fs.mediaMeta(arena.allocator(), dirname, &.{std.fs.path.basename(path)}, 15_000) catch {};
-    lap("media metadata", &t);
+    if (!piped) {
+        const dirname = std.fs.path.dirname(path) orelse "/";
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        _ = fs.mediaMeta(arena.allocator(), dirname, &.{std.fs.path.basename(path)}, 15_000) catch {};
+        lap("media metadata", &t);
+    }
     const link_ms = @as(f64, @floatFromInt(clock.nowNs() - load0)) / 1e6;
     var w: c_int = 0;
     var h: c_int = 0;
@@ -191,19 +215,28 @@ fn e2e(host: []const u8, path: []const u8, mode: []const u8, bound: u32) !void {
     });
 }
 
-fn previewOver(fs: *fsdrive.Fs, path: []const u8, codecs: []const u8, bound: u32, probed: bool, t: *u64) ![]u8 {
-    const job = if (bound == 0) try fs.startPreviewCodecs(path, codecs) else try fs.startPreviewSized(path, codecs, bound);
-    return sidecarOver(fs, job, probed, t);
+fn pipedMeta(fs: *fsdrive.Fs, req: u32, t: *u64) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    _ = fs.mediaMetaResults(arena.allocator(), try fs.awaitJob(req), 15_000) catch {};
+    lap("media metadata (submitted early)", t);
 }
 
-fn sidecarOver(fs: *fsdrive.Fs, job: u64, probed: bool, t: *u64) ![]u8 {
+fn previewOver(fs: *fsdrive.Fs, path: []const u8, codecs: []const u8, bound: u32, probed: bool, t: *u64) ![]u8 {
+    const job = if (bound == 0) try fs.startPreviewCodecs(path, codecs) else try fs.startPreviewSized(path, codecs, bound);
+    return sidecarOver(fs, job, probed, false, t);
+}
+
+fn sidecarOver(fs: *fsdrive.Fs, job: u64, probed: bool, unawaited: bool, t: *u64) ![]u8 {
     var event = try fs.waitJobTerminal(job, 120_000);
     defer event.deinit();
     if (!std.mem.eql(u8, event.ev, "done") or event.path.len == 0) return error.PreviewFailed;
-    lap("preview job (host)", t);
+    lap(if (event.keep) "preview job (host, cached)" else "preview job (host)", t);
     const bytes = try readAll(fs, event.path, 2 << 20, probed);
     lap("read preview", t);
-    if (!event.keep) fs.unlink(event.path) catch {};
+    if (!event.keep) {
+        if (unawaited) fs.unlinkNoWait(event.path) catch {} else fs.unlink(event.path) catch {};
+    }
     lap("unlink sidecar", t);
     return bytes;
 }
@@ -218,7 +251,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return e2e(std.mem.span(argv[2]), std.mem.span(argv[3]), std.mem.span(argv[4]), bound);
     }
     if (argv.len < 2) {
-        std.debug.print("usage: bench-preview <image>... | --e2e <host-spec> <remote path> old|new [display bound]\n", .{});
+        std.debug.print("usage: bench-preview <image>... | --e2e <host-spec> <remote path> old|new|piped [display bound]\n", .{});
         return;
     }
     std.debug.print("codecs loaded: \"{s}\"\n", .{imagecodec.capabilities()});

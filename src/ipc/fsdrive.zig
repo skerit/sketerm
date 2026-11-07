@@ -484,13 +484,15 @@ pub const JobEnd = struct {
 /// the Fs until awaitSubmitted hands it (and its buffer) to the caller.
 pub const PendingOp = struct {
     req: u32,
-    kind: enum { read, write },
+    kind: enum { read, write, job },
     done: bool = false,
     failed: bool = false,
     /// read: collected fs_data payload bytes.
     data: std.ArrayList(u8) = .empty,
     info: ReadInfo = .{ .size = 0, .eof = false },
     written: u64 = 0,
+    /// job: the id the daemon minted (0 = the reply named none).
+    job: u64 = 0,
 };
 
 pub const Fs = struct {
@@ -605,14 +607,29 @@ pub const Fs = struct {
         self.job_events.append(self.allocator, ev) catch arena.deinit();
     }
 
-    /// Route any pushed frame to its stash. Every receive loop calls
-    /// this for non-reply frames so pushes are never dropped.
+    /// Route any pushed frame to its stash, and a pipelined op's reply or
+    /// data to its pending entry, so a receive loop never drops either.
     fn stashPush(self: *Fs, ftype: wire.FrameType, payload: []const u8) void {
         switch (ftype) {
             .fs_delta => self.stashDelta(payload),
             .fs_job => self.stashJobEvent(payload),
+            // A pipelined op's reply can land while a job is awaited;
+            // dropping it here would leave that op waiting forever.
+            .fs_data => self.routePendingData(payload),
+            .fs_reply => self.routePendingReply(payload),
             else => {},
         }
+    }
+
+    fn routePendingReply(self: *Fs, payload: []const u8) void {
+        if (self.pending_ops.items.len == 0) return;
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const rep = std.json.parseFromSliceLeaky(Reply, scratch.allocator(), payload, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        }) catch return;
+        _ = self.completePending(&rep);
     }
 
     /// Pop the oldest pending delta (caller deinits), draining any
@@ -1146,6 +1163,7 @@ pub const Fs = struct {
         }
         p.info = .{ .size = rep.size, .eof = rep.eof, .mtime_ns = rep.mtime_ns, .ino = rep.ino };
         p.written = rep.written;
+        p.job = rep.job;
         return true;
     }
 
@@ -1174,6 +1192,38 @@ pub const Fs = struct {
             return err;
         };
         return req;
+    }
+
+    /// Start a job without waiting for its id; pair with `awaitJob`. Lets
+    /// a caller put several job starts (and reads) on the wire at once
+    /// instead of paying a round trip for each.
+    pub fn jobSubmit(self: *Fs, op: []const u8, args: anytype) Error!u32 {
+        const req = self.nextReq();
+        self.pending_ops.append(self.allocator, .{ .req = req, .kind = .job }) catch
+            return Error.OutOfMemory;
+        self.sendOp(op, req, args) catch |err| {
+            _ = self.pending_ops.pop();
+            return err;
+        };
+        return req;
+    }
+
+    /// The job id a `jobSubmit` was answered with.
+    pub fn awaitJob(self: *Fs, req: u32) Error!u64 {
+        const p = try self.awaitSubmitted(req, OP_TIMEOUT_MS);
+        if (p.job == 0) return Error.BadReply;
+        return p.job;
+    }
+
+    /// `startPreviewSized` (bound 0: `startPreviewCodecs`) as a `jobSubmit`.
+    pub fn previewSubmit(self: *Fs, path: []const u8, image_codecs: []const u8, bound: u32) Error!u32 {
+        return self.jobSubmit("preview", .{ .path = path, .image_codecs = image_codecs, .bound = bound });
+    }
+
+    /// Unlink without waiting for the reply, which any later receive
+    /// loop drops by its nonce; for best-effort cleanup off the critical path.
+    pub fn unlinkNoWait(self: *Fs, path: []const u8) Error!void {
+        try self.sendOp("unlink", self.nextReq(), .{ .path = path });
     }
 
     /// Wait for one submitted op, routing every other frame to its
@@ -1608,6 +1658,11 @@ pub const Fs = struct {
     /// as job events with ev == "match", one per name, so a caller can
     /// render rows as they land; the terminal event ends the batch.
     pub fn startMediaMeta(self: *Fs, dir: []const u8, names: []const []const u8) Error!u64 {
+        return self.awaitJob(try self.mediaMetaSubmit(dir, names));
+    }
+
+    /// `startMediaMeta` as a `jobSubmit`.
+    pub fn mediaMetaSubmit(self: *Fs, dir: []const u8, names: []const []const u8) Error!u32 {
         if (names.len == 0 or names.len > MEDIA_BATCH_MAX) return Error.BadRequest;
         var joined: std.ArrayList(u8) = .empty;
         defer joined.deinit(self.allocator);
@@ -1615,7 +1670,7 @@ pub const Fs = struct {
             if (i > 0) joined.append(self.allocator, MEDIA_SEP) catch return Error.OutOfMemory;
             joined.appendSlice(self.allocator, name) catch return Error.OutOfMemory;
         }
-        return self.startJob("media_meta", .{ .path = dir, .pattern = joined.items });
+        return self.jobSubmit("media_meta", .{ .path = dir, .pattern = joined.items });
     }
 
     /// Run one media_meta batch to completion (bounded) and collect the
@@ -1628,7 +1683,11 @@ pub const Fs = struct {
         names: []const []const u8,
         timeout_ms: i64,
     ) Error![]MediaResult {
-        const job = try self.startMediaMeta(dir, names);
+        return self.mediaMetaResults(arena, try self.startMediaMeta(dir, names), timeout_ms);
+    }
+
+    /// Collect a started media_meta job's results into `arena` (bounded).
+    pub fn mediaMetaResults(self: *Fs, arena: std.mem.Allocator, job: u64, timeout_ms: i64) Error![]MediaResult {
         var out: std.ArrayList(MediaResult) = .empty;
         const deadline = nowMs() + timeout_ms;
         while (true) {

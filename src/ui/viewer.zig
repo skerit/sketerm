@@ -454,12 +454,20 @@ fn fetchArchive(fs: *fsdrive.Fs, path: []const u8, size_hint: u64) !?FetchPayloa
     return payload;
 }
 
-fn fetchMetadata(fs: *fsdrive.Fs, resource: model.Resource, payload: *FetchPayload) void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer arena.deinit();
+/// Ask the host for `resource`'s metadata without waiting, so it is
+/// worked out while the image bytes are fetched. Null: no metadata.
+fn submitMetadata(fs: *fsdrive.Fs, resource: model.Resource) ?u32 {
     const dir = std.fs.path.dirname(resource.path) orelse "/";
     const names = [_][]const u8{std.fs.path.basename(resource.path)};
-    const results = fs.mediaMeta(arena.allocator(), dir, &names, 15_000) catch return;
+    return fs.mediaMetaSubmit(dir, &names) catch null;
+}
+
+/// Collect a `submitMetadata` request's answer into `payload`.
+fn finishMetadata(fs: *fsdrive.Fs, req: ?u32, payload: *FetchPayload) void {
+    const job = fs.awaitJob(req orelse return) catch return;
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const results = fs.mediaMetaResults(arena.allocator(), job, 15_000) catch return;
     if (results.len == 0) return;
     const interesting = [_]struct { key: []const u8, label: []const u8 }{
         .{ .key = "media.format", .label = "Format" },
@@ -560,13 +568,19 @@ fn fetchOn(work: *LoadWork, fs: *fsdrive.Fs, resource: model.Resource) !FetchPay
             .bytes = try out.toOwnedSlice(allocator),
         };
     }
+    // Metadata is asked for up front, on every path below, so the host
+    // works it out while the image crosses the link: collected last, it
+    // used to cost a round trip plus the host's time after the image.
+    // A failed load drops the outstanding requests with it.
+    errdefer fs.cancelSubmitted();
     if (variant == .original or variant == .external_copy) {
         // The ceiling belongs to whole-file reads only: a preview of a
         // multi-GB video is a small daemon-rendered poster.
         if (source.size > ORIGINAL_BYTES_MAX) return error.SourceTooLarge;
+        const meta = submitMetadata(fs, resource);
         const bytes = try readAll(fs, resource.path, ORIGINAL_BYTES_MAX);
         var payload = FetchPayload{ .source_size = bytes.len, .bytes = bytes };
-        fetchMetadata(fs, resource, &payload);
+        finishMetadata(fs, meta, &payload);
         return payload;
     }
 
@@ -582,23 +596,28 @@ fn fetchOn(work: *LoadWork, fs: *fsdrive.Fs, resource: model.Resource) !FetchPay
     });
     const preview = switch (plan) {
         .original => {
+            const meta = submitMetadata(fs, resource);
             const bytes = try readAll(fs, resource.path, ORIGINAL_BYTES_MAX);
             var payload = FetchPayload{ .source_size = bytes.len, .bytes = bytes, .variant = .original };
-            fetchMetadata(fs, resource, &payload);
+            finishMetadata(fs, meta, &payload);
             return payload;
         },
         .preview => |p| p,
     };
-    // Both jobs start at once: the host renders them on parallel helpers,
-    // and the quick one is on screen while the sized one crosses the link.
-    const quick_job: ?u64 = if (preview.quick_first)
-        fs.startPreviewSized(resource.path, preview.codecs, imagepolicy.DEFAULT_BOUND) catch null
+    // Every job starts in one round trip: the host renders the previews
+    // on parallel helpers, and the quick one is on screen while the
+    // sized one crosses the link.
+    const quick_req: ?u32 = if (preview.quick_first)
+        fs.previewSubmit(resource.path, preview.codecs, imagepolicy.DEFAULT_BOUND) catch null
     else
         null;
-    const job = if (preview.bound == 0)
-        try fs.startPreviewCodecs(resource.path, preview.codecs)
-    else
-        try fs.startPreviewSized(resource.path, preview.codecs, preview.bound);
+    const job_req = try fs.previewSubmit(resource.path, preview.codecs, preview.bound);
+    const meta = submitMetadata(fs, resource);
+    const quick_job: ?u64 = if (quick_req) |r| fs.awaitJob(r) catch |err| blk: {
+        if (isTransportError(err)) return err;
+        break :blk null;
+    } else null;
+    const job = try fs.awaitJob(job_req);
     if (quick_job) |quick| {
         // Best effort: a failed stand-in only means waiting for the real one.
         if (fetchSidecar(fs, quick, null)) |bytes| deliverInterim(work, bytes) else |err| {
@@ -607,7 +626,7 @@ fn fetchOn(work: *LoadWork, fs: *fsdrive.Fs, resource: model.Resource) !FetchPay
     }
     const bytes = try fetchSidecar(fs, job, &work.result);
     var payload = FetchPayload{ .source_size = @intCast(source.size), .bytes = bytes };
-    fetchMetadata(fs, resource, &payload);
+    finishMetadata(fs, meta, &payload);
     return payload;
 }
 
@@ -625,7 +644,9 @@ fn fetchSidecar(fs: *fsdrive.Fs, job: u64, result: ?*LoadResult) ![]u8 {
             "the host's preview job failed");
         return error.PreviewFailed;
     }
-    defer if (!event.keep) fs.unlink(event.path) catch {};
+    // Released without waiting: the reply is not worth a round trip
+    // before the image is shown.
+    defer if (!event.keep) fs.unlinkNoWait(event.path) catch {};
     return readAll(fs, event.path, PREVIEW_BYTES_MAX);
 }
 
