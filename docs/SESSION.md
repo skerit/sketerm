@@ -1,5 +1,28 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-07: tree expand keeps the scroll and the keyboard cursor
+
+Report: in a scrolled listing, expanding a directory row flashed or jumped
+to the top, and after Right-expanding, Up/Down started from the top while
+the selection still showed the expanded row. Root cause: `toggleExpand`
+named the toggled row changed (to redraw its chevron), so the windowed
+splice REPLACED that row's item. GtkListBase tracks its keyboard cursor and
+scroll anchor by item: the focused widget went with the old item, focus was
+lost, `refocusListingIfLost` re-grabbed the column view and GTK focused (and
+scrolled to) its stale tracker, row 0. With zebra stripes on, an odd child
+count also flipped every later row's parity, which was a reuse criterion,
+so everything below rebound (99 rows in the rig). Now the row keeps its
+item, the chevron flips in place, the row becomes the scroll anchor before
+the splice (a clicked row further down would otherwise be the anchor and
+push the viewport), parity is restamped on kept rows instead of rebinding
+them, chevron presses are claimed so they never move the cursor, and any
+splice that still replaces the cursor's row restores it through
+`colview.FocusKeep` (path, else nearest ancestor, else position; never
+scrolling). `zig build smoke-tree` covers click and Right/Left, an odd count
+under zebra, nested and empty directories, expanding above the cursor,
+collapsing under it and a descending sort, via the new `browser-rows`
+verification command.
+
 ## 2026-11-07: PDF previews say why they failed
 
 Report: previewing a PDF showed "preview failed". The viewer's status read
