@@ -1,5 +1,32 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-07: performance pass over the file browser, viewer and mux IO
+
+Every change below was measured before and after; ideas that did not
+measure as a win were dropped. The daemon's `clientReadable` slid its read
+buffer down after every frame, the same quadratic shape `Conn.takeFrame`
+had: on its 16 KiB reads, 4 B input frames went 5 -> 4053 MB/s and 200 B
+ones 112 -> 17858 MB/s (framing microbench). `wire.dropTaken` is now the
+one lazy-compaction policy for both ends. The disk-usage analyzer rescanned
+every result node (0.8-1.9 ms at the 75k cap) on each render AND each chart
+draw; a model generation keys the child list, so smoke-usage's hover sweep
+costs 0 scans (17 -> 4 over the run), and the analyzer's "file: <path>"
+status line survives re-renders. `invalidateBackingRefs` cleared
+`name_cells` on every delta while a partial splice kept those rows bound:
+after one expand 15 of 18 visible rows were unreachable for thumbnails and
+inline rename (smoke-tree now checks `unmapped`). Window-sized image
+previews are cached on the host (`sketerm/previews/<md5>-<bound>-<size>`,
+256 MiB budget): a 2048 px reopen takes 5 ms instead of 290 on loopback.
+The viewer pipelines its preview/metadata job starts and no longer waits on
+sidecar unlinks or the metadata job after the image (`Fs.jobSubmit`,
+`awaitJob`; `stashPush` now routes pipelined replies): over 10 Mbit/50 ms
+the final 2048 px image lands at 1382 ms instead of 1685 (1127 on reopen).
+A 50k-entry folder (`SKETERM_SMOKE_TREE_BIG=50000 zig build smoke-tree`,
+dev build) rendered in 133 ms per delta: `presorted.sort` skips sorting a
+listing that is still in order (sort 43 -> 13 ms) and `renderList` builds
+GObjects only for the spliced window (rows 88 -> 45 ms); listing it went
+8.5 -> 2.9 s and a new file shows in 120 ms instead of 320.
+
 ## 2026-11-07: the disk-usage analyzer stops flickering under a selection
 
 Report: "Analyze disk usage" was glitchy; selecting a result flickered.
