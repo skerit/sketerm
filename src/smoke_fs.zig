@@ -1592,6 +1592,27 @@ fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: [
                 _ = std.fmt.bufPrintSentinel(&side_z, "{s}", .{sidecar}, 0) catch unreachable;
                 if (c.access(&side_z, c.F_OK) == 0) fail("sidecar survived its release");
             }
+
+            // preview_bound: a sized request renders from the source in
+            // the receiver's cheapest codec (JPEG for opaque pixels).
+            if (!fs.conn.caps.preview_bound) fail("daemon does not advertise preview_bound");
+            {
+                const sj = fs.startPreviewSized(pic, "jpeg,png", 1024) catch failErr("start sized preview", fs.lastErr());
+                var ev = fs.waitJobTerminal(sj, 20_000) catch failErr("sized preview wait", fs.lastErr());
+                defer ev.deinit();
+                if (!std.mem.eql(u8, ev.ev, "done") or ev.path.len == 0) fail("sized preview job failed");
+                if (!std.mem.endsWith(u8, ev.path, ".jpg")) fail("opaque sized preview is not a JPEG sidecar");
+                var bytes: std.ArrayList(u8) = .empty;
+                defer bytes.deinit(allocator);
+                const info = fs.read(ev.path, 0, 2 << 20, &bytes) catch failErr("read sized sidecar", fs.lastErr());
+                if (!info.eof or bytes.items.len == 0) fail("sized sidecar read incomplete");
+                var w: c_int = 0;
+                var h: c_int = 0;
+                var n: c_int = 0;
+                if (c.stbi_info_from_memory(bytes.items.ptr, @intCast(bytes.items.len), &w, &h, &n) == 0 or w != 64 or h != 48)
+                    fail("sized preview has the wrong geometry (a bound above the source never upscales)");
+                fs.unlink(ev.path) catch failErr("unlink sized sidecar", fs.lastErr());
+            }
         }
 
         // dir_size walks host-side: bytes in `done`, entries in `total`.

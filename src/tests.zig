@@ -143,6 +143,7 @@ comptime {
     _ = @import("util/shellintegration.zig");
     _ = @import("util/png.zig");
     _ = @import("util/imagecodec.zig");
+    _ = @import("util/imagepolicy.zig");
     _ = @import("util/marks.zig");
     _ = @import("util/gifrec.zig");
     _ = @import("util/webm.zig");

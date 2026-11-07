@@ -6,6 +6,7 @@ const atomicwrite = @import("../../util/atomicwrite.zig");
 const png = @import("../../util/png.zig");
 const imagecodec = @import("../../util/imagecodec.zig");
 const pathz = @import("../../util/pathz.zig");
+const imagepolicy = @import("../../util/imagepolicy.zig");
 const thumbs = @import("../../filebrowser/thumbs.zig");
 const fsjob = @import("../fsjob.zig");
 const Job = fsjob.Job;
@@ -49,21 +50,6 @@ fn rasterThumbnail(allocator: std.mem.Allocator, source: [:0]const u8, output: [
 /// Must match the GUI's PREVIEW_IMAGE_CAP: reads refuse larger assets.
 const TRANSPORT_BYTE_CAP: usize = 2 << 20;
 
-const PngSink = struct {
-    allocator: std.mem.Allocator,
-    buf: std.ArrayList(u8) = .empty,
-    failed: bool = false,
-};
-
-fn pngSinkWrite(ctx: ?*anyopaque, data: ?*anyopaque, size: c_int) callconv(.c) void {
-    const sink: *PngSink = @ptrCast(@alignCast(ctx.?));
-    if (sink.failed or size <= 0) return;
-    const chunk = @as([*]const u8, @ptrCast(data.?))[0..@intCast(size)];
-    sink.buf.appendSlice(sink.allocator, chunk) catch {
-        sink.failed = true;
-    };
-}
-
 /// A decoded, bound-scaled RGBA image with its backing storage.
 const ScaledRgba = struct {
     rgba: []const u8,
@@ -89,15 +75,9 @@ fn loadScaledRgba(allocator: std.mem.Allocator, source_path: []const u8, bound: 
     var owned = true;
     defer if (owned) c.stbi_image_free(pixels);
     if (width <= 0 or height <= 0) return null;
-    const max_dim = @max(width, height);
-    const out_w: u32 = if (max_dim > bound)
-        @intFromFloat(@max(1.0, @as(f64, @floatFromInt(width)) * @as(f64, @floatFromInt(bound)) / @as(f64, @floatFromInt(max_dim))))
-    else
-        @intCast(width);
-    const out_h: u32 = if (max_dim > bound)
-        @intFromFloat(@max(1.0, @as(f64, @floatFromInt(height)) * @as(f64, @floatFromInt(bound)) / @as(f64, @floatFromInt(max_dim))))
-    else
-        @intCast(height);
+    const fit = imagepolicy.fitWithin(@intCast(width), @intCast(height), bound);
+    const out_w = fit.w;
+    const out_h = fit.h;
     const pixels_len = std.math.mul(usize, @intCast(width), @intCast(height)) catch return null;
     const src_len = std.math.mul(usize, pixels_len, 4) catch return null;
     const src = @as([*]const u8, @ptrCast(pixels))[0..src_len];
@@ -115,46 +95,50 @@ fn loadScaledRgba(allocator: std.mem.Allocator, source_path: []const u8, bound: 
     };
 }
 
-/// Transcode a host-local image into the receiver's best transport codec.
-fn transportPreview(
-    job: *const Job,
-    source_path: []const u8,
-    codecs: []const u8,
-    bound: u32,
-    out_path: *[4096:0]u8,
-) ?[]const u8 {
-    const allocator = job.allocator;
-    if (codecs.len == 0) return null;
-    const img = loadScaledRgba(allocator, source_path, bound) orelse return null;
-    defer img.deinit(allocator);
-    const rgba = img.rgba;
-    const out_w = img.w;
-    const out_h = img.h;
-    // Prefer the compact codecs; PNG is the always-available last
-    // resort (stb encoder is compiled in — a host without
-    // libjxl/libwebp, or a static mux-portable whose dlopen can never
-    // load them, still previews). A local receiver lists only "png",
-    // so local previews keep skipping the transcode entirely.
-    var png_sink = PngSink{ .allocator = allocator };
-    defer png_sink.buf.deinit(allocator);
-    var jx_bytes: ?[]u8 = null;
-    defer if (jx_bytes) |b| allocator.free(b);
-    var bytes: []const u8 = undefined;
-    var ext: []const u8 = undefined;
-    if (imagecodec.encodePreferred(allocator, rgba, out_w, out_h, codecs, TRANSPORT_BYTE_CAP)) |encoded| {
-        jx_bytes = encoded.bytes;
-        bytes = encoded.bytes;
-        ext = switch (encoded.codec) {
+/// An encoded transport asset and the file extension that names its codec.
+const Encoded = struct {
+    bytes: []u8,
+    ext: []const u8,
+};
+
+/// True when every pixel is opaque, so dropping alpha (JPEG) loses nothing.
+fn opaqueRgba(rgba: []const u8) bool {
+    var i: usize = 3;
+    while (i < rgba.len) : (i += 4) if (rgba[i] != 255) return false;
+    return true;
+}
+
+/// Encode RGBA into the receiver's best transport codec under `cap` bytes.
+/// Order: JXL/WebP when listed and loadable, then JPEG (opaque images
+/// only), then PNG, the always-available last resort (stb is compiled
+/// in, so a host without libjxl/libwebp, or a static mux-portable whose
+/// dlopen can never load them, still previews).
+/// @return null when no listed codec fits under `cap`.
+fn encodeTransport(allocator: std.mem.Allocator, rgba: []const u8, w: u32, h: u32, codecs: []const u8, cap: usize) ?Encoded {
+    if (imagecodec.encodePreferred(allocator, rgba, w, h, codecs, cap)) |encoded| {
+        return .{ .bytes = encoded.bytes, .ext = switch (encoded.codec) {
             .jxl => "jxl",
             .webp => "webp",
-        };
-    } else |_| {
-        if (!imagecodec.wanted(codecs, "png")) return null;
-        if (c.stbi_write_png_to_func(&pngSinkWrite, @ptrCast(&png_sink), @intCast(out_w), @intCast(out_h), 4, rgba.ptr, @intCast(out_w * 4)) == 0 or
-            png_sink.failed or png_sink.buf.items.len > TRANSPORT_BYTE_CAP) return null;
-        bytes = png_sink.buf.items;
-        ext = "png";
+        } };
+    } else |_| {}
+    if (imagecodec.wanted(codecs, "jpeg") and opaqueRgba(rgba)) {
+        if (png.encodeRgbaJpeg(allocator, rgba, w, h, imagepolicy.JPEG_QUALITY)) |bytes| {
+            if (bytes.len <= cap) return .{ .bytes = bytes, .ext = "jpg" };
+            allocator.free(bytes);
+        } else |_| {}
     }
+    if (!imagecodec.wanted(codecs, "png")) return null;
+    const bytes = png.encodeRgba(allocator, rgba, w, h) catch return null;
+    if (bytes.len > cap) {
+        allocator.free(bytes);
+        return null;
+    }
+    return .{ .bytes = bytes, .ext = "png" };
+}
+
+/// Write `bytes` to a fresh exclusive /tmp sidecar, registered with the
+/// daemon as this job's asset before the first byte lands.
+fn writeSidecar(job: *const Job, bytes: []const u8, ext: []const u8, out_path: *[4096:0]u8) ?[]const u8 {
     var random: [8]u8 = undefined;
     if (c.getentropy(&random, random.len) != 0) {
         var ts: c.struct_timespec = undefined;
@@ -188,6 +172,77 @@ fn transportPreview(
     if (c.fsync(fd) != 0 or c.close(fd) != 0) return null;
     open = false;
     return out;
+}
+
+/// Transcode a host-local image into the receiver's best transport codec.
+fn transportPreview(
+    job: *const Job,
+    source_path: []const u8,
+    codecs: []const u8,
+    bound: u32,
+    out_path: *[4096:0]u8,
+) ?[]const u8 {
+    const allocator = job.allocator;
+    if (codecs.len == 0) return null;
+    const img = loadScaledRgba(allocator, source_path, bound) orelse return null;
+    defer img.deinit(allocator);
+    const encoded = encodeTransport(allocator, img.rgba, img.w, img.h, codecs, TRANSPORT_BYTE_CAP) orelse return null;
+    defer allocator.free(encoded.bytes);
+    return writeSidecar(job, encoded.bytes, encoded.ext, out_path);
+}
+
+/// Encode `img` under the transport cap, halving its geometry while a
+/// listed codec overflows (an alpha photo as PNG at 4096 px would);
+/// never below the legacy 512 px tier.
+fn encodeFitting(allocator: std.mem.Allocator, img: ScaledRgba, codecs: []const u8) ?Encoded {
+    var w = img.w;
+    var h = img.h;
+    var owned: ?[]u8 = null;
+    defer if (owned) |b| allocator.free(b);
+    var rgba = img.rgba;
+    while (true) {
+        if (encodeTransport(allocator, rgba, w, h, codecs, TRANSPORT_BYTE_CAP)) |encoded| return encoded;
+        if (@max(w, h) <= imagepolicy.DEFAULT_BOUND) return null;
+        const fit = imagepolicy.fitWithin(w, h, @max(imagepolicy.DEFAULT_BOUND, @max(w, h) / 2));
+        const smaller = png.downscaleRgba(allocator, rgba, w, h, fit.w, fit.h) catch return null;
+        if (owned) |b| allocator.free(b);
+        owned = smaller;
+        rgba = smaller;
+        w = fit.w;
+        h = fit.h;
+    }
+}
+
+/// A `preview_bound` image preview: one decode of the SOURCE, one scale
+/// to the requested bound, one encode. No freedesktop tier is involved
+/// (its sizes are fixed by spec) and nothing is cached: the sized
+/// request comes from a viewer showing one image at its window size.
+/// Formats stb cannot read (WebP, GIF, TIFF, SVG, ...) go through the
+/// legacy generators at the same bound first.
+fn runSizedPreview(job: *const Job, source: [:0]const u8, bound: u32) u8 {
+    const allocator = job.allocator;
+    const spec = job.spec;
+    var raw_buf: [4096:0]u8 = undefined;
+    var raw: ?[:0]const u8 = null;
+    defer if (raw) |r| {
+        _ = c.unlink(r.ptr);
+    };
+    const img = loadScaledRgba(allocator, spec.src, bound) orelse blk: {
+        const r = std.fmt.bufPrintSentinel(&raw_buf, "/tmp/.sketerm-thumbgen-{d}-sized.png", .{c.getpid()}, 0) catch return job.emitError("preview path too long");
+        if (!generateThumbPng(allocator, spec.src, source, r, @intCast(bound)))
+            return job.emitError("preview generator unavailable or failed");
+        raw = r;
+        break :blk loadScaledRgba(allocator, r, bound) orelse return job.emitError("preview generator produced an unreadable image");
+    };
+    defer img.deinit(allocator);
+    const encoded = encodeFitting(allocator, img, spec.image_codecs) orelse
+        return job.emitError("no accepted preview codec (jpeg/png) under the 2 MiB cap");
+    defer allocator.free(encoded.bytes);
+    var transport_buf: [4096:0]u8 = undefined;
+    const transport = writeSidecar(job, encoded.bytes, encoded.ext, &transport_buf) orelse
+        return job.emitError("cannot write the preview sidecar");
+    job.emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = transport });
+    return 0;
 }
 
 /// Resize/transcode a previewer-owned image without installing a cache entry.
@@ -691,6 +746,10 @@ pub fn runPreview(job: *const Job, thumbnail_only: bool) u8 {
         return 0;
     }
     if (!media) return job.emitError("no thumbnailer for this file type");
+    // A sized request (`preview_bound`) for an image renders straight
+    // from the source; posters (video, audio, pdf) keep the tier path.
+    if (spec.bound != 0 and extIs(spec.src, &image_exts))
+        return runSizedPreview(job, source, imagepolicy.jobBound(spec.bound));
 
     var cache_buf: [4096]u8 = undefined;
     const cache_root = cacheRootDir(&cache_buf);
@@ -761,6 +820,52 @@ test "transportPreview serves PNG when jxl/webp cannot, refuses without any acce
     // A receiver accepting nothing usable gets a refusal, not a PNG.
     var out2: [4096:0]u8 = undefined;
     try t.expect(transportPreview(&job, src, "", 512, &out2) == null);
+}
+
+test "encodeTransport: JPEG for opaque pixels, PNG once alpha appears or JPEG is not listed" {
+    const t = std.testing;
+    var rgba: [16 * 8 * 4]u8 = undefined;
+    for (0..16 * 8) |i| {
+        rgba[i * 4] = @truncate(i * 3);
+        rgba[i * 4 + 1] = @truncate(i * 5);
+        rgba[i * 4 + 2] = @truncate(i * 7);
+        rgba[i * 4 + 3] = 255;
+    }
+    const jpg = encodeTransport(t.allocator, &rgba, 16, 8, "jpeg,png", TRANSPORT_BYTE_CAP) orelse return error.TestUnexpectedResult;
+    defer t.allocator.free(jpg.bytes);
+    try t.expectEqualStrings("jpg", jpg.ext);
+    try t.expect(jpg.bytes.len > 2 and jpg.bytes[0] == 0xff and jpg.bytes[1] == 0xd8);
+    const legacy = encodeTransport(t.allocator, &rgba, 16, 8, "png", TRANSPORT_BYTE_CAP) orelse return error.TestUnexpectedResult;
+    defer t.allocator.free(legacy.bytes);
+    try t.expectEqualStrings("png", legacy.ext);
+    rgba[3] = 128;
+    const alpha = encodeTransport(t.allocator, &rgba, 16, 8, "jpeg,png", TRANSPORT_BYTE_CAP) orelse return error.TestUnexpectedResult;
+    defer t.allocator.free(alpha.bytes);
+    try t.expectEqualStrings("png", alpha.ext);
+    // Alpha with only JPEG acceptable: nothing honest to send.
+    try t.expect(encodeTransport(t.allocator, &rgba, 16, 8, "jpeg", TRANSPORT_BYTE_CAP) == null);
+}
+
+test "encodeFitting halves an over-cap preview but never below the 512 px tier" {
+    const t = std.testing;
+    // Translucent noise: PNG is the only listed codec that keeps it,
+    // and 1024x1024 of it is far over the 2 MiB cap.
+    const side: u32 = 1024;
+    const rgba = try t.allocator.alloc(u8, side * side * 4);
+    defer t.allocator.free(rgba);
+    var prng = std.Random.DefaultPrng.init(42);
+    prng.random().bytes(rgba);
+    const img = ScaledRgba{ .rgba = rgba, .w = side, .h = side, .pixels = null, .scaled = null };
+    const fitted = encodeFitting(t.allocator, img, "jpeg,png") orelse return error.TestUnexpectedResult;
+    defer t.allocator.free(fitted.bytes);
+    try t.expectEqualStrings("png", fitted.ext);
+    try t.expect(fitted.bytes.len <= TRANSPORT_BYTE_CAP);
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var n: c_int = 0;
+    try t.expect(c.stbi_info_from_memory(fitted.bytes.ptr, @intCast(fitted.bytes.len), &w, &h, &n) != 0);
+    try t.expectEqual(@as(c_int, 512), w);
+    try t.expectEqual(@as(c_int, 512), h);
 }
 
 test "rasterThumbnail puts the longest side exactly on the bound and keeps small images as-is" {

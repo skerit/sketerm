@@ -143,6 +143,9 @@ pub const FsOpReq = struct {
     attrs: []const u8 = "",
     /// Preferred image transport codecs supported by the receiver.
     image_codecs: []const u8 = "",
+    /// preview: longest side to render at (0 = the legacy 512 px tier;
+    /// see the `preview_bound` capability).
+    bound: u32 = 0,
     /// thumbnail: cache the codec bytes host-side and serve that
     /// persistent file (remote-serving mode; see fsjob.Spec).
     wire_cache: bool = false,

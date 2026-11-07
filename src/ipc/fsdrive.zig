@@ -817,6 +817,7 @@ pub const Fs = struct {
             dial_tries: u32 = 0,
             attrs: []const u8 = "",
             image_codecs: []const u8 = "",
+            bound: u32 = 0,
             /// install: the destination mtime the caller last saw.
             expected_mtime_ns: ?i64 = null,
         };
@@ -1672,6 +1673,12 @@ pub const Fs = struct {
     /// bounded sidecar the receiver reads and then unlinks.
     pub fn startPreviewCodecs(self: *Fs, path: []const u8, image_codecs: []const u8) Error!u64 {
         return self.startJob("preview", .{ .path = path, .image_codecs = image_codecs });
+    }
+
+    /// Image preview rendered at `bound` px (longest side) by a daemon
+    /// advertising `preview_bound`; older daemons ignore the bound.
+    pub fn startPreviewSized(self: *Fs, path: []const u8, image_codecs: []const u8, bound: u32) Error!u64 {
+        return self.startJob("preview", .{ .path = path, .image_codecs = image_codecs, .bound = bound });
     }
 
     /// Transcode a video into a growing low-bitrate spool for playback;

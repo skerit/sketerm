@@ -198,6 +198,13 @@ pub const Flag = enum {
     /// with the new `self`, then the address's mail. Absent = such a server
     /// keeps its anon address until it reconnects.
     peer_name_handover,
+    /// Preview jobs honor `bound` (the longest side the client will
+    /// show, `imagepolicy.jobBound`) and the `jpeg` transport codec,
+    /// rendering an image preview straight from the source at that size
+    /// instead of the 512 px freedesktop tier. Absent = the old daemon
+    /// ignores both and serves its 512 px PNG, so a client sends the
+    /// legacy request.
+    preview_bound,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

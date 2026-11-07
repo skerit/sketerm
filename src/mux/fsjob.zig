@@ -142,6 +142,8 @@ pub const Spec = struct {
     gid: i64 = -1,
     /// Receiver-supported preview transport codecs, preference order.
     image_codecs: []const u8 = "",
+    /// preview: longest side to render at (0 = the legacy 512 px tier).
+    bound: u32 = 0,
     /// The preview transport helper owns and removes its source scratch.
     delete_source: bool = false,
     /// thumbnail: cache the transport codec bytes themselves (JXL/

@@ -362,6 +362,7 @@ comptime {
     _ = @import("util/fdcancel.zig");
     _ = @import("util/humantype.zig");
     _ = @import("util/imagecodec.zig");
+    _ = @import("util/imagepolicy.zig");
     _ = @import("util/markdown.zig");
     _ = @import("util/marks.zig");
     _ = @import("util/mounts.zig");
