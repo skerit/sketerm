@@ -1,5 +1,40 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-07: remote images: small originals direct, previews sized to the window
+
+A remote 2918x3508 UI PNG showed as a 425x512 preview: the viewer asked
+the host for the freedesktop x-large tier (512 px, `jobs/preview.zig`
+`runPreview`), PNG only, through a decode -> scale -> stb PNG -> install ->
+decode -> stb PNG chain, then waited six sequential round trips, and never
+fetched the original unless asked. Now (`util/imagepolicy.zig`, one table
+for daemon and viewer): an original of at most 2 MiB that the viewer
+decodes is fetched as-is (full resolution, no host work); anything bigger
+asks for a preview at the canvas' device size (welcome capability
+`preview_bound`, fs_op `bound`, codec token `jpeg`), rendered straight from
+the source as stb JPEG q90 (PNG when there is alpha), and a remote one
+also gets a 512 px stand-in from a parallel job that shows while the
+sized one crosses the link. Old daemons get the legacy request. The
+viewer's reads lost their stat probe (one round trip per file).
+
+`zig build bench-preview -- <image>...` times each stage per bound and
+codec. On this machine, a 2048 px preview costs stb PNG 230-680 ms and
+0.6-6.7 MB, stb JPEG 25-40 ms and 0.5-1.1 MB, WebP/JXL 200-400 ms and
+0.3-0.8 MB; the UI PNG's whole original is 566 KB. `--e2e` replays the
+viewer's requests against an isolated daemon behind a shaped fake ssh
+(time to first image, old -> new, window bound 2048):
+
+| image (bytes on disk) | loopback | 50 Mbit/20 ms | 10 Mbit/50 ms |
+|---|---|---|---|
+| UI PNG 2918x3508 (566 KB) | 66 -> 4 ms, now full res | 200 -> 155 ms | 449 -> 608 ms |
+| UI + wallpaper PNG (6.6 MB) | 135 -> 91 ms (2048 px at 162) | 293 -> 185 (393) | 632 -> 361 (1086) |
+| photo PNG 3508x2631 (12 MB) | 226 -> 168 (223) | 426 -> 257 (488) | 918 -> 415 (1238) |
+| photo JPEG (2.2 MB) | 127 -> 61 (127) | 321 -> 148 (382) | 809 -> 313 (1139) |
+| photo JPEG 2560x1441 (1 MB) | 124 -> 5 ms, full res | 314 -> 234 | 763 -> 999 |
+
+Verified with test-core/test on 0.17 and test-core/test on 0.16, smoke-fs
+(sized JPEG sidecar), mux-portable, and smoke-e2e's new
+`viewerRemoteImageStage` (`SKETERM_SMOKE_E2E_VIEWER_REUSE_ONLY=1`).
+
 ## 2026-10-19: every MCP text lane carries what its next call needs
 
 An audit of all 155 tools in text mode found ~20 whose text dropped a
