@@ -643,6 +643,17 @@ const TINY_PNG = [_]u8{
     0x44, 0xae, 0x42, 0x60, 0x82,
 };
 
+/// Write `minipdf`'s one-page PDF to `path`.
+fn writeMinimalPdf(path: []const u8) void {
+    var buf: [2048]u8 = undefined;
+    const bytes = @import("util/minipdf.zig").build(&buf);
+    var pz: [4096:0]u8 = undefined;
+    const p = std.fmt.bufPrintSentinel(&pz, "{s}", .{path}, 0) catch fail("pdf path");
+    const fp = c.fopen(p.ptr, "wb") orelse fail("create pdf");
+    defer _ = c.fclose(fp);
+    if (c.fwrite(bytes.ptr, 1, bytes.len, fp) != bytes.len) fail("write pdf");
+}
+
 const WireThumbRes = struct {
     ok: bool = false,
     keep: bool = false,
@@ -1612,6 +1623,54 @@ fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: [
                 if (c.stbi_info_from_memory(bytes.items.ptr, @intCast(bytes.items.len), &w, &h, &n) == 0 or w != 64 or h != 48)
                     fail("sized preview has the wrong geometry (a bound above the source never upscales)");
                 fs.unlink(ev.path) catch failErr("unlink sized sidecar", fs.lastErr());
+            }
+
+            // PDF posters: pdftoppm renders page 1 for both the legacy
+            // (viewer) request and a sized one (bound applies to images
+            // only). Hosts without poppler skip it.
+            if (pathz.executableOnPath("pdftoppm")) {
+                var fpd: [4096]u8 = undefined;
+                const pdf = std.fmt.bufPrint(&fpd, "{s}/doc.pdf", .{sdir}) catch unreachable;
+                writeMinimalPdf(pdf);
+                const requests = [_]struct { codecs: []const u8, bound: u32 }{ .{ .codecs = "png", .bound = 0 }, .{ .codecs = "jpeg,png", .bound = 1024 } };
+                for (requests) |rq| {
+                    const pj = (if (rq.bound == 0) fs.startPreviewCodecs(pdf, rq.codecs) else fs.startPreviewSized(pdf, rq.codecs, rq.bound)) catch failErr("start pdf preview", fs.lastErr());
+                    var ev = fs.waitJobTerminal(pj, 20_000) catch failErr("pdf preview wait", fs.lastErr());
+                    defer ev.deinit();
+                    if (!std.mem.eql(u8, ev.ev, "done") or ev.path.len == 0) {
+                        std.debug.print("smoke-fs: pdf preview event {s}: {s}\n", .{ ev.ev, ev.message });
+                        fail("pdf preview job failed");
+                    }
+                    if (ev.keep) continue;
+                    fs.unlink(ev.path) catch failErr("unlink pdf sidecar", fs.lastErr());
+                }
+                // A file named like a PDF that is not one: the job's
+                // error carries pdftoppm's own reason to the client.
+                var fbd: [4096]u8 = undefined;
+                const bad = std.fmt.bufPrint(&fbd, "{s}/._doc.pdf", .{sdir}) catch unreachable;
+                var bad_z: [4096:0]u8 = undefined;
+                _ = std.fmt.bufPrintSentinel(&bad_z, "{s}", .{bad}, 0) catch unreachable;
+                const bf = c.fopen(&bad_z, "wb") orelse fail("create ._doc.pdf");
+                _ = c.fwrite("\x00\x05\x16\x07\x00\x02\x00\x00Mac OS X        ", 1, 24, bf);
+                _ = c.fclose(bf);
+                const bj = fs.startPreviewCodecs(bad, "png") catch failErr("start broken pdf preview", fs.lastErr());
+                var bev = fs.waitJobTerminal(bj, 20_000) catch failErr("broken pdf preview wait", fs.lastErr());
+                defer bev.deinit();
+                if (!std.mem.eql(u8, bev.ev, "error") or !std.mem.startsWith(u8, bev.message, "pdftoppm failed: ")) {
+                    std.debug.print("smoke-fs: broken pdf event {s}: {s}\n", .{ bev.ev, bev.message });
+                    fail("a broken PDF's preview error does not carry pdftoppm's reason");
+                }
+                // The file browser's remote request (wire cache): same
+                // poster, same reason on failure.
+                const wp = wireThumbRequest(allocator, &fs, "preview", pdf, 9201);
+                if (!wp.ok) {
+                    std.debug.print("smoke-fs: wire pdf preview: {s}\n", .{wp.errMsg()});
+                    fail("wire pdf preview failed");
+                }
+                if (!wp.keep) fs.unlink(wp.assetPath()) catch failErr("unlink wire pdf sidecar", fs.lastErr());
+                const wb = wireThumbRequest(allocator, &fs, "preview", bad, 9202);
+                if (wb.ok or !std.mem.startsWith(u8, wb.errMsg(), "pdftoppm failed: "))
+                    fail("a broken PDF's wire preview error does not carry pdftoppm's reason");
             }
         }
 

@@ -229,8 +229,9 @@ fn runSizedPreview(job: *const Job, source: [:0]const u8, bound: u32) u8 {
     };
     const img = loadScaledRgba(allocator, spec.src, bound) orelse blk: {
         const r = std.fmt.bufPrintSentinel(&raw_buf, "/tmp/.sketerm-thumbgen-{d}-sized.png", .{c.getpid()}, 0) catch return job.emitError("preview path too long");
-        if (!generateThumbPng(allocator, spec.src, source, r, @intCast(bound)))
-            return job.emitError("preview generator unavailable or failed");
+        var why: Why = .{};
+        if (!generateThumbPng(allocator, spec.src, source, r, @intCast(bound), &why))
+            return job.emitError(why.text());
         raw = r;
         break :blk loadScaledRgba(allocator, r, bound) orelse return job.emitError("preview generator produced an unreadable image");
     };
@@ -520,6 +521,111 @@ fn fileHasBytes(path: [*:0]const u8) bool {
     return st.st_size > 0;
 }
 
+/// Why a preview generator produced no image, for the job's error event.
+const Why = struct {
+    buf: [320]u8 = undefined,
+    len: usize = 0,
+
+    fn set(self: *Why, comptime fmt: []const u8, args: anytype) void {
+        var w: std.Io.Writer = .fixed(&self.buf);
+        // An overlong detail is cut, never dropped: the head is the useful part.
+        w.print(fmt, args) catch {};
+        self.len = w.end;
+    }
+
+    fn text(self: *const Why) []const u8 {
+        return if (self.len == 0) "the preview generator failed" else self.buf[0..self.len];
+    }
+};
+
+/// The package a missing generator comes from, named in the error.
+fn toolHint(tool: []const u8) []const u8 {
+    if (std.mem.eql(u8, tool, "pdftoppm")) return " (PDF previews need poppler-utils)";
+    if (std.mem.eql(u8, tool, "rsvg-convert")) return " (SVG previews need librsvg)";
+    if (std.mem.eql(u8, tool, "ffmpeg")) return " (video, audio and exotic image previews need it)";
+    return "";
+}
+
+/// The last non-blank line of a tool's stderr: the error that ended it
+/// (pdftoppm prints its "May not be a PDF file" warning first).
+fn lastLine(text: []const u8) []const u8 {
+    var it = std.mem.splitBackwardsScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return "";
+}
+
+/// Run an external generator with stdin/stdout on /dev/null and its
+/// stderr captured into `why` on failure. stdout MUST NOT be inherited:
+/// it is this job helper's event pipe to the daemon.
+fn runGenerator(argv: []const ?[*:0]const u8, why: *Why) bool {
+    const tool = std.mem.span(argv[0].?);
+    if (!binaryExists(tool)) {
+        why.set("{s} is not installed on the host{s}", .{ tool, toolHint(tool) });
+        return false;
+    }
+    var pipefd: [2]c_int = undefined;
+    if (c.pipe(&pipefd) != 0) {
+        why.set("cannot run {s}: pipe failed", .{tool});
+        return false;
+    }
+    const pid = c.fork();
+    if (pid < 0) {
+        _ = c.close(pipefd[0]);
+        _ = c.close(pipefd[1]);
+        why.set("cannot run {s}: fork failed", .{tool});
+        return false;
+    }
+    if (pid == 0) {
+        const null_fd = c.open("/dev/null", c.O_RDWR);
+        if (null_fd >= 0) {
+            _ = c.dup2(null_fd, 0);
+            _ = c.dup2(null_fd, 1);
+            _ = c.close(null_fd);
+        }
+        _ = c.dup2(pipefd[1], 2);
+        _ = c.close(pipefd[0]);
+        _ = c.close(pipefd[1]);
+        _ = c.execvp(argv[0].?, @ptrCast(@constCast(argv.ptr)));
+        c._exit(127);
+    }
+    _ = c.close(pipefd[1]);
+    // Keep the TAIL of stderr (the final error), and keep draining past
+    // it so a chatty tool never blocks on a full pipe.
+    var tail: [2048]u8 = undefined;
+    var tail_len: usize = 0;
+    var chunk: [1024]u8 = undefined;
+    while (true) {
+        const n = c.read(pipefd[0], &chunk, chunk.len);
+        if (n < 0 and std.posix.errno(n) == .INTR) continue;
+        if (n <= 0) break;
+        const got = chunk[0..@intCast(n)];
+        if (tail_len + got.len > tail.len) {
+            const drop = @min(tail_len, tail_len + got.len - tail.len);
+            std.mem.copyForwards(u8, tail[0 .. tail_len - drop], tail[drop..tail_len]);
+            tail_len -= drop;
+        }
+        const keep = got[got.len - @min(got.len, tail.len - tail_len) ..];
+        @memcpy(tail[tail_len..][0..keep.len], keep);
+        tail_len += keep.len;
+    }
+    _ = c.close(pipefd[0]);
+    var st: c_int = 0;
+    while (c.waitpid(pid, &st, 0) < 0 and std.posix.errno(@as(c_int, -1)) == .INTR) {}
+    if (c.WIFEXITED(st) and c.WEXITSTATUS(st) == 0) return true;
+    const detail = lastLine(tail[0..tail_len]);
+    if (c.WIFSIGNALED(st)) {
+        why.set("{s} was killed by signal {d}", .{ tool, c.WTERMSIG(st) });
+    } else if (detail.len > 0) {
+        why.set("{s} failed: {s}", .{ tool, detail });
+    } else {
+        why.set("{s} failed (exit status {d})", .{ tool, c.WEXITSTATUS(st) });
+    }
+    return false;
+}
+
 /// Grab a video's poster frame into `raw`, one second in.
 ///
 /// ffmpeg exits 0 when a seek lands past the end of a short clip and
@@ -528,44 +634,57 @@ fn fileHasBytes(path: [*:0]const u8) bool {
 /// Retrying is cheaper than clamping the seek to a probed duration:
 /// it costs a second ffmpeg only for the rare sub-second clip, where
 /// a clamp would cost an ffprobe on every single video preview.
-fn videoPosterPng(source: [:0]const u8, raw: [:0]const u8, vf: [:0]const u8) bool {
+fn videoPosterPng(source: [:0]const u8, raw: [:0]const u8, vf: [:0]const u8, why: *Why) bool {
     const seek = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-ss", "1", "-i", source.ptr, "-frames:v", "1", "-vf", vf.ptr, raw.ptr, null };
-    if (runArgv(&seek) and fileHasBytes(raw.ptr)) return true;
+    if (runGenerator(&seek, why) and fileHasBytes(raw.ptr)) return true;
     const start = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-i", source.ptr, "-frames:v", "1", "-vf", vf.ptr, raw.ptr, null };
-    return runArgv(&start) and fileHasBytes(raw.ptr);
+    return runGenerator(&start, why) and fileHasBytes(raw.ptr);
 }
 
 /// Generate a raw (uninstalled) thumbnail PNG for `src_path` at
-/// `raw`, bounded to `bound` px. @return false when no generator on
-/// this host could produce it.
-fn generateThumbPng(allocator: std.mem.Allocator, src_path: []const u8, source: [:0]const u8, raw: [:0]const u8, bound: c_int) bool {
+/// `raw`, bounded to `bound` px. @return false, with the reason in
+/// `why`, when no generator on this host could produce it.
+fn generateThumbPng(allocator: std.mem.Allocator, src_path: []const u8, source: [:0]const u8, raw: [:0]const u8, bound: c_int, why: *Why) bool {
     var generated = false;
+    var tool: []const u8 = "ffmpeg";
     if (extIs(src_path, &image_exts)) {
         if (extIs(src_path, &[_][]const u8{".svg"})) {
+            tool = "rsvg-convert";
             var size_buf: [16:0]u8 = undefined;
             const size = std.fmt.bufPrintSentinel(&size_buf, "{d}", .{bound}, 0) catch unreachable;
             const argv = [_:null]?[*:0]const u8{ "rsvg-convert", "--keep-aspect-ratio", "-w", size.ptr, "-h", size.ptr, "-o", raw.ptr, source.ptr, null };
-            generated = runArgv(&argv);
+            generated = runGenerator(&argv, why);
         } else {
             generated = rasterThumbnail(allocator, source, raw, bound);
             if (!generated) {
                 var vf_buf: [64:0]u8 = undefined;
                 const vf = std.fmt.bufPrintSentinel(&vf_buf, "scale={d}:{d}:force_original_aspect_ratio=decrease", .{ bound, bound }, 0) catch return false;
                 const argv = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-i", source.ptr, "-frames:v", "1", "-vf", vf.ptr, raw.ptr, null };
-                generated = runArgv(&argv);
+                generated = runGenerator(&argv, why);
             }
         }
     } else if (extIs(src_path, &pdf_exts)) {
+        tool = "pdftoppm";
         var prefix_buf: [4096:0]u8 = undefined;
-        const prefix = std.fmt.bufPrintSentinel(&prefix_buf, "{s}.page", .{raw[0 .. raw.len - 4]}, 0) catch return false;
+        const prefix = std.fmt.bufPrintSentinel(&prefix_buf, "{s}.page", .{raw[0 .. raw.len - 4]}, 0) catch {
+            why.set("preview path too long", .{});
+            return false;
+        };
         var scale_buf: [16:0]u8 = undefined;
         const scale = std.fmt.bufPrintSentinel(&scale_buf, "{d}", .{bound}, 0) catch unreachable;
         const argv = [_:null]?[*:0]const u8{ "pdftoppm", "-f", "1", "-singlefile", "-scale-to", scale.ptr, "-png", source.ptr, prefix.ptr, null };
-        generated = runArgv(&argv);
+        generated = runGenerator(&argv, why);
         if (generated) {
             var made: [4096:0]u8 = undefined;
-            const mp = std.fmt.bufPrintSentinel(&made, "{s}.png", .{prefix}, 0) catch return false;
-            generated = c.rename(mp.ptr, raw.ptr) == 0;
+            const mp = std.fmt.bufPrintSentinel(&made, "{s}.png", .{prefix}, 0) catch {
+                why.set("preview path too long", .{});
+                return false;
+            };
+            if (c.rename(mp.ptr, raw.ptr) != 0) {
+                why.set("pdftoppm wrote no page image", .{});
+                _ = c.unlink(mp.ptr);
+                return false;
+            }
         }
     } else {
         var vf_buf: [64:0]u8 = undefined;
@@ -574,16 +693,19 @@ fn generateThumbPng(allocator: std.mem.Allocator, src_path: []const u8, source: 
         else
             std.fmt.bufPrintSentinel(&vf_buf, "showwavespic=s={d}x{d}", .{ bound, bound }, 0) catch return false;
         if (extIs(src_path, &video_exts)) {
-            generated = videoPosterPng(source, raw, vf);
+            generated = videoPosterPng(source, raw, vf, why);
         } else {
             const argv = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-i", source.ptr, "-filter_complex", vf.ptr, "-frames:v", "1", raw.ptr, null };
-            generated = runArgv(&argv);
+            generated = runGenerator(&argv, why);
         }
     }
+    if (!generated) return false;
     // Every generator above writes `raw`; a zero exit that produced no
     // file is a failure, and reporting it as success hands the caller a
     // path it cannot read.
-    return generated and fileHasBytes(raw.ptr);
+    if (fileHasBytes(raw.ptr)) return true;
+    why.set("{s} produced no image", .{tool});
+    return false;
 }
 
 /// Encode a host-local image into the receiver's best NON-PNG codec.
@@ -656,8 +778,9 @@ fn runWireThumb(job: *const Job, thumbnail_only: bool, mtime_sec: i64, cache_roo
     };
     const enc_src: []const u8 = if (thumbs.validatePng(final, uri, mtime_sec)) final else blk: {
         const r = std.fmt.bufPrintSentinel(&raw_buf, "/tmp/.sketerm-thumbgen-{d}.png", .{c.getpid()}, 0) catch return job.emitError("thumbnail path too long");
-        if (!generateThumbPng(allocator, spec.src, source, r, if (thumbnail_only) 128 else 512))
-            return job.emitError("preview generator unavailable or failed");
+        var why: Why = .{};
+        if (!generateThumbPng(allocator, spec.src, source, r, if (thumbnail_only) 128 else 512, &why))
+            return job.emitError(why.text());
         raw = r;
         break :blk r;
     };
@@ -784,8 +907,9 @@ pub fn runPreview(job: *const Job, thumbnail_only: bool) u8 {
         const raw = std.fmt.bufPrintSentinel(&raw_buf, "{s}.generated-{d}.png", .{ final, c.getpid() }, 0) catch return job.emitError("thumbnail path too long");
         defer _ = c.unlink(raw.ptr);
         const bound: c_int = if (thumbnail_only) 128 else 512;
-        if (!generateThumbPng(allocator, spec.src, source, raw, bound))
-            return job.emitError("preview generator unavailable or failed");
+        var why: Why = .{};
+        if (!generateThumbPng(allocator, spec.src, source, raw, bound, &why))
+            return job.emitError(why.text());
         thumbs.installPng(allocator, raw, final, uri, mtime_sec) catch return job.emitError("cannot install thumbnail cache entry");
     }
 
@@ -925,6 +1049,79 @@ test "video poster: a clip shorter than the 1s seek still yields a frame" {
     defer _ = c.unlink(raw.ptr);
     var vf_z: [64:0]u8 = undefined;
     const vf = std.fmt.bufPrintSentinel(&vf_z, "scale=128:128:force_original_aspect_ratio=decrease", .{}, 0) catch unreachable;
-    try t.expect(videoPosterPng(src, raw, vf));
+    var why: Why = .{};
+    try t.expect(videoPosterPng(src, raw, vf, &why));
     try t.expect(fileHasBytes(raw.ptr));
+}
+
+test "lastLine picks the final non-blank stderr line" {
+    const t = std.testing;
+    try t.expectEqualStrings("Syntax Error: Couldn't read xref table", lastLine("Syntax Warning: May not be a PDF file\nSyntax Error: Couldn't read xref table\n\n"));
+    try t.expectEqualStrings("only", lastLine("  only \r\n"));
+    try t.expectEqualStrings("", lastLine("\n \n"));
+}
+
+test "runGenerator names a missing tool, the failing line, and drains a chatty stderr" {
+    const t = std.testing;
+    var why: Why = .{};
+    const missing = [_:null]?[*:0]const u8{ "sketerm-no-such-generator", null };
+    try t.expect(!runGenerator(&missing, &why));
+    try t.expectEqualStrings("sketerm-no-such-generator is not installed on the host", why.text());
+
+    why = .{};
+    const failing = [_:null]?[*:0]const u8{ "sh", "-c", "echo warning >&2; echo 'Syntax Error: boom' >&2; exit 3", null };
+    try t.expect(!runGenerator(&failing, &why));
+    try t.expectEqualStrings("sh failed: Syntax Error: boom", why.text());
+
+    why = .{};
+    const silent = [_:null]?[*:0]const u8{ "sh", "-c", "exit 4", null };
+    try t.expect(!runGenerator(&silent, &why));
+    try t.expectEqualStrings("sh failed (exit status 4)", why.text());
+
+    // Far more stderr than a pipe buffer: the tail survives, nothing blocks.
+    why = .{};
+    const chatty = [_:null]?[*:0]const u8{ "sh", "-c", "i=0; while [ $i -lt 20000 ]; do echo noise-line-$i >&2; i=$((i+1)); done; echo final >&2; exit 1", null };
+    try t.expect(!runGenerator(&chatty, &why));
+    try t.expectEqualStrings("sh failed: final", why.text());
+
+    // stdout is not inherited (it is the job's event pipe).
+    why = .{};
+    const ok = [_:null]?[*:0]const u8{ "sh", "-c", "echo stray-stdout", null };
+    try t.expect(runGenerator(&ok, &why));
+}
+
+test "PDF poster: page 1 renders at the bound, a broken PDF says why" {
+    const t = std.testing;
+    if (!binaryExists("pdftoppm")) return;
+    const minipdf = @import("../../util/minipdf.zig");
+    var src_z: [128:0]u8 = undefined;
+    const src = std.fmt.bufPrintSentinel(&src_z, "/tmp/.sketerm-test-pdf-{d}.pdf", .{c.getpid()}, 0) catch unreachable;
+    defer _ = c.unlink(src.ptr);
+    var raw_z: [128:0]u8 = undefined;
+    const raw = std.fmt.bufPrintSentinel(&raw_z, "/tmp/.sketerm-test-pdf-{d}.png", .{c.getpid()}, 0) catch unreachable;
+    defer _ = c.unlink(raw.ptr);
+
+    var pdf_buf: [2048]u8 = undefined;
+    const pdf = minipdf.build(&pdf_buf);
+    var fp = c.fopen(src.ptr, "wb") orelse return error.CreateFailed;
+    try t.expectEqual(pdf.len, c.fwrite(pdf.ptr, 1, pdf.len, fp));
+    _ = c.fclose(fp);
+    var why: Why = .{};
+    try t.expect(generateThumbPng(t.allocator, src, src, raw, 512, &why));
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var n: c_int = 0;
+    try t.expect(c.stbi_info(raw.ptr, &w, &h, &n) != 0);
+    try t.expectEqual(@as(c_int, 512), w);
+    try t.expect(h > 350 and h < 365);
+
+    // An AppleDouble "._x.pdf" sidecar: named like a PDF, not one.
+    _ = c.unlink(raw.ptr);
+    fp = c.fopen(src.ptr, "wb") orelse return error.CreateFailed;
+    _ = c.fwrite("\x00\x05\x16\x07\x00\x02\x00\x00Mac OS X        ", 1, 24, fp);
+    _ = c.fclose(fp);
+    why = .{};
+    try t.expect(!generateThumbPng(t.allocator, src, src, raw, 512, &why));
+    try t.expect(std.mem.startsWith(u8, why.text(), "pdftoppm failed: "));
+    try t.expect(!fileHasBytes(raw.ptr));
 }
