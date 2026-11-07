@@ -1001,6 +1001,11 @@ pub const RowsReport = struct {
     /// Visible rows the path -> name-cell map does not lead back to (a
     /// thumbnail or inline rename aimed at them would miss).
     unmapped: u32 = 0,
+    /// Listing renders so far and the last one's cost (`BTab.render_*`).
+    renders: u64 = 0,
+    render_us: u64 = 0,
+    sort_us: u64 = 0,
+    list_us: u64 = 0,
     selected: []const []u8,
     rows: []RowGeometry,
 };
@@ -1017,6 +1022,10 @@ pub fn rowsReport(tab: *BTab, out: []RowGeometry) RowsReport {
         .focus = -1,
         .focus_path = "",
         .binds = tab.name_binds,
+        .renders = tab.render_count,
+        .render_us = tab.render_ns / 1000,
+        .sort_us = tab.render_sort_ns / 1000,
+        .list_us = tab.render_list_ns / 1000,
         .selected = tab.selected.items,
         .rows = out[0..0],
     };

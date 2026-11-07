@@ -139,11 +139,15 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
     // for it — a socket render right after a click render is still a
     // back-to-back rebuild.
     self.last_listing_render_ms = clock.nowMs();
+    const t_start = clock.nowNs();
+    tab.render_count += 1;
+    defer tab.render_ns = clock.nowNs() - t_start;
     // Media values are stitched onto the entries BEFORE the sort:
     // they arrive from a batched job long after the listing, and a
     // sort by a media column reads them straight off the entries.
     mediacols.applyValues(self, tab);
     tab.applySort();
+    tab.render_sort_ns = clock.nowNs() - t_start;
     self.updateSortHeader(tab);
     self.applyViewChrome(tab);
     // The filter is per tab; the shared entry follows the visible one.
@@ -156,6 +160,7 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
     for (tab.root.entries.items) |e| {
         if (views.entryVisible(tab, e)) tab.vs.shown += 1;
     }
+    const t_list = clock.nowNs();
     switch (tab.view_mode) {
         .details, .compact => self.renderList(tab),
         .icons => self.renderGrid(tab),
@@ -164,6 +169,7 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
             self.renderList(tab);
         },
     }
+    tab.render_list_ns = clock.nowNs() - t_list;
     // What an empty listing area MEANS, decided once and shown in both
     // places (the area itself and the status line) so they cannot
     // disagree.

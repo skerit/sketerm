@@ -22,6 +22,7 @@ const paths = @import("../../filebrowser/paths.zig");
 const fsserve = @import("../../mux/fsserve.zig");
 const formatSpec = paths.formatSpec;
 const naturalLess = @import("../../filebrowser/format.zig").naturalLess;
+const presorted = @import("../../util/presorted.zig");
 pub const SelectionSet = @import("../../filebrowser/selection_set.zig").SelectionSet;
 pub const JobOp = @import("../../filebrowser/jobop.zig").JobOp;
 
@@ -580,7 +581,10 @@ pub const Dir = struct {
     pub fn sort(self: *Dir) void {
         if (self.attr_sort == null and self.sort_key == .kind and self.sortByTypeLabel()) return;
         const Ctx = struct { key: browser_model.SortKey, desc: bool, dirs_first: bool, attr: ?ColumnSort };
-        std.mem.sort(Entry, self.entries.items, Ctx{
+        // Between two renders the entries are almost always still in
+        // order (deltas append, removals keep it): a full sort of a 50k
+        // listing on every render was a third of a delta's main-loop time.
+        presorted.sort(Entry, self.entries.items, Ctx{
             .key = self.sort_key,
             .desc = self.descending,
             .dirs_first = self.dirs_first,
@@ -782,6 +786,12 @@ pub const BTab = struct {
     /// Name cells bound over the tab's life; read only by the
     /// `browser-rows` verification command (how much a render rebound).
     name_binds: u64 = 0,
+    /// Listing renders and what the last one cost, split into the sort
+    /// and the list rebuild; read only by `browser-rows`.
+    render_count: u64 = 0,
+    render_ns: u64 = 0,
+    render_sort_ns: u64 = 0,
+    render_list_ns: u64 = 0,
     /// Signature of the column set the view currently shows;
     /// syncColumns rebuilds the columns only when it changes.
     col_sig: u64 = 0,

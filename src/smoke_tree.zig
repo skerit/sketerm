@@ -119,6 +119,10 @@ const Listing = struct {
     focus_path: []const u8 = "",
     binds: u64 = 0,
     unmapped: u32 = 0,
+    renders: u64 = 0,
+    render_us: u64 = 0,
+    sort_us: u64 = 0,
+    list_us: u64 = 0,
     selected: []const []const u8 = &.{},
     rows: []Row = &.{},
 };
@@ -487,6 +491,48 @@ const ColReply = struct {
     listing: struct { columns: []struct { title: []const u8, x: f64, width: f64, y: f64 } = &.{} } = .{},
 };
 
+/// Opt-in measurement (`SKETERM_SMOKE_TREE_BIG=<entries>`): list a folder
+/// that big, then add files to it one at a time, and say what each
+/// render cost. Asserts nothing beyond the listing completing.
+fn bigStage(app: *appdrive.App, rt: []const u8) ?[]const u8 {
+    const env = c.getenv("SKETERM_SMOKE_TREE_BIG") orelse return null;
+    const n = std.fmt.parseInt(u32, std.mem.span(env), 10) catch return "SKETERM_SMOKE_TREE_BIG is not a count";
+    var dir_buf: [200]u8 = undefined;
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/big", .{rt}, 0) catch return "big dir path";
+    _ = c.mkdir(dir.ptr, 0o755);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) touch("{s}/file-{d:0>6}.txt", .{ dir, i });
+    var req_buf: [256]u8 = undefined;
+    const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"browser-here\",\"pane\":1,\"data\":\"{s}\"}}\n", .{dir}) catch return "browser-here format";
+    const t0 = clock.nowMs();
+    const r = ctlsock.roundtrip(g_alloc, app, g_gui_sock, req) orelse return "browser-here roundtrip";
+    g_alloc.free(r);
+    if (waitItems(app, n, t0)) |why| return why;
+    var k: u32 = 0;
+    while (k < 5) : (k += 1) {
+        const t1 = clock.nowMs();
+        touch("{s}/new-{d}.txt", .{ dir, k });
+        if (waitItems(app, n + k + 1, t1)) |why| return why;
+    }
+    return null;
+}
+
+fn waitItems(app: *appdrive.App, want: u32, t0: i64) ?[]const u8 {
+    while (true) {
+        pumpFor(app, 50);
+        const reply = ctlsock.roundtrip(g_alloc, app, g_gui_sock, "{\"cmd\":\"browser-rows\",\"pane\":1}\n") orelse return "browser-rows roundtrip";
+        defer g_alloc.free(reply);
+        const s = std.json.parseFromSlice(Reply, g_alloc, reply, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return "browser-rows JSON";
+        defer s.deinit();
+        const l = s.value.listing;
+        if (l.n_items >= want) {
+            say("big: {d} items after {d} ms; {d} renders, last {d} us (sort {d} us, rows {d} us)", .{ l.n_items, clock.nowMs() - t0, l.renders, l.render_us, l.sort_us, l.list_us });
+            return null;
+        }
+        if (clock.nowMs() - t0 > 180_000) return "the big listing never completed";
+    }
+}
+
 pub fn main(init: std.process.Init.Minimal) u8 {
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
@@ -690,6 +736,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (keyStage(app, 1, 1, "sorted, keys")) |why| return fail("sorted Right/Down/Up/Left: {s}", .{why});
     if (clickStage(app, 3, 3, "sorted, click")) |why| return fail("sorted click expand/collapse: {s}", .{why});
 
+    if (bigStage(app, rt)) |why| return fail("big folder: {s}", .{why});
     say("PASS: expanding and collapsing rows keeps the scroll, the rows on screen and the keyboard cursor", .{});
     teardown();
     return 0;
