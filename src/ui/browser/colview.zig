@@ -149,10 +149,10 @@ pub fn itemDataAt(tab: *BTab, pos: c.guint) ?*ItemData {
 /// traffic and a streamed listing calls this once per event, so
 /// `BTab.backing_fence` collapses a whole stream into one sweep. Every
 /// caller relies on that latch rather than a local flag of its own.
+/// `name_cells` is left alone: its keys are the bound ITEMS' own paths
+/// (a bound cell holds its item), and a partial splice keeps those rows
+/// bound, so clearing it here lost every kept row until it was rebound.
 pub fn invalidateBackingRefs(tab: *BTab) void {
-    // Cheap, and a cell may outlive the item that named it, so this
-    // half stays outside the latch.
-    tab.name_cells.clearRetainingCapacity();
     // The model must not be read past the widget teardown fence.
     if (tab.view.widgets_dead) return;
     if (!tab.backing_fence.needsSweep()) return;
@@ -998,6 +998,9 @@ pub const RowsReport = struct {
     focus_path: []const u8,
     /// Name cells bound since the tab was created (rebind cost probe).
     binds: u64,
+    /// Visible rows the path -> name-cell map does not lead back to (a
+    /// thumbnail or inline rename aimed at them would miss).
+    unmapped: u32 = 0,
     selected: []const []u8,
     rows: []RowGeometry,
 };
@@ -1044,6 +1047,7 @@ pub fn rowsReport(tab: *BTab, out: []RowGeometry) RowsReport {
         const cy = rb.origin.y + rb.size.height / 2;
         if (cy < vb.origin.y or cy > vb.origin.y + vb.size.height) continue;
         const nc = nameCellOf(root) orelse continue;
+        if (tab.name_cells.get(d.path) != root) rep.unmapped += 1;
         var g: RowGeometry = .{
             .path = d.path,
             .pos = pos,

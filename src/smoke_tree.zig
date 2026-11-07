@@ -118,6 +118,7 @@ const Listing = struct {
     focus: i64 = -1,
     focus_path: []const u8 = "",
     binds: u64 = 0,
+    unmapped: u32 = 0,
     selected: []const []const u8 = &.{},
     rows: []Row = &.{},
 };
@@ -137,12 +138,12 @@ fn rows(app: *appdrive.App, label: []const u8) ?Snap {
         return null;
     }
     const l = parsed.value.listing;
-    say("{s}: scroll {d:.0}/{d:.0}, {d} items, {d} rows visible ({s} .. {s}), focus {d} {s}, selected {d}{s}{s}, binds {d}", .{
+    say("{s}: scroll {d:.0}/{d:.0}, {d} items, {d} rows visible ({s} .. {s}), focus {d} {s}, selected {d}{s}{s}, binds {d}, unmapped {d}", .{
         label,                                          l.scroll, l.upper, l.n_items, l.rows.len,
         std.fs.path.basename(l.rows[0].path),           std.fs.path.basename(l.rows[l.rows.len - 1].path),
         l.focus,                                        std.fs.path.basename(l.focus_path),    l.selected.len,
         if (l.selected.len > 0) " " else "",            if (l.selected.len > 0) std.fs.path.basename(l.selected[0]) else "",
-        l.binds,
+        l.binds,                                        l.unmapped,
     });
     return parsed;
 }
@@ -188,6 +189,10 @@ fn stable(before: Listing, after: Listing, path: []const u8) ?[]const u8 {
         return std.fmt.bufPrint(&why_buf, "the row moved on screen from y={d:.0} to y={d:.0}", .{ b.y, a.y }) catch "row moved";
     if (after.binds - before.binds > MAX_BINDS)
         return std.fmt.bufPrint(&why_buf, "{d} name cells rebound (at most {d} may)", .{ after.binds - before.binds, MAX_BINDS }) catch "rebound";
+    // Kept rows must still be reachable by path (thumbnails, inline
+    // rename): a splice that keeps a row also keeps its map entry.
+    if (after.unmapped != 0)
+        return std.fmt.bufPrint(&why_buf, "{d} visible rows lost their path -> name cell entry", .{after.unmapped}) catch "unmapped";
     return stripes(after);
 }
 
