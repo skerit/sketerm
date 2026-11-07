@@ -1,5 +1,27 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-07: the disk-usage analyzer stops flickering under a selection
+
+Report: "Analyze disk usage" was glitchy; selecting a result flickered.
+Two causes, measured with the new `zig build smoke-usage` rig (a 20k-file
+tree). First, `diskusage.renderRows` removed and recreated EVERY result row
+on every render, and renders come from the 160ms result coalescer and from
+every generic `renderTab` of the tab (a file landing in the analyzed
+folder is enough): 15,288 row widgets were built for 91 rows during one
+scan, and each render destroyed the clicked row, its selection and focus
+and reset the scroll to the top. Rows are now synced in place (keyed by
+node index, sorted by a field, labels rewritten only when the `RowFace`
+they print changes), selection is kept by path, focus stays in the list
+when a drill-down replaces it, and Alt+Up returns to the folder it left,
+scrolled where it was and with that folder selected. Second, results took
+~28s to arrive after a ~1s scan: `Conn.takeFrame` slid the whole read
+buffer down after every frame, and `fillAvailable` buffers up to 4 MB, so
+draining N buffered frames cost O(N x buffered bytes) on the GUI main
+thread (the drain idle was 100% busy at ~400 frames/s while the daemon had
+sent all 3.3 MB within 1.4s). The buffer now keeps a taken-prefix offset
+and compacts lazily; the same scan now settles in ~1s with 5 renders. This
+applies to every `muxclient.Conn` reader (file views, hostlink, terminals).
+
 ## 2026-11-07: tree expand keeps the scroll and the keyboard cursor
 
 Report: in a scrolled listing, expanding a directory row flashed or jumped
