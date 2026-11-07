@@ -123,6 +123,7 @@ const Usage = struct {
     rows_dropped: u64 = 0,
     nodes: u64 = 0,
     scans: u64 = 0,
+    status: []const u8 = "",
     draws: u64 = 0,
     chart_x: f64 = 0,
     chart_y: f64 = 0,
@@ -252,6 +253,13 @@ fn selectStage(app: *appdrive.App, label: []const u8, skip: usize) ?[]const u8 {
     const s2 = usage(app, "  after listing churn") orelse return "no report after the churn";
     defer s2.deinit();
     savePng(app, "selected");
+    // Clicking a file says what it is; the churn's re-render must not
+    // replace that with the scan's progress line.
+    const said = s2.value.usage.status;
+    if (!std.mem.startsWith(u8, said, "file: ") or !std.mem.endsWith(u8, said, std.fs.path.basename(path))) {
+        say("  status line after the churn: '{s}'", .{said});
+        return "a re-render overwrote the clicked file's status line";
+    }
     return unchurned(s1.value.usage, s2.value.usage, path);
 }
 

@@ -96,6 +96,11 @@ pub const State = struct {
     /// Child-list rebuilds and chart draws (`browser-usage`).
     scans: u64 = 0,
     draws: u64 = 0,
+    /// The analyzer's own message on the status line ("file: ..."), kept
+    /// until the progress text changes, and the hash of that text.
+    status_note: [256]u8 = undefined,
+    status_note_len: usize = 0,
+    status_hash: u64 = 0,
 
     fn free(user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(State, user);
@@ -139,6 +144,13 @@ pub const State = struct {
         try self.model.directChildren(self.current, self.metric, &self.children);
         self.children_gen = self.model.generation;
         self.scans += 1;
+    }
+
+    /// Say `fmt` on the status line until the scan's progress moves on.
+    fn note(self: *State, comptime fmt: []const u8, args: anytype) void {
+        const text = std.fmt.bufPrint(&self.status_note, fmt, args) catch self.status_note[0..];
+        self.status_note_len = text.len;
+        self.tab.view.setStatus(text);
     }
 
     fn displayedTotal(self: *const State) u64 {
@@ -676,7 +688,22 @@ fn renderHeader(self: *State) void {
         }, 0) catch "Scan complete";
         c.gtk_label_set_text(self.progress_label, txt.ptr);
     }
-    if (self.tab.view.currentTab() == self.tab) self.tab.view.setStatus(std.mem.span(c.gtk_label_get_text(self.progress_label)));
+    if (self.tab.view.currentTab() == self.tab) syncStatus(self, std.mem.span(c.gtk_label_get_text(self.progress_label)));
+}
+
+/// Put the progress text on the status line, except over the analyzer's
+/// own note while the progress has not moved on: every render used to
+/// overwrite "file: <path>" the moment it was said.
+fn syncStatus(self: *State, progress: []const u8) void {
+    const shown = std.mem.span(c.gtk_label_get_text(self.tab.view.status_label));
+    const hash = std.hash.Wyhash.hash(0, progress);
+    if (hash != self.status_hash) {
+        self.status_hash = hash;
+        self.status_note_len = 0;
+    } else if (self.status_note_len > 0 and std.mem.startsWith(u8, self.status_note[0..self.status_note_len], shown) and shown.len > 0) {
+        return;
+    }
+    if (!std.mem.eql(u8, shown, progress)) self.tab.view.setStatus(progress);
 }
 
 fn ctxOf(row: *c.GtkWidget) ?*RowCtx {
@@ -986,7 +1013,7 @@ fn onRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, _: ?*anyopaque) callc
     if (node.kind == .dir) {
         ctx.state.setCurrent(node.path);
     } else {
-        ctx.state.tab.view.setStatusFmt("{s}: {s}", .{ if (node.kind == .mount) "not scanned" else "file", node.path });
+        ctx.state.note("{s}: {s}", .{ if (node.kind == .mount) "not scanned" else "file", node.path });
     }
 }
 
@@ -1002,7 +1029,7 @@ fn onChartPressed(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyop
     const id = hitAt(self, x, y) orelse return;
     if (id == OTHER_ID) return;
     const node = self.model.nodes.items[id];
-    if (node.kind == .dir) self.setCurrent(node.path) else self.tab.view.setStatusFmt("file: {s}", .{node.path});
+    if (node.kind == .dir) self.setCurrent(node.path) else self.note("file: {s}", .{node.path});
 }
 
 fn onChartMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
@@ -1161,6 +1188,8 @@ pub const UsageReport = struct {
     rows_built: u64,
     rows_dropped: u64,
     scans: u64,
+    /// The browser's status line as shown.
+    status: []const u8,
     draws: u64,
     /// The treemap's box in surface coordinates (zero until laid out).
     chart_x: f64 = 0,
@@ -1197,6 +1226,7 @@ pub fn report(tab: *BTab, out: []UsageRow) ?UsageReport {
         .rows_built = self.rows_built,
         .rows_dropped = self.rows_dropped,
         .scans = self.scans,
+        .status = std.mem.span(c.gtk_label_get_text(self.tab.view.status_label)),
         .draws = self.draws,
         .rows = out[0..0],
     };
