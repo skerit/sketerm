@@ -25,13 +25,15 @@ const format = @import("../filebrowser/format.zig");
 const appmenu = @import("appmenu.zig");
 const remotestream = @import("remotestream.zig");
 const crashlog = @import("../util/crashlog.zig");
+const imagepolicy = @import("../util/imagepolicy.zig");
 
 pub const Variant = enum { preview, original, external_copy, head };
 const PREVIEW_BYTES_MAX: usize = 2 << 20;
 /// Bounded head fetched for text/hex content (`.head` loads).
 pub const HEAD_BYTES_MAX: usize = 256 << 10;
 const ORIGINAL_BYTES_MAX: usize = 128 << 20;
-const PREVIEW_PIXELS_MAX: usize = 4 * 1024 * 1024;
+/// A sized preview may be `imagepolicy.MAX_BOUND` on its longest side.
+const PREVIEW_PIXELS_MAX: usize = @as(usize, imagepolicy.MAX_BOUND) * imagepolicy.MAX_BOUND;
 const ORIGINAL_PIXELS_MAX: usize = 64 * 1024 * 1024;
 const ORIGINAL_ANIMATION_BYTES_MAX: usize = 256 << 20;
 const LOAD_TIMEOUT_MS: i64 = 120_000;
@@ -57,6 +59,9 @@ pub const LoadResult = struct {
     metadata_len: usize = 0,
     materialized: [4096:0]u8 = @splat(0),
     materialized_len: usize = 0,
+    /// A quick low-resolution stand-in shown while this load's real
+    /// preview is still on its way; it never chains further loads.
+    interim: bool = false,
 
     pub fn messageText(self: *const LoadResult) []const u8 {
         return self.message[0..self.message_len];
@@ -118,6 +123,9 @@ pub const LoadTarget = struct {
     /// connection out, so the put-back must drop it rather than cache
     /// a dead socket.
     conn_poisoned: bool = false,
+    /// Longest side (device px) of the area images are shown in, sent
+    /// as a sized preview's bound; 0 = not allocated yet. Under the mutex.
+    display_bound: u32 = 0,
 
     pub fn create(callback: LoadCallback, context: ?*anyopaque) ?*LoadTarget {
         const allocator = std.heap.c_allocator;
@@ -248,6 +256,13 @@ pub const LoadTarget = struct {
         return self.alive and self.generation == generation;
     }
 
+    /// Record the image area's size for the next loads' sized previews.
+    pub fn setDisplayBound(self: *LoadTarget, bound: u32) void {
+        self.lock();
+        defer self.unlock();
+        self.display_bound = bound;
+    }
+
     pub fn start(self: *LoadTarget, spec: []const u8, variant: Variant) bool {
         const allocator = std.heap.c_allocator;
         const work = allocator.create(LoadWork) catch return false;
@@ -261,6 +276,7 @@ pub const LoadTarget = struct {
             .variant = variant,
         };
         self.lock();
+        work.display_bound = self.display_bound;
         if (!self.alive) {
             self.unlock();
             allocator.free(work.spec);
@@ -300,6 +316,11 @@ const LoadWork = struct {
     generation: u64,
     spec: []u8,
     variant: Variant,
+    /// Copied from the target at start (see LoadTarget.display_bound).
+    display_bound: u32 = 0,
+    /// A `.preview` load that fetched the original directly and could
+    /// not decode it retries as a real preview with this set.
+    no_direct: bool = false,
     result: LoadResult = undefined,
 };
 
@@ -320,32 +341,36 @@ pub fn connectFs(host: ?[]const u8) !fsdrive.Fs {
     return fsdrive.Fs.initConn(allocator, conn);
 }
 
+/// Read a whole file in MAX_READ chunks. No stat probe first: the first
+/// reply carries the size, so a file under MAX_READ costs one round trip.
 fn readAll(fs: *fsdrive.Fs, path: []const u8, cap: usize) ![]u8 {
     const allocator = std.heap.c_allocator;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    const probe = try fs.read(path, 0, 0, &out);
-    if (probe.size > cap) return error.SourceTooLarge;
-    try out.ensureTotalCapacity(allocator, @intCast(probe.size));
-    var offset: u64 = 0;
-    while (offset < probe.size) {
+    var size: ?u64 = null;
+    while (true) {
         const before = out.items.len;
-        const remaining = probe.size - offset;
-        const requested: u32 = @intCast(@min(remaining, fsdrive.fsserve.MAX_READ));
-        const info = try fs.read(path, offset, requested, &out);
-        const received = out.items.len - before;
-        if (received == 0) return error.ShortRead;
-        offset += received;
+        // One byte past the cap is how an over-cap file shows itself.
+        const requested: u32 = @intCast(@min(cap + 1 - before, fsdrive.fsserve.MAX_READ));
+        const info = try fs.read(path, before, requested, &out);
+        if (size == null) {
+            if (info.size > cap) return error.SourceTooLarge;
+            size = info.size;
+            try out.ensureTotalCapacity(allocator, @intCast(info.size));
+        }
         if (out.items.len > cap) return error.SourceTooLarge;
         if (info.eof) break;
+        if (out.items.len == before) return error.ShortRead;
     }
-    if (offset != probe.size) return error.ShortRead;
+    if (out.items.len != size.?) return error.ShortRead;
     return out.toOwnedSlice(allocator);
 }
 
 const FetchPayload = struct {
     bytes: []u8,
     source_size: usize,
+    /// What `bytes` are: a `.preview` load may have fetched the original.
+    variant: ?Variant = null,
     metadata: [1024]u8 = undefined,
     metadata_len: usize = 0,
     head_kind: HeadKind = .bytes,
@@ -542,18 +567,84 @@ fn fetchOn(work: *LoadWork, fs: *fsdrive.Fs, resource: model.Resource) !FetchPay
         return payload;
     }
 
-    const job = try fs.startPreviewCodecs(resource.path, "png");
-    var event = try fs.waitJobTerminal(job, LOAD_TIMEOUT_MS);
-    defer event.deinit();
-    if (!std.mem.eql(u8, event.ev, "done") or event.path.len == 0) return error.PreviewFailed;
-    const bytes = readAll(fs, event.path, PREVIEW_BYTES_MAX) catch |err| {
-        if (!event.keep) fs.unlink(event.path) catch {};
-        return err;
+    // A small original IS the preview, at full resolution and with no
+    // host decode/re-encode; anything bigger is rendered host-side at
+    // the size the window shows it (imagepolicy.planLoad has the why).
+    const plan = imagepolicy.planLoad(.{
+        .source_bytes = source.size,
+        .client_decodes_original = !work.no_direct and !posterOnly(resource.name()),
+        .sized_previews = fs.conn.caps.preview_bound,
+        .display_bound = if (work.display_bound > 0) work.display_bound else imagepolicy.UNKNOWN_DISPLAY_BOUND,
+        .remote = resource.host != null,
+    });
+    const preview = switch (plan) {
+        .original => {
+            const bytes = try readAll(fs, resource.path, ORIGINAL_BYTES_MAX);
+            var payload = FetchPayload{ .source_size = bytes.len, .bytes = bytes, .variant = .original };
+            fetchMetadata(fs, resource, &payload);
+            return payload;
+        },
+        .preview => |p| p,
     };
-    if (!event.keep) fs.unlink(event.path) catch {};
+    // Both jobs start at once: the host renders them on parallel helpers,
+    // and the quick one is on screen while the sized one crosses the link.
+    const quick_job: ?u64 = if (preview.quick_first)
+        fs.startPreviewSized(resource.path, preview.codecs, imagepolicy.DEFAULT_BOUND) catch null
+    else
+        null;
+    const job = if (preview.bound == 0)
+        try fs.startPreviewCodecs(resource.path, preview.codecs)
+    else
+        try fs.startPreviewSized(resource.path, preview.codecs, preview.bound);
+    if (quick_job) |quick| {
+        // Best effort: a failed stand-in only means waiting for the real one.
+        if (fetchSidecar(fs, quick)) |bytes| deliverInterim(work, bytes) else |err| {
+            if (isTransportError(err)) return err;
+        }
+    }
+    const bytes = try fetchSidecar(fs, job);
     var payload = FetchPayload{ .source_size = @intCast(source.size), .bytes = bytes };
     fetchMetadata(fs, resource, &payload);
     return payload;
+}
+
+/// Wait for a preview job and read (then release) its sidecar.
+fn fetchSidecar(fs: *fsdrive.Fs, job: u64) ![]u8 {
+    var event = try fs.waitJobTerminal(job, LOAD_TIMEOUT_MS);
+    defer event.deinit();
+    if (!std.mem.eql(u8, event.ev, "done") or event.path.len == 0) return error.PreviewFailed;
+    defer if (!event.keep) fs.unlink(event.path) catch {};
+    return readAll(fs, event.path, PREVIEW_BYTES_MAX);
+}
+
+/// Decode a quick stand-in on this worker and hand it to the UI as an
+/// interim result of the same generation, ahead of the real one.
+fn deliverInterim(work: *LoadWork, bytes: []u8) void {
+    const allocator = std.heap.c_allocator;
+    const interim = allocator.create(LoadWork) catch {
+        allocator.free(bytes);
+        return;
+    };
+    interim.* = .{
+        .target = work.target,
+        .generation = work.generation,
+        .spec = &.{},
+        .variant = .preview,
+        .result = .{ .variant = .preview, .interim = true },
+    };
+    deliverImage(interim, bytes);
+    const target = work.target;
+    target.lock();
+    const deliver = interim.result.decoded != null and target.alive and target.generation == work.generation;
+    // The idle handback owns one reference, exactly like a finished load.
+    if (deliver) target.refs += 1;
+    target.unlock();
+    if (!deliver) {
+        interim.result.deinit();
+        allocator.destroy(interim);
+        return;
+    }
+    _ = c.g_idle_add(@ptrCast(&loadIdle), @ptrCast(interim));
 }
 
 /// Keep the daemon's own reason for a refused operation: "FsOpFailed"
@@ -577,6 +668,7 @@ fn loadThread(first: *LoadWork) void {
     while (true) {
         work.result = .{ .variant = work.variant };
         if (fetch(work)) |payload| {
+            if (payload.variant) |v| work.result.variant = v;
             work.result.source_bytes = payload.source_size;
             work.result.metadata_len = payload.metadata_len;
             @memcpy(work.result.metadata[0..payload.metadata_len], payload.metadata[0..payload.metadata_len]);
@@ -595,6 +687,16 @@ fn loadThread(first: *LoadWork) void {
                 }
             } else deliverImage(work, payload.bytes);
         } else |err| if (work.result.message_len == 0) work.result.setError(err);
+        // A directly fetched original this client cannot decode (over
+        // the pixel ceiling, an unsupported variant of its format):
+        // the host's preview may still show it.
+        if (work.variant == .preview and work.result.variant == .original and work.result.decoded == null and
+            !work.no_direct and work.target.current(work.generation))
+        {
+            work.no_direct = true;
+            work.result.deinit();
+            continue;
+        }
         allocator.free(work.spec);
         work.spec = &.{};
 
@@ -625,11 +727,12 @@ fn deliverImage(work: *LoadWork, bytes: []u8) void {
     if (work.target.current(work.generation) and work.variant == .external_copy) {
         materializeOpenCopy(work, bytes, &work.result) catch |err| work.result.setError(err);
     } else if (work.target.current(work.generation)) {
-        const max_pixels = if (work.variant == .preview) PREVIEW_PIXELS_MAX else ORIGINAL_PIXELS_MAX;
+        const preview = work.result.variant == .preview;
+        const max_pixels = if (preview) PREVIEW_PIXELS_MAX else ORIGINAL_PIXELS_MAX;
         work.result.decoded = decoder.decodeBytes(allocator, bytes, .{
             .max_pixels = max_pixels,
-            .max_animation_bytes = if (work.variant == .preview) PREVIEW_PIXELS_MAX * 4 else ORIGINAL_ANIMATION_BYTES_MAX,
-            .max_frames = if (work.variant == .preview) 1 else 240,
+            .max_animation_bytes = if (preview) PREVIEW_PIXELS_MAX * 4 else ORIGINAL_ANIMATION_BYTES_MAX,
+            .max_frames = if (preview) 1 else 240,
             .cancel_context = @ptrCast(work),
             .should_cancel = &decodeStillCurrent,
         }) catch |err| blk: {
@@ -1429,6 +1532,12 @@ pub const ViewerWindow = struct {
         self.setContentMode(.image);
         c.gtk_label_set_text(self.status, "Loading preview...");
         self.canvas.setAccessible(resource.name(), "Loading preview", true);
+        const area = self.canvas.widget();
+        self.target.setDisplayBound(imagepolicy.displayBound(
+            c.gtk_widget_get_width(area),
+            c.gtk_widget_get_height(area),
+            c.gtk_widget_get_scale_factor(area),
+        ));
         if (!self.target.start(resource.spec, .preview)) c.gtk_label_set_text(self.status, "Could not start preview loader");
     }
 
@@ -1946,6 +2055,15 @@ fn onLoaded(user: ?*anyopaque, result: *LoadResult) void {
     };
     const first = image.first();
     self.updatePlaybackButton();
+    if (result.interim) {
+        // The real preview is still crossing the link; it replaces this
+        // and decides the metadata, buttons and any original chain.
+        var quick: [128:0]u8 = undefined;
+        const text = std.fmt.bufPrintSentinel(&quick, "Quick preview  {d} x {d}; loading a sharper one...", .{ first.width, first.height }, 0) catch "Quick preview";
+        c.gtk_label_set_text(self.status, text.ptr);
+        self.updateAccessibleState();
+        return;
+    }
     if (result.metadata_len > 0)
         self.setMetadata(result.metadataText())
     else

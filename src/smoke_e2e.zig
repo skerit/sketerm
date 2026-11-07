@@ -967,6 +967,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (!have_wl) return fail("focused viewer-reuse smoke is GTK/Wayland-only");
         if (viewerReuseStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
         say("viewer reuse: stepping through a remote batch rode the connection the first load dialed");
+        if (viewerRemoteImageStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+        say("viewer remote images: a small original arrives at full resolution, a large one as a display-sized preview");
         teardown();
         return 0;
     }
@@ -8206,6 +8208,96 @@ fn viewerReuseStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: [:0]co
         _ = c.fprintf(platform.stderr(), "smoke-e2e: viewer reuse: %zu ssh dials for %zu steps\n", dials, words.len - 1);
         return "viewer reuse: every step dialed the host again instead of reusing the connection";
     }
+    return null;
+}
+
+/// The remote image policy (util/imagepolicy.zig) on a real viewer: a
+/// flat 2918x3508 UI-like PNG of well under 2 MiB is fetched as the
+/// original and shown at full resolution, where the old request showed
+/// a 425x512 preview; a 1000x760 noise PNG over the budget arrives as a
+/// host-rendered preview at its own size (the window is wider than it),
+/// not at the old 512 px tier.
+fn viewerRemoteImageStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: [:0]const u8, wl: [*:0]const u8) ?[]const u8 {
+    const ocr = @import("util/ocr.zig");
+    if (!ocr.available()) {
+        say("viewer remote images: tesseract unavailable; skipping");
+        return null;
+    }
+    if (remote_mux_pid <= 0) return "viewer remote images: the fake-SSH daemon is not running";
+    var dir_buf: [512:0]u8 = undefined;
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/vimg", .{rt}, 0) catch return "viewer remote images: dir path";
+    _ = c.mkdir(dir.ptr, 0o700);
+    var flat_buf: [600:0]u8 = undefined;
+    const flat = std.fmt.bufPrintSentinel(&flat_buf, "{s}/flat.png", .{dir}, 0) catch return "viewer remote images: path";
+    var noise_buf: [600:0]u8 = undefined;
+    const noise = std.fmt.bufPrintSentinel(&noise_buf, "{s}/noise.png", .{dir}, 0) catch return "viewer remote images: path";
+    {
+        // White page with black-bordered blocks: compresses to a few KB.
+        const w: usize = 2918;
+        const h: usize = 3508;
+        const px = allocator.alloc(u8, w * h * 3) catch return "viewer remote images: oom";
+        defer allocator.free(px);
+        @memset(px, 0xff);
+        for (0..h) |y| for (0..w) |x| {
+            const bx = x % 700;
+            const by = y % 500;
+            if ((bx < 12 or by < 12) and x > 40 and y > 40) @memset(px[(y * w + x) * 3 ..][0..3], 0);
+        };
+        if (c.stbi_write_png(flat.ptr, @intCast(w), @intCast(h), 3, px.ptr, @intCast(w * 3)) == 0) return "viewer remote images: write flat.png";
+        const w2: usize = 1000;
+        const h2: usize = 760;
+        var prng = std.Random.DefaultPrng.init(7);
+        prng.random().bytes(px[0 .. w2 * h2 * 3]);
+        if (c.stbi_write_png(noise.ptr, @intCast(w2), @intCast(h2), 3, px.ptr, @intCast(w2 * 3)) == 0) return "viewer remote images: write noise.png";
+    }
+    var specs: [2][600:0]u8 = undefined;
+    _ = std.fmt.bufPrintSentinel(&specs[0], "localhost:{s}", .{flat}, 0) catch return "viewer remote images: spec";
+    _ = std.fmt.bufPrintSentinel(&specs[1], "localhost:{s}", .{noise}, 0) catch return "viewer remote images: spec";
+
+    _ = app.drainLive(2_000);
+    var known: [32]u32 = undefined;
+    var n_known: usize = 0;
+    for (app.windows.items) |w| {
+        if (w.popup or n_known >= known.len) continue;
+        known[n_known] = w.id;
+        n_known += 1;
+    }
+    const pid = c.fork();
+    if (pid < 0) return "viewer remote images: fork";
+    if (pid == 0) {
+        platform.dieWithParent();
+        _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2evimg", 1);
+        _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
+        _ = c.setenv("GDK_BACKEND", "wayland", 1);
+        _ = unsetEnv("DISPLAY");
+        _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+        _ = c.setenv("GTK_A11Y", "none", 1);
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "view", &specs[0], &specs[1], null };
+        _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    vcast_pid = pid;
+    defer if (vcast_pid > 0) {
+        reap(vcast_pid, c.SIGTERM, 3000);
+        vcast_pid = -1;
+    };
+    var waited: u32 = 0;
+    const vwin = while (waited < 25_000) : (waited += 200) {
+        if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
+        pumpFor(app, 200);
+    } else return "viewer remote images: sketerm view never mapped a window";
+
+    if (!viewerWaitOcr(allocator, app, vwin, "Full resolution 2918 x 3508", 40_000)) {
+        viewerShot(allocator, app, vwin, "viewer-remote-flat");
+        return viewerWhy("viewer remote images: the small remote original was not shown at full resolution");
+    }
+    viewerShot(allocator, app, vwin, "viewer-remote-flat");
+    app.pressKey(vwin, "Right") catch return "viewer remote images: injecting Right failed";
+    if (!viewerWaitOcr(allocator, app, vwin, "Preview 1000 x 760", 40_000)) {
+        viewerShot(allocator, app, vwin, "viewer-remote-noise");
+        return viewerWhy("viewer remote images: the large remote image did not arrive as a display-sized preview");
+    }
+    viewerShot(allocator, app, vwin, "viewer-remote-noise");
     return null;
 }
 
