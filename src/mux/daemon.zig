@@ -762,7 +762,10 @@ pub const Client = struct {
     /// (`clients` is swapRemove'd, so list position is not arrival
     /// order) for the controller-death handover.
     id: u32 = 0,
+    /// Received bytes; the first `rhead` are already handled and are
+    /// dropped lazily (`wire.dropTaken`), never per frame.
     rbuf: std.ArrayList(u8) = .empty,
+    rhead: usize = 0,
     /// Ordinary mux traffic. Audio has its own priority lane so a large
     /// graphical commit cannot strand PCM behind the whole queued backlog.
     wbuf: std.ArrayList(u8) = .empty,

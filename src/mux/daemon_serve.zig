@@ -67,21 +67,18 @@ pub fn clientReadable(self: *Daemon, cl: *Client) void {
         return;
     };
     while (true) {
-        const peeled = wire.peelFrame(cl.rbuf.items) catch {
+        const peeled = wire.peelFrame(cl.rbuf.items[cl.rhead..]) catch {
             cl.dead = true;
             return;
         } orelse break;
+        // Taken before handling: the payload stays valid in place, and
+        // sliding the tail down per frame made a read of N small frames
+        // cost O(N * buffered bytes).
+        cl.rhead += peeled.consumed;
         handleFrame(self, cl, peeled.frame);
-        // Drop consumed bytes (front removal; frames are small
-        // except INPUT pastes, and rbuf shrinks right back).
-        const remaining = cl.rbuf.items.len - peeled.consumed;
-        std.mem.copyForwards(u8, cl.rbuf.items[0..remaining], cl.rbuf.items[peeled.consumed..]);
-        cl.rbuf.shrinkRetainingCapacity(remaining);
         if (cl.dead) return;
     }
-    // Don't let one big INPUT paste pin its high-water capacity.
-    if (cl.rbuf.items.len == 0 and cl.rbuf.capacity > (4 << 20))
-        cl.rbuf.clearAndFree(cl.allocator);
+    wire.dropTaken(&cl.rbuf, cl.allocator, &cl.rhead);
 }
 
 pub fn clientWritable(self: *Daemon, cl: *Client) void {
@@ -632,6 +629,51 @@ test "a frame the peer sent before closing is still served after a write to it f
     // 4. The end of its input is what ends it.
     clientReadable(&d, &cl);
     try t.expect(cl.dead);
+}
+
+test "a read of many small frames is served in order without losing a split frame" {
+    const t = std.testing;
+    const a = t.allocator;
+    var fds: [2]c_int = undefined;
+    try t.expect(c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) == 0);
+    defer _ = c.close(fds[0]);
+    defer _ = c.close(fds[1]);
+    try t.expect(c.fcntl(fds[0], c.F_SETFL, @as(c_int, c.O_NONBLOCK)) == 0);
+    var empty: [0]u8 = .{};
+    var d = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    defer d.clients.deinit(a);
+    var cl = Client{ .allocator = a, .fd = fds[0], .id = 1, .proto = wire.PROTO_VERSION };
+    defer cl.rbuf.deinit(a);
+    defer cl.wbuf.deinit(a);
+    defer cl.audio_wbuf.deinit(a);
+    try d.clients.append(a, &cl);
+
+    // Unattached keystrokes (each refused or dropped, never fatal), then the
+    // frame whose effect is visible, split across two reads.
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(a);
+    for (0..3000) |_| try wire.appendFrame(&stream, a, .input, "k");
+    try wire.appendFrame(&stream, a, .quit_idle, "");
+    const split = stream.items.len - 2;
+    var off: usize = 0;
+    while (off < split) {
+        const n = c.write(fds[1], stream.items.ptr + off, split - off);
+        try t.expect(n > 0);
+        off += @intCast(n);
+        // Each call reads at most 16 KiB: drain until nothing is pending.
+        var pfd = c.struct_pollfd{ .fd = fds[0], .events = c.POLLIN, .revents = 0 };
+        while (!cl.dead and c.poll(&pfd, 1, 0) > 0) clientReadable(&d, &cl);
+    }
+    try t.expect(!cl.dead);
+    try t.expect(d.running);
+    // Only the split frame's first 3 bytes are still buffered.
+    try t.expectEqual(@as(usize, 3), cl.rbuf.items.len - cl.rhead);
+    try t.expectEqual(@as(isize, 2), c.write(fds[1], stream.items.ptr + split, 2));
+    clientReadable(&d, &cl);
+    try t.expect(!cl.dead);
+    try t.expect(!d.running);
+    try t.expectEqual(@as(usize, 0), cl.rbuf.items.len);
+    try t.expectEqual(@as(usize, 0), cl.rhead);
 }
 
 /// Bytes the session's child echoed within `ms` (empty = it got nothing).

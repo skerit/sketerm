@@ -651,6 +651,47 @@ pub fn compactConsumed(list: *std.ArrayList(u8), consumed: usize) void {
     list.shrinkRetainingCapacity(rem);
 }
 
+/// Taken prefix below which `dropTaken` leaves a receive buffer alone.
+pub const COMPACT_MIN: usize = 64 * 1024;
+
+/// Drop the taken prefix `head.*` of a receive buffer once it is all of
+/// it, or large and at least half of it, so a drain of N buffered frames
+/// moves each byte O(1) times instead of sliding the tail per frame.
+/// An emptied buffer holding over 4 MiB is freed: one big frame must not
+/// pin its high-water capacity for the connection's lifetime.
+pub fn dropTaken(list: *std.ArrayList(u8), allocator: std.mem.Allocator, head: *usize) void {
+    if (head.* == list.items.len) {
+        list.clearRetainingCapacity();
+        head.* = 0;
+        if (list.capacity > (4 << 20)) list.clearAndFree(allocator);
+        return;
+    }
+    if (head.* < COMPACT_MIN or head.* < list.items.len - head.*) return;
+    compactConsumed(list, head.*);
+    head.* = 0;
+}
+
+test "dropTaken compacts only a dominant prefix and frees an emptied big buffer" {
+    const t = std.testing;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(t.allocator);
+    try list.appendNTimes(t.allocator, 'a', COMPACT_MIN);
+    try list.appendNTimes(t.allocator, 'b', COMPACT_MIN + 1);
+    // A big prefix that is not yet half the buffer stays in place.
+    var head: usize = COMPACT_MIN;
+    dropTaken(&list, t.allocator, &head);
+    try t.expectEqual(@as(usize, COMPACT_MIN), head);
+    head += 1;
+    dropTaken(&list, t.allocator, &head);
+    try t.expectEqual(@as(usize, 0), head);
+    try t.expectEqual(@as(usize, COMPACT_MIN), list.items.len);
+    for (list.items) |b| try t.expectEqual(@as(u8, 'b'), b);
+    try list.appendNTimes(t.allocator, 'c', 5 << 20);
+    head = list.items.len;
+    dropTaken(&list, t.allocator, &head);
+    try t.expectEqual(@as(usize, 0), list.capacity);
+}
+
 /// Frozen legacy event schema: records have no length, so adding a tag
 /// would desynchronize older readers; new optional data belongs in a mux
 /// frame until a negotiated length-delimited event schema exists.

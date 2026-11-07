@@ -2182,32 +2182,13 @@ pub const Conn = struct {
         const peeled = (try wire.peelFrame(self.unread())) orelse return null;
         const owned = try self.allocator.dupe(u8, peeled.frame.payload);
         self.rhead += peeled.consumed;
-        self.compactRead();
+        wire.dropTaken(&self.rbuf, self.allocator, &self.rhead);
         return .{ .ftype = peeled.frame.ftype, .payload = owned };
     }
 
     /// Received bytes not yet taken as frames.
     pub fn unread(self: *const Conn) []const u8 {
         return self.rbuf.items[self.rhead..];
-    }
-
-    /// Taken prefix below which the buffer is not compacted.
-    const COMPACT_MIN: usize = 64 * 1024;
-
-    /// Drop the taken prefix once it is everything, or large and at least
-    /// half the buffer, so each byte is moved O(1) times overall.
-    fn compactRead(self: *Conn) void {
-        if (self.rhead == self.rbuf.items.len) {
-            self.rbuf.clearRetainingCapacity();
-            self.rhead = 0;
-            // One big frame (a multi-MB window buffer) must not pin its
-            // high-water capacity for the connection's lifetime.
-            if (self.rbuf.capacity > (4 << 20)) self.rbuf.clearAndFree(self.allocator);
-            return;
-        }
-        if (self.rhead < COMPACT_MIN or self.rhead < self.rbuf.items.len - self.rhead) return;
-        wire.compactConsumed(&self.rbuf, self.rhead);
-        self.rhead = 0;
     }
 
     /// Top the read buffer up with whatever bytes have already arrived, without
@@ -2483,7 +2464,7 @@ test "taking buffered frames compacts lazily and never loses or reorders bytes" 
             taken += 1;
             max_moved_prefix = @max(max_moved_prefix, conn.rhead);
             // The taken prefix is dropped once it dominates the buffer.
-            try t.expect(conn.rhead < Conn.COMPACT_MIN or conn.rhead < conn.rbuf.items.len - conn.rhead);
+            try t.expect(conn.rhead < wire.COMPACT_MIN or conn.rhead < conn.rbuf.items.len - conn.rhead);
         }
     }
     try t.expect(max_moved_prefix > 0);
