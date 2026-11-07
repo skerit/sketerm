@@ -18,25 +18,56 @@ const tab_effects = @import("tab_effects.zig");
 const muxtabs = @import("muxtabs.zig");
 const picker = @import("picker.zig");
 const fpicker = @import("../filebrowser/picker.zig");
+const splitratio = @import("splitratio.zig");
 
-/// Owned ratio holder for `applyPanedRatio` / `applyPanedRatioMap`,
-/// released by a `cast.destroyCtx(PanedRatioCtx)` notify. Carries its own
-/// allocator so that notify can free without needing a Window pointer.
-/// Live ratio tracker for a GtkPaned. `ratio` is updated whenever the
-/// user drags (via notify::position) and re-applied on every map (via
-/// the map signal). Tab switches unmap+remap the paged subtree; without
-/// re-apply, GtkPaned reverts to natural sizes on remap.
-///
-/// `setting` guards against the feedback loop: our own gtk_paned_set_
-/// position triggers notify::position, which would re-read total (which
-/// may be transient during allocation) and corrupt ratio. We bracket
-/// every set_position with setting=true so the notify handler ignores
-/// our own writes.
+/// Per-GtkPaned divider state. Owned by the paned's qdata (`SPLIT_KEY`,
+/// freed at finalize) and borrowed, notify-free, by its notify and map
+/// handlers. The fraction in `tracker` is the split's source of truth:
+/// see `splitratio.zig` for why GtkPaned's own integer position cannot be.
 pub const PanedRatioCtx = struct {
     allocator: std.mem.Allocator,
-    ratio: f32,
-    setting: bool = false,
+    tracker: splitratio.Tracker,
 };
+
+const SPLIT_KEY = "sketerm-split-ratio";
+
+/// A GtkPaned for a pane split that holds `ratio` of its space for the
+/// start child across resizes, clamps and remaps.
+pub fn newSplitPaned(allocator: std.mem.Allocator, orientation: c_uint, ratio: f32) !*c.GtkWidget {
+    const ctx = try allocator.create(PanedRatioCtx);
+    ctx.* = .{ .allocator = allocator, .tracker = splitratio.Tracker.init(ratio) };
+    const paned = c.gtk_paned_new(orientation);
+    c.g_object_set_data_full(@ptrCast(paned), SPLIT_KEY, ctx, @ptrCast(cast.destroyCtx(PanedRatioCtx)));
+    c.gtk_paned_set_resize_start_child(@ptrCast(paned), 1);
+    c.gtk_paned_set_resize_end_child(@ptrCast(paned), 1);
+    c.gtk_paned_set_shrink_start_child(@ptrCast(paned), 0);
+    c.gtk_paned_set_shrink_end_child(@ptrCast(paned), 0);
+    // Wide handle so GtkPaned honours CSS min-width on the separator
+    // (gives us the gutter around the line).
+    c.gtk_paned_set_wide_handle(@ptrCast(paned), 1);
+    // Stretch to fill the container: a paned in a Box wrapper otherwise
+    // takes its natural size only.
+    c.gtk_widget_set_hexpand(@ptrCast(paned), 1);
+    c.gtk_widget_set_vexpand(@ptrCast(paned), 1);
+    // GtkPaned notifies all three from one freeze/thaw inside its
+    // size_allocate, before it lays the children out, so a position set
+    // here takes effect in that same allocation. min/max-position are
+    // watched too because a resize or a child's minimum changing can
+    // leave the position itself untouched.
+    for ([_][*:0]const u8{ "notify::position", "notify::min-position", "notify::max-position" }) |sig| {
+        _ = c.g_signal_connect_data(paned, sig, @ptrCast(&onPanedNotify), ctx, null, c.G_CONNECT_DEFAULT);
+    }
+    _ = c.g_signal_connect_data(paned, "map", @ptrCast(&onPanedMap), ctx, null, c.G_CONNECT_DEFAULT);
+    return paned;
+}
+
+/// The fraction a split paned holds, or null for a paned not made by
+/// `newSplitPaned`.
+pub fn splitRatioOf(paned: *c.GtkWidget) ?f32 {
+    const raw = c.g_object_get_data(@ptrCast(paned), SPLIT_KEY) orelse return null;
+    const ctx = cast.userData(PanedRatioCtx, raw);
+    return @floatCast(ctx.tracker.ratio);
+}
 
 
 /// Spawn a new tab from a layout TabSpec (used on --restore). `at_end`
@@ -221,14 +252,7 @@ pub fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree, node_
                 @intCast(c.GTK_ORIENTATION_HORIZONTAL)
             else
                 @intCast(c.GTK_ORIENTATION_VERTICAL);
-            const paned = c.gtk_paned_new(orientation);
-            c.gtk_paned_set_resize_start_child(@ptrCast(paned), 1);
-            c.gtk_paned_set_resize_end_child(@ptrCast(paned), 1);
-            c.gtk_paned_set_shrink_start_child(@ptrCast(paned), 0);
-            c.gtk_paned_set_shrink_end_child(@ptrCast(paned), 0);
-            // Wide handle so GtkPaned honours CSS min-width on
-            // the separator (gives us the gutter around the line).
-            c.gtk_paned_set_wide_handle(@ptrCast(paned), 1);
+            const paned = try newSplitPaned(self.allocator, orientation, splitRatio(s.ratio));
             var first_node: PaneTree.Node = undefined;
             var second_node: PaneTree.Node = undefined;
             const first = try buildTreeWidget(self, s.children[0], &first_node);
@@ -244,30 +268,8 @@ pub fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree, node_
             };
             node_out.* = .{ .split = split_node };
 
-            // Apply saved ratio after the widget gets its first
-            // allocation. Until then we don't know the total
-            // size in pixels.
-            const ratio_holder = try self.allocator.create(PanedRatioCtx);
-            ratio_holder.* = .{
-                .allocator = self.allocator,
-                .ratio = splitRatio(s.ratio),
-            };
-            _ = c.g_signal_connect_data(
-                paned,
-                "notify::position",
-                @ptrCast(&onPanedPositionChanged),
-                @ptrCast(ratio_holder),
-                @ptrCast(cast.destroyCtx(PanedRatioCtx)),
-                c.G_CONNECT_DEFAULT,
-            );
-            _ = c.g_signal_connect_data(
-                paned,
-                "map",
-                @ptrCast(&applyPanedRatioMap),
-                @ptrCast(ratio_holder),
-                null,
-                c.G_CONNECT_DEFAULT,
-            );
+            // The paned's tracker applies the saved ratio once the
+            // paned gets its first allocation.
             return paned;
         },
     }
@@ -537,12 +539,7 @@ pub fn collectTree(self: *Window, arena: std.mem.Allocator, w: *c.GtkWidget) !?l
         const start = c.gtk_paned_get_start_child(@ptrCast(w)) orelse return error.MissingChild;
         const end = c.gtk_paned_get_end_child(@ptrCast(w)) orelse return error.MissingChild;
         const orientation = c.gtk_orientable_get_orientation(@ptrCast(@alignCast(w)));
-        const total: c_int = if (orientation == c.GTK_ORIENTATION_HORIZONTAL)
-            c.gtk_widget_get_width(w)
-        else
-            c.gtk_widget_get_height(w);
-        const pos = c.gtk_paned_get_position(@ptrCast(w));
-        const ratio = positionRatio(pos, total) orelse 0.5;
+        const ratio = splitRatioOf(w) orelse 0.5;
         const first = try collectTree(self, arena, start);
         const second = try collectTree(self, arena, end);
         return joinSplit(
@@ -691,16 +688,10 @@ pub fn modelTreeToLayout(self: *Window, arena: std.mem.Allocator, node: PaneTree
             return .{ .pane = try paneSpec(self, arena, p) };
         },
         .split => |sp| {
-            var ratio: f32 = splitRatio(sp.ratio);
-            if (sp.view) |v| {
-                const paned: *c.GtkWidget = @ptrCast(@alignCast(v));
-                const total: c_int = if (sp.orientation == .horizontal)
-                    c.gtk_widget_get_width(paned)
-                else
-                    c.gtk_widget_get_height(paned);
-                const pos = c.gtk_paned_get_position(@ptrCast(paned));
-                if (positionRatio(pos, total)) |r| ratio = r;
-            }
+            const ratio: f32 = if (sp.view) |v|
+                splitRatioOf(@ptrCast(@alignCast(v))) orelse splitRatio(sp.ratio)
+            else
+                splitRatio(sp.ratio);
             const first = try modelTreeToLayout(self, arena, sp.children[0]);
             const second = try modelTreeToLayout(self, arena, sp.children[1]);
             return joinSplit(
@@ -1038,52 +1029,57 @@ pub fn onLoadLayoutDone(user: ?*anyopaque, result: ?fpicker.Result) void {
     if (!ok and target != self) c.gtk_window_close(@ptrCast(target.app_window));
 }
 
-pub fn applyPanedRatioMap(paned: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
-    applyPanedRatioImpl(paned, user);
-}
-
-/// notify::position fires when the user drags the divider AND when the
-/// paned itself re-allocates on window resize. We re-snap to the
-/// device-pixel grid (see `alignmentForScale`) so GtkGraphicsOffload
-/// keeps engaging at fractional scale, and update ratio so the next
-/// remap and layout save reflect the snapped position.
-pub fn onPanedPositionChanged(paned: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
-    const ctx = cast.userData(PanedRatioCtx, user);
-    if (ctx.setting) return;
-    const w: *c.GtkWidget = @ptrCast(paned);
-    const orientation = c.gtk_orientable_get_orientation(@ptrCast(@alignCast(w)));
-    const total: c_int = if (orientation == c.GTK_ORIENTATION_HORIZONTAL)
-        c.gtk_widget_get_width(w)
-    else
-        c.gtk_widget_get_height(w);
-    if (total <= 0) return;
-    const pos = c.gtk_paned_get_position(@ptrCast(w));
-    if (pos <= 0) return;
-
-    const m = winmod.alignmentForScale(winmod.widgetSurfaceScale(w));
-    const snapped = winmod.snapDown(pos, m);
-    if (snapped != pos) {
-        ctx.setting = true;
-        c.gtk_paned_set_position(@ptrCast(w), snapped);
-        ctx.setting = false;
-    }
-    ctx.ratio = @as(f32, @floatFromInt(snapped)) / @as(f32, @floatFromInt(total));
-}
-
-pub fn applyPanedRatioImpl(paned: *c.GtkWidget, user: ?*anyopaque) void {
-    const ctx = cast.userData(PanedRatioCtx, user);
+/// What a split paned's notification shows right now.
+fn observePaned(paned: *c.GtkWidget) splitratio.Tracker.Observed {
     const orientation = c.gtk_orientable_get_orientation(@ptrCast(@alignCast(paned)));
-    const total: c_int = if (orientation == c.GTK_ORIENTATION_HORIZONTAL)
+    const size: c_int = if (orientation == c.GTK_ORIENTATION_HORIZONTAL)
         c.gtk_widget_get_width(paned)
     else
         c.gtk_widget_get_height(paned);
-    if (total <= 0) return;
-    const raw_pos: c_int = @intFromFloat(@as(f32, @floatFromInt(total)) * ctx.ratio);
-    const m = winmod.alignmentForScale(winmod.widgetSurfaceScale(paned));
-    const pos = winmod.snapDown(raw_pos, m);
-    ctx.setting = true;
-    c.gtk_paned_set_position(@ptrCast(paned), pos);
-    ctx.setting = false;
+    var min: c_int = 0;
+    var max: c_int = 0;
+    c.g_object_get(@as(?*anyopaque, @ptrCast(paned)), "min-position", &min, "max-position", &max, @as(?*anyopaque, null));
+    return .{
+        .avail = size - handleSize(paned, orientation),
+        .min = min,
+        .max = max,
+        .pos = c.gtk_paned_get_position(@ptrCast(paned)),
+        .grid = winmod.alignmentForScale(winmod.widgetSurfaceScale(paned)),
+    };
+}
+
+/// The handle's extent along the split, measured as GtkPaned measures it
+/// before dividing the rest between the children.
+fn handleSize(paned: *c.GtkWidget, orientation: c_uint) c_int {
+    const start = c.gtk_paned_get_start_child(@ptrCast(paned));
+    const end = c.gtk_paned_get_end_child(@ptrCast(paned));
+    var ch = c.gtk_widget_get_first_child(paned);
+    while (ch) |w| : (ch = c.gtk_widget_get_next_sibling(w)) {
+        if (w == start or w == end) continue;
+        var min: c_int = 0;
+        c.gtk_widget_measure(w, orientation, -1, &min, null, null, null);
+        return min;
+    }
+    return 0;
+}
+
+fn setPanedPosition(paned: *c.GtkWidget, pos: ?i32) void {
+    // Our own set_position notifies again; the tracker already holds
+    // `pos`, so that echo is a no-op rather than a feedback loop.
+    if (pos) |p| c.gtk_paned_set_position(@ptrCast(paned), p);
+}
+
+fn onPanedNotify(paned: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(PanedRatioCtx, user);
+    const w: *c.GtkWidget = @ptrCast(paned);
+    setPanedPosition(w, ctx.tracker.observe(observePaned(w)));
+}
+
+/// Tab switches unmap and remap the page's subtree; re-derive the
+/// position from the fraction rather than trust what the paned kept.
+fn onPanedMap(paned: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(PanedRatioCtx, user);
+    setPanedPosition(paned, ctx.tracker.reapply(observePaned(paned)));
 }
 
 // -- layout <-> tree decisions, free of widgets ---------------------------
@@ -1119,13 +1115,6 @@ pub fn restoresTitleLocked(saved: ?bool) bool {
 /// hide one side (anything outside the open interval 0..1, NaN too).
 pub fn splitRatio(r: f32) f32 {
     return if (r > 0 and r < 1) r else 0.5;
-}
-
-/// A divider position as a fraction of the paned's size; null before
-/// the paned has been allocated.
-pub fn positionRatio(pos: c_int, total: c_int) ?f32 {
-    if (total <= 0) return null;
-    return @as(f32, @floatFromInt(pos)) / @as(f32, @floatFromInt(total));
 }
 
 /// A saved split, collapsed onto the surviving child when the other
@@ -1208,12 +1197,6 @@ test "a split ratio that would hide a side restores as an even split" {
     try testing.expectEqual(@as(f32, 0.5), splitRatio(-0.2));
     try testing.expectEqual(@as(f32, 0.5), splitRatio(7.5));
     try testing.expectEqual(@as(f32, 0.5), splitRatio(std.math.nan(f32)));
-}
-
-test "a divider position becomes a fraction only once the paned has a size" {
-    try testing.expectEqual(@as(?f32, 0.25), positionRatio(300, 1200));
-    try testing.expectEqual(@as(?f32, null), positionRatio(300, 0));
-    try testing.expectEqual(@as(?f32, null), positionRatio(0, -1));
 }
 
 test "a split whose child saved nothing collapses onto the survivor" {

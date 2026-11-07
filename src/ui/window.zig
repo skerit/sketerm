@@ -2310,23 +2310,12 @@ pub const Window = struct {
         const new_pane = try self.spawnShellPaneOpts(inherit_cwd, focused_pane.active_profile);
         const new_w = new_pane.widget();
 
-        const paned = c.gtk_paned_new(orientation);
-        c.gtk_paned_set_resize_start_child(@ptrCast(paned), 1);
-        c.gtk_paned_set_resize_end_child(@ptrCast(paned), 1);
-        c.gtk_paned_set_shrink_start_child(@ptrCast(paned), 0);
-        c.gtk_paned_set_shrink_end_child(@ptrCast(paned), 0);
-        // Wide handle so GtkPaned honours CSS min-width on the
-        // separator (gives us the gutter around the line).
-        c.gtk_paned_set_wide_handle(@ptrCast(paned), 1);
-        // Make the paned itself stretch to fill its container — without
-        // this, a paned in a Box wrapper takes natural size only.
-        c.gtk_widget_set_hexpand(@ptrCast(paned), 1);
-        c.gtk_widget_set_vexpand(@ptrCast(paned), 1);
-
+        const paned = try winlayout_mod.newSplitPaned(self.allocator, orientation, 0.5);
         // Without an explicit position, GtkPaned defaults to start_
         // child's natural size (which is 0 for an empty GLArea) — the
         // new pane ends up with zero width and renders black. Pre-
-        // seed position to half the focused widget's current dim.
+        // seed position to half the focused widget's current dim; the
+        // paned's tracker corrects it on the first allocation.
         const focused_dim: c_int = if (orientation == c.GTK_ORIENTATION_HORIZONTAL)
             c.gtk_widget_get_width(focused_w)
         else
@@ -2334,26 +2323,6 @@ pub const Window = struct {
         if (focused_dim > 0) {
             c.gtk_paned_set_position(@ptrCast(paned), @divFloor(focused_dim, 2));
         }
-        // Safety net: also apply 0.5 ratio on map, in case the paned
-        // gets a different allocation than its focused predecessor.
-        const ratio_holder = try self.allocator.create(winlayout_mod.PanedRatioCtx);
-        ratio_holder.* = .{ .allocator = self.allocator, .ratio = 0.5 };
-        _ = c.g_signal_connect_data(
-            paned,
-            "notify::position",
-            @ptrCast(&winlayout_mod.onPanedPositionChanged),
-            @ptrCast(ratio_holder),
-            @ptrCast(cast.destroyCtx(winlayout_mod.PanedRatioCtx)),
-            c.G_CONNECT_DEFAULT,
-        );
-        _ = c.g_signal_connect_data(
-            paned,
-            "map",
-            @ptrCast(&winlayout_mod.applyPanedRatioMap),
-            @ptrCast(ratio_holder),
-            null,
-            c.G_CONNECT_DEFAULT,
-        );
 
         // Hold an extra reference to focused_w during reparent — without
         // it, gtk_box_remove / gtk_paned_set_*_child(NULL) drops the
