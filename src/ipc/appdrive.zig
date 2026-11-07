@@ -2352,7 +2352,14 @@ pub const App = struct {
     /// Press-move-release drag. Motions go out in small bursts with
     /// pumps between so the app sees a gesture, not one event blob.
     pub fn drag(self: *App, win_id: u32, x1: f64, y1: f64, x2: f64, y2: f64, button: u32) Error!void {
-        return self.dragInner(win_id, x1, y1, x2, y2, button, false);
+        return self.dragInner(win_id, x1, y1, x2, y2, button, false, 0);
+    }
+
+    /// drag() whose pointer rests at (x2,y2) for `hold_ms` before the
+    /// release, as a hand that pauses does (GTK's edge autoscrolls run
+    /// on exactly such a pause).
+    pub fn dragHold(self: *App, win_id: u32, x1: f64, y1: f64, x2: f64, y2: f64, button: u32, hold_ms: i64) Error!void {
+        return self.dragInner(win_id, x1, y1, x2, y2, button, false, hold_ms);
     }
 
     /// drag() for a toolkit DRAG-AND-DROP destination. The release is
@@ -2366,10 +2373,10 @@ pub const App = struct {
     /// GtkDropTarget flows; pointer-grab drags (paned dividers) never
     /// flip the dnd state and should keep calling drag().
     pub fn dragDnd(self: *App, win_id: u32, x1: f64, y1: f64, x2: f64, y2: f64, button: u32) Error!void {
-        return self.dragInner(win_id, x1, y1, x2, y2, button, true);
+        return self.dragInner(win_id, x1, y1, x2, y2, button, true, 0);
     }
 
-    fn dragInner(self: *App, win_id: u32, x1: f64, y1: f64, x2: f64, y2: f64, button: u32, expect_dnd: bool) Error!void {
+    fn dragInner(self: *App, win_id: u32, x1: f64, y1: f64, x2: f64, y2: f64, button: u32, expect_dnd: bool, hold_ms: i64) Error!void {
         // `chan` is captured here and the `*Window` is never touched
         // again: every pump below can free it (native_sync prunes what
         // a resync replay did not re-announce, chan_close/toplevel_gone
@@ -2472,6 +2479,7 @@ pub const App = struct {
                 _ = self.pumpOnce(20);
             }
         }
+        if (hold_ms > 0) self.pumpFor(hold_ms);
         units.clearRetainingCapacity();
         wlpipe.appendSeatButton(&units, a, evdevButton(button), false) catch return Error.OutOfMemory;
         // Unconditional, on the captured channel: a button left

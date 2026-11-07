@@ -881,6 +881,21 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         var buf: [32]winlayout.SplitGeometry = undefined;
         const n = winlayout.splitGeometry(ownerWindow(self, pane), pane, &buf);
         try ipc_protocol.writeOk(out, allocator, "splits", buf[0..n]);
+    } else if (eql(u8, req.cmd, "browser-columns")) {
+        // Verification hook for smoke rigs: the live column widths of
+        // the addressed pane's current file-view tab.
+        if (c.getenv("SKETERM_VERIFY_TREE") == null)
+            return ipc_protocol.writeErr(out, allocator, .unavailable, "browser columns are reported only under SKETERM_VERIFY_TREE");
+        const pane = reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
+        const browser = @import("browser.zig");
+        const view = browser.BrowserView.fromPane(pane) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "pane has no file view");
+        const tab = view.currentTab() orelse return ipc_protocol.writeErr(out, allocator, .not_found, "file view has no tab");
+        var buf: [64]browser.ColumnGeometry = undefined;
+        const n = browser.columnGeometry(tab, &buf);
+        try ipc_protocol.writeOk(out, allocator, "listing", .{
+            .viewport = c.gtk_widget_get_width(tab.scroller),
+            .columns = buf[0..n],
+        });
     } else if (eql(u8, req.cmd, "focus")) {
         if (req.pane != null or req.session != null) {
             const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");

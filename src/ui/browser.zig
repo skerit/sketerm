@@ -15,6 +15,9 @@ const paths = @import("../filebrowser/paths.zig");
 
 pub const BrowserView = @import("browser/view.zig").BrowserView;
 pub const HostAction = @import("browser/types.zig").HostAction;
+/// Live column geometry, for the `browser-columns` verification command.
+pub const ColumnGeometry = @import("browser/colview.zig").ColumnGeometry;
+pub const columnGeometry = @import("browser/colview.zig").columnGeometry;
 
 /// Location specs are plain data, so the parser and the network-mount
 /// bypass live GTK-free under src/filebrowser.
