@@ -417,7 +417,13 @@ pub const Conn = struct {
     allocator: std.mem.Allocator,
     fd: c_int,
     transport: Transport = .local,
+    /// Received bytes; the first `rhead` of them are already taken. Read
+    /// what is still unread through `unread()`, never `rbuf.items`.
     rbuf: std.ArrayList(u8) = .empty,
+    /// Taken prefix of `rbuf`, compacted away lazily: sliding the tail
+    /// down after every frame made a drain of N buffered frames cost
+    /// O(N * buffered bytes) (a 3 MB disk-usage burst took 30 s).
+    rhead: usize = 0,
     /// Complete frames queued by GUI main-loop producers. These are
     /// flushed incrementally without polling so backpressure cannot freeze
     /// GTK.
@@ -838,6 +844,7 @@ pub const Conn = struct {
         _ = c.close(self.fd);
         self.fd = -1;
         self.rbuf.deinit(self.allocator);
+        self.rhead = 0;
         self.wbuf.deinit(self.allocator);
     }
 
@@ -2123,7 +2130,7 @@ pub const Conn = struct {
     /// Half-arrived frame in the receive buffer, if any — for
     /// timeout diagnostics ("2.1 MB of an 8.3 MB frame buffered").
     pub fn pendingPartial(self: *const Conn) ?struct { expected: usize, have: usize } {
-        const p = wire.partialInfo(self.rbuf.items) orelse return null;
+        const p = wire.partialInfo(self.unread()) orelse return null;
         return .{ .expected = p.expected, .have = p.have };
     }
 
@@ -2172,14 +2179,35 @@ pub const Conn = struct {
     /// buffered so far is only PART of a frame. Never touches the fd, so it
     /// cannot block.
     pub fn takeFrame(self: *Conn) !?OwnedFrame {
-        const peeled = (try wire.peelFrame(self.rbuf.items)) orelse return null;
+        const peeled = (try wire.peelFrame(self.unread())) orelse return null;
         const owned = try self.allocator.dupe(u8, peeled.frame.payload);
-        wire.compactConsumed(&self.rbuf, peeled.consumed);
-        // One big frame (a multi-MB window buffer) must not pin its
-        // high-water capacity for the connection's lifetime.
-        if (self.rbuf.items.len == 0 and self.rbuf.capacity > (4 << 20))
-            self.rbuf.clearAndFree(self.allocator);
+        self.rhead += peeled.consumed;
+        self.compactRead();
         return .{ .ftype = peeled.frame.ftype, .payload = owned };
+    }
+
+    /// Received bytes not yet taken as frames.
+    pub fn unread(self: *const Conn) []const u8 {
+        return self.rbuf.items[self.rhead..];
+    }
+
+    /// Taken prefix below which the buffer is not compacted.
+    const COMPACT_MIN: usize = 64 * 1024;
+
+    /// Drop the taken prefix once it is everything, or large and at least
+    /// half the buffer, so each byte is moved O(1) times overall.
+    fn compactRead(self: *Conn) void {
+        if (self.rhead == self.rbuf.items.len) {
+            self.rbuf.clearRetainingCapacity();
+            self.rhead = 0;
+            // One big frame (a multi-MB window buffer) must not pin its
+            // high-water capacity for the connection's lifetime.
+            if (self.rbuf.capacity > (4 << 20)) self.rbuf.clearAndFree(self.allocator);
+            return;
+        }
+        if (self.rhead < COMPACT_MIN or self.rhead < self.rbuf.items.len - self.rhead) return;
+        wire.compactConsumed(&self.rbuf, self.rhead);
+        self.rhead = 0;
     }
 
     /// Top the read buffer up with whatever bytes have already arrived, without
@@ -2425,6 +2453,52 @@ fn panelIdentitySupport(allocator: std.mem.Allocator, payload: []const u8) !Pane
     if (panel_rpc >= wire.PANEL_RPC_VERSION) return .current;
     if (!(parsed.value.attach_identity orelse false)) return .legacy;
     return .unsupported;
+}
+
+test "taking buffered frames compacts lazily and never loses or reorders bytes" {
+    const t = std.testing;
+    var conn = Conn{ .allocator = t.allocator, .fd = -1 };
+    defer conn.rbuf.deinit(t.allocator);
+    var payload: [300]u8 = undefined;
+    // Enough frames that the taken prefix crosses COMPACT_MIN several times.
+    const n_frames = 2000;
+    var appended: usize = 0;
+    var taken: usize = 0;
+    var max_moved_prefix: usize = 0;
+    while (taken < n_frames) {
+        // Keep feeding while taking, the way a drain interleaves reads.
+        var k: usize = 0;
+        while (k < 7 and appended < n_frames) : (k += 1) {
+            @memset(&payload, @truncate(appended));
+            try wire.appendFrame(&conn.rbuf, t.allocator, .fs_job, payload[0 .. 1 + appended % payload.len]);
+            appended += 1;
+        }
+        var j: usize = 0;
+        while (j < 5) : (j += 1) {
+            const f = (try conn.takeFrame()) orelse break;
+            defer f.deinit(t.allocator);
+            try t.expectEqual(wire.FrameType.fs_job, f.ftype);
+            try t.expectEqual(1 + taken % payload.len, f.payload.len);
+            for (f.payload) |b| try t.expectEqual(@as(u8, @truncate(taken)), b);
+            taken += 1;
+            max_moved_prefix = @max(max_moved_prefix, conn.rhead);
+            // The taken prefix is dropped once it dominates the buffer.
+            try t.expect(conn.rhead < Conn.COMPACT_MIN or conn.rhead < conn.rbuf.items.len - conn.rhead);
+        }
+    }
+    try t.expect(max_moved_prefix > 0);
+    try t.expectEqual(@as(usize, 0), conn.unread().len);
+    try t.expectEqual(@as(usize, 0), conn.rhead);
+    // A partial frame stays unread and is completed by later bytes.
+    try wire.appendFrame(&conn.rbuf, t.allocator, .fs_job, "abc");
+    const whole = conn.rbuf.items.len;
+    conn.rbuf.shrinkRetainingCapacity(whole - 2);
+    try t.expect((try conn.takeFrame()) == null);
+    try t.expectEqual(whole - 2, conn.unread().len);
+    try conn.rbuf.appendSlice(t.allocator, "bc");
+    const f = (try conn.takeFrame()).?;
+    defer f.deinit(t.allocator);
+    try t.expectEqualStrings("abc", f.payload);
 }
 
 test "panel identity support requires a valid positive capability classification" {

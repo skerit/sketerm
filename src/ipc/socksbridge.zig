@@ -1235,7 +1235,7 @@ test "transport: stop interrupts a partial mux header" {
     const partial = [_]u8{ 5, 0 };
     try t.expectEqual(@as(isize, partial.len), c.write(pair[1], &partial, partial.len));
     try t.expect(bridge.pumpConn());
-    try t.expectEqual(partial.len, conn.rbuf.items.len);
+    try t.expectEqual(partial.len, conn.unread().len);
     try testRunAndStop(&bridge);
 }
 

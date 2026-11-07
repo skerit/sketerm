@@ -721,7 +721,7 @@ fn inTurn() bool {
 fn buffered() bool {
     if (link.status != .up) return false;
     const p = if (link.peer) |*pp| pp else return false;
-    return p.inbox.items.len > 0 or p.conn.rbuf.items.len > 0;
+    return p.inbox.items.len > 0 or p.conn.unread().len > 0;
 }
 
 /// Between requests: reconnect for kept acks, take what the broker pushed,
