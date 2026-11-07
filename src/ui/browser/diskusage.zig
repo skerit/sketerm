@@ -70,6 +70,24 @@ pub const State = struct {
     children: std.ArrayList(usize) = .empty,
     hits: std.ArrayList(Hit) = .empty,
     hovered: ?usize = null,
+    scroller: *c.GtkWidget = undefined,
+    /// The live result rows by node index (`OTHER_ID` for the remainder),
+    /// borrowed from their widgets, which own the contexts. A render
+    /// updates these in place; only rows that leave the view are removed.
+    rows: std.AutoHashMapUnmanaged(usize, *RowCtx) = .empty,
+    /// The selected result, by path: it survives a rescan (indices are
+    /// reassigned) and is what going back up re-selects.
+    selected_path: ?[]u8 = null,
+    trail: model_mod.Trail,
+    /// Set while a sync adds, removes or selects rows itself, so GTK's
+    /// selection signals are not mistaken for the user's.
+    syncing: bool = false,
+    /// Verification counters (`browser-usage`): renders, the renders a
+    /// generic browser re-render caused, and row widgets made/dropped.
+    renders: u64 = 0,
+    external_renders: u64 = 0,
+    rows_built: u64 = 0,
+    rows_dropped: u64 = 0,
 
     fn free(user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(State, user);
@@ -77,6 +95,10 @@ pub const State = struct {
         if (self.render_source != 0) _ = c.g_source_remove(self.render_source);
         self.children.deinit(self.allocator);
         self.hits.deinit(self.allocator);
+        // The row contexts belong to their (already disposed) widgets.
+        self.rows.deinit(self.allocator);
+        if (self.selected_path) |p| self.allocator.free(p);
+        self.trail.deinit();
         self.model.deinit();
         self.allocator.free(self.root);
         self.allocator.free(self.current);
@@ -88,11 +110,19 @@ pub const State = struct {
         self.render_source = c.g_timeout_add(RENDER_DELAY_MS, @ptrCast(&onRenderTick), @ptrCast(self));
     }
 
+    /// The browser's generic re-render of this tab (listing deltas, git
+    /// overlays, tab switches) landing on the analyzer.
+    pub fn renderExternal(self: *State) void {
+        self.external_renders += 1;
+        self.render();
+    }
+
     pub fn render(self: *State) void {
         if (self.tab.view.widgets_dead) return;
+        self.renders += 1;
         self.model.directChildren(self.current, self.metric, &self.children) catch return;
         renderHeader(self);
-        renderRows(self);
+        syncRows(self);
         c.gtk_widget_queue_draw(self.chart);
     }
 
@@ -117,20 +147,43 @@ pub const State = struct {
         return if (std.mem.eql(u8, self.current, self.root)) @max(self.progress_items, total) else total;
     }
 
+    /// Show `path`, keeping the keyboard in the list: a descent opens at
+    /// the top, a return shows the folder where it was left with the
+    /// folder it came from selected.
     fn setCurrent(self: *State, path: []const u8) void {
         const fresh = self.allocator.dupe(u8, path) catch return;
+        const vadj = c.gtk_scrolled_window_get_vadjustment(@ptrCast(@alignCast(self.scroller)));
+        const scroll = self.trail.move(self.current, if (vadj) |a| c.gtk_adjustment_get_value(a) else 0, fresh);
+        if (model_mod.childToward(fresh, self.current)) |came_from| self.setSelectedPath(came_from);
         self.allocator.free(self.current);
         self.current = fresh;
         self.hovered = null;
         self.render();
+        if (vadj) |a| {
+            // The rows just changed but are not laid out yet, so the
+            // adjustment still has the old folder's height: widen it
+            // for now and the next allocation keeps the offset.
+            const page = c.gtk_adjustment_get_page_size(a);
+            const upper = @max(c.gtk_adjustment_get_upper(a), scroll + page);
+            c.gtk_adjustment_configure(a, scroll, c.gtk_adjustment_get_lower(a), upper, c.gtk_adjustment_get_step_increment(a), c.gtk_adjustment_get_page_increment(a), page);
+        }
     }
 
     fn goUp(self: *State) bool {
         if (std.mem.eql(u8, self.current, self.root)) return false;
         const parent = std.fs.path.dirname(self.current) orelse return false;
-        if (!withinRoot(self.root, parent)) return false;
+        if (!model_mod.within(self.root, parent)) return false;
         self.setCurrent(parent);
         return true;
+    }
+
+    fn setSelectedPath(self: *State, path: ?[]const u8) void {
+        if (self.selected_path) |old| {
+            if (path != null and std.mem.eql(u8, old, path.?)) return;
+            self.allocator.free(old);
+            self.selected_path = null;
+        }
+        if (path) |p| self.selected_path = self.allocator.dupe(u8, p) catch null;
     }
 
     fn setProgressText(self: *State, text: []const u8) void {
@@ -139,16 +192,24 @@ pub const State = struct {
     }
 };
 
+/// One result row's widgets and what they show; owned by the row widget.
 const RowCtx = struct {
     allocator: std.mem.Allocator,
     state: *State,
-    index: usize,
+    /// Node index, or `OTHER_ID` for the remainder row.
+    id: usize,
+    /// Position in the list, read by the list's sort function.
+    order: usize,
+    seen: bool = false,
+    face: ?model_mod.RowFace = null,
+    row: *c.GtkWidget,
+    icon: *c.GtkWidget,
+    name: *c.GtkWidget,
+    bar: ?*c.GtkWidget,
+    size: *c.GtkWidget,
+    percent: *c.GtkWidget,
+    items: *c.GtkWidget,
 };
-
-fn withinRoot(root: []const u8, path: []const u8) bool {
-    if (!std.mem.startsWith(u8, path, root)) return false;
-    return path.len == root.len or root.len == 1 or path[root.len] == '/';
-}
 
 const zText = strz.copyZ;
 
@@ -178,6 +239,7 @@ fn createState(tab: *BTab, root: []const u8) ?*State {
         .root = root_owned,
         .current = current,
         .model = model_mod.Model.init(allocator),
+        .trail = model_mod.Trail.init(allocator),
     };
 
     const page = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0).?;
@@ -282,6 +344,7 @@ fn createState(tab: *BTab, root: []const u8) ?*State {
     c.gtk_box_append(@ptrCast(left), columns);
 
     const scroll = c.gtk_scrolled_window_new().?;
+    self.scroller = scroll;
     c.gtk_widget_set_hexpand(scroll, 1);
     c.gtk_widget_set_vexpand(scroll, 1);
     self.listbox = @ptrCast(@alignCast(c.gtk_list_box_new().?));
@@ -289,7 +352,15 @@ fn createState(tab: *BTab, root: []const u8) ?*State {
     c.gtk_list_box_set_activate_on_single_click(self.listbox, 1);
     c.gtk_widget_add_css_class(@ptrCast(@alignCast(self.listbox)), "boxed-list");
     _ = c.g_signal_connect_data(self.listbox, "row-activated", @ptrCast(&onRowActivated), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(self.listbox, "row-selected", @ptrCast(&onRowSelected), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+    // Rows keep their widgets across renders; order is a field, not
+    // insertion order, so a reorder never re-creates a row.
+    c.gtk_list_box_set_sort_func(self.listbox, @ptrCast(&sortRows), null, null);
     c.gtk_scrolled_window_set_child(@ptrCast(scroll), @ptrCast(@alignCast(self.listbox)));
+    // GtkViewport's scroll-to-focus runs at the next allocation, against
+    // rows a folder change has only just inserted, and lands the list at
+    // the top; the list box keeps its own cursor row in view instead.
+    if (c.gtk_scrolled_window_get_child(@ptrCast(scroll))) |vp| c.gtk_viewport_set_scroll_to_focus(@ptrCast(@alignCast(vp)), 0);
     c.gtk_box_append(@ptrCast(left), scroll);
     self.progress_label = @ptrCast(@alignCast(c.gtk_label_new("").?));
     c.gtk_label_set_xalign(self.progress_label, 0);
@@ -592,120 +663,247 @@ fn renderHeader(self: *State) void {
     if (self.tab.view.currentTab() == self.tab) self.tab.view.setStatus(std.mem.span(c.gtk_label_get_text(self.progress_label)));
 }
 
-fn renderRows(self: *State) void {
-    while (c.gtk_widget_get_first_child(@ptrCast(@alignCast(self.listbox)))) |child|
-        c.gtk_list_box_remove(self.listbox, @ptrCast(@alignCast(child)));
+fn ctxOf(row: *c.GtkWidget) ?*RowCtx {
+    const raw = c.g_object_get_data(@ptrCast(row), ROW_QDATA) orelse return null;
+    return @ptrCast(@alignCast(raw));
+}
+
+fn sortRows(a: *c.GtkListBoxRow, b: *c.GtkListBoxRow, _: ?*anyopaque) callconv(.c) c_int {
+    const oa = if (ctxOf(@ptrCast(@alignCast(a)))) |ctx| ctx.order else std.math.maxInt(usize);
+    const ob = if (ctxOf(@ptrCast(@alignCast(b)))) |ctx| ctx.order else std.math.maxInt(usize);
+    return if (oa < ob) -1 else if (oa > ob) 1 else 0;
+}
+
+/// The result row holding keyboard focus, if any.
+fn focusedRow(self: *State) ?*c.GtkWidget {
+    const lb: *c.GtkWidget = @ptrCast(@alignCast(self.listbox));
+    const root = c.gtk_widget_get_root(lb) orelse return null;
+    const focused = c.gtk_root_get_focus(root) orelse return null;
+    const row = c.gtk_widget_get_ancestor(focused, c.gtk_list_box_row_get_type()) orelse return null;
+    return if (c.gtk_widget_get_parent(row) == lb) row else null;
+}
+
+/// Bring the list in line with `self.children`: rows still shown keep
+/// their widgets (and so their selection, focus and hover) and only
+/// rewrite labels whose numbers changed; rows that left are removed and
+/// new ones inserted at their sorted place.
+fn syncRows(self: *State) void {
     const total = self.displayedTotal();
     const count = @min(self.children.items.len, MAX_ROWS);
-    for (self.children.items[0..count]) |index| appendNodeRow(self, index, total);
     var represented: u64 = 0;
     for (self.children.items[0..count]) |index| represented +|= self.model.nodes.items[index].value(self.metric);
     const remainder = total -| represented;
-    if (remainder > 0) appendOtherRow(self, remainder, total, self.children.items.len - count);
+    const had_focus = focusedRow(self) != null;
+    self.syncing = true;
+    defer self.syncing = false;
+
+    var it = self.rows.valueIterator();
+    while (it.next()) |ctx| ctx.*.seen = false;
+    var reorder = false;
+    for (self.children.items[0..count], 0..) |index, order| {
+        const face = model_mod.nodeFace(self.model.nodes.items[index], self.metric, total);
+        reorder = placeRow(self, index, order, face, total) or reorder;
+    }
+    if (remainder > 0) reorder = placeRow(self, OTHER_ID, count, model_mod.otherFace(remainder, total, self.children.items.len - count), total) or reorder;
+
+    // Rows no longer shown; collected first, the map cannot shrink mid-walk.
+    var stale: [64]usize = undefined;
+    while (true) {
+        var n: usize = 0;
+        var walk = self.rows.iterator();
+        while (walk.next()) |kv| {
+            if (kv.value_ptr.*.seen) continue;
+            stale[n] = kv.key_ptr.*;
+            n += 1;
+            if (n == stale.len) break;
+        }
+        if (n == 0) break;
+        for (stale[0..n]) |id| {
+            const ctx = self.rows.fetchRemove(id).?.value;
+            c.gtk_list_box_remove(self.listbox, ctx.row);
+            self.rows_dropped += 1;
+        }
+    }
+    if (reorder) c.gtk_list_box_invalidate_sort(self.listbox);
+    restoreSelection(self);
+    // Removing the focused row hands focus to whatever GTK finds next,
+    // usually outside the list, and the arrow keys stop working.
+    if (had_focus and focusedRow(self) == null) {
+        const target: *c.GtkWidget = if (c.gtk_list_box_get_selected_row(self.listbox)) |row|
+            @ptrCast(@alignCast(row))
+        else if (c.gtk_list_box_get_row_at_index(self.listbox, 0)) |row|
+            @ptrCast(@alignCast(row))
+        else
+            @ptrCast(@alignCast(self.listbox));
+        _ = c.gtk_widget_grab_focus(target);
+    }
 }
 
-fn appendNodeRow(self: *State, index: usize, total: u64) void {
-    const node = self.model.nodes.items[index];
-    const ctx = self.allocator.create(RowCtx) catch return;
-    ctx.* = .{ .allocator = self.allocator, .state = self, .index = index };
+/// Show `id` at `order` with `face`, creating its row when it has none.
+/// @return whether the list must re-sort.
+fn placeRow(self: *State, id: usize, order: usize, face: model_mod.RowFace, total: u64) bool {
+    if (self.rows.get(id)) |ctx| {
+        ctx.seen = true;
+        applyFace(ctx, face, total);
+        if (ctx.order == order) return false;
+        ctx.order = order;
+        return true;
+    }
+    const ctx = buildRow(self, id, order) orelse return false;
+    self.rows.put(self.allocator, id, ctx) catch {
+        // Untracked, the row could never be removed again: drop it now.
+        c.gtk_list_box_remove(self.listbox, ctx.row);
+        return false;
+    };
+    ctx.seen = true;
+    applyFace(ctx, face, total);
+    // Inserted at its sorted place, but its neighbours may still carry
+    // the previous render's order until the walk reaches them.
+    return true;
+}
+
+fn fixedLabel(width: c_int, xalign: f32) *c.GtkWidget {
+    const label = c.gtk_label_new("").?;
+    c.gtk_widget_set_size_request(label, width, -1);
+    c.gtk_label_set_xalign(@ptrCast(label), xalign);
+    return label;
+}
+
+fn buildRow(self: *State, id: usize, order: usize) ?*RowCtx {
+    const ctx = self.allocator.create(RowCtx) catch return null;
+    const other = id == OTHER_ID;
     const row = c.gtk_list_box_row_new().?;
     const box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8).?;
     c.gtk_widget_set_margin_start(box, 8);
     c.gtk_widget_set_margin_end(box, 8);
-    c.gtk_widget_set_margin_top(box, 5);
-    c.gtk_widget_set_margin_bottom(box, 5);
-    const icon_name: [*:0]const u8 = switch (node.kind) {
-        .dir => "folder-symbolic",
-        .mount => "drive-harddisk-symbolic",
-        .file => "text-x-generic-symbolic",
-    };
-    c.gtk_box_append(@ptrCast(box), c.gtk_image_new_from_icon_name(icon_name));
-
+    c.gtk_widget_set_margin_top(box, if (other) 7 else 5);
+    c.gtk_widget_set_margin_bottom(box, if (other) 7 else 5);
+    const icon = c.gtk_image_new().?;
+    c.gtk_box_append(@ptrCast(box), icon);
     const name_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 3).?;
     c.gtk_widget_set_hexpand(name_box, 1);
     const name = c.gtk_label_new("").?;
-    var name_z: [1024:0]u8 = undefined;
-    c.gtk_label_set_text(@ptrCast(name), zText(&name_z, std.fs.path.basename(node.path)));
     c.gtk_label_set_xalign(@ptrCast(name), 0);
     c.gtk_label_set_ellipsize(@ptrCast(name), c.PANGO_ELLIPSIZE_END);
-    if (node.errors > 0) c.gtk_widget_add_css_class(name, "warning");
-    if (node.kind == .mount) c.gtk_widget_add_css_class(name, "dim-label");
     c.gtk_box_append(@ptrCast(name_box), name);
-    const bar = c.gtk_progress_bar_new().?;
-    const value = node.value(self.metric);
-    const fraction = if (total > 0) @as(f64, @floatFromInt(value)) / @as(f64, @floatFromInt(total)) else 0;
-    c.gtk_progress_bar_set_fraction(@ptrCast(bar), std.math.clamp(fraction, 0, 1));
-    c.gtk_widget_set_size_request(bar, -1, 5);
-    c.gtk_box_append(@ptrCast(name_box), bar);
-    c.gtk_box_append(@ptrCast(box), name_box);
-
-    var size_buf: [48:0]u8 = undefined;
-    const size = c.gtk_label_new(format.fmtSize(&size_buf, value).ptr).?;
-    c.gtk_widget_set_size_request(size, 90, -1);
-    c.gtk_label_set_xalign(@ptrCast(size), 1);
-    c.gtk_box_append(@ptrCast(box), size);
-    var percent_buf: [24:0]u8 = undefined;
-    const percent_text = if (total > 0) std.fmt.bufPrintSentinel(&percent_buf, "{d:.1}%", .{fraction * 100}, 0) catch "" else "";
-    const percent = c.gtk_label_new(percent_text.ptr).?;
-    c.gtk_widget_set_size_request(percent, 58, -1);
-    c.gtk_label_set_xalign(@ptrCast(percent), 1);
-    c.gtk_box_append(@ptrCast(box), percent);
-    var items_buf: [40:0]u8 = undefined;
-    var item_text: [*:0]const u8 = "1";
-    if (node.kind == .mount) {
-        item_text = "Not scanned";
-    } else if (node.kind == .dir) {
-        if (std.fmt.bufPrintSentinel(&items_buf, "{d}", .{node.items -| 1}, 0)) |text|
-            item_text = text.ptr
-        else |_|
-            item_text = "";
+    var bar: ?*c.GtkWidget = null;
+    if (other) {
+        c.gtk_widget_add_css_class(name, "dim-label");
+        c.gtk_image_set_from_icon_name(@ptrCast(icon), "view-more-symbolic");
+        // Nothing to open or act on: the remainder is not a target.
+        c.gtk_list_box_row_set_activatable(@ptrCast(row), 0);
+        c.gtk_list_box_row_set_selectable(@ptrCast(row), 0);
+    } else {
+        const node = self.model.nodes.items[id];
+        var name_z: [1024:0]u8 = undefined;
+        c.gtk_label_set_text(@ptrCast(name), zText(&name_z, std.fs.path.basename(node.path)));
+        c.gtk_widget_set_tooltip_text(row, zText(&name_z, node.path));
+        const b = c.gtk_progress_bar_new().?;
+        c.gtk_widget_set_size_request(b, -1, 5);
+        c.gtk_box_append(@ptrCast(name_box), b);
+        bar = b;
     }
-    const items = c.gtk_label_new(item_text).?;
-    c.gtk_widget_set_size_request(items, 78, -1);
-    c.gtk_label_set_xalign(@ptrCast(items), 1);
+    c.gtk_box_append(@ptrCast(box), name_box);
+    const size = fixedLabel(90, 1);
+    c.gtk_box_append(@ptrCast(box), size);
+    const percent = fixedLabel(58, 1);
+    c.gtk_box_append(@ptrCast(box), percent);
+    const items = fixedLabel(78, 1);
     c.gtk_box_append(@ptrCast(box), items);
     c.gtk_list_box_row_set_child(@ptrCast(row), box);
-    c.gtk_widget_set_tooltip_text(row, zText(&name_z, node.path));
+    ctx.* = .{
+        .allocator = self.allocator,
+        .state = self,
+        .id = id,
+        .order = order,
+        .row = row,
+        .icon = icon,
+        .name = name,
+        .bar = bar,
+        .size = size,
+        .percent = percent,
+        .items = items,
+    };
     c.g_object_set_data_full(@ptrCast(row), ROW_QDATA, @ptrCast(ctx), @ptrCast(cast.destroyCtx(RowCtx)));
     c.gtk_list_box_append(self.listbox, row);
+    self.rows_built += 1;
+    return ctx;
 }
 
-fn appendOtherRow(self: *State, value: u64, total: u64, omitted: usize) void {
-    const row = c.gtk_list_box_row_new().?;
-    c.gtk_list_box_row_set_activatable(@ptrCast(row), 0);
-    const box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8).?;
-    c.gtk_widget_set_margin_start(box, 8);
-    c.gtk_widget_set_margin_end(box, 8);
-    c.gtk_widget_set_margin_top(box, 7);
-    c.gtk_widget_set_margin_bottom(box, 7);
-    c.gtk_box_append(@ptrCast(box), c.gtk_image_new_from_icon_name("view-more-symbolic"));
-    var label_buf: [96:0]u8 = undefined;
-    const label_text = if (omitted > 0)
-        std.fmt.bufPrintSentinel(&label_buf, "Other ({d} smaller entries)", .{omitted}, 0) catch "Other"
-    else
-        std.fmt.bufPrintSentinel(&label_buf, "Other files and folder metadata", .{}, 0) catch "Other";
-    const label = c.gtk_label_new(label_text.ptr).?;
-    c.gtk_label_set_xalign(@ptrCast(label), 0);
-    c.gtk_widget_set_hexpand(label, 1);
-    c.gtk_widget_add_css_class(label, "dim-label");
-    c.gtk_box_append(@ptrCast(box), label);
+/// Rewrite a row's widgets, and only when what it prints changed.
+fn applyFace(ctx: *RowCtx, face: model_mod.RowFace, total: u64) void {
+    if (ctx.face) |old| if (old.eql(face)) return;
+    const old = ctx.face;
+    ctx.face = face;
+    if (!face.other and (old == null or old.?.kind != face.kind)) {
+        c.gtk_image_set_from_icon_name(@ptrCast(ctx.icon), switch (face.kind) {
+            .dir => "folder-symbolic",
+            .mount => "drive-harddisk-symbolic",
+            .file => "text-x-generic-symbolic",
+        });
+        if (face.kind == .mount) c.gtk_widget_add_css_class(ctx.name, "dim-label") else c.gtk_widget_remove_css_class(ctx.name, "dim-label");
+    }
+    if (face.warning) c.gtk_widget_add_css_class(ctx.name, "warning") else c.gtk_widget_remove_css_class(ctx.name, "warning");
+    if (face.other) {
+        var label_buf: [96:0]u8 = undefined;
+        const text = if (face.omitted > 0)
+            std.fmt.bufPrintSentinel(&label_buf, "Other ({d} smaller entries)", .{face.omitted}, 0) catch "Other"
+        else
+            "Other files and folder metadata";
+        c.gtk_label_set_text(@ptrCast(ctx.name), text.ptr);
+    }
+    if (ctx.bar) |bar| {
+        const fraction = if (total > 0) @as(f64, @floatFromInt(face.value)) / @as(f64, @floatFromInt(total)) else 0;
+        c.gtk_progress_bar_set_fraction(@ptrCast(bar), std.math.clamp(fraction, 0, 1));
+    }
     var size_buf: [48:0]u8 = undefined;
-    const size = c.gtk_label_new(format.fmtSize(&size_buf, value).ptr).?;
-    c.gtk_widget_set_size_request(size, 90, -1);
-    c.gtk_label_set_xalign(@ptrCast(size), 1);
-    c.gtk_box_append(@ptrCast(box), size);
+    c.gtk_label_set_text(@ptrCast(ctx.size), format.fmtSize(&size_buf, face.value).ptr);
     var percent_buf: [24:0]u8 = undefined;
-    const fraction = if (total > 0) @as(f64, @floatFromInt(value)) / @as(f64, @floatFromInt(total)) else 0;
-    const pct = std.fmt.bufPrintSentinel(&percent_buf, "{d:.1}%", .{fraction * 100}, 0) catch "";
-    const percent = c.gtk_label_new(pct.ptr).?;
-    c.gtk_widget_set_size_request(percent, 58, -1);
-    c.gtk_label_set_xalign(@ptrCast(percent), 1);
-    c.gtk_box_append(@ptrCast(box), percent);
-    const blank = c.gtk_label_new("").?;
-    c.gtk_widget_set_size_request(blank, 78, -1);
-    c.gtk_box_append(@ptrCast(box), blank);
-    c.gtk_list_box_row_set_child(@ptrCast(row), box);
-    c.gtk_list_box_append(self.listbox, row);
+    const percent = if (total > 0)
+        std.fmt.bufPrintSentinel(&percent_buf, "{d}.{d}%", .{ face.permille / 10, face.permille % 10 }, 0) catch ""
+    else
+        "";
+    c.gtk_label_set_text(@ptrCast(ctx.percent), percent.ptr);
+    var items_buf: [40:0]u8 = undefined;
+    const items: [*:0]const u8 = if (face.other)
+        ""
+    else switch (face.kind) {
+        .mount => "Not scanned",
+        .file => "1",
+        .dir => if (std.fmt.bufPrintSentinel(&items_buf, "{d}", .{face.items}, 0)) |t| t.ptr else |_| "",
+    };
+    c.gtk_label_set_text(@ptrCast(ctx.items), items);
+}
+
+/// Select the remembered result when it has a row and nothing else is.
+fn restoreSelection(self: *State) void {
+    const want = self.selected_path orelse return;
+    const id = self.model.indexOf(want) orelse return;
+    const ctx = self.rows.get(id) orelse return;
+    if (c.gtk_list_box_get_selected_row(self.listbox)) |sel| if (@as(*c.GtkWidget, @ptrCast(@alignCast(sel))) == ctx.row) return;
+    c.gtk_list_box_select_row(self.listbox, @ptrCast(@alignCast(ctx.row)));
+}
+
+/// Drop every row; their node indices are about to be reassigned.
+fn clearRows(self: *State) void {
+    self.syncing = true;
+    defer self.syncing = false;
+    var it = self.rows.valueIterator();
+    while (it.next()) |ctx| {
+        c.gtk_list_box_remove(self.listbox, ctx.*.row);
+        self.rows_dropped += 1;
+    }
+    self.rows.clearRetainingCapacity();
+}
+
+fn onRowSelected(_: *c.GtkListBox, row: ?*c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(State, user);
+    if (self.syncing) return;
+    // NULL outside a sync is the user deselecting (Ctrl+click).
+    const r = row orelse return self.setSelectedPath(null);
+    const ctx = ctxOf(@ptrCast(@alignCast(r))) orelse return;
+    if (ctx.id == OTHER_ID) return;
+    self.setSelectedPath(self.model.nodes.items[ctx.id].path);
 }
 
 fn onRenderTick(user: ?*anyopaque) callconv(.c) c.gboolean {
@@ -740,7 +938,9 @@ fn onRescanClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(State, user);
     if (self.running and !self.canceling) return;
     const root = self.allocator.dupe(u8, self.root) catch null;
+    clearRows(self);
     self.model.clear();
+    self.trail.truncate(0);
     self.hits.clearRetainingCapacity();
     self.hovered = null;
     self.progress_size = 0;
@@ -763,9 +963,9 @@ fn onMetricToggled(button: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) vo
 }
 
 fn onRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, _: ?*anyopaque) callconv(.c) void {
-    const raw = c.g_object_get_data(@ptrCast(row), ROW_QDATA) orelse return;
-    const ctx: *RowCtx = @ptrCast(@alignCast(raw));
-    const node = ctx.state.model.nodes.items[ctx.index];
+    const ctx = ctxOf(@ptrCast(@alignCast(row))) orelse return;
+    if (ctx.id == OTHER_ID) return;
+    const node = ctx.state.model.nodes.items[ctx.id];
     if (node.kind == .dir) {
         ctx.state.setCurrent(node.path);
     } else {
@@ -917,8 +1117,96 @@ pub fn leave(tab: *BTab) bool {
     return true;
 }
 
-test "disk usage root containment rejects sibling prefixes" {
-    try std.testing.expect(withinRoot("/srv/data", "/srv/data/a"));
-    try std.testing.expect(withinRoot("/", "/var"));
-    try std.testing.expect(!withinRoot("/srv/data", "/srv/database"));
+/// One on-screen analyzer row, for the `browser-usage` verification command.
+pub const UsageRow = struct {
+    path: []const u8,
+    pos: i32,
+    x: f64,
+    y: f64,
+    selected: bool,
+};
+
+/// Scan state, scroll, selection, focus and churn counters of a tab's analyzer.
+pub const UsageReport = struct {
+    running: bool,
+    current: []const u8,
+    scroll: f64,
+    upper: f64,
+    page: f64,
+    n_rows: u32,
+    selected: []const u8,
+    focus: []const u8,
+    focus_widget: []const u8,
+    nodes: usize,
+    renders: u64,
+    external_renders: u64,
+    rows_built: u64,
+    rows_dropped: u64,
+    rows: []UsageRow,
+};
+
+fn rowPath(self: *const State, row: *c.GtkWidget) []const u8 {
+    const ctx = ctxOf(row) orelse return "(unknown)";
+    if (ctx.id == OTHER_ID) return "(other)";
+    return self.model.nodes.items[ctx.id].path;
+}
+
+/// The analyzer of `tab` in surface coordinates, null when it has none.
+/// @return the report; its strings borrow the analyzer's model and `out`.
+pub fn report(tab: *BTab, out: []UsageRow) ?UsageReport {
+    const self = tab.usage orelse return null;
+    const vadj = c.gtk_scrolled_window_get_vadjustment(@ptrCast(@alignCast(self.scroller)));
+    var rep: UsageReport = .{
+        .running = self.running,
+        .current = self.current,
+        .scroll = if (vadj) |a| c.gtk_adjustment_get_value(a) else 0,
+        .upper = if (vadj) |a| c.gtk_adjustment_get_upper(a) else 0,
+        .page = if (vadj) |a| c.gtk_adjustment_get_page_size(a) else 0,
+        .n_rows = 0,
+        .selected = "",
+        .focus = "",
+        .focus_widget = "",
+        .nodes = self.model.nodes.items.len,
+        .renders = self.renders,
+        .external_renders = self.external_renders,
+        .rows_built = self.rows_built,
+        .rows_dropped = self.rows_dropped,
+        .rows = out[0..0],
+    };
+    if (c.gtk_list_box_get_selected_row(self.listbox)) |row| rep.selected = rowPath(self, @ptrCast(@alignCast(row)));
+    const lb: *c.GtkWidget = @ptrCast(@alignCast(self.listbox));
+    if (c.gtk_widget_get_root(lb)) |root| if (c.gtk_root_get_focus(root)) |focused| {
+        rep.focus_widget = std.mem.span(c.gtk_widget_get_name(focused));
+        if (c.gtk_widget_get_ancestor(focused, c.gtk_list_box_row_get_type())) |row| {
+            if (c.gtk_widget_get_parent(row) == lb) rep.focus = rowPath(self, row);
+        }
+    };
+    const native = c.gtk_widget_get_native(lb) orelse return rep;
+    const nat: *c.GtkWidget = @ptrCast(@alignCast(native));
+    var sx: f64 = 0;
+    var sy: f64 = 0;
+    c.gtk_native_get_surface_transform(native, &sx, &sy);
+    var vb: c.graphene_rect_t = undefined;
+    const have_viewport = c.gtk_widget_compute_bounds(self.scroller, nat, &vb) != 0;
+    var n: usize = 0;
+    var child = c.gtk_widget_get_first_child(lb);
+    while (child) |row| : (child = c.gtk_widget_get_next_sibling(row)) {
+        if (c.gtk_widget_get_visible(row) == 0) continue;
+        rep.n_rows += 1;
+        if (!have_viewport or n >= out.len or c.gtk_widget_get_mapped(row) == 0) continue;
+        var rb: c.graphene_rect_t = undefined;
+        if (c.gtk_widget_compute_bounds(row, nat, &rb) == 0) continue;
+        const cy = rb.origin.y + rb.size.height / 2;
+        if (cy < vb.origin.y or cy > vb.origin.y + vb.size.height) continue;
+        out[n] = .{
+            .path = rowPath(self, row),
+            .pos = c.gtk_list_box_row_get_index(@ptrCast(@alignCast(row))),
+            .x = sx + rb.origin.x + @min(rb.size.width / 2, 120),
+            .y = sy + cy,
+            .selected = c.gtk_list_box_row_is_selected(@ptrCast(@alignCast(row))) != 0,
+        };
+        n += 1;
+    }
+    rep.rows = out[0..n];
+    return rep;
 }

@@ -21,6 +21,10 @@ pub const columnGeometry = @import("browser/colview.zig").columnGeometry;
 /// Visible rows, scroll and focus, for the `browser-rows` verification command.
 pub const RowGeometry = @import("browser/colview.zig").RowGeometry;
 pub const rowsReport = @import("browser/colview.zig").rowsReport;
+/// The disk-usage analyzer, for the `browser-usage` verification command.
+pub const UsageRow = @import("browser/diskusage.zig").UsageRow;
+pub const usageReport = @import("browser/diskusage.zig").report;
+pub const startDiskUsage = @import("browser/diskusage.zig").start;
 
 /// Location specs are plain data, so the parser and the network-mount
 /// bypass live GTK-free under src/filebrowser.

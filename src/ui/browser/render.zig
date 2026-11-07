@@ -132,7 +132,7 @@ fn onCoalescedRenderTick(user: ?*anyopaque) callconv(.c) c.gboolean {
 pub fn renderTab(self: *BrowserView, tab: *BTab) void {
     if (self.widgets_dead) return;
     if (tab.usage) |usage| {
-        usage.render();
+        usage.renderExternal();
         return;
     }
     // Every full render restamps the throttle window, whoever asked

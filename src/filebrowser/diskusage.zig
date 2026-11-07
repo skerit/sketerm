@@ -130,6 +130,109 @@ pub const Model = struct {
     }
 };
 
+/// Whether `path` is `root` or lies beneath it, segment-wise.
+pub fn within(root: []const u8, path: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    return path.len == root.len or root.len == 1 or path[root.len] == '/';
+}
+
+/// The entry directly under `ancestor` on the way to `descendant`, null
+/// unless `descendant` lies strictly beneath `ancestor`.
+pub fn childToward(ancestor: []const u8, descendant: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, ancestor, descendant) or !within(ancestor, descendant)) return null;
+    const start = if (ancestor.len == 1) 1 else ancestor.len + 1;
+    const end = std.mem.indexOfScalarPos(u8, descendant, start, '/') orelse descendant.len;
+    return descendant[0..end];
+}
+
+/// What one result row shows; a row is rewritten only when this changes,
+/// so a re-render with the same numbers touches no widget.
+pub const RowFace = struct {
+    kind: Kind,
+    /// The "Other" remainder row rather than a node.
+    other: bool = false,
+    value: u64,
+    /// Share of the displayed total in tenths of a percent, as printed.
+    permille: u32,
+    /// Contained entries (directories) as printed in the Contents column.
+    items: u64,
+    warning: bool,
+    /// Children the "Other" row stands for beyond the row cap.
+    omitted: usize = 0,
+
+    pub fn eql(a: RowFace, b: RowFace) bool {
+        return a.kind == b.kind and a.other == b.other and a.value == b.value and
+            a.permille == b.permille and a.items == b.items and a.warning == b.warning and
+            a.omitted == b.omitted;
+    }
+};
+
+/// Rounded share of `total` in tenths of a percent, capped at 100%.
+pub fn permilleOf(value: u64, total: u64) u32 {
+    if (total == 0) return 0;
+    const v: u128 = @min(value, total);
+    return @intCast((v * 1000 + total / 2) / total);
+}
+
+pub fn nodeFace(node: Node, metric: Metric, total: u64) RowFace {
+    const value = node.value(metric);
+    return .{
+        .kind = node.kind,
+        .value = value,
+        .permille = permilleOf(value, total),
+        .items = if (node.kind == .dir) node.items -| 1 else 1,
+        .warning = node.errors > 0,
+    };
+}
+
+pub fn otherFace(value: u64, total: u64, omitted: usize) RowFace {
+    return .{ .kind = .file, .other = true, .value = value, .permille = permilleOf(value, total), .items = 0, .warning = false, .omitted = omitted };
+}
+
+/// The folders drilled through and how far each was scrolled, so going
+/// back up shows a folder where it was left.
+pub const Trail = struct {
+    allocator: std.mem.Allocator,
+    entries: std.ArrayList(Entry) = .empty,
+
+    pub const Entry = struct { path: []u8, scroll: f64 };
+
+    pub fn init(allocator: std.mem.Allocator) Trail {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *Trail) void {
+        self.truncate(0);
+        self.entries.deinit(self.allocator);
+    }
+
+    pub fn truncate(self: *Trail, len: usize) void {
+        for (self.entries.items[len..]) |e| self.allocator.free(e.path);
+        self.entries.shrinkRetainingCapacity(len);
+    }
+
+    /// Leave `from`, scrolled to `scroll`, for `to`.
+    /// @return the scroll offset to show `to` at: where it was left when
+    /// it is on the trail, else the top.
+    pub fn move(self: *Trail, from: []const u8, scroll: f64, to: []const u8) f64 {
+        // Only ancestors of the destination stay meaningful.
+        var keep: usize = 0;
+        while (keep < self.entries.items.len and within(self.entries.items[keep].path, to)) keep += 1;
+        if (keep > 0 and std.mem.eql(u8, self.entries.items[keep - 1].path, to)) {
+            const back = self.entries.items[keep - 1].scroll;
+            self.truncate(keep - 1);
+            return back;
+        }
+        self.truncate(keep);
+        if (!std.mem.eql(u8, from, to) and within(from, to)) {
+            // Out of memory only forgets where `from` was scrolled.
+            const owned = self.allocator.dupe(u8, from) catch return 0;
+            self.entries.append(self.allocator, .{ .path = owned, .scroll = scroll }) catch self.allocator.free(owned);
+        }
+        return 0;
+    }
+};
+
 pub const TreemapItem = struct { id: usize, value: u64 };
 pub const Rect = struct { id: usize, x: f64, y: f64, w: f64, h: f64 };
 
@@ -217,4 +320,76 @@ test "balanced treemap preserves bounds and positive area" {
         area += rect.w * rect.h;
     }
     try t.expectApproxEqAbs(@as(f64, 8000), area, 0.01);
+}
+
+test "disk usage containment rejects sibling prefixes" {
+    try std.testing.expect(within("/srv/data", "/srv/data/a"));
+    try std.testing.expect(within("/srv/data", "/srv/data"));
+    try std.testing.expect(within("/", "/var"));
+    try std.testing.expect(!within("/srv/data", "/srv/database"));
+}
+
+test "disk usage names the child on the way down" {
+    const t = std.testing;
+    try t.expectEqualStrings("/r/a", childToward("/r", "/r/a/b/c").?);
+    try t.expectEqualStrings("/r/a", childToward("/r", "/r/a").?);
+    try t.expectEqualStrings("/var", childToward("/", "/var/log").?);
+    try t.expect(childToward("/r", "/r") == null);
+    try t.expect(childToward("/r/a", "/r") == null);
+    try t.expect(childToward("/r", "/rx/a") == null);
+}
+
+test "disk usage row faces change only with what a row prints" {
+    const t = std.testing;
+    var path = "/scan/a".*;
+    const node: Node = .{ .path = &path, .kind = .dir, .size = 300, .allocated = 400, .items = 5, .errors = 0, .skipped = 0, .mtime_ms = 0 };
+    const a = nodeFace(node, .allocated, 1000);
+    try t.expectEqual(@as(u32, 400), a.permille);
+    try t.expectEqual(@as(u64, 4), a.items);
+    // A total that moves by less than the printed precision is the same face.
+    try t.expect(a.eql(nodeFace(node, .allocated, 1001)));
+    try t.expect(!a.eql(nodeFace(node, .allocated, 2000)));
+    try t.expect(!a.eql(nodeFace(node, .apparent, 1000)));
+    var warned = node;
+    warned.errors = 1;
+    try t.expect(!a.eql(nodeFace(warned, .allocated, 1000)));
+    try t.expect(!otherFace(10, 100, 0).eql(otherFace(10, 100, 3)));
+    try t.expectEqual(@as(u32, 0), permilleOf(5, 0));
+    try t.expectEqual(@as(u32, 1000), permilleOf(7, 5));
+    try t.expectEqual(@as(u32, 1), permilleOf(1, 1999));
+}
+
+test "disk usage trail restores the scroll of the folders it drilled through" {
+    const t = std.testing;
+    var trail = Trail.init(t.allocator);
+    defer trail.deinit();
+    try t.expectEqual(@as(f64, 0), trail.move("/r", 300, "/r/a"));
+    try t.expectEqual(@as(f64, 0), trail.move("/r/a", 50, "/r/a/b"));
+    try t.expectEqual(@as(f64, 50), trail.move("/r/a/b", 9, "/r/a"));
+    try t.expectEqual(@as(f64, 300), trail.move("/r/a", 0, "/r"));
+    try t.expectEqual(@as(usize, 0), trail.entries.items.len);
+    // A jump sideways forgets the branch it left, not the shared root.
+    _ = trail.move("/r", 120, "/r/a");
+    _ = trail.move("/r/a", 40, "/r/a/b");
+    try t.expectEqual(@as(f64, 0), trail.move("/r/a/b", 0, "/r/c"));
+    try t.expectEqual(@as(usize, 1), trail.entries.items.len);
+    try t.expectEqual(@as(f64, 120), trail.move("/r/c", 0, "/r"));
+    // Re-entering a remembered folder from above starts at the top.
+    _ = trail.move("/r", 80, "/r/a");
+    try t.expectEqual(@as(f64, 0), trail.move("/r/a", 0, "/r/a/b"));
+    try t.expectEqual(@as(usize, 2), trail.entries.items.len);
+}
+
+test "disk usage trail survives allocation failure" {
+    const testalloc = @import("../util/testalloc.zig");
+    // Index 0 fails the path copy, 1 the list growth: either way the
+    // trail only forgets, it never leaks or keeps a dangling entry.
+    for (0..2) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(testalloc.no_resize, .{ .fail_index = fail_index });
+        var trail = Trail.init(failing.allocator());
+        defer trail.deinit();
+        try std.testing.expectEqual(@as(f64, 0), trail.move("/r", 300, "/r/a"));
+        try std.testing.expectEqual(@as(usize, 0), trail.entries.items.len);
+        try std.testing.expectEqual(@as(f64, 0), trail.move("/r/a", 0, "/r"));
+    }
 }

@@ -908,6 +908,19 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         const tab = view.currentTab() orelse return ipc_protocol.writeErr(out, allocator, .not_found, "file view has no tab");
         var buf: [256]browser.RowGeometry = undefined;
         try ipc_protocol.writeOk(out, allocator, "listing", browser.rowsReport(tab, &buf));
+    } else if (eql(u8, req.cmd, "browser-usage")) {
+        // Verification hook for smoke rigs: the addressed pane's current
+        // file-view tab's disk-usage analyzer; `data` starts one there.
+        if (c.getenv("SKETERM_VERIFY_TREE") == null)
+            return ipc_protocol.writeErr(out, allocator, .unavailable, "disk usage is reported only under SKETERM_VERIFY_TREE");
+        const pane = reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
+        const browser = @import("browser.zig");
+        const view = browser.BrowserView.fromPane(pane) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "pane has no file view");
+        const tab = view.currentTab() orelse return ipc_protocol.writeErr(out, allocator, .not_found, "file view has no tab");
+        if (req.data) |root| browser.startDiskUsage(tab, root);
+        var buf: [256]browser.UsageRow = undefined;
+        const rep = browser.usageReport(tab, &buf) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "the tab shows no disk usage analysis");
+        try ipc_protocol.writeOk(out, allocator, "usage", rep);
     } else if (eql(u8, req.cmd, "focus")) {
         if (req.pane != null or req.session != null) {
             const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");

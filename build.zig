@@ -788,6 +788,20 @@ pub fn build(b: *std.Build) void {
     const smoke_tree_step = b.step("smoke-tree", "Expanding/collapsing file-view tree rows keeps the scroll offset and the keyboard cursor (headless, no X)");
     smoke_tree_step.dependOn(&smoke_tree_run.step);
 
+    // Disk-usage analyzer smoke — `zig build smoke-usage`. Streaming
+    // results, clicks and browser re-renders never rebuild result rows
+    // or drop the selection, focus or scroll (src/smoke_usage.zig).
+    const smoke_usage_mod = dev.module(b, target, "src/smoke_usage.zig");
+    configureSysDeps(b, smoke_usage_mod, cbindings_mod);
+    smoke_usage_mod.addImport("build_options", dev.glib_opts);
+    addVideo(b, smoke_usage_mod);
+    const smoke_usage = dev.executable(b, "sketerm-smoke-usage", smoke_usage_mod);
+    const smoke_usage_run = b.addRunArtifact(smoke_usage);
+    dev_bins.drive(smoke_usage_run, &.{ dev_bins.gui, dev_bins.mux });
+    smoke_usage_run.setCwd(b.path("."));
+    const smoke_usage_step = b.step("smoke-usage", "The disk-usage analyzer keeps its rows, selection, focus and scroll through streaming results and re-renders (headless, no X)");
+    smoke_usage_step.dependOn(&smoke_usage_run.step);
+
     // AT-SPI accessibility smoke — `zig build smoke-atspi` (Linux).
     // Same self-hosted rig as smoke-e2e, PLUS a private accessibility
     // bus (dbus-daemon + at-spi2-registryd via mux/a11yhub.zig): the
