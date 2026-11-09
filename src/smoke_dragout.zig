@@ -244,7 +244,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // The staging cache is the point of this rig: keep it in the sandbox.
     _ = c.setenv("XDG_CACHE_HOME", cache.ptr, 1);
     for ([_][*:0]const u8{ "SKETERM_SOCKET", "SKETERM_MUX_SOCKET", "SKETERM_SESSION", "SKETERM_PANE_ID", "SKETERM_SESSION_ORIGIN_ID", "SKETERM_SSH" }) |name| _ = unsetEnv(name);
-    defer @import("util/pathz.zig").removeTree(rt);
+    defer removeSandbox(rt);
     _ = c.system("fc-cache >/dev/null 2>&1");
 
     // ── the files ─────────────────────────────────────────────────
@@ -544,4 +544,20 @@ fn browserAt(app: *appdrive.App, spec: []const u8) ?void {
         return null;
     }
     pumpFor(app, 2000);
+}
+
+/// Remove the sandbox once the GUI's FUSE mount of the fake host (made
+/// when the file view entered `rbox:`) has gone: its helper exits after
+/// the GUI and would otherwise leave its mountpoint behind.
+fn removeSandbox(rt: [:0]const u8) void {
+    const t0 = clock.nowMs();
+    while (clock.nowMs() - t0 < 5_000) {
+        const mounts = readFile("/proc/mounts") orelse break;
+        defer g_alloc.free(mounts);
+        if (std.mem.indexOf(u8, mounts, rt) == null) break;
+        _ = c.usleep(100_000);
+    }
+    // The helper may still be creating its mountpoint as it exits.
+    _ = c.usleep(300_000);
+    @import("util/pathz.zig").removeTree(rt);
 }
