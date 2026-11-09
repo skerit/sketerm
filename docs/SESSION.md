@@ -1,5 +1,30 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-09: a dropped file's folder check no longer freezes the editor or viewer
+
+Report: the editor's and viewer's GdkFileList drop handlers (files from
+Dolphin/Nautilus) called `g_file_query_file_type` on the GTK thread to
+skip folders, a synchronous stat that froze the window on a hung NFS or
+FUSE path. `ui/filedrop.zig` now asks GIO for `standard::type` with
+`g_file_query_info_async`, one path at a time in drop order, and the face
+opens each non-folder as its answer lands; a failed query still opens the
+path (the old UNKNOWN answer did too, and the load reports why). GIO, not
+the daemon: the daemon serves `stat` inline in its poll loop, so a hung
+mount would freeze every session there, and a path on a sketerm FUSE
+mount the GUI serves could deadlock against it. Lifetime is a liveness
+fence: the face owns a `filedrop.Owner`, jobs hold a reference, `sever`
+(editor `deinit`; viewer window destroy and finalize) clears the face
+pointer and cancels the query. The viewer opens the first file and any
+batch replacement retires a pending drop (`cancelPending`). The drag-specs
+path is unchanged. One visible difference: a list of only folders is now
+accepted (the drop handler cannot know yet) and simply opens nothing.
+`smoke-dragout` gained a source strip on the `dnd-probe` window offering
+only a GdkFileList and an `editor-tabs` control command: a drop of
+file/folder/file opens two tabs in drop order, and a drop of a file on
+the GUI's FUSE mount of a SIGSTOPped host keeps the control socket at
+1 ms per round trip (the old handler: 9.8 s) and opens it after SIGCONT.
+The viewer shares the module but has no e2e drop stage.
+
 ## 2026-11-09: files dropped on a web page reach it as files
 
 Report: dropping a file (from Sketerm Files, or from Dolphin/Nautilus)
