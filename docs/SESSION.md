@@ -1,5 +1,34 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-09: a remote host without pdftoppm gets its PDFs previewed here
+
+A host without pdftoppm (a NAS, a minimal server) answered every PDF
+preview with "pdftoppm is not installed on the host". Now a remote PDF
+of at most 2 MiB (2097152 bytes, one daemon read) is fetched into
+`$XDG_CACHE_HOME/sketerm/pdf-local/` and the LOCAL daemon renders it with
+its ordinary preview job; a larger one is never fetched and its error
+says "pdftoppm is not installed on <host>, and this N MiB PDF is over the
+2 MiB limit for previewing it on this computer". When neither host has
+pdftoppm the error says so. Policy, staging names and messages live in
+`filebrowser/pdflocal.zig`; the viewer's loader thread, the file browser
+preview pane and its row thumbnails all use it, and the latter two ride
+the view's local HostConn (`PreviewRead.via`/`RemoteThumb.via`) while the
+cache key stays the remote entry's. Staged copies are named by host,
+path, size and mtime, so a revisit renders from the copy without a fetch
+(and hits the local thumbnail cache); `dirsweep` drops copies older than
+a day or past 64 whenever a new one is staged.
+
+Machine-readable on the wire, append-only: a preview whose generator is
+missing fails with job error kind `no_generator`
+(`fsjob.NO_GENERATOR_KIND`), and the welcome carries `pdf_preview`
+(pdftoppm on the daemon's PATH, looked up per welcome) behind the new
+`preview_tools` capability, so a client goes straight to the local
+render instead of asking a host known to lack the tool. Old daemons say
+neither: they keep their own error. Covered by pdflocal unit tests,
+smoke-fs (the fact, and the kind on both request shapes with PATH
+emptied) and `pdfFallbackStage` in the viewer e2e stage, which adds a
+third private daemon with an empty PATH as `nopdfhost`.
+
 ## 2026-11-09: a dropped file's folder check no longer freezes the editor or viewer
 
 Report: the editor's and viewer's GdkFileList drop handlers (files from
