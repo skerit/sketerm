@@ -169,6 +169,7 @@ const unconditional_caps = [_]proto.Cap{
     .view_screen,
     .motion_drift,
     .view_screen_early,
+    .drag_drop,
 };
 
 /// Test-only negotiation seam: an environment switch that withholds one
@@ -959,6 +960,12 @@ pub const Server = struct {
             .input_paste => self.host.paste(try self.dec(cn, proto.InputPaste, frame.payload)),
             .popup_policy_set => self.host.popupPolicySet(try self.dec(cn, proto.PopupPolicySet, frame.payload)),
             .clipboard_read => self.host.clipboardRead(try self.dec(cn, proto.ClipboardRead, frame.payload)),
+            .input_drag => {
+                var req = try proto.InputDrag.decodeAlloc(frame.payload, self.gpa);
+                defer req.freeLists(self.gpa);
+                try self.xlateIn(cn, proto.InputDrag, &req);
+                self.host.drag(req);
+            },
             .input_focus => self.host.focus(try self.dec(cn, proto.InputFocus, frame.payload)),
             // v1 accepts the release for symmetry but keeps no per-buffer
             // state: one memfd per view, replaced on resize.

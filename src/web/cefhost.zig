@@ -57,6 +57,7 @@ const host_webext = @import("cefhost/webext.zig");
 const host_cookies = @import("cefhost/cookies.zig");
 const host_stream = @import("cefhost/stream.zig");
 const host_motion = @import("cefhost/motion.zig");
+const host_dragdrop = @import("cefhost/dragdrop.zig");
 const streamsrv = @import("streamsrv.zig");
 pub const untrusted = @import("cefhost/untrusted.zig");
 const emulation = @import("cefhost/emulation.zig");
@@ -3802,6 +3803,7 @@ pub const Host = struct {
     pub const motionStartReach = host_motion.motionStartReach;
     pub const motionDriftSet = host_motion.motionDriftSet;
     pub const motionDriftYield = host_motion.motionDriftYield;
+    pub const drag = host_dragdrop.drag;
     pub const motionDriftFree = host_motion.motionDriftFree;
 
     /// One CHAR event for `cp`; codepoints outside the BMP need a

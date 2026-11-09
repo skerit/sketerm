@@ -493,6 +493,13 @@ pub const CAP_VIEW_SCREEN = "view-screen";
 /// `view_create*` is dropped, and a client sends it after the create
 /// instead (where the first navigation can race it).
 pub const CAP_VIEW_SCREEN_EARLY = "view-screen-early";
+/// The helper accepts `input_drag`: an external drag-and-drop over a
+/// view, played into the engine as its own drag-target sequence, so the
+/// page gets real `dragenter`/`dragover`/`drop` events with `File`
+/// objects, and what the page leaves unhandled the engine handles as a
+/// browser does (a dropped file or link is opened). Without it a client
+/// can only open what was dropped itself.
+pub const CAP_DRAG_DROP = "drag-drop";
 pub const MAX_VIEW_FPS: u16 = 240;
 pub const DEFAULT_HEADLESS_FPS: u16 = 60;
 
@@ -575,6 +582,7 @@ pub const Cap = enum {
     view_screen,
     motion_drift,
     view_screen_early,
+    drag_drop,
 
     /// The wire name `hello_ack` carries.
     pub fn name(self: Cap) []const u8 {
@@ -766,6 +774,7 @@ pub const Tag = enum(u8) {
     input_focus = 0x24,
     input_paste = 0x25,
     clipboard_read = 0x26,
+    input_drag = 0x28,
     ev_clipboard_text = 0x27,
     frame_buffer = 0x30,
     frame_damage = 0x31,
@@ -974,6 +983,7 @@ pub fn observerAllows(tag: Tag, control: bool) bool {
         .find,
         .find_stop,
         .scroll_to,
+        .input_drag,
         => control,
         else => false,
     };
@@ -1458,6 +1468,79 @@ pub const EvClipboardText = struct {
     view: u32,
     seq: u32,
     text: Text,
+};
+
+/// `input_drag` kind byte (append-only values).
+pub const DragKind = enum(u8) { enter = 0, over = 1, leave = 2, drop = 3, _ };
+
+/// `InputDrag.ops` bits: the operations the drag's source allows.
+pub const drag_op_copy: u8 = 1;
+pub const drag_op_link: u8 = 2;
+pub const drag_op_move: u8 = 4;
+
+/// One step of an external drag over `view` (capability "drag-drop").
+///
+/// `enter` carries the drag's data; `over` and `leave` carry none. A
+/// `drop` with `FLAG_DATA` REPLACES the data `enter` carried: the client
+/// learned the real files only at the drop (remote entries staged on
+/// demand), and the helper re-enters with them before dropping, so the
+/// page sees one `dragleave`/`dragenter` pair more than usual. `files`
+/// are absolute paths on the HELPER's host, so a client never sends its
+/// own paths to a helper on another host. Coordinates are logical, as
+/// in `input_pointer`.
+pub const InputDrag = struct {
+    pub const tag: Tag = .input_drag;
+    pub const FLAG_DATA: u8 = 1;
+    /// Most paths one frame carries; a longer list is truncated.
+    pub const MAX_FILES: usize = 1024;
+
+    view: u32,
+    kind: u8,
+    x: i32,
+    y: i32,
+    mods: u32,
+    ops: u8,
+    flags: u8 = 0,
+    files: []const []const u8 = &.{},
+    url: []const u8 = "",
+    text: Text = .{ .s = "" },
+
+    pub fn encodeTo(self: InputDrag, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU8(gpa, out, self.kind);
+        try putI32(gpa, out, self.x);
+        try putI32(gpa, out, self.y);
+        try putU32(gpa, out, self.mods);
+        try putU8(gpa, out, self.ops);
+        try putU8(gpa, out, self.flags);
+        const n: u16 = @intCast(@min(self.files.len, MAX_FILES));
+        try putU16(gpa, out, n);
+        for (self.files[0..n]) |f| try putStr(gpa, out, f);
+        try putStr(gpa, out, self.url);
+        try putText(gpa, out, self.text);
+    }
+
+    /// Caller frees `files` (`freeLists`); strings borrow from `payload`.
+    pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !InputDrag {
+        var cur = Cur{ .buf = payload };
+        var out: InputDrag = .{ .view = 0, .kind = 0, .x = 0, .y = 0, .mods = 0, .ops = 0 };
+        out.view = try cur.readU32();
+        out.kind = try cur.readU8();
+        out.x = try cur.readI32();
+        out.y = try cur.readI32();
+        out.mods = try cur.readU32();
+        out.ops = try cur.readU8();
+        out.flags = try cur.readU8();
+        out.files = try readStrList(&cur, gpa);
+        errdefer gpa.free(out.files);
+        out.url = try cur.readStr();
+        out.text = try cur.readText();
+        return out;
+    }
+
+    pub fn freeLists(self: InputDrag, gpa: std.mem.Allocator) void {
+        gpa.free(self.files);
+    }
 };
 
 pub const FrameBuffer = struct {
@@ -4382,7 +4465,7 @@ pub const EvRequestRefused = struct {
 /// Capabilities an untrusted helper leaves out of `hello_ack`; `untrustedWithheld` refuses their frames.
 pub fn untrustedWithholdsCap(cap: Cap) bool {
     return switch (cap) {
-        .devtools, .clipboard, .popup_open, .downloads, .download_start, .download_staging, .download_errors, .userscripts, .userscripts_gm, .webext, .webext_tabs, .webext_action, .webext_events, .webext_transaction, .filter_subscribe, .cookie_sync, .observe, .observe_notify => true,
+        .devtools, .clipboard, .popup_open, .downloads, .download_start, .download_staging, .download_errors, .userscripts, .userscripts_gm, .webext, .webext_tabs, .webext_action, .webext_events, .webext_transaction, .filter_subscribe, .cookie_sync, .observe, .observe_notify, .drag_drop => true,
         else => false,
     };
 }
@@ -4400,6 +4483,7 @@ pub fn untrustedWithheld(tag: Tag) bool {
     return switch (tag) {
         .devtools_show,
         .clipboard_read,
+        .input_drag,
         .popup_policy_set,
         .download_decide,
         .download_cancel,
@@ -5814,6 +5898,44 @@ test "round-trip: scalar and string frames" {
     // overflow is swallowed silently by the client's `post`.
     try roundTrip(InputPaste, .{ .view = 7, .text = .{ .s = "hello\nworld" } });
     try roundTrip(ClipboardRead, .{ .view = 7, .seq = 3, .mode = 1 });
+    {
+        const gpa = std.testing.allocator;
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(gpa);
+        try encode(gpa, &bytes, InputDrag{
+            .view = 7,
+            .kind = @intFromEnum(DragKind.drop),
+            .x = -3,
+            .y = 40,
+            .mods = mod_shift,
+            .ops = drag_op_copy | drag_op_link,
+            .flags = InputDrag.FLAG_DATA,
+            .files = &.{ "/tmp/a b.txt", "/srv/report \u{e9}.pdf" },
+            .url = "https://example.org/",
+            .text = .{ .s = "dropped\ntext" },
+        });
+        var reader = Reader.init(bytes.items);
+        const frame = (try reader.next()).?;
+        try std.testing.expectEqual(Tag.input_drag, frame.tag);
+        const got = try InputDrag.decodeAlloc(frame.payload, gpa);
+        defer got.freeLists(gpa);
+        try std.testing.expectEqual(@as(u32, 7), got.view);
+        try std.testing.expectEqual(DragKind.drop, @as(DragKind, @enumFromInt(got.kind)));
+        try std.testing.expectEqual(@as(i32, -3), got.x);
+        try std.testing.expectEqual(InputDrag.FLAG_DATA, got.flags);
+        try std.testing.expectEqual(@as(usize, 2), got.files.len);
+        try std.testing.expectEqualStrings("/srv/report \u{e9}.pdf", got.files[1]);
+        try std.testing.expectEqualStrings("https://example.org/", got.url);
+        try std.testing.expectEqualStrings("dropped\ntext", got.text.s);
+        // A data-less step is what `over`/`leave` send.
+        bytes.clearRetainingCapacity();
+        try encodePayload(gpa, &bytes, InputDrag{ .view = 1, .kind = @intFromEnum(DragKind.over), .x = 1, .y = 2, .mods = 0, .ops = drag_op_copy });
+        const bare = try InputDrag.decodeAlloc(bytes.items, gpa);
+        defer bare.freeLists(gpa);
+        try std.testing.expectEqual(@as(usize, 0), bare.files.len);
+        try std.testing.expectEqual(@as(u8, 0), bare.flags);
+        try std.testing.expectError(error.Truncated, InputDrag.decodeAlloc(bytes.items[0 .. bytes.items.len - 1], gpa));
+    }
     try roundTrip(EvClipboardText, .{ .view = 7, .seq = 3, .text = .{ .s = "selected ê" } });
     try roundTrip(PopupPolicySet, .{ .view = 0, .mode = popup_mode_allow });
     try roundTrip(EvPagePopup, .{
@@ -7342,6 +7464,8 @@ test "an untrusted helper refuses the request frames of every capability it with
         .{ .cap = .filter_subscribe, .tags = &.{.intercept_subscribe} },
         .{ .cap = .cookie_sync, .tags = &.{ .cookie_sync_enable, .cookie_apply, .cookie_dump_req } },
         .{ .cap = .observe, .tags = &.{ .observe_enable, .observe_subscribe, .observe_control } },
+        // A drop hands the page host files and text, like the clipboard.
+        .{ .cap = .drag_drop, .tags = &.{.input_drag} },
     };
     for (families) |f| {
         try std.testing.expect(untrustedWithholdsCap(f.cap));

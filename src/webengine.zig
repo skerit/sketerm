@@ -20,4 +20,5 @@ test {
     _ = @import("web/cefhost/downloads.zig");
     _ = @import("web/cefhost/untrusted.zig");
     _ = @import("web/cefhost/emulation.zig");
+    _ = @import("web/cefhost/dragdrop.zig");
 }
