@@ -114,6 +114,7 @@ const editormenu = @import("editormenu.zig");
 const toolbtn = @import("toolbtn.zig");
 const confirm = @import("confirm.zig");
 const dragspecs = @import("dragspecs.zig");
+const filedrop = @import("filedrop.zig");
 const editor_model = @import("../editor/model.zig");
 const syntax = @import("../editor/syntax.zig");
 const structure = @import("../editor/structure.zig");
@@ -551,6 +552,9 @@ pub const EditorView = struct {
     allocator: std.mem.Allocator,
     pane: ?*Pane = null,
     fence: *Fence = undefined,
+    /// Dropped files waiting on their type query (`filedrop.zig`);
+    /// null only when it could not be allocated.
+    drops: ?*filedrop.Owner = null,
 
     root_box: *c.GtkWidget = undefined,
     tabhost: TabHost = undefined,
@@ -847,6 +851,7 @@ pub const EditorView = struct {
         self.projects = project_mod.Set.init(allocator);
         self.results = psearch.Results.init(allocator);
         self.fence = Fence.create(self) orelse return error.OutOfMemory;
+        self.drops = filedrop.Owner.create(allocator, @ptrCast(self), onDroppedFile, .all) catch null;
         self.pane = pane;
         self.font.font_size = pane.surface.font_size;
         self.font.line_pad = pane.surface.line_pad_px;
@@ -1680,6 +1685,7 @@ pub const EditorView = struct {
         self.projects = project_mod.Set.init(allocator);
         self.results = psearch.Results.init(allocator);
         self.fence = Fence.create(self) orelse return error.OutOfMemory;
+        self.drops = filedrop.Owner.create(allocator, @ptrCast(self), onDroppedFile, .all) catch null;
         self.standalone_config = cfg;
         self.buildUi();
         // The window's header bar carries Open / Save / Save As, and
@@ -1775,10 +1781,11 @@ pub const EditorView = struct {
         self.detachIm();
     }
 
-    /// Dropped local files open as document tabs, one per file; an
-    /// already-open file is focused rather than opened twice
-    /// (`openSpec`). Non-local URIs (sftp://, trash://) have no path
-    /// and are skipped.
+    /// Dropped local files open as document tabs, one per file, in drop
+    /// order; an already-open file is focused rather than opened twice
+    /// (`openSpec`). A file list's folders are only known after an async
+    /// type query (`filedrop.zig`); non-local URIs (sftp://, trash://)
+    /// have no path and are skipped.
     fn onFileDrop(_: *c.GtkDropTarget, value: [*c]const c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
         const self = cast.userData(EditorView, user);
         if (self.widgets_dead) return 0;
@@ -1797,29 +1804,16 @@ pub const EditorView = struct {
             return 1;
         }
         if (c.g_type_check_value_holds(value, c.gdk_file_list_get_type()) == 0) return 0;
-        const flist: ?*c.GdkFileList = @ptrCast(c.g_value_get_boxed(value));
-        // get_files is transfer-container: free the list, not the GFiles.
-        const files = c.gdk_file_list_get_files(flist);
-        defer c.g_slist_free(files);
-        var opened: usize = 0;
-        var node = files;
-        while (node != null) : (node = node.*.next) {
-            const gfile: ?*c.GFile = @ptrCast(node.*.data);
-            const path_c = c.g_file_get_path(gfile);
-            if (path_c == null) continue;
-            defer c.g_free(path_c);
-            // A dropped directory is not a document; opening one would
-            // only produce a tab whose load fails.
-            if (c.g_file_query_file_type(gfile, c.G_FILE_QUERY_INFO_NONE, null) == c.G_FILE_TYPE_DIRECTORY) continue;
-            const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_c)));
-            if (path.len == 0) continue;
-            var buf: [paths.SPEC_BUF_LEN]u8 = undefined;
-            self.openSpec(paths.formatSpec(&buf, null, path), null);
-            opened += 1;
-        }
-        if (opened == 0) return 0;
-        self.focusFace();
-        return 1;
+        const drops = self.drops orelse return 0;
+        return @intFromBool(filedrop.start(drops, @ptrCast(c.g_value_get_boxed(value))));
+    }
+
+    fn onDroppedFile(ctx: *anyopaque, path: [:0]const u8, nth: usize) void {
+        const self = cast.userData(EditorView, ctx);
+        if (self.widgets_dead) return;
+        var buf: [paths.SPEC_BUF_LEN]u8 = undefined;
+        self.openSpec(paths.formatSpec(&buf, null, path), null);
+        if (nth == 0) self.focusFace();
     }
 
     fn focusCb(ctx: *anyopaque) void {
@@ -1910,6 +1904,7 @@ pub const EditorView = struct {
             c.abort();
         }
         self.fence.close();
+        if (self.drops) |d| d.sever();
         // Last resort — every ordinary path severed already (either
         // `prepareDestroyCb` or the area's ::destroy). Only safe while
         // the widget is alive; once it is finalized its own destroy

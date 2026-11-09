@@ -16,6 +16,7 @@ const Config = @import("../config.zig").Config;
 const platform = @import("../util/platform.zig");
 const dirsweep = @import("../util/dirsweep.zig");
 const dragspecs = @import("dragspecs.zig");
+const filedrop = @import("filedrop.zig");
 const castbox = @import("castbox.zig");
 const Terminal = @import("../terminal.zig").Terminal;
 const Playbar = @import("playbar.zig").Playbar;
@@ -960,6 +961,8 @@ pub const ViewerWindow = struct {
     cast_title: [512]u8 = undefined,
     cast_title_len: usize = 0,
     pending_mount: ?*MountOpen = null,
+    /// Dropped files waiting on their type query (`filedrop.zig`).
+    drops: *filedrop.Owner,
     /// Image-canvas context menu. Borrowed: the click gesture on the
     /// canvas owns it and frees it when the canvas dies.
     canvas_menu: ?*CanvasMenu = null,
@@ -1103,6 +1106,8 @@ pub const ViewerWindow = struct {
         errdefer target.close();
         const open_target = LoadTarget.create(&onOpenCopyLoaded, @ptrCast(self)) orelse return error.OutOfMemory;
         errdefer open_target.close();
+        const drops = try filedrop.Owner.create(allocator, @ptrCast(self), onDroppedFile, .first);
+        errdefer drops.sever();
         self.* = .{
             .allocator = allocator,
             .window = window,
@@ -1111,6 +1116,7 @@ pub const ViewerWindow = struct {
             .canvas = canvas,
             .target = target,
             .open_target = open_target,
+            .drops = drops,
             .status = @ptrCast(@alignCast(status)),
             .position = @ptrCast(@alignCast(position)),
             .zoom_label = @ptrCast(@alignCast(zoom_label)),
@@ -1242,6 +1248,7 @@ pub const ViewerWindow = struct {
         if (self.pending_mount) |pending| pending.viewer = null;
         self.pending_mount = null;
         self.anim_bar.destroy();
+        self.drops.sever();
         self.open_target.close();
         self.target.close();
         self.session.deinit(self.allocator);
@@ -1285,6 +1292,8 @@ pub const ViewerWindow = struct {
         }
         if (self.video_tick != 0) _ = c.g_source_remove(self.video_tick);
         self.video_tick = 0;
+        // Opening a dropped file now would touch widgets on their way out.
+        self.drops.sever();
     }
 
     /// Show exactly one content surface and the header controls that
@@ -1684,6 +1693,9 @@ pub const ViewerWindow = struct {
             return;
         }
         const spec = self.allocator.dupe(u8, spec_in) catch return;
+        // Whatever replaces the batch also retires a file-list drop still
+        // waiting on its type query, so it cannot land on top later.
+        _ = self.drops.cancelPending();
         const one = self.allocator.alloc([]u8, 1) catch {
             self.allocator.free(spec);
             return;
@@ -2484,7 +2496,8 @@ fn toggleFullscreen(self: *ViewerWindow) void {
 
 /// A dropped file replaces the batch, the same way a pick from the
 /// Open dialog does. Non-local URIs (sftp://, trash://) carry no path
-/// and are skipped; the first file that has one wins.
+/// and are skipped; the first file that has one wins, once the async
+/// type query (`filedrop.zig`) says it is not a folder.
 fn onFileDrop(_: *c.GtkDropTarget, value: [*c]const c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
     if (dragspecs.holds(value)) {
@@ -2500,23 +2513,12 @@ fn onFileDrop(_: *c.GtkDropTarget, value: [*c]const c.GValue, _: f64, _: f64, us
         return 0;
     }
     if (c.g_type_check_value_holds(value, c.gdk_file_list_get_type()) == 0) return 0;
-    const flist: ?*c.GdkFileList = @ptrCast(c.g_value_get_boxed(value));
-    // get_files is transfer-container: free the list, not the GFiles.
-    const files = c.gdk_file_list_get_files(flist);
-    defer c.g_slist_free(files);
-    var node = files;
-    while (node != null) : (node = node.*.next) {
-        const gfile: ?*c.GFile = @ptrCast(node.*.data);
-        const path_c = c.g_file_get_path(gfile);
-        if (path_c == null) continue;
-        defer c.g_free(path_c);
-        if (c.g_file_query_file_type(gfile, c.G_FILE_QUERY_INFO_NONE, null) == c.G_FILE_TYPE_DIRECTORY) continue;
-        const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_c)));
-        if (path.len == 0) continue;
-        self.replaceWithLocal(path);
-        return 1;
-    }
-    return 0;
+    return @intFromBool(filedrop.start(self.drops, @ptrCast(c.g_value_get_boxed(value))));
+}
+
+fn onDroppedFile(ctx: *anyopaque, path: [:0]const u8, _: usize) void {
+    const self = cast.userData(ViewerWindow, ctx);
+    self.replaceWithLocal(path);
 }
 
 fn onOpenClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
