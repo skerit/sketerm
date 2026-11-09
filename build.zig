@@ -788,6 +788,21 @@ pub fn build(b: *std.Build) void {
     const smoke_tree_step = b.step("smoke-tree", "Expanding/collapsing file-view tree rows keeps the scroll offset and the keyboard cursor (headless, no X)");
     smoke_tree_step.dependOn(&smoke_tree_run.step);
 
+    // Drag-out smoke — `zig build smoke-dragout`. File-browser entries
+    // dragged onto a foreign-style receiver arrive as file:// URIs,
+    // remote ones fetched into the staging cache on request, while
+    // sketerm's own targets keep getting specs (src/smoke_dragout.zig).
+    const smoke_dragout_mod = dev.module(b, target, "src/smoke_dragout.zig");
+    configureSysDeps(b, smoke_dragout_mod, cbindings_mod);
+    smoke_dragout_mod.addImport("build_options", dev.glib_opts);
+    addVideo(b, smoke_dragout_mod);
+    const smoke_dragout = dev.executable(b, "sketerm-smoke-dragout", smoke_dragout_mod);
+    const smoke_dragout_run = b.addRunArtifact(smoke_dragout);
+    dev_bins.drive(smoke_dragout_run, &.{ dev_bins.gui, dev_bins.mux });
+    smoke_dragout_run.setCwd(b.path("."));
+    const smoke_dragout_step = b.step("smoke-dragout", "Dragged file-browser entries reach other applications as file:// URIs, remote ones fetched on request (headless, no X)");
+    smoke_dragout_step.dependOn(&smoke_dragout_run.step);
+
     // Disk-usage analyzer smoke — `zig build smoke-usage`. Streaming
     // results, clicks and browser re-renders never rebuild result rows
     // or drop the selection, focus or scroll (src/smoke_usage.zig).

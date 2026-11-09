@@ -2352,14 +2352,14 @@ pub const App = struct {
     /// Press-move-release drag. Motions go out in small bursts with
     /// pumps between so the app sees a gesture, not one event blob.
     pub fn drag(self: *App, win_id: u32, x1: f64, y1: f64, x2: f64, y2: f64, button: u32) Error!void {
-        return self.dragInner(win_id, x1, y1, x2, y2, button, false, 0);
+        return self.dragInner(win_id, x1, y1, null, x2, y2, button, false, 0);
     }
 
     /// drag() whose pointer rests at (x2,y2) for `hold_ms` before the
     /// release, as a hand that pauses does (GTK's edge autoscrolls run
     /// on exactly such a pause).
     pub fn dragHold(self: *App, win_id: u32, x1: f64, y1: f64, x2: f64, y2: f64, button: u32, hold_ms: i64) Error!void {
-        return self.dragInner(win_id, x1, y1, x2, y2, button, false, hold_ms);
+        return self.dragInner(win_id, x1, y1, null, x2, y2, button, false, hold_ms);
     }
 
     /// drag() for a toolkit DRAG-AND-DROP destination. The release is
@@ -2373,10 +2373,21 @@ pub const App = struct {
     /// GtkDropTarget flows; pointer-grab drags (paned dividers) never
     /// flip the dnd state and should keep calling drag().
     pub fn dragDnd(self: *App, win_id: u32, x1: f64, y1: f64, x2: f64, y2: f64, button: u32) Error!void {
-        return self.dragInner(win_id, x1, y1, x2, y2, button, true, 0);
+        return self.dragInner(win_id, x1, y1, null, x2, y2, button, true, 0);
     }
 
-    fn dragInner(self: *App, win_id: u32, x1: f64, y1: f64, x2: f64, y2: f64, button: u32, expect_dnd: bool, hold_ms: i64) Error!void {
+    /// dragDnd() from `src_win` to (x2,y2) on ANOTHER toplevel of the
+    /// same client: the pointer leaves the source surface and enters
+    /// the destination mid-drag, as when a file is dragged between two
+    /// windows of one application.
+    pub fn dragDndBetween(self: *App, src_win: u32, x1: f64, y1: f64, dst_win: u32, x2: f64, y2: f64, button: u32) Error!void {
+        const src = self.winById(src_win) orelse return Error.NoSuchWindow;
+        const dst = self.winById(dst_win) orelse return Error.NoSuchWindow;
+        if (src.chan != dst.chan) return Error.NoSuchWindow;
+        return self.dragInner(src_win, x1, y1, dst_win, x2, y2, button, true, 0);
+    }
+
+    fn dragInner(self: *App, win_id: u32, x1: f64, y1: f64, dst_win: ?u32, x2: f64, y2: f64, button: u32, expect_dnd: bool, hold_ms: i64) Error!void {
         // `chan` is captured here and the `*Window` is never touched
         // again: every pump below can free it (native_sync prunes what
         // a resync replay did not re-announce, chan_close/toplevel_gone
@@ -2421,13 +2432,48 @@ pub const App = struct {
         // A stalled daemon still gets the gesture, release included.
         self.awaitIntentsApplied(10_000) catch |err| if (err != Error.Timeout) return err;
         self.pumpFor(if (expect_dnd) 160 else 40);
-        const dist = @max(@abs(x2 - x1), @abs(y2 - y1));
+        // Between windows: lift the drag off the source first (GTK's
+        // threshold must fire on the surface that was pressed), then
+        // carry the pointer over to the destination surface.
+        var end_off_x = off_x;
+        var end_off_y = off_y;
+        var start_x = x1;
+        var start_y = y1;
+        if (dst_win) |dst_id| {
+            var k: u32 = 1;
+            while (k <= 8) : (k += 1) {
+                units.clearRetainingCapacity();
+                const step: f64 = @floatFromInt(k * 6);
+                wlpipe.appendSeatMotion(&units, a, hit.x + step, hit.y) catch return Error.OutOfMemory;
+                try self.sendIntents(chan, units.items);
+                self.pumpFor(16);
+            }
+            const drag_deadline = nowMs() + 4_000;
+            while (nowMs() < drag_deadline and !self.exited) {
+                const ch = self.chans.get(chan) orelse break;
+                if (ch.comp.drag.active) break;
+                _ = self.pumpOnce(20);
+            }
+            const dst = self.winById(dst_id) orelse return Error.NoSuchWindow;
+            // Enter near the destination's top-left corner and travel
+            // to the drop point from there.
+            start_x = @min(8.0, x2);
+            start_y = @min(8.0, y2);
+            const dst_hit = self.ptrTarget(dst, x2, y2);
+            end_off_x = x2 - dst_hit.x;
+            end_off_y = y2 - dst_hit.y;
+            units.clearRetainingCapacity();
+            wlpipe.appendSeatEnter(&units, a, dst_hit.sid, start_x - end_off_x, start_y - end_off_y) catch return Error.OutOfMemory;
+            try self.sendIntents(chan, units.items);
+            self.pumpFor(30);
+        }
+        const dist = @max(@abs(x2 - start_x), @abs(y2 - start_y));
         const steps: u32 = @intFromFloat(std.math.clamp(dist / 16.0, 8.0, 40.0));
         var i: u32 = 1;
         while (i <= steps) : (i += 1) {
             const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(steps));
             units.clearRetainingCapacity();
-            wlpipe.appendSeatMotion(&units, a, x1 + (x2 - x1) * t - off_x, y1 + (y2 - y1) * t - off_y) catch return Error.OutOfMemory;
+            wlpipe.appendSeatMotion(&units, a, start_x + (x2 - start_x) * t - end_off_x, start_y + (y2 - start_y) * t - end_off_y) catch return Error.OutOfMemory;
             try self.sendIntents(chan, units.items);
             self.pumpFor(12);
         }
@@ -2441,12 +2487,12 @@ pub const App = struct {
         // emulate that: a few sub-pixel-scale motions at the target
         // guarantee the session sees enough movement to pick and
         // accept the right drop target, wherever the threshold fired.
-        const frames_before_jiggle = if (self.winById(win_id)) |w| w.frames else 0;
+        const frames_before_jiggle = if (self.winById(dst_win orelse win_id)) |w| w.frames else 0;
         var j: u32 = 0;
         while (j < 4) : (j += 1) {
             const dy: f64 = if (j % 2 == 0) 1.0 else 0.0;
             units.clearRetainingCapacity();
-            wlpipe.appendSeatMotion(&units, a, x2 - off_x, y2 + dy - off_y) catch return Error.OutOfMemory;
+            wlpipe.appendSeatMotion(&units, a, x2 - end_off_x, y2 + dy - end_off_y) catch return Error.OutOfMemory;
             try self.sendIntents(chan, units.items);
             self.pumpFor(30);
         }
@@ -2461,7 +2507,7 @@ pub const App = struct {
         // closed channel), not merely move the list.
         const release_deadline = nowMs() + 2_000;
         while (nowMs() < release_deadline and !self.exited) {
-            const w = self.winById(win_id) orelse break;
+            const w = self.winById(dst_win orelse win_id) orelse break;
             if (w.frames > frames_before_jiggle) break;
             _ = self.pumpOnce(20);
         }
@@ -2487,7 +2533,7 @@ pub const App = struct {
         // pressed on, so the release goes out even when the window
         // disappeared mid-gesture.
         try self.sendIntents(chan, units.items);
-        self.rememberPtr(win_id, x2, y2);
+        self.rememberPtr(dst_win orelse win_id, x2, y2);
     }
 
     /// Fetch the app's AT-SPI accessibility tree as JSON (the daemon

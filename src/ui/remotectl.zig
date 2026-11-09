@@ -921,6 +921,20 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         var buf: [256]browser.UsageRow = undefined;
         const rep = browser.usageReport(tab, &buf) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "the tab shows no disk usage analysis");
         try ipc_protocol.writeOk(out, allocator, "usage", rep);
+    } else if (eql(u8, req.cmd, "dnd-probe")) {
+        // Verification hook for smoke rigs: a second toplevel whose
+        // drop zones read a drag as a foreign app and as sketerm's own
+        // targets would; `data:"reset"` forgets earlier drops.
+        if (c.getenv("SKETERM_VERIFY_TREE") == null)
+            return ipc_protocol.writeErr(out, allocator, .unavailable, "the drag probe exists only under SKETERM_VERIFY_TREE");
+        const probe = @import("dndprobe.zig");
+        const rep = probe.ensure(if (req.data) |d| eql(u8, d, "reset") else false);
+        try ipc_protocol.writeOk(out, allocator, "probe", .{
+            .drops = rep.drops,
+            .external = rep.external,
+            .internal = rep.internal,
+            .fetches = @import("browser/dragout.zig").fetches_started,
+        });
     } else if (eql(u8, req.cmd, "focus")) {
         if (req.pane != null or req.session != null) {
             const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
