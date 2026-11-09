@@ -14,10 +14,14 @@
 //! daemon identically.
 
 const std = @import("std");
+const dragout = @import("dragout.zig");
+const parseSpec = @import("paths.zig").parseSpec;
 
 pub const GNOME = "x-special/gnome-copied-files";
 pub const URI = "text/uri-list";
 pub const KDE_CUT = "application/x-kde-cutselection";
+/// Another sketerm process's copy: host-qualified specs (`dragout.SPECS_MIME`).
+pub const SPECS = dragout.SPECS_MIME;
 pub const MAX_EXTERNAL_BYTES = 1024 * 1024;
 pub const MAX_EXTERNAL_FILES = 4096;
 
@@ -160,6 +164,46 @@ pub fn parseExternal(allocator: std.mem.Allocator, data: []const u8, gnome: bool
     }
     if (board.isEmpty()) return error.EmptyClipboard;
     return board;
+}
+
+/// Import another sketerm process's copy from its specs flavor: every
+/// record names the same host (null = local) and an absolute path, and a
+/// `dragout.CUT_RECORD` makes it a cut. Errors as `parseExternal`, plus
+/// MixedHosts for records on different hosts.
+pub fn parseSpecs(allocator: std.mem.Allocator, data: []const u8) !Board {
+    if (data.len > MAX_EXTERNAL_BYTES) return error.PayloadTooLarge;
+    var board = Board{ .allocator = allocator, .cut = dragout.hasCutRecord(data) };
+    errdefer board.deinit();
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    var records: dragout.Records = .{ .bytes = data };
+    var count: usize = 0;
+    while (records.next()) |rec| {
+        count += 1;
+        if (count > MAX_EXTERNAL_FILES) return error.TooManyFiles;
+        const loc = parseSpec(rec.spec);
+        // A bare path would mean "the reader's current host": the writer
+        // always qualifies, so anything else is not ours.
+        if (loc.current_host or loc.path.len == 0 or loc.path[0] != '/') return error.InvalidClipboard;
+        if (count == 1) {
+            if (loc.host) |h| board.host = try allocator.dupe(u8, h);
+        } else if (!sameHost(board.hostOpt(), loc.host)) return error.MixedHosts;
+        const entry = try seen.getOrPut(loc.path);
+        if (entry.found_existing) continue;
+        const owned = try allocator.dupe(u8, loc.path);
+        board.paths.append(allocator, owned) catch |err| {
+            allocator.free(owned);
+            return err;
+        };
+        // The map borrows `data`; the board owns its copy.
+    }
+    if (board.isEmpty()) return error.EmptyClipboard;
+    return board;
+}
+
+fn sameHost(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 var g_board: ?Board = null;
@@ -380,6 +424,41 @@ test "board set clears rather than keeping a partial or falsely local selection 
             try t.expectEqualStrings("/new/three", board.items()[2]);
             try t.expect(board.cut);
             try t.expectEqual(@as(u64, 42), board.dev);
+        }
+    }.run, .{});
+}
+
+test "another sketerm's specs flavor imports host, paths and the cut record" {
+    const t = std.testing;
+    const a = t.allocator;
+    {
+        var b = try parseSpecs(a, "fbox:/srv/a b\x00fbox:/srv/a b\x00dbox:/srv/dir\x00" ++ dragout.CUT_RECORD ++ "\x00");
+        defer b.deinit();
+        try t.expectEqualStrings("box", b.host.?);
+        try t.expect(b.cut);
+        try t.expectEqual(@as(usize, 2), b.items().len);
+        try t.expectEqualStrings("/srv/a b", b.items()[0]);
+        try t.expectEqualStrings("/srv/dir", b.items()[1]);
+    }
+    {
+        var b = try parseSpecs(a, "flocal:/home/me/x\x00");
+        defer b.deinit();
+        try t.expect(b.host == null);
+        try t.expect(!b.cut);
+        try t.expectEqualStrings("/home/me/x", b.items()[0]);
+    }
+    try t.expectError(error.MixedHosts, parseSpecs(a, "fbox:/a\x00flocal:/b\x00"));
+    try t.expectError(error.MixedHosts, parseSpecs(a, "flocal:/a\x00fbox:/b\x00"));
+    try t.expectError(error.InvalidClipboard, parseSpecs(a, "f/bare/path\x00"));
+    try t.expectError(error.EmptyClipboard, parseSpecs(a, dragout.CUT_RECORD ++ "\x00"));
+    try t.expectError(error.EmptyClipboard, parseSpecs(a, ""));
+}
+
+test "specs import unwinds every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var b = try parseSpecs(allocator, "fbox:/a\x00fbox:/b\x00fbox:/c\x00");
+            b.deinit();
         }
     }.run, .{});
 }

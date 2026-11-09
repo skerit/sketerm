@@ -35,6 +35,10 @@ const batchrename = @import("../../filebrowser/batchrename.zig");
 const shellverb = @import("../../filebrowser/shellverb.zig");
 const errorPhrase = @import("../../filebrowser/format.zig").errorPhrase;
 const RenameRun = @import("types.zig").RenameRun;
+const dragout = @import("../../filebrowser/dragout.zig");
+const dragspecs = @import("../dragspecs.zig");
+const fileExport = @import("dragout.zig");
+const formatSpecAlloc = @import("../../filebrowser/paths.zig").formatSpecAlloc;
 
 /// One in-flight .trashinfo fetch for Restore from Trash.
 pub const RestoreRead = struct {
@@ -177,15 +181,31 @@ fn clipStore(self: *BrowserView, tab: *BTab, srcs: []const []u8, cut: bool) void
         self.setStatus("file copy/cut canceled: out of memory");
         return;
     }
-    if (!exportClipToGdk(board, clip)) {
+    // Listing facts decide whether remote entries are offered to other
+    // apps as files (fetched when one asks) or as their paths only.
+    const fps = self.allocator.alloc(dragout.Fingerprint, roots.len) catch {
+        board.clear();
+        _ = c.gdk_clipboard_set_content(clip, null);
+        self.setStatus("file copy/cut canceled: out of memory");
+        return;
+    };
+    defer self.allocator.free(fps);
+    for (roots, fps) |root, *fp| fp.* = dnd.fingerprint(tab, tab.hc.host, root);
+    const offer = exportClipToGdk(board, clip, fps, @ptrCast(self)) orelse {
         self.setStatus("file clipboard export failed; copy/cut canceled");
         return;
-    }
+    };
     const verb: []const u8 = if (cut) "cut" else "copied";
+    const note: []const u8 = switch (offer) {
+        .files => "",
+        .text_remote_dir => " (other apps get the path: drag a remote folder to hand it over)",
+        .text_too_large => std.fmt.comptimePrint(" (other apps get the path: over {d} MiB, drag it to hand it over)", .{dragout.CLIP_STAGE_MAX_BYTES >> 20}),
+        .text_unknown_size => " (other apps get the path: drag it to hand it over)",
+    };
     if (board.items().len > 1) {
-        self.setStatusFmt("{s} {d} items", .{ verb, board.items().len });
+        self.setStatusFmt("{s} {d} items{s}", .{ verb, board.items().len, note });
     } else if (board.first()) |only| {
-        self.setStatusFmt("{s}: {s}", .{ verb, only });
+        self.setStatusFmt("{s}: {s}{s}", .{ verb, only, note });
     }
 }
 
@@ -216,16 +236,23 @@ fn onFileClipboardChanged(clip: *c.GdkClipboard, _: ?*anyopaque) callconv(.c) vo
 }
 
 /// Mirror the internal clipboard onto the GDK clipboard so other apps
-/// can paste it: text/plain is newline-delimited absolute paths (a
-/// text-editor paste gives usable paths, Nemo-style, no file://) and
-/// GNOME and URI-list/KDE formats carry file:// URIs and the cut flag.
+/// can paste it. text/plain is newline-delimited absolute paths (a
+/// text-editor or terminal paste gives usable paths, Nemo-style, no
+/// file://; for a remote entry, its path on that host). The specs flavor
+/// carries host-qualified entries and the cut to another sketerm process.
+/// Files go out through `browser/dragout.zig`'s export: text/uri-list
+/// (CRLF, GTK's serializer), the document portal types and GNOME
+/// copied-files, plus KDE's cut flag; a remote entry is fetched into the
+/// staging cache only when a receiver reads one of those, and only when
+/// `dragout.clipOffer` allows it (clipboard managers read them on every
+/// change). Remote cuts are announced as copies (`dragout.externalCut`).
 ///
 /// Paste-into-self uses the internal board only while GDK still owns
-/// this export; external offers use a separate bounded read. Remote
-/// entries export their TEXT form only (the path on that host, which
-/// is what a paste into a terminal or editor wants); the file:// list
-/// is skipped because a local file manager would use this disk.
-fn exportClipToGdk(board: *clipboard.Board, clip: *c.GdkClipboard) bool {
+/// this export, so it never reads these formats or fetches anything;
+/// external offers use a separate bounded read. `fps` describes each
+/// board item (a length mismatch counts as no facts); `origin` is the
+/// view whose Transfer Center shows fetches.
+fn exportClipToGdk(board: *clipboard.Board, clip: *c.GdkClipboard, fps: []const dragout.Fingerprint, origin: ?*anyopaque) ?dragout.ClipOffer {
     // Disconnect before replacing content: set_content emits changed
     // synchronously, and the old owner must not clear the new board.
     file_clipboard_owner.release();
@@ -235,46 +262,69 @@ fn exportClipToGdk(board: *clipboard.Board, clip: *c.GdkClipboard) bool {
         // Do not leave a previous cut export available for re-import.
         _ = c.gdk_clipboard_set_content(clip, null);
     };
-    if (board.isEmpty()) return false;
-    const local = board.host == null;
+    if (board.isEmpty()) return null;
+    const items = board.items();
+    const remote = board.host != null;
+    const facts = fps.len == items.len;
+    const offer: dragout.ClipOffer = if (remote and !facts) .text_unknown_size else dragout.clipOffer(remote, fps);
     const a = board.allocator;
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(a);
-    var gnome: std.ArrayList(u8) = .empty;
-    defer gnome.deinit(a);
-    gnome.appendSlice(a, if (board.cut) "cut" else "copy") catch return false;
-    for (board.items(), 0..) |p, i| {
-        if (i > 0) text.append(a, '\n') catch return false;
-        text.appendSlice(a, p) catch return false;
-        if (!local) continue;
-        const pz = a.dupeSentinel(u8, p, 0) catch return false;
-        defer a.free(pz);
-        const uri = c.g_filename_to_uri(pz.ptr, null, null) orelse return false;
-        defer c.g_free(uri);
-        gnome.append(a, '\n') catch return false;
-        gnome.appendSlice(a, std.mem.span(@as([*:0]const u8, @ptrCast(uri)))) catch return false;
+    const records = a.alloc([:0]u8, items.len + 1) catch return null;
+    var made: usize = 0;
+    defer {
+        for (records[0..made]) |r| a.free(r);
+        a.free(records);
     }
-    text.append(a, 0) catch return false;
+    const sources = a.alloc(fileExport.Source, items.len) catch return null;
+    defer a.free(sources);
+    for (items, 0..) |p, i| {
+        // A file:// URI names an absolute path; anything else is a bug
+        // upstream that must not reach another app as a guess.
+        if (!remote and !std.fs.path.isAbsolute(p)) return null;
+        if (i > 0) text.append(a, '\n') catch return null;
+        text.appendSlice(a, p) catch return null;
+        const fp: dragout.Fingerprint = if (facts) fps[i] else .{ .size = 0, .mtime_ms = 0, .is_dir = false };
+        const spec = formatSpecAlloc(a, board.hostOpt(), p) catch return null;
+        defer a.free(spec);
+        records[made] = dragout.encodeRecord(a, if (fp.is_dir) .dir else .file, spec) catch return null;
+        made += 1;
+        sources[i] = .{ .host = board.hostOpt(), .path = p, .fp = fp };
+    }
+    if (board.cut) {
+        records[made] = a.dupeSentinel(u8, dragout.CUT_RECORD, 0) catch return null;
+        made += 1;
+    }
+    text.append(a, 0) catch return null;
+    const external_cut = dragout.externalCut(board.cut, remote);
     // The typed provider copies the string into its GValue; the union
     // takes ownership of its providers; set_content refs the union,
     // so our own ref is dropped afterwards.
-    const text_provider = c.gdk_content_provider_new_typed(c.G_TYPE_STRING, text.items.ptr);
-    const provider = if (local) blk: {
-        const bytes = c.g_bytes_new(gnome.items.ptr, gnome.items.len);
-        defer c.g_bytes_unref(bytes);
-        const gnome_provider = c.gdk_content_provider_new_for_bytes(clipboard.GNOME, bytes);
-        const uris = gnome.items[if (board.cut) @as(usize, 4) else 5..];
-        const uri_bytes = c.g_bytes_new(uris.ptr, uris.len);
-        defer c.g_bytes_unref(uri_bytes);
-        const uri_provider = c.gdk_content_provider_new_for_bytes(clipboard.URI, uri_bytes);
-        const cut_bytes = c.g_bytes_new(if (board.cut) "1" else "0", 1);
+    var providers: [4]?*c.GdkContentProvider = .{
+        c.gdk_content_provider_new_typed(c.G_TYPE_STRING, text.items.ptr),
+        dragspecs.provider(records[0..made]),
+        null,
+        null,
+    };
+    if (offer == .files) {
+        providers[2] = fileExport.newProvider(a, sources, origin, .{ .gnome_cut = external_cut });
+        const cut_bytes = c.g_bytes_new(if (external_cut) "1" else "0", 1);
         defer c.g_bytes_unref(cut_bytes);
-        const cut_provider = c.gdk_content_provider_new_for_bytes(clipboard.KDE_CUT, cut_bytes);
-        var providers = [_]?*c.GdkContentProvider{ gnome_provider, uri_provider, cut_provider, text_provider };
-        break :blk c.gdk_content_provider_new_union(&providers, providers.len);
-    } else text_provider;
+        providers[3] = c.gdk_content_provider_new_for_bytes(clipboard.KDE_CUT, cut_bytes);
+    }
+    var n: usize = 0;
+    var complete = true;
+    for (providers, 0..) |p, i| {
+        if (p) |ok| {
+            providers[n] = ok;
+            n += 1;
+        } else if (i < 2 or offer == .files) complete = false;
+    }
+    const provider = c.gdk_content_provider_new_union(&providers, n);
     defer c.g_object_unref(@as(?*anyopaque, @ptrCast(provider)));
-    if (c.gdk_clipboard_set_content(clip, provider) == 0) return false;
+    // A missing flavor would hand other apps less than this copy promises.
+    if (!complete) return null;
+    if (c.gdk_clipboard_set_content(clip, provider) == 0) return null;
     _ = c.g_object_ref(clip);
     _ = c.g_object_ref(provider);
     file_clipboard_owner = .{
@@ -284,10 +334,10 @@ fn exportClipToGdk(board: *clipboard.Board, clip: *c.GdkClipboard) bool {
     };
     if (file_clipboard_owner.changed == 0 or c.gdk_clipboard_get_content(clip) != provider) {
         file_clipboard_owner.release();
-        return false;
+        return null;
     }
     exported = true;
-    return true;
+    return offer;
 }
 
 /// Chord-driven paste (Ctrl+V): the clipboard into the current tab.
@@ -303,7 +353,8 @@ pub fn canPaste(self: *BrowserView, tab: *BTab) bool {
     const clip = c.gtk_widget_get_clipboard(@ptrCast(@alignCast(tab.colview))) orelse return false;
     if (file_clipboard_owner.clip == clip and c.gdk_clipboard_get_content(clip) == file_clipboard_owner.provider) return false;
     const formats = c.gdk_clipboard_get_formats(clip);
-    return c.gdk_content_formats_contain_mime_type(formats, clipboard.GNOME) != 0 or
+    return c.gdk_content_formats_contain_mime_type(formats, clipboard.SPECS) != 0 or
+        c.gdk_content_formats_contain_mime_type(formats, clipboard.GNOME) != 0 or
         c.gdk_content_formats_contain_mime_type(formats, clipboard.URI) != 0;
 }
 
@@ -322,8 +373,12 @@ pub fn pasteIntoTab(self: *BrowserView, tab: *BTab) void {
     }
     const clip = c.gtk_widget_get_clipboard(@ptrCast(@alignCast(tab.colview))) orelse return;
     const formats = c.gdk_clipboard_get_formats(clip);
+    // Another sketerm process's copy carries host-qualified specs: read
+    // those first, or its remote entries would be fetched into a staging
+    // copy and pasted from there instead of transferred host to host.
+    const specs = c.gdk_content_formats_contain_mime_type(formats, clipboard.SPECS) != 0;
     const gnome = c.gdk_content_formats_contain_mime_type(formats, clipboard.GNOME) != 0;
-    if (!gnome and c.gdk_content_formats_contain_mime_type(formats, clipboard.URI) == 0) {
+    if (!specs and !gnome and c.gdk_content_formats_contain_mime_type(formats, clipboard.URI) == 0) {
         self.setStatus("clipboard contains no supported files");
         return;
     }
@@ -339,8 +394,8 @@ pub fn pasteIntoTab(self: *BrowserView, tab: *BTab) void {
         .view_id = tab.root.view_id,
         .clip = clip,
         .cancel = c.g_cancellable_new().?,
-        .kind = if (gnome) .gnome else .uri,
-        .kde_hint = !gnome and c.gdk_content_formats_contain_mime_type(formats, clipboard.KDE_CUT) != 0,
+        .kind = if (specs) .specs else if (gnome) .gnome else .uri,
+        .kde_hint = !specs and !gnome and c.gdk_content_formats_contain_mime_type(formats, clipboard.KDE_CUT) != 0,
     };
     _ = c.g_object_ref(clip);
     self.external_paste = read;
@@ -361,7 +416,7 @@ pub const ExternalPaste = struct {
     clip: *c.GdkClipboard,
     cancel: *c.GCancellable,
     stream: ?*c.GInputStream = null,
-    kind: enum { gnome, uri, kde_cut },
+    kind: enum { specs, gnome, uri, kde_cut },
     kde_hint: bool,
     data: std.ArrayList(u8) = .empty,
     board: ?clipboard.Board = null,
@@ -371,6 +426,7 @@ pub const ExternalPaste = struct {
 
     fn open(self: *ExternalPaste) void {
         const mime: [*:0]const u8 = switch (self.kind) {
+            .specs => clipboard.SPECS,
             .gnome => clipboard.GNOME,
             .uri => clipboard.URI,
             .kde_cut => clipboard.KDE_CUT,
@@ -438,6 +494,16 @@ pub const ExternalPaste = struct {
                 return;
             }
             self.board.?.cut = std.mem.eql(u8, hint, "1");
+        } else if (self.kind == .specs) {
+            self.board = clipboard.parseSpecs(self.allocator, self.data.items) catch |err| {
+                self.finish(switch (err) {
+                    error.OutOfMemory => "paste canceled: out of memory",
+                    error.PayloadTooLarge, error.TooManyFiles => "file clipboard is too large; paste canceled",
+                    error.MixedHosts => "clipboard holds files from several hosts; paste canceled",
+                    else => "clipboard holds no valid file list; paste canceled",
+                });
+                return;
+            };
         } else {
             self.board = clipboard.parseExternal(self.allocator, self.data.items, self.kind == .gnome) catch |err| {
                 self.finish(switch (err) {
@@ -482,8 +548,9 @@ pub const ExternalPaste = struct {
             return;
         }
         const board = &self.board.?;
-        // file: URIs always name this machine, even in a remote tab.
-        if (view.beginPaste(self.tab, null, board.items(), board.cut, false) and board.cut)
+        // file: URIs always name this machine, even in a remote tab; a
+        // specs board names its own host.
+        if (view.beginPaste(self.tab, board.hostOpt(), board.items(), board.cut, false) and board.cut)
             _ = c.gdk_clipboard_set_content(self.clip, null);
     }
 };
@@ -2976,18 +3043,21 @@ test "file clipboard ownership follows local and remote GDK providers" {
     }
     for ([_]?[]const u8{ null, "remote" }) |host| {
         try t.expect(board.set(host, &.{"/first"}, true, 1));
-        try t.expect(exportClipToGdk(board, clip));
+        // No listing facts: a remote entry goes out as its path only.
+        try t.expectEqual(if (host == null) dragout.ClipOffer.files else .text_unknown_size, exportClipToGdk(board, clip, &.{}, null).?);
         const formats = c.gdk_clipboard_get_formats(clip);
         try t.expectEqual(host == null, c.gdk_content_formats_contain_mime_type(formats, "x-special/gnome-copied-files") != 0);
         try t.expectEqual(host == null, c.gdk_content_formats_contain_mime_type(formats, clipboard.URI) != 0);
         try t.expectEqual(host == null, c.gdk_content_formats_contain_mime_type(formats, clipboard.KDE_CUT) != 0);
+        // Another sketerm process reads the specs flavor either way.
+        try t.expect(c.gdk_content_formats_contain_mime_type(formats, clipboard.SPECS) != 0);
         c.g_signal_emit_by_name(clip, "changed");
         try t.expect(board.cut);
         try t.expectEqualStrings("/first", board.first().?);
 
         // A new Files export synchronously replaces the previous provider.
         try t.expect(board.set(host, &.{"/second"}, true, 1));
-        try t.expect(exportClipToGdk(board, clip));
+        try t.expect(exportClipToGdk(board, clip, &.{}, null) != null);
         try t.expect(board.cut);
         try t.expectEqualStrings("/second", board.first().?);
 
@@ -2998,28 +3068,28 @@ test "file clipboard ownership follows local and remote GDK providers" {
         try t.expect(file_clipboard_owner.clip == null);
 
         try t.expect(board.set(host, &.{"/third"}, true, 1));
-        try t.expect(exportClipToGdk(board, clip));
+        try t.expect(exportClipToGdk(board, clip, &.{}, null) != null);
         // External ownership has no local content provider.
         try t.expect(c.gdk_clipboard_set_content(clip, null) != 0);
         try t.expect(board.isEmpty());
         try t.expect(!board.cut);
 
         try t.expect(board.set(host, &.{"/fourth"}, true, 1));
-        try t.expect(exportClipToGdk(board, clip));
+        try t.expect(exportClipToGdk(board, clip, &.{}, null) != null);
         try t.expect(board.set(host, &.{"/failed-export"}, true, 1));
         failing.fail_index = failing.alloc_index;
-        try t.expect(!exportClipToGdk(board, clip));
+        try t.expect(exportClipToGdk(board, clip, &.{}, null) == null);
         failing.fail_index = std.math.maxInt(usize);
         try t.expect(board.isEmpty());
         try t.expect(!board.cut);
         try t.expect(file_clipboard_owner.clip == null);
     }
     try t.expect(board.set(null, &.{"relative-path-cannot-be-a-file-uri"}, true, 1));
-    try t.expect(!exportClipToGdk(board, clip));
+    try t.expect(exportClipToGdk(board, clip, &.{}, null) == null);
     try t.expect(board.isEmpty());
 
     try t.expect(board.set("remote", &.{"/last"}, true, 1));
-    try t.expect(exportClipToGdk(board, clip));
+    try t.expect(exportClipToGdk(board, clip, &.{}, null) != null);
     clipboard.resetShared();
     c.gdk_clipboard_set_text(clip, "ownership changed after board teardown");
     try t.expect(file_clipboard_owner.clip == null);
@@ -3272,6 +3342,32 @@ test "external paste reads KDE cut metadata rather than guessing from its presen
     try f.expectStatus("nothing to paste here");
 }
 
+test "external paste prefers another sketerm's specs flavor and its cut record" {
+    var f: ExternalPasteTest = .{};
+    try f.init();
+    defer f.deinit();
+    f.tab.hc = &f.local;
+    f.root.path = @constCast("/source");
+    // Same outcomes as the KDE test: a cut is a same-folder no-op move,
+    // a copy reaches the disconnected host. The malformed GNOME and URI
+    // payloads beside it prove the specs flavor is the one read.
+    for ([_]struct { specs: []const u8, status: []const u8 }{
+        .{ .specs = "flocal:/source/one\x00", .status = "not connected to local" },
+        .{ .specs = "flocal:/source/one\x00" ++ dragout.CUT_RECORD ++ "\x00", .status = "nothing to paste here" },
+        .{ .specs = "flocal:/source/one\x00fbox:/source/two\x00", .status = "clipboard holds files from several hosts; paste canceled" },
+        .{ .specs = "f/bare\x00", .status = "clipboard holds no valid file list; paste canceled" },
+    }) |case| {
+        try f.offer(&.{
+            .{ .mime = clipboard.GNOME, .data = "move\nnot a uri" },
+            .{ .mime = clipboard.SPECS, .data = case.specs },
+            .{ .mime = clipboard.URI, .data = "not a uri" },
+        });
+        try std.testing.expect(canPaste(&f.view, &f.tab));
+        try f.paste();
+        try f.expectStatus(case.status);
+    }
+}
+
 test "external paste pending reads respect ownership navigation and teardown fences" {
     const t = std.testing;
     const Change = enum { owner, timeout, generation, view_id, removed_tab, cancel, tab_teardown, view_fence, widgets_dead };
@@ -3342,7 +3438,7 @@ test "external paste does not reimport a consumed internal cut export" {
     defer f.deinit();
     const board = f.view.clipboard();
     try t.expect(board.set(null, &.{"/source/one"}, true, 0));
-    try t.expect(exportClipToGdk(board, f.clip.?));
+    try t.expect(exportClipToGdk(board, f.clip.?, &.{}, null) != null);
     const provider = c.gdk_clipboard_get_content(f.clip.?);
     try t.expect(canPaste(&f.view, &f.tab));
     board.clear(); // successful internal cut consumption leaves the MIME export
@@ -3369,7 +3465,7 @@ test "paste complete admission retains the whole internal cut on partial admissi
         const board = f.view.clipboard();
         const sources: []const []const u8 = if (partial) &.{ "/source/one", "/source/two" } else &.{"/source/one"};
         try t.expect(board.set(null, sources, true, 0));
-        try t.expect(exportClipToGdk(board, f.clip.?));
+        try t.expect(exportClipToGdk(board, f.clip.?, &.{}, null) != null);
         const provider = c.gdk_clipboard_get_content(f.clip.?);
         const original_items = board.items().ptr;
         try t.expectEqual(!partial, beginPaste(&f.view, &f.tab, board.hostOpt(), board.items(), board.cut, true));
@@ -3435,7 +3531,7 @@ test "paste complete admission counts self-copy refusal and overlong destination
         const refused = if (self_copy) "/destination" else long_source;
         const cut = !self_copy;
         try t.expect(board.set(null, &.{ "/source/one", refused }, cut, 0));
-        try t.expect(exportClipToGdk(board, f.clip.?));
+        try t.expect(exportClipToGdk(board, f.clip.?, &.{}, null) != null);
         const provider = c.gdk_clipboard_get_content(f.clip.?);
         try t.expect(!beginPaste(&f.view, &f.tab, board.hostOpt(), board.items(), board.cut, true));
         try f.expectOneConflict(cut);

@@ -112,6 +112,67 @@ pub fn reusable(staged: Fingerprint, dragged: Fingerprint, finished_ms: i64, now
     return now_ms >= finished_ms and now_ms - finished_ms < REUSE_MS;
 }
 
+/// Largest total size of remote files a clipboard copy hands other
+/// applications as files. Clipboard managers (KDE's Klipper among them)
+/// read text/uri-list on EVERY clipboard change, and a remote entry is
+/// fetched when its URI is read, so this caps the download a plain
+/// Ctrl+C can cause without anyone pasting. A drag has no cap: only a
+/// drop asks for its files.
+pub const CLIP_STAGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// What a clipboard copy offers other applications.
+pub const ClipOffer = enum {
+    /// Files (text/uri-list, GNOME copied-files, the portal types).
+    files,
+    /// Path text only: a remote directory's size is unknown.
+    text_remote_dir,
+    /// Path text only: the remote files exceed `CLIP_STAGE_MAX_BYTES`.
+    text_too_large,
+    /// Path text only: no listing facts say how big an entry is.
+    text_unknown_size,
+};
+
+/// The offer for a copy of `remote` entries described by `fps`; a local
+/// copy always offers files, since nothing is fetched for it.
+pub fn clipOffer(remote: bool, fps: []const Fingerprint) ClipOffer {
+    if (!remote) return .files;
+    var total: u64 = 0;
+    for (fps) |fp| {
+        if (fp.is_dir) return .text_remote_dir;
+        if (fp.mtime_ms == 0) return .text_unknown_size;
+        total +|= fp.size;
+    }
+    return if (total > CLIP_STAGE_MAX_BYTES) .text_too_large else .files;
+}
+
+/// Whether other applications are told a copy is a cut. Never for remote
+/// entries: they receive a staged copy, and a receiver moving that copy
+/// must not read as the original having moved.
+pub fn externalCut(cut: bool, remote: bool) bool {
+    return cut and !remote;
+}
+
+/// A specs-flavor record marking a clipboard cut. Its first byte is no
+/// `Kind`, so `Records` (and every older reader) skips it.
+pub const CUT_RECORD = "~cut";
+
+/// Whether the serialized specs flavor carries `CUT_RECORD`.
+pub fn hasCutRecord(bytes: []const u8) bool {
+    var it = std.mem.splitScalar(u8, bytes, 0);
+    while (it.next()) |raw| if (std.mem.eql(u8, raw, CUT_RECORD)) return true;
+    return false;
+}
+
+/// Append the x-special/gnome-copied-files payload: the verb line, then
+/// one URI per line, no trailing newline (Nautilus's own spelling).
+pub fn appendGnomeCopied(list: *std.ArrayList(u8), allocator: std.mem.Allocator, cut: bool, uris: anytype) !void {
+    try list.appendSlice(allocator, if (cut) "cut" else "copy");
+    for (uris) |uri| {
+        try list.append(allocator, '\n');
+        try list.appendSlice(allocator, uri);
+    }
+}
+
 test "spec records round-trip through the serialized flavor" {
     const t = std.testing;
     const a = t.allocator;
@@ -170,4 +231,61 @@ test "a finished fetch is reused only for the same unchanged file within the win
     // No listing facts (a search hit without metadata): never reuse.
     const unknown: Fingerprint = .{ .size = 0, .mtime_ms = 0, .is_dir = false };
     try t.expect(!reusable(unknown, unknown, 1000, 2000));
+}
+
+test "clipboard offers files only for remote copies a manager may read cheaply" {
+    const t = std.testing;
+    const small: Fingerprint = .{ .size = 10, .mtime_ms = 5000, .is_dir = false };
+    const dir: Fingerprint = .{ .size = 0, .mtime_ms = 5000, .is_dir = true };
+    const unknown: Fingerprint = .{ .size = 0, .mtime_ms = 0, .is_dir = false };
+    // Local copies are never fetched, so size does not matter.
+    try t.expectEqual(ClipOffer.files, clipOffer(false, &.{ dir, unknown, .{ .size = std.math.maxInt(u64), .mtime_ms = 1, .is_dir = false } }));
+    try t.expectEqual(ClipOffer.files, clipOffer(true, &.{ small, small }));
+    try t.expectEqual(ClipOffer.text_remote_dir, clipOffer(true, &.{ small, dir }));
+    try t.expectEqual(ClipOffer.text_unknown_size, clipOffer(true, &.{unknown}));
+    // The cap is inclusive and counts the whole selection.
+    const half: Fingerprint = .{ .size = CLIP_STAGE_MAX_BYTES / 2, .mtime_ms = 1, .is_dir = false };
+    try t.expectEqual(ClipOffer.files, clipOffer(true, &.{ half, half }));
+    try t.expectEqual(ClipOffer.text_too_large, clipOffer(true, &.{ half, half, small }));
+    // Saturating: sizes near the top of u64 cannot wrap back under the cap.
+    const huge: Fingerprint = .{ .size = std.math.maxInt(u64), .mtime_ms = 1, .is_dir = false };
+    try t.expectEqual(ClipOffer.text_too_large, clipOffer(true, &.{ huge, huge }));
+}
+
+test "remote cuts reach other applications as copies" {
+    const t = std.testing;
+    try t.expect(externalCut(true, false));
+    try t.expect(!externalCut(true, true));
+    try t.expect(!externalCut(false, false));
+    try t.expect(!externalCut(false, true));
+}
+
+test "the cut record rides the specs flavor without disturbing its records" {
+    const t = std.testing;
+    const a = t.allocator;
+    const rec = try encodeRecord(a, .file, "box:/srv/a");
+    defer a.free(rec);
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(a);
+    try wire.appendSlice(a, rec);
+    try wire.append(a, 0);
+    try t.expect(!hasCutRecord(wire.items));
+    try wire.appendSlice(a, CUT_RECORD ++ "\x00");
+    try t.expect(hasCutRecord(wire.items));
+    var it: Records = .{ .bytes = wire.items };
+    try t.expectEqualStrings("box:/srv/a", it.next().?.spec);
+    try t.expect(it.next() == null);
+    // A spec that merely contains the marker text is not a cut.
+    try t.expect(!hasCutRecord("f/x/~cut\x00"));
+}
+
+test "GNOME copied-files payload spells the verb and LF-separated URIs" {
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try appendGnomeCopied(&out, a, false, &[_][]const u8{ "file:///a%20b", "file:///c" });
+    try std.testing.expectEqualStrings("copy\nfile:///a%20b\nfile:///c", out.items);
+    out.clearRetainingCapacity();
+    try appendGnomeCopied(&out, a, true, &[_][]const u8{"file:///x"});
+    try std.testing.expectEqualStrings("cut\nfile:///x", out.items);
 }

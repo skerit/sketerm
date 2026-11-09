@@ -256,7 +256,7 @@ pub fn provider(tab: *BTab, dragged: []const u8) ?*c.GdkContentProvider {
     const specs_provider = dragspecs.provider(facts.records);
     // Other applications get files: file:// URIs (remote entries are
     // fetched into a local staging copy on their first request).
-    const files_provider = export_.newProvider(allocator, facts.sources, @ptrCast(tab.view));
+    const files_provider = export_.newProvider(allocator, facts.sources, @ptrCast(tab.view), .{});
     // Order matters: the browser's own targets match the quoted string
     // first (unlike GStrv it also crosses process boundaries, and the
     // same decoder handles both); the specs flavor is what sketerm's
@@ -299,18 +299,25 @@ fn describe(allocator: std.mem.Allocator, tab: *BTab, specs: []const [:0]u8) !Fa
     for (specs, 0..) |spec, i| {
         const loc = parseSpec(spec);
         const host: ?[]const u8 = if (loc.current_host) null else loc.host;
-        // Listing facts exist only for entries of this tab's own host.
-        const entry = if (hostEq(host, tab.hc.host)) nav.entryForPath(tab, loc.path) else null;
-        const fp: dragout.Fingerprint = if (entry) |e| .{
-            .size = e.size,
-            .mtime_ms = e.mtime_ms,
-            .is_dir = std.mem.eql(u8, e.kind, "dir") or e.tdir,
-        } else .{ .size = 0, .mtime_ms = 0, .is_dir = false };
+        const fp = fingerprint(tab, host, loc.path);
         records[i] = try dragout.encodeRecord(allocator, if (fp.is_dir) .dir else .file, spec);
         made += 1;
         sources[i] = .{ .host = host, .path = loc.path, .fp = fp };
     }
     return .{ .records = records, .sources = sources };
+}
+
+/// What `tab`'s listing says about `path` on `host` (null = local); all
+/// zero when the entry is not listed there (no facts: never reused).
+pub fn fingerprint(tab: *BTab, host: ?[]const u8, path: []const u8) dragout.Fingerprint {
+    // Listing facts exist only for entries of this tab's own host.
+    const entry = if (hostEq(host, tab.hc.host)) nav.entryForPath(tab, path) else null;
+    const e = entry orelse return .{ .size = 0, .mtime_ms = 0, .is_dir = false };
+    return .{
+        .size = e.size,
+        .mtime_ms = e.mtime_ms,
+        .is_dir = std.mem.eql(u8, e.kind, "dir") or e.tdir,
+    };
 }
 
 pub const ValueIter = struct {

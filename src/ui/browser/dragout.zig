@@ -1,14 +1,16 @@
-//! Browser entries leaving sketerm by drag: the content provider that
-//! hands them to other applications as files.
+//! Browser entries leaving sketerm for other applications, by drag or
+//! by clipboard: the content provider that hands them over as files.
 //!
 //! The provider offers the MIME types GTK serializes a GdkFileList to
 //! (text/uri-list, plus the document portal's
 //! `application/vnd.portal.filetransfer` when the portal is running) and
 //! answers them with `gdk_content_serialize_async` on a real GdkFileList,
-//! so URI encoding and portal export are GTK's own. Nothing is fetched
-//! until a receiver asks for one of those types: a drag that is
-//! cancelled, or dropped on a sketerm surface (those read
-//! `dragspecs`), never downloads anything.
+//! so URI encoding and portal export are GTK's own. A clipboard export
+//! also offers x-special/gnome-copied-files, written here from the same
+//! file list. Nothing is fetched until a receiver asks for one of those
+//! types: a drag that is cancelled, or dropped on a sketerm surface
+//! (those read `dragspecs`), and a copy pasted only inside sketerm (the
+//! process-wide board), never download anything.
 //!
 //! A remote entry is fetched on that first request through the
 //! transfer service (`submitDelivery`, a daemon `cross_copy` into
@@ -18,10 +20,12 @@
 //! transfer's error. Once requested, a fetch runs to completion even if
 //! the drag ends: receivers with a short read timeout (Qt, XWayland
 //! bridges) give up on a slow fetch, and the finished copy is then
-//! handed instantly to the next drag of the same unchanged file
-//! (`dragout.reusable`). Staged copies are swept after
-//! `dragout.STAGE_TTL_SECS`, because receivers such as chat clients
-//! upload asynchronously after the drop.
+//! handed instantly to the next request for the same unchanged file
+//! (`dragout.reusable`). A clipboard export lives on after the copy, so
+//! a later request whose staged copy is gone (moved away by a receiver,
+//! swept) or older than `dragout.REUSE_MS` fetches afresh. Staged copies
+//! are swept after `dragout.STAGE_TTL_SECS`, because receivers such as
+//! chat clients upload asynchronously after the drop or paste.
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
@@ -146,6 +150,9 @@ const Item = struct {
 const State = struct {
     allocator: std.mem.Allocator,
     items: []Item,
+    /// Clipboard exports also offer x-special/gnome-copied-files with
+    /// this verb (true = cut); null for a drag.
+    gnome_cut: ?bool = null,
 
     fn deinit(self: *State) void {
         for (self.items) |item| {
@@ -224,9 +231,15 @@ fn finalize(object: [*c]c.GObject) callconv(.c) void {
     if (object_class.finalize) |f| f(object);
 }
 
+pub const Options = struct {
+    /// Offer x-special/gnome-copied-files too (a clipboard export),
+    /// with this verb (true = cut).
+    gnome_cut: ?bool = null,
+};
+
 /// The provider for `sources`, or null when nothing can be offered.
 /// `origin` names the browser view whose Transfer Center shows the fetches.
-pub fn newProvider(allocator: std.mem.Allocator, sources: []const Source, origin: ?*anyopaque) ?*c.GdkContentProvider {
+pub fn newProvider(allocator: std.mem.Allocator, sources: []const Source, origin: ?*anyopaque, opts: Options) ?*c.GdkContentProvider {
     if (!registry.allocator_set) {
         registry.allocator = allocator;
         registry.allocator_set = true;
@@ -237,6 +250,7 @@ pub fn newProvider(allocator: std.mem.Allocator, sources: []const Source, origin
         return null;
     } };
     @memset(state.items, .{});
+    state.gnome_cut = opts.gnome_cut;
     for (sources, state.items) |src, *item| {
         if (src.host) |host| {
             item.fetch = fetchFor(host, src.path, src.fp, origin) orelse {
@@ -294,8 +308,9 @@ fn fetchFor(host: []const u8, path: []const u8, fp: dragout.Fingerprint, origin:
 }
 
 /// The MIME types a GdkFileList serializes to, minus plain text (the
-/// drag's own quoted-spec string answers that).
-fn refFormats(_: [*c]c.GdkContentProvider) callconv(.c) ?*c.GdkContentFormats {
+/// drag's own quoted-spec string answers that), plus GNOME's copied-files
+/// type for a clipboard export.
+fn refFormats(provider: [*c]c.GdkContentProvider) callconv(.c) ?*c.GdkContentFormats {
     const builder = c.gdk_content_formats_builder_new();
     const files = c.gdk_content_formats_union_serialize_mime_types(c.gdk_content_formats_new_for_gtype(c.gdk_file_list_get_type()));
     defer c.gdk_content_formats_unref(files);
@@ -306,8 +321,12 @@ fn refFormats(_: [*c]c.GdkContentProvider) callconv(.c) ?*c.GdkContentFormats {
         if (std.mem.startsWith(u8, mime, "text/plain")) continue;
         c.gdk_content_formats_builder_add_mime_type(builder, mimes[i]);
     }
+    if (instanceOf(provider).state) |state| if (state.gnome_cut != null)
+        c.gdk_content_formats_builder_add_mime_type(builder, GNOME_MIME);
     return c.gdk_content_formats_builder_free_to_formats(builder);
 }
+
+const GNOME_MIME = "x-special/gnome-copied-files";
 
 /// In-process readers only: a local drag answers at once; a remote one
 /// refuses rather than fetch for a sketerm surface (they read `dragspecs`).
@@ -373,11 +392,18 @@ fn writeMimeTypeAsync(
         .priority = priority,
         .cancellable = if (cancellable != null) @ptrCast(@alignCast(c.g_object_ref(cancellable))) else null,
     };
-    // A request (re)starts every fetch it needs; one that failed for an
-    // earlier request gets a fresh attempt.
+    // A request (re)starts every fetch it needs: one that failed for an
+    // earlier request gets a fresh attempt, and a finished one whose copy
+    // is gone or old (a clipboard export outlives its first paste) is
+    // fetched again.
+    const now = nowMs();
     for (state.items) |item| {
         const f = item.fetch orelse continue;
-        if (f.phase == .idle or f.phase == .failed) start(f);
+        switch (f.phase) {
+            .idle, .failed => start(f),
+            .ready => if (!stagedExists(f) or now - f.finished_ms >= dragout.REUSE_MS) start(f),
+            .running => {},
+        }
     }
     registry.waiters.append(registry.allocator, waiter) catch {
         destroyWaiter(waiter);
@@ -441,6 +467,10 @@ fn serialize(w: *Waiter, state: *const State) void {
         destroyWaiter(w);
         return;
     };
+    if (std.mem.eql(u8, std.mem.span(w.mime), GNOME_MIME)) {
+        writeGnome(w, state, list);
+        return;
+    }
     var value: c.GValue = std.mem.zeroes(c.GValue);
     _ = c.g_value_init(&value, c.gdk_file_list_get_type());
     c.g_value_take_boxed(&value, list);
@@ -448,6 +478,59 @@ fn serialize(w: *Waiter, state: *const State) void {
     const task = w.task;
     c.gdk_content_serialize_async(w.stream, w.mime, &value, w.priority, w.cancellable, @ptrCast(&onSerialized), task);
     destroyWaiter(w);
+}
+
+/// GTK has no GdkFileList serializer for GNOME's type: write it from the
+/// same files, URIs spelled by `g_file_get_uri` like the serializer's.
+fn writeGnome(w: *Waiter, state: *const State, list: *c.GdkFileList) void {
+    defer c.g_boxed_free(c.gdk_file_list_get_type(), list);
+    const a = registry.allocator;
+    var uris: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (uris.items) |u| c.g_free(@ptrCast(@constCast(u.ptr)));
+        uris.deinit(a);
+    }
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(a);
+    const files = c.gdk_file_list_get_files(list);
+    defer c.g_slist_free(files);
+    var node = files;
+    var ok = while (node != null) : (node = node.*.next) {
+        const uri = c.g_file_get_uri(@ptrCast(@alignCast(node.*.data))) orelse break false;
+        uris.append(a, std.mem.span(@as([*:0]const u8, @ptrCast(uri)))) catch {
+            c.g_free(uri);
+            break false;
+        };
+    } else true;
+    if (ok) dragout.appendGnomeCopied(&payload, a, state.gnome_cut orelse false, uris.items) catch {
+        ok = false;
+    };
+    if (!ok) {
+        failTask(w.task, "out of memory");
+        destroyWaiter(w);
+        return;
+    }
+    // The bytes must outlive the async write: the task owns a g_malloc copy.
+    const buf: [*]u8 = @ptrCast(c.g_malloc(@max(payload.items.len, 1)) orelse {
+        failTask(w.task, "out of memory");
+        destroyWaiter(w);
+        return;
+    });
+    @memcpy(buf[0..payload.items.len], payload.items);
+    const task = w.task;
+    c.g_task_set_task_data(task, buf, &c.g_free);
+    c.g_output_stream_write_all_async(w.stream, buf, payload.items.len, w.priority, w.cancellable, @ptrCast(&onGnomeWritten), task);
+    destroyWaiter(w);
+}
+
+fn onGnomeWritten(stream: ?*c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    const task: *c.GTask = @ptrCast(@alignCast(user.?));
+    var err: ?*c.GError = null;
+    if (c.g_output_stream_write_all_finish(@ptrCast(@alignCast(stream)), result, null, &err) == 0)
+        c.g_task_return_error(task, err)
+    else
+        c.g_task_return_boolean(task, 1);
+    c.g_object_unref(task);
 }
 
 fn onSerialized(_: ?*c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
