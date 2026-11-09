@@ -1,8 +1,8 @@
-//! smoke-dragout: file-browser entries dragged out of sketerm arrive as
-//! FILES, on the REAL GUI and sketerm's own compositor (CLAUDE.md
-//! "Headless GUI testing"; never X).
+//! smoke-dragout: file-browser entries dragged out of sketerm, or copied
+//! with Ctrl+C / Ctrl+X, arrive as FILES, on the REAL GUI and sketerm's
+//! own compositor (CLAUDE.md "Headless GUI testing"; never X).
 //!
-//! The receiver is the `dnd-probe` verification window, a second
+//! The drag receiver is the `dnd-probe` verification window, a second
 //! toplevel of the GUI. Its left zone reads a drop the way a foreign
 //! application (Chromium/Electron, a GTK app) does: raw text/uri-list
 //! bytes, which runs the drag's own content provider, the remote fetch
@@ -12,12 +12,23 @@
 //! dnd only, so the bytes travel GDK's in-process pipe rather than a
 //! wl_data_offer fd. Everything up to the pipe is the real path.
 //!
-//! Stages: a local file (percent-encoded URI, CRLF, readable content);
-//! the same drop on the sketerm zone gets specs and fetches nothing; a
-//! remote file over a fake-ssh host (no fetch for the sketerm zone,
-//! a staged copy with the original name and content for the external
-//! one); a remote directory, recursively; a re-drag reusing the finished
-//! copy; and an unreadable remote file failing the drop instead of hanging it.
+//! The clipboard receiver IS another process: the rig itself asks the
+//! GUI's selection for a MIME type over `wl_data_source.send`
+//! (`appdrive.getClipboardMime`), the request a paste in Slack, Nautilus
+//! or Dolphin makes.
+//!
+//! Drag stages: a local file (percent-encoded URI, CRLF, readable
+//! content); the same drop on the sketerm zone gets specs and fetches
+//! nothing; a remote file over a fake-ssh host (no fetch for the sketerm
+//! zone, a staged copy with the original name and content for the
+//! external one); a remote directory, recursively; a re-drag reusing the
+//! finished copy; and an unreadable remote file failing the drop instead
+//! of hanging it. Clipboard stages: a local copy (CRLF URI list, GNOME
+//! copied-files, path text); a remote copy fetched only when its URI
+//! list is read; sketerm's own paste of it transferring host to host
+//! without staging anything; a remote cut announced as a copy whose
+//! original survives the external paste; and a remote file over the
+//! clipboard cap offered as its path only.
 
 const std = @import("std");
 const bindir = @import("smoke/bindir.zig");
@@ -216,6 +227,11 @@ const LOCAL_BODY = "local bytes\n";
 const REMOTE_NAME = "remote report.txt";
 const REMOTE_BODY = "remote bytes, fetched on demand\n";
 const GONE_NAME = "unreadable.txt";
+const CLIP_NAME = "clip remote.txt";
+const CLIP_BODY = "copied on one host, pasted as a file\n";
+const CUT_NAME = "cut me.txt";
+const CUT_BODY = "a cut must not take this away\n";
+const BIG_NAME = "big.bin";
 
 pub fn main(init: std.process.Init.Minimal) u8 {
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
@@ -267,6 +283,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     if (!writeFile(std.fmt.bufPrintSentinel(&p_buf, "{s}/rdir/a.txt", .{remote_dir}, 0) catch return fail("path", .{}), "aaa\n")) return fail("rdir/a", .{});
     if (!writeFile(std.fmt.bufPrintSentinel(&p_buf, "{s}/rdir/sub/b.txt", .{remote_dir}, 0) catch return fail("path", .{}), "bbb\n")) return fail("rdir/sub/b", .{});
+    for ([_]struct { name: []const u8, body: []const u8 }{
+        .{ .name = CLIP_NAME, .body = CLIP_BODY },
+        .{ .name = CUT_NAME, .body = CUT_BODY },
+    }) |f| if (!writeFile(std.fmt.bufPrintSentinel(&p_buf, "{s}/{s}", .{ remote_dir, f.name }, 0) catch return fail("path", .{}), f.body))
+        return fail("writing {s}", .{f.name});
+    {
+        // Sparse, just over the clipboard's fetch cap.
+        const big = std.fmt.bufPrintSentinel(&p_buf, "{s}/{s}", .{ remote_dir, BIG_NAME }, 0) catch return fail("path", .{});
+        if (!writeFile(big, "")) return fail("writing the big file", .{});
+        if (c.truncate(big.ptr, 65 * 1024 * 1024) != 0) return fail("growing the big file", .{});
+    }
 
     // ── the "remote" host: a second private daemon behind fake ssh ─
     var rrt_buf: [160]u8 = undefined;
@@ -528,7 +555,129 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         say("PASS a failed fetch ends the drop empty ({s}{s})", .{ r.state, if (r.err.len > 0) r.err else "" });
     }
 
-    say("PASS: dragged files reach other applications as files, local and remote", .{});
+    // ── 5. clipboard: a local copy ────────────────────────────────
+    // "local:" -- a bare path would stay on the tab's current host, rbox.
+    var local_spec_buf: [300]u8 = undefined;
+    const local_spec = std.fmt.bufPrint(&local_spec_buf, "local:{s}", .{local_dir}) catch return fail("spec", .{});
+    browserAt(app, local_spec) orelse return fail("browser-here refused the local folder", .{});
+    {
+        var want_buf: [400]u8 = undefined;
+        const want = std.fmt.bufPrint(&want_buf, "{s}/{s}", .{ local_dir, LOCAL_NAME }) catch return fail("path", .{});
+        clipRow(app, LOCAL_NAME, "ctrl+c", want) orelse return fail("Ctrl+C on the local file never reached the clipboard", .{});
+        const uris = readClip(app, "text/uri-list", 20_000) orelse return fail("reading the local copy's text/uri-list", .{});
+        defer allocator.free(uris);
+        say("local copy text/uri-list: {s}", .{std.mem.trimEnd(u8, uris, "\r\n")});
+        if (std.mem.indexOf(u8, uris, "%20") == null or std.mem.indexOf(u8, uris, "%23") == null or std.mem.indexOf(u8, uris, "%C3%A9") == null)
+            return fail("the copied URI is not percent-encoded: {s}", .{uris});
+        const path = singlePath(uris) orelse return fail("not exactly one CRLF-terminated file:// URI: {s}", .{uris});
+        defer allocator.free(path);
+        if (!std.mem.eql(u8, path, want)) return fail("a local copy must name the file in place, got {s}", .{path});
+        if (expectContent(path, LOCAL_BODY)) |why| return fail("local copy: {s}", .{why});
+        const gnome = readClip(app, "x-special/gnome-copied-files", 20_000) orelse return fail("reading GNOME copied-files", .{});
+        defer allocator.free(gnome);
+        var g_buf: [600]u8 = undefined;
+        const want_gnome = std.fmt.bufPrint(&g_buf, "copy\n{s}", .{uris[0 .. uris.len - 2]}) catch return fail("path", .{});
+        if (!std.mem.eql(u8, gnome, want_gnome)) return fail("GNOME copied-files {s}, want {s}", .{ gnome, want_gnome });
+        const kde = readClip(app, "application/x-kde-cutselection", 20_000) orelse return fail("reading the KDE cut flag", .{});
+        defer allocator.free(kde);
+        if (!std.mem.eql(u8, kde, "0")) return fail("a copy announced KDE cut flag {s}", .{kde});
+        if (fetchCount(app) != 3) return fail("a local copy started a fetch", .{});
+    }
+    say("PASS a local copy pastes elsewhere as its own file (CRLF URI list, GNOME, KDE)", .{});
+
+    // ── 6. clipboard: a remote copy, fetched only for a file read ──
+    browserAt(app, remote_spec) orelse return fail("browser-here refused the remote folder", .{});
+    {
+        var want_buf: [400]u8 = undefined;
+        const want = std.fmt.bufPrint(&want_buf, "{s}/{s}", .{ remote_dir, CLIP_NAME }) catch return fail("path", .{});
+        clipRow(app, CLIP_NAME, "ctrl+c", want) orelse return fail("Ctrl+C on the remote file never reached the clipboard", .{});
+        // Copying, and reading the path text, fetch nothing.
+        pumpFor(app, 1500);
+        if (fetchCount(app) != 3) return fail("copying a remote file fetched it before anyone asked for files", .{});
+        const uris = readClip(app, "text/uri-list", 90_000) orelse return fail("reading the remote copy's text/uri-list", .{});
+        defer allocator.free(uris);
+        say("remote copy text/uri-list: {s}", .{std.mem.trimEnd(u8, uris, "\r\n")});
+        const path = singlePath(uris) orelse return fail("remote copy: not exactly one CRLF file:// URI: {s}", .{uris});
+        defer allocator.free(path);
+        var root_buf: [300]u8 = undefined;
+        const root = std.fmt.bufPrint(&root_buf, "{s}/sketerm/dnd/drag-", .{cache}) catch return fail("path", .{});
+        if (!std.mem.startsWith(u8, path, root)) return fail("the pasted copy is not a staged one: {s}", .{path});
+        if (!std.mem.eql(u8, std.fs.path.basename(path), CLIP_NAME)) return fail("the staged copy lost its name: {s}", .{path});
+        if (expectContent(path, CLIP_BODY)) |why| return fail("remote copy: {s}", .{why});
+        if (fetchCount(app) != 4) return fail("expected the copy's first file read to fetch once, saw {d} fetches", .{fetchCount(app)});
+        // A second reader (GNOME's type) gets the same staged file.
+        const gnome = readClip(app, "x-special/gnome-copied-files", 20_000) orelse return fail("reading GNOME copied-files", .{});
+        defer allocator.free(gnome);
+        if (!std.mem.startsWith(u8, gnome, "copy\n") or !std.mem.eql(u8, gnome[5..], uris[0 .. uris.len - 2]))
+            return fail("GNOME copied-files {s} disagrees with the URI list", .{gnome});
+        if (fetchCount(app) != 4) return fail("a second read of the same copy fetched again", .{});
+    }
+    say("PASS a remote copy is fetched when a receiver reads files, once", .{});
+
+    // ── 7. sketerm's own paste of that copy stages nothing ─────────
+    browserAt(app, local_spec) orelse return fail("browser-here refused the local folder", .{});
+    {
+        const dirs_before = stagingDirs(cache);
+        const row = findRow(app, LOCAL_NAME, 15_000) orelse return fail("no local row to focus", .{});
+        app.click(g_win, row.x, row.y, 1) catch return fail("click", .{});
+        pumpFor(app, 300);
+        app.pressKey(g_win, "ctrl+v") catch return fail("Ctrl+V", .{});
+        var dst_buf: [400]u8 = undefined;
+        const dst = std.fmt.bufPrintSentinel(&dst_buf, "{s}/{s}", .{ local_dir, CLIP_NAME }, 0) catch return fail("path", .{});
+        const t0 = clock.nowMs();
+        while (expectContent(dst, CLIP_BODY) != null) {
+            if (clock.nowMs() - t0 > 60_000) return fail("sketerm's own paste never produced {s}", .{dst});
+            pumpFor(app, 250);
+        }
+        if (fetchCount(app) != 4) return fail("sketerm's own paste started a staging fetch", .{});
+        if (stagingDirs(cache) != dirs_before) return fail("sketerm's own paste created a staging directory", .{});
+    }
+    say("PASS sketerm's own paste transfers host to host and stages nothing", .{});
+
+    // ── 8. a remote cut reaches other apps as a copy ───────────────
+    browserAt(app, remote_spec) orelse return fail("browser-here refused the remote folder", .{});
+    {
+        var want_buf: [400]u8 = undefined;
+        const want = std.fmt.bufPrint(&want_buf, "{s}/{s}", .{ remote_dir, CUT_NAME }) catch return fail("path", .{});
+        clipRow(app, CUT_NAME, "ctrl+x", want) orelse return fail("Ctrl+X on the remote file never reached the clipboard", .{});
+        const gnome = readClip(app, "x-special/gnome-copied-files", 90_000) orelse return fail("reading the cut's GNOME copied-files", .{});
+        defer allocator.free(gnome);
+        say("remote cut x-special/gnome-copied-files: {s}", .{gnome});
+        if (!std.mem.startsWith(u8, gnome, "copy\nfile://")) return fail("a remote cut must reach other apps as a copy: {s}", .{gnome});
+        const kde = readClip(app, "application/x-kde-cutselection", 20_000) orelse return fail("reading the KDE cut flag", .{});
+        defer allocator.free(kde);
+        if (!std.mem.eql(u8, kde, "0")) return fail("a remote cut announced KDE cut flag {s}", .{kde});
+        const uris = readClip(app, "text/uri-list", 20_000) orelse return fail("reading the cut's text/uri-list", .{});
+        defer allocator.free(uris);
+        const path = singlePath(uris) orelse return fail("remote cut URI: {s}", .{uris});
+        defer allocator.free(path);
+        if (expectContent(path, CUT_BODY)) |why| return fail("remote cut staged copy: {s}", .{why});
+        // What a file manager does with a cut: take the file it was given.
+        if (c.unlink(path.ptr) != 0) return fail("removing the staged copy as a mover would", .{});
+        pumpFor(app, 2000);
+        var orig_buf: [400]u8 = undefined;
+        const orig = std.fmt.bufPrintSentinel(&orig_buf, "{s}/{s}", .{ remote_dir, CUT_NAME }, 0) catch return fail("path", .{});
+        if (expectContent(orig, CUT_BODY)) |why| return fail("the cut's remote original: {s}", .{why});
+        if (fetchCount(app) != 5) return fail("expected one fetch for the cut, saw {d} total", .{fetchCount(app)});
+    }
+    say("PASS a remote cut pasted elsewhere hands over a copy and keeps the original", .{});
+
+    // ── 9. over the clipboard cap: the path, never a download ──────
+    {
+        var want_buf: [400]u8 = undefined;
+        const want = std.fmt.bufPrint(&want_buf, "{s}/{s}", .{ remote_dir, BIG_NAME }) catch return fail("path", .{});
+        clipRow(app, BIG_NAME, "ctrl+c", want) orelse return fail("Ctrl+C on the big file never reached the clipboard", .{});
+        for ([_][]const u8{ "text/uri-list", "x-special/gnome-copied-files" }) |mime| {
+            const got = readClip(app, mime, 20_000) orelse return fail("reading {s} of the big copy", .{mime});
+            defer allocator.free(got);
+            if (got.len != 0) return fail("a copy over the cap offered {s}: {s}", .{ mime, got });
+        }
+        pumpFor(app, 1000);
+        if (fetchCount(app) != 5) return fail("a copy over the cap fetched", .{});
+    }
+    say("PASS a remote copy over the cap reaches other apps as its path only", .{});
+
+    say("PASS: dragged and copied files reach other applications as files, local and remote", .{});
     teardown();
     return 0;
 }
@@ -544,6 +693,58 @@ fn browserAt(app: *appdrive.App, spec: []const u8) ?void {
         return null;
     }
     pumpFor(app, 2000);
+}
+
+/// The GUI's selection in `mime`, read as another client would. Caller frees.
+fn readClip(app: *appdrive.App, mime: []const u8, timeout_ms: i64) ?[]u8 {
+    return app.getClipboardMime(mime, timeout_ms) catch |err| {
+        say("clipboard read of {s}: {s}", .{ mime, @errorName(err) });
+        return null;
+    };
+}
+
+/// Select the row named `name`, press `chord`, and wait until the GUI's
+/// selection reads as `text` (the copy's path text).
+fn clipRow(app: *appdrive.App, name: []const u8, chord: []const u8, text: []const u8) ?void {
+    var attempt: u32 = 0;
+    while (attempt < 2) : (attempt += 1) {
+        const row = findRow(app, name, 15_000) orelse {
+            say("no row named '{s}' in the listing", .{name});
+            return null;
+        };
+        app.click(g_win, row.x, row.y, 1) catch return null;
+        pumpFor(app, 300);
+        say("{s} on '{s}'", .{ chord, name });
+        app.pressKey(g_win, chord) catch return null;
+        const t0 = clock.nowMs();
+        while (clock.nowMs() - t0 < 5_000) {
+            pumpFor(app, 200);
+            const got = app.getClipboardMime("text/plain;charset=utf-8", 5_000) catch continue;
+            defer g_alloc.free(got);
+            if (std.mem.eql(u8, got, text)) return;
+        }
+    }
+    return null;
+}
+
+fn fetchCount(app: *appdrive.App) u64 {
+    const p = probe(app, false) orelse return std.math.maxInt(u64);
+    defer p.deinit();
+    return p.value.probe.fetches;
+}
+
+/// Staging directories under the drag cache root.
+fn stagingDirs(cache: [:0]const u8) usize {
+    var buf: [300]u8 = undefined;
+    const root = std.fmt.bufPrintSentinel(&buf, "{s}/sketerm/dnd", .{cache}, 0) catch return 0;
+    const d = c.opendir(root.ptr) orelse return 0;
+    defer _ = c.closedir(d);
+    var n: usize = 0;
+    while (c.readdir(d)) |ent| {
+        const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.*.d_name)), 0);
+        if (std.mem.startsWith(u8, name, "drag-")) n += 1;
+    }
+    return n;
 }
 
 /// Remove the sandbox once the GUI's FUSE mount of the fake host (made

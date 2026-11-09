@@ -2612,6 +2612,15 @@ pub const App = struct {
     pub fn getClipboard(self: *App, timeout_ms: i64) Error![]u8 {
         self.drain();
         const offer = self.clip_offer orelse return Error.NoClipboard;
+        return self.getClipboardMime(offer.mime, timeout_ms);
+    }
+
+    /// Fetch the app's current selection in `mime`, asked over the real
+    /// `wl_data_source.send` exactly as another client's paste asks it;
+    /// a type the app does not offer reads empty. Caller owns the result.
+    pub fn getClipboardMime(self: *App, mime: []const u8, timeout_ms: i64) Error![]u8 {
+        self.drain();
+        const offer = self.clip_offer orelse return Error.NoClipboard;
         const a = self.allocator;
         self.clip_got = false;
         var pl: std.ArrayList(u8) = .empty;
@@ -2619,7 +2628,7 @@ pub const App = struct {
         var idb: [4]u8 = undefined;
         std.mem.writeInt(u32, &idb, offer.source, .little);
         pl.appendSlice(a, &idb) catch return Error.OutOfMemory;
-        pl.appendSlice(a, offer.mime) catch return Error.OutOfMemory;
+        pl.appendSlice(a, mime) catch return Error.OutOfMemory;
         var units: std.ArrayList(u8) = .empty;
         defer units.deinit(a);
         wlpipe.appendUnit(&units, a, .clip_send, pl.items) catch return Error.OutOfMemory;
