@@ -232,6 +232,27 @@ const CLIP_BODY = "copied on one host, pasted as a file\n";
 const CUT_NAME = "cut me.txt";
 const CUT_BODY = "a cut must not take this away\n";
 const BIG_NAME = "big.bin";
+const WEB_NAME = "web upload.txt";
+const WEB_BODY = "remote bytes, dropped on a page\n";
+
+/// A page whose LEFT half is a drop zone recording every dropped file's
+/// name and content in the title; its right half handles nothing, so a
+/// drop there is the engine's own (a browser opens the file).
+const DROP_PAGE =
+    \\<!doctype html><html><head><meta charset="utf-8"><title>ready</title>
+    \\<style>html,body{margin:0;height:100%}#z{position:fixed;left:0;top:0;width:50%;height:100%;background:#cfc}</style>
+    \\</head><body><div id="z">drop here</div><script>
+    \\const z = document.getElementById('z'); let n = 0;
+    \\z.addEventListener('dragover', e => e.preventDefault());
+    \\z.addEventListener('drop', async e => {
+    \\  e.preventDefault(); n++;
+    \\  const out = [];
+    \\  for (const f of e.dataTransfer.files) out.push(f.name + '=' + (await f.text()).trim());
+    \\  document.title = 'drop' + n + ':' + out.join('|');
+    \\});
+    \\</script></body></html>
+    \\
+;
 
 pub fn main(init: std.process.Init.Minimal) u8 {
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
@@ -294,6 +315,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (!writeFile(big, "")) return fail("writing the big file", .{});
         if (c.truncate(big.ptr, 65 * 1024 * 1024) != 0) return fail("growing the big file", .{});
     }
+    if (!writeFile(std.fmt.bufPrintSentinel(&p_buf, "{s}/{s}", .{ remote_dir, WEB_NAME }, 0) catch return fail("path", .{}), WEB_BODY))
+        return fail("writing {s}", .{WEB_NAME});
 
     // ── the "remote" host: a second private daemon behind fake ssh ─
     var rrt_buf: [160]u8 = undefined;
@@ -400,6 +423,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             _ = c.setenv("GTK_A11Y", "none", 1);
             _ = c.setenv("SKETERM_WELCOME", "0", 1);
             _ = c.setenv("SKETERM_VERIFY_TREE", "1", 1);
+    // Authoritative: the GUI must run THIS tree's helper, never another.
+    var web_bin_buf: [4096]u8 = undefined;
+    if (c.realpath("zig-out/bin/sketerm-webengine", &web_bin_buf)) |p| _ = c.setenv("SKETERM_WEB_BIN", p, 1);
             const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), null };
             _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
             c._exit(127);
@@ -677,6 +703,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     say("PASS a remote copy over the cap reaches other apps as its path only", .{});
 
+    // ── 10. files dropped on a web page arrive as DOM files ────────
+    if (c.access("zig-out/bin/sketerm-webengine", c.X_OK) != 0) {
+        say("SKIP the web page drop stage (zig-out/bin/sketerm-webengine is not built: zig build web)", .{});
+    } else if (webDropStage(app, rt, local_dir, local_spec, remote_spec)) |why| {
+        return fail("web drop: {s}", .{why});
+    }
+
     say("PASS: dragged and copied files reach other applications as files, local and remote", .{});
     teardown();
     return 0;
@@ -761,4 +794,142 @@ fn removeSandbox(rt: [:0]const u8) void {
     // The helper may still be creating its mountpoint as it exits.
     _ = c.usleep(300_000);
     @import("util/pathz.zig").removeTree(rt);
+}
+const WebViewInfo = struct { pane: u32 = 0, url: []const u8 = "", title: []const u8 = "" };
+const WebListReply = struct { ok: bool = false, views: []WebViewInfo = &.{} };
+
+/// The url and title of the web page on `pane`. Caller deinits.
+fn webState(app: *appdrive.App, pane: u32) ?struct { parsed: std.json.Parsed(WebListReply), view: WebViewInfo } {
+    const reply = ctlsock.roundtrip(g_alloc, app, g_gui_sock, "{\"cmd\":\"web-list\"}\n") orelse return null;
+    defer g_alloc.free(reply);
+    const parsed = std.json.parseFromSlice(WebListReply, g_alloc, reply, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return null;
+    for (parsed.value.views) |v| if (v.pane == pane) return .{ .parsed = parsed, .view = v };
+    parsed.deinit();
+    return null;
+}
+
+const WebWait = enum { title, url };
+
+/// Wait until the page on `pane` shows a title (or url) that differs from
+/// `prev` and has `want` as its suffix (title: after the "dropN:" count)
+/// or substring (url). Returns false on timeout, saying what it saw.
+fn waitWeb(app: *appdrive.App, pane: u32, what: WebWait, prev: []const u8, want: []const u8, timeout_ms: i64) bool {
+    const t0 = clock.nowMs();
+    var last: [512]u8 = undefined;
+    var last_len: usize = 0;
+    while (clock.nowMs() - t0 < timeout_ms) {
+        pumpFor(app, 200);
+        const st = webState(app, pane) orelse continue;
+        defer st.parsed.deinit();
+        const got = if (what == .title) st.view.title else st.view.url;
+        last_len = @min(got.len, last.len);
+        @memcpy(last[0..last_len], got[0..last_len]);
+        if (std.mem.eql(u8, got, prev)) continue;
+        const ok = switch (what) {
+            .title => if (std.mem.indexOfScalar(u8, got, ':')) |i| std.mem.eql(u8, got[i + 1 ..], want) else std.mem.eql(u8, got, want),
+            .url => std.mem.indexOf(u8, got, want) != null,
+        };
+        if (ok) return true;
+    }
+    say("the page's {s} stayed {s}", .{ @tagName(what), last[0..last_len] });
+    return false;
+}
+
+/// The page's current title, copied into `buf`.
+fn webTitle(app: *appdrive.App, pane: u32, buf: []u8) []const u8 {
+    const st = webState(app, pane) orelse return "";
+    defer st.parsed.deinit();
+    const n = @min(st.view.title.len, buf.len);
+    @memcpy(buf[0..n], st.view.title[0..n]);
+    return buf[0..n];
+}
+
+/// Drag the row named `name` onto window `win` at the given fractions
+/// of its size.
+fn dragToWeb(app: *appdrive.App, name: []const u8, win: u32, fx: f64, fy: f64) bool {
+    const row = findRow(app, name, 15_000) orelse {
+        say("no row named '{s}' in the listing", .{name});
+        return false;
+    };
+    const w = app.winById(win) orelse return false;
+    say("dragging '{s}' onto the web page at ({d:.2}, {d:.2})", .{ name, fx, fy });
+    app.dragDndBetween(g_win, row.x, row.y, win, @as(f64, @floatFromInt(w.w)) * fx, @as(f64, @floatFromInt(w.h)) * fy, 1) catch |err| {
+        say("drag failed: {s}", .{@errorName(err)});
+        return false;
+    };
+    return true;
+}
+
+/// Files from the file browser dropped on a web page: the page's own
+/// drop handler receives them as DOM files (a remote one fetched at the
+/// drop, a local one in place), and a drop the page does not handle
+/// opens the file as a browser does. Null on success, else why.
+fn webDropStage(app: *appdrive.App, rt: [:0]const u8, local_dir: [:0]const u8, local_spec: []const u8, remote_spec: []const u8) ?[]const u8 {
+    var page_buf: [300]u8 = undefined;
+    const page = std.fmt.bufPrintSentinel(&page_buf, "{s}/drop page.html", .{rt}, 0) catch return "page path";
+    if (!writeFile(page, DROP_PAGE)) return "writing the drop page";
+    const uri = c.g_filename_to_uri(page.ptr, null, null) orelse return "page uri";
+    defer c.g_free(uri);
+    var req_buf: [600]u8 = undefined;
+    const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-open\",\"target\":\"window\",\"data\":\"{s}\"}}\n", .{std.mem.span(@as([*:0]const u8, @ptrCast(uri)))}) catch return "web-open request";
+    const reply = ctlsock.roundtrip(g_alloc, app, g_gui_sock, req) orelse return "web-open never answered";
+    defer g_alloc.free(reply);
+    const Opened = struct { ok: bool = false, pane: u32 = 0 };
+    const opened = std.json.parseFromSlice(Opened, g_alloc, reply, .{ .ignore_unknown_fields = true }) catch return "web-open reply";
+    defer opened.deinit();
+    if (!opened.value.ok) {
+        say("web-open: {s}", .{reply});
+        return "web-open refused";
+    }
+    const pane = opened.value.pane;
+    var web_win: u32 = 0;
+    {
+        const t0 = clock.nowMs();
+        while (web_win == 0) {
+            pumpFor(app, 200);
+            for (app.windows.items) |w| {
+                if (w.popup or w.w <= 0 or w.id == g_win or w.id == g_probe) continue;
+                web_win = w.id;
+            }
+            if (clock.nowMs() - t0 > 20_000) return "the web window never appeared";
+        }
+    }
+    app.resizeWindow(web_win, 900, 700) catch return "sizing the web window";
+    if (!waitWeb(app, pane, .title, "", "ready", 90_000)) return "the drop page never loaded";
+    pumpFor(app, 1000);
+    say("drop page is up in window {d} (pane {d})", .{ web_win, pane });
+
+    var tbuf: [512]u8 = undefined;
+    // A remote file: fetched once, at the drop, and read by the page.
+    browserAt(app, remote_spec) orelse return "browser-here refused the remote folder";
+    {
+        const before = fetchCount(app);
+        const prev = webTitle(app, pane, &tbuf);
+        if (!dragToWeb(app, WEB_NAME, web_win, 0.25, 0.6)) return "dragging the remote file";
+        const want = WEB_NAME ++ "=" ++ comptime std.mem.trimEnd(u8, WEB_BODY, "\n");
+        if (!waitWeb(app, pane, .title, prev, want, 90_000)) return "the page never received the remote file";
+        if (fetchCount(app) != before + 1) return "the remote drop did not fetch exactly once";
+    }
+    say("PASS a remote file dropped on a page's drop zone arrives as a DOM file, fetched at the drop", .{});
+    // A local file, in place.
+    browserAt(app, local_spec) orelse return "browser-here refused the local folder";
+    {
+        const before = fetchCount(app);
+        const prev = webTitle(app, pane, &tbuf);
+        if (!dragToWeb(app, LOCAL_NAME, web_win, 0.25, 0.6)) return "dragging the local file";
+        const want = LOCAL_NAME ++ "=" ++ comptime std.mem.trimEnd(u8, LOCAL_BODY, "\n");
+        if (!waitWeb(app, pane, .title, prev, want, 60_000)) return "the page never received the local file";
+        if (fetchCount(app) != before) return "a local drop started a fetch";
+    }
+    say("PASS a local file dropped on a page's drop zone arrives as a DOM file", .{});
+    // Where the page handles nothing, the engine opens the file.
+    {
+        if (!dragToWeb(app, LOCAL_NAME, web_win, 0.75, 0.6)) return "dragging onto the unhandled half";
+        var want_buf: [300]u8 = undefined;
+        const local_uri = c.g_filename_to_uri((std.fmt.bufPrintSentinel(&want_buf, "{s}/{s}", .{ local_dir, LOCAL_NAME }, 0) catch return "path").ptr, null, null) orelse return "uri";
+        defer c.g_free(local_uri);
+        if (!waitWeb(app, pane, .url, "", std.mem.span(@as([*:0]const u8, @ptrCast(local_uri))), 60_000)) return "a drop the page ignored did not open the file";
+    }
+    say("PASS a drop the page does not handle opens the file, as a browser does", .{});
+    return null;
 }
