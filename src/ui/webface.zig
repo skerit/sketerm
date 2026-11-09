@@ -253,6 +253,7 @@ const socksbridge = @import("../ipc/socksbridge.zig");
 const mux_cli = @import("../ipc/mux_cli.zig");
 const socks5_client = @import("../mux/socks5_client.zig");
 const clipboard = @import("clipboard.zig");
+const dragspecs = @import("dragspecs.zig");
 const webreader = @import("webreader.zig");
 const fpicker = @import("../filebrowser/picker.zig");
 const webstore = @import("webstore.zig");
@@ -2638,9 +2639,10 @@ pub const WebFace = struct {
         }
 
         // File drag & drop -> navigate to the file's URI (a dropped
-        // text is treated as an address). Mirrors pane.zig's target.
+        // text is treated as an address). Mirrors pane.zig's target,
+        // sketerm browser drags included (`dragspecs`).
         const drop = c.gtk_drop_target_new(c.G_TYPE_INVALID, @intCast(c.GDK_ACTION_COPY));
-        var drop_types = [_]c.GType{ c.gdk_file_list_get_type(), c.G_TYPE_STRING };
+        var drop_types = [_]c.GType{ dragspecs.gtype(), c.gdk_file_list_get_type(), c.G_TYPE_STRING };
         c.gtk_drop_target_set_gtypes(drop, &drop_types, drop_types.len);
         _ = c.g_signal_connect_data(@ptrCast(drop), "drop", @ptrCast(&onFileDrop), self, null, 0);
         c.gtk_widget_add_controller(self.view_area, @ptrCast(drop));
@@ -3631,6 +3633,14 @@ pub const WebFace = struct {
     /// an address (pane.zig's target shape, different verb).
     fn onFileDrop(_: *c.GtkDropTarget, value: [*c]const c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
         const self = cast.userData(WebFace, user);
+        if (dragspecs.holds(value)) {
+            // The quoted-spec text this target always got from a
+            // browser drag, before the drag also offered a file list.
+            const txt = dragspecs.quotedText(self.allocator, value) catch return 0;
+            defer self.allocator.free(txt);
+            self.navigate(txt);
+            return 1;
+        }
         if (c.g_type_check_value_holds(value, c.gdk_file_list_get_type()) != 0) {
             const flist: ?*c.GdkFileList = @ptrCast(c.g_value_get_boxed(value));
             // get_files is transfer-container: free the list, not the GFiles.

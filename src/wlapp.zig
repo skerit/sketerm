@@ -26,6 +26,7 @@ const Compositor = @import("wlhost/compositor.zig").Compositor;
 const wlpipe = @import("wlhost/pipe.zig");
 const imhost = @import("ui/imhost.zig");
 const clipmod = @import("ui/clipboard.zig");
+const dragspecs = @import("ui/dragspecs.zig");
 
 /// A window named across app connections: the connection's session id
 /// plus a surface id in THAT connection's space. Neither half is
@@ -1657,9 +1658,11 @@ pub const AppHost = struct {
         c.gtk_widget_add_controller(picture, scroll);
 
         // Host→app dnd: dropping local files or text onto the
-        // forwarded window synthesizes a Wayland drop in the app.
+        // forwarded window synthesizes a Wayland drop in the app. A
+        // sketerm browser drag lands as its quoted-spec text, never as
+        // a fetched copy (`ui/dragspecs.zig`).
         const drop = c.gtk_drop_target_new(c.G_TYPE_INVALID, c.GDK_ACTION_COPY);
-        var drop_types = [_]c.GType{ c.gdk_file_list_get_type(), c.G_TYPE_STRING };
+        var drop_types = [_]c.GType{ dragspecs.gtype(), c.gdk_file_list_get_type(), c.G_TYPE_STRING };
         c.gtk_drop_target_set_gtypes(drop, &drop_types, drop_types.len);
         _ = c.g_signal_connect_data(@ptrCast(drop), "drop", @ptrCast(&onHostDrop), win, null, 0);
         c.gtk_widget_add_controller(picture, @ptrCast(drop));
@@ -1999,6 +2002,13 @@ pub const AppHost = struct {
         const host = win.host;
         const p = win.mapXY(x, y);
         host.stampNow();
+        if (dragspecs.holds(v)) {
+            const txt = dragspecs.quotedText(host.allocator, v) catch return 0;
+            defer host.allocator.free(txt);
+            host.hostDropIntent(win.surface, p[0], p[1], "text/plain;charset=utf-8", txt);
+            host.flushHost();
+            return 1;
+        }
         if (c.g_type_check_value_holds(v, c.G_TYPE_STRING) != 0) {
             const s = c.g_value_get_string(v) orelse return 0;
             host.hostDropIntent(win.surface, p[0], p[1], "text/plain;charset=utf-8", std.mem.span(@as([*:0]const u8, @ptrCast(s))));

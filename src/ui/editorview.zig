@@ -113,6 +113,7 @@ const ecmd = @import("../editor/commands.zig");
 const editormenu = @import("editormenu.zig");
 const toolbtn = @import("toolbtn.zig");
 const confirm = @import("confirm.zig");
+const dragspecs = @import("dragspecs.zig");
 const editor_model = @import("../editor/model.zig");
 const syntax = @import("../editor/syntax.zig");
 const structure = @import("../editor/structure.zig");
@@ -1781,6 +1782,20 @@ pub const EditorView = struct {
     fn onFileDrop(_: *c.GtkDropTarget, value: [*c]const c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
         const self = cast.userData(EditorView, user);
         if (self.widgets_dead) return 0;
+        if (dragspecs.holds(value)) {
+            var opened_specs: usize = 0;
+            var it = dragspecs.Iter.init(value);
+            while (it.next()) |rec| {
+                if (rec.kind == .dir) continue;
+                var buf: [paths.SPEC_BUF_LEN]u8 = undefined;
+                // A bare path is local; anything else is already `host:/path`.
+                self.openSpec(if (rec.spec.len > 0 and rec.spec[0] == '/') paths.formatSpec(&buf, null, rec.spec) else rec.spec, null);
+                opened_specs += 1;
+            }
+            if (opened_specs == 0) return 0;
+            self.focusFace();
+            return 1;
+        }
         if (c.g_type_check_value_holds(value, c.gdk_file_list_get_type()) == 0) return 0;
         const flist: ?*c.GdkFileList = @ptrCast(c.g_value_get_boxed(value));
         // get_files is transfer-container: free the list, not the GFiles.
@@ -2028,8 +2043,10 @@ pub const EditorView = struct {
         // dropped file. On the canvas rather than the root box so a
         // hidden editor face (another face showing in the pane) never
         // sees the drop: an unmapped widget's controller does not fire.
+        // A sketerm browser drag opens its specs natively (remote ones
+        // as remote documents, never as a fetched copy).
         const drop = c.gtk_drop_target_new(c.G_TYPE_INVALID, @intCast(c.GDK_ACTION_COPY));
-        var drop_types = [_]c.GType{c.gdk_file_list_get_type()};
+        var drop_types = [_]c.GType{ dragspecs.gtype(), c.gdk_file_list_get_type() };
         c.gtk_drop_target_set_gtypes(drop, &drop_types, drop_types.len);
         _ = c.g_signal_connect_data(drop, "drop", @ptrCast(&onFileDrop), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(area_widget, @ptrCast(drop));

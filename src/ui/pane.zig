@@ -579,10 +579,12 @@ pub const Pane = struct {
         c.gtk_widget_add_controller(area_widget, @ptrCast(motion));
         c.gtk_widget_set_has_tooltip(area_widget, 1);
 
-        // File drag & drop → paste shell-quoted path(s). Accepts file
-        // lists from file managers and plain text as fallback.
+        // File drag & drop → paste shell-quoted path(s). Accepts a
+        // sketerm browser drag (its host-qualified specs, never a
+        // fetched copy), file lists from file managers and plain text
+        // as fallback.
         const drop = c.gtk_drop_target_new(c.G_TYPE_INVALID, @intCast(c.GDK_ACTION_COPY));
-        var drop_types = [_]c.GType{ c.gdk_file_list_get_type(), c.G_TYPE_STRING };
+        var drop_types = [_]c.GType{ dragspecs.gtype(), c.gdk_file_list_get_type(), c.G_TYPE_STRING };
         c.gtk_drop_target_set_gtypes(drop, &drop_types, drop_types.len);
         _ = c.g_signal_connect_data(drop, "drop", @ptrCast(&onFileDrop), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(area_widget, @ptrCast(drop));
@@ -2162,9 +2164,22 @@ fn onPointerShapeEvent(ctx: ?*anyopaque, name: []const u8) void {
 }
 
 const appendShellQuoted = @import("../util/shellquote.zig").appendQuoted;
+const dragspecs = @import("dragspecs.zig");
 
 fn onFileDrop(_: *c.GtkDropTarget, value: [*c]const c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(Pane, user);
+
+    // A browser drag pastes exactly the text its plain-text flavor
+    // carries; listing the specs type first only keeps GTK from
+    // preferring the file list (and fetching remote entries for it).
+    if (dragspecs.holds(value)) {
+        const txt = dragspecs.quotedText(self.allocator, value) catch return 0;
+        defer self.allocator.free(txt);
+        if (txt.len == 0) return 0;
+        clipboard.pasteText(self.terminal, txt);
+        _ = c.gtk_widget_grab_focus(@ptrCast(self.surface.area));
+        return 1;
+    }
 
     if (c.g_type_check_value_holds(value, c.gdk_file_list_get_type()) != 0) {
         const flist: ?*c.GdkFileList = @ptrCast(c.g_value_get_boxed(value));

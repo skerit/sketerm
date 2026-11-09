@@ -15,6 +15,7 @@ const muxclient = @import("../mux/client.zig");
 const Config = @import("../config.zig").Config;
 const platform = @import("../util/platform.zig");
 const dirsweep = @import("../util/dirsweep.zig");
+const dragspecs = @import("dragspecs.zig");
 const castbox = @import("castbox.zig");
 const Terminal = @import("../terminal.zig").Terminal;
 const Playbar = @import("playbar.zig").Playbar;
@@ -1170,9 +1171,10 @@ pub const ViewerWindow = struct {
 
         // File drag & drop anywhere on the window shows the dropped
         // file, exactly as the Open dialog would. Several files: the
-        // first one with a local path wins.
+        // first one with a local path wins. A sketerm browser drag
+        // shows its first file natively, remote ones included.
         const drop = c.gtk_drop_target_new(c.G_TYPE_INVALID, @intCast(c.GDK_ACTION_COPY));
-        var drop_types = [_]c.GType{c.gdk_file_list_get_type()};
+        var drop_types = [_]c.GType{ dragspecs.gtype(), c.gdk_file_list_get_type() };
         c.gtk_drop_target_set_gtypes(drop, &drop_types, drop_types.len);
         _ = c.g_signal_connect_data(drop, "drop", @ptrCast(&onFileDrop), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(window, @ptrCast(drop));
@@ -2485,6 +2487,18 @@ fn toggleFullscreen(self: *ViewerWindow) void {
 /// and are skipped; the first file that has one wins.
 fn onFileDrop(_: *c.GtkDropTarget, value: [*c]const c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    if (dragspecs.holds(value)) {
+        var it = dragspecs.Iter.init(value);
+        while (it.next()) |rec| {
+            if (rec.kind == .dir) continue;
+            if (rec.spec.len > 0 and rec.spec[0] == '/')
+                self.replaceWithLocal(rec.spec)
+            else
+                self.replaceWithSpec(rec.spec);
+            return 1;
+        }
+        return 0;
+    }
     if (c.g_type_check_value_holds(value, c.gdk_file_list_get_type()) == 0) return 0;
     const flist: ?*c.GdkFileList = @ptrCast(c.g_value_get_boxed(value));
     // get_files is transfer-container: free the list, not the GFiles.

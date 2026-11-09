@@ -8,6 +8,10 @@ const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
 const BTab = @import("types.zig").BTab;
 const cast = @import("../../util/cast.zig");
 const oproots = @import("oproots.zig");
+const nav = @import("nav.zig");
+const dragout = @import("../../filebrowser/dragout.zig");
+const dragspecs = @import("../dragspecs.zig");
+const export_ = @import("dragout.zig");
 
 const Origin = struct {
     active: bool = false,
@@ -234,28 +238,79 @@ pub fn provider(tab: *BTab, dragged: []const u8) ?*c.GdkContentProvider {
     // submitted its tail as a command line, while the same drag of two
     // rows was quoted. `ValueIter` decodes both spellings, so the one
     // rule is the safe one.
-    for (specs, 0..) |spec, i| {
-        if (i > 0) text.append(allocator, ' ') catch {
-            c.g_object_unref(vector_provider);
-            return null;
-        };
-        appendAlwaysQuoted(&text, allocator, spec) catch {
-            c.g_object_unref(vector_provider);
-            return null;
-        };
-    }
+    dragout.appendQuotedSpecs(&text, allocator, specs) catch {
+        c.g_object_unref(vector_provider);
+        return null;
+    };
     text.append(allocator, 0) catch {
         c.g_object_unref(vector_provider);
         return null;
     };
     const text_provider = c.gdk_content_provider_new_typed(c.G_TYPE_STRING, text.items.ptr);
-    // Prefer the quoted string inside GTK: unlike GStrv it also crosses
-    // process boundaries, and the same decoder now handles both cases.
-    var providers = [_]?*c.GdkContentProvider{ text_provider, vector_provider };
-    const combined = c.gdk_content_provider_new_union(&providers, providers.len);
+    const facts = describe(allocator, tab, specs) catch {
+        c.g_object_unref(vector_provider);
+        c.g_object_unref(text_provider);
+        return null;
+    };
+    defer facts.deinit(allocator);
+    const specs_provider = dragspecs.provider(facts.records);
+    // Other applications get files: file:// URIs (remote entries are
+    // fetched into a local staging copy on their first request).
+    const files_provider = export_.newProvider(allocator, facts.sources, @ptrCast(tab.view));
+    // Order matters: the browser's own targets match the quoted string
+    // first (unlike GStrv it also crosses process boundaries, and the
+    // same decoder handles both); the specs flavor is what sketerm's
+    // file-list targets prefer; the file list is for everyone else.
+    var providers = [_]?*c.GdkContentProvider{ text_provider, vector_provider, specs_provider, files_provider };
+    var n: usize = 0;
+    for (providers) |p| if (p != null) {
+        providers[n] = p;
+        n += 1;
+    };
+    const combined = c.gdk_content_provider_new_union(&providers, n);
     setOrigin(specs);
     clearDragSelection(tab);
     return combined;
+}
+
+/// What a drag says about its specs beyond the strings: each entry's
+/// kind and, for the file export, its host, path and listing facts.
+const Facts = struct {
+    records: [][:0]u8,
+    sources: []export_.Source,
+
+    fn deinit(self: Facts, allocator: std.mem.Allocator) void {
+        for (self.records) |r| allocator.free(r);
+        allocator.free(self.records);
+        allocator.free(self.sources);
+    }
+};
+
+/// The returned sources borrow from `specs`.
+fn describe(allocator: std.mem.Allocator, tab: *BTab, specs: []const [:0]u8) !Facts {
+    const records = try allocator.alloc([:0]u8, specs.len);
+    var made: usize = 0;
+    errdefer {
+        for (records[0..made]) |r| allocator.free(r);
+        allocator.free(records);
+    }
+    const sources = try allocator.alloc(export_.Source, specs.len);
+    errdefer allocator.free(sources);
+    for (specs, 0..) |spec, i| {
+        const loc = parseSpec(spec);
+        const host: ?[]const u8 = if (loc.current_host) null else loc.host;
+        // Listing facts exist only for entries of this tab's own host.
+        const entry = if (hostEq(host, tab.hc.host)) nav.entryForPath(tab, loc.path) else null;
+        const fp: dragout.Fingerprint = if (entry) |e| .{
+            .size = e.size,
+            .mtime_ms = e.mtime_ms,
+            .is_dir = std.mem.eql(u8, e.kind, "dir") or e.tdir,
+        } else .{ .size = 0, .mtime_ms = 0, .is_dir = false };
+        records[i] = try dragout.encodeRecord(allocator, if (fp.is_dir) .dir else .file, spec);
+        made += 1;
+        sources[i] = .{ .host = host, .path = loc.path, .fp = fp };
+    }
+    return .{ .records = records, .sources = sources };
 }
 
 pub const ValueIter = struct {

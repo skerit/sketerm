@@ -383,6 +383,7 @@ comptime {
     _ = @import("filebrowser/colkeys.zig");
     _ = @import("filebrowser/cache.zig");
     _ = @import("filebrowser/clipboard.zig");
+    _ = @import("filebrowser/dragout.zig");
     _ = @import("filebrowser/emblems.zig");
     _ = @import("filebrowser/places.zig");
     _ = @import("filebrowser/thumbs.zig");

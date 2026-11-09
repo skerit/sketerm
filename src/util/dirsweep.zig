@@ -7,6 +7,9 @@
 //! trimmed oldest-first -- and only ever removes regular files the
 //! calling user owns, so a sweep pointed at the wrong directory by a
 //! bad environment cannot delete anything that is not ours.
+//! `sweepTrees` is the directory-tree variant (drag staging copies):
+//! the same ownership rule on the swept directory, and no symlink is
+//! ever followed.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -85,6 +88,68 @@ pub fn sweep(dir: [*:0]const u8, policy: Policy) void {
     }
 }
 
+/// Deepest directory nesting `sweepTrees` descends into; a deeper tree
+/// is left partly in place for a later sweep rather than recursed into
+/// without bound.
+const MAX_TREE_DEPTH: usize = 64;
+
+/// Sweep whole directory trees out of `dir`: every subdirectory whose
+/// name carries `policy.prefix`, that the calling user owns, and whose
+/// own mtime is older than `policy.max_age_secs` goes with everything
+/// in it. Symlinks are removed, never followed. `max_files` and
+/// `suffix` are ignored; without `max_age_secs` nothing is removed.
+pub fn sweepTrees(dir: [*:0]const u8, policy: Policy) void {
+    const age = policy.max_age_secs orelse return;
+    const dfd = c.open(dir, c.O_RDONLY | c.O_DIRECTORY | c.O_NOFOLLOW | c.O_CLOEXEC);
+    if (dfd < 0) return;
+    defer _ = c.close(dfd);
+    const dup = c.dup(dfd);
+    if (dup < 0) return;
+    const d = c.fdopendir(dup) orelse {
+        _ = c.close(dup);
+        return;
+    };
+    defer _ = c.closedir(d);
+    const now = c.time(null);
+    const uid = c.geteuid();
+    while (c.readdir(d)) |ent| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (!std.mem.startsWith(u8, name, policy.prefix)) continue;
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        var st: c.struct_stat = undefined;
+        if (c.fstatat(dfd, @ptrCast(&ent.*.d_name), &st, c.AT_SYMLINK_NOFOLLOW) != 0) continue;
+        if (st.st_uid != uid or (st.st_mode & c.S_IFMT) != c.S_IFDIR) continue;
+        if (mtimeSec(&st) + age >= now) continue;
+        removeTree(dfd, @ptrCast(&ent.*.d_name), 0);
+    }
+}
+
+/// Remove `name` (a directory under `parent`) and its contents. Best
+/// effort: whatever cannot be removed stays.
+fn removeTree(parent: c_int, name: [*:0]const u8, depth: usize) void {
+    if (depth < MAX_TREE_DEPTH) {
+        const fd = c.openat(parent, name, c.O_RDONLY | c.O_DIRECTORY | c.O_NOFOLLOW | c.O_CLOEXEC);
+        if (fd >= 0) {
+            if (c.fdopendir(fd)) |d| {
+                defer _ = c.closedir(d);
+                const inner = c.dirfd(d);
+                while (c.readdir(d)) |ent| {
+                    const child: [*:0]const u8 = @ptrCast(&ent.*.d_name);
+                    const span = std.mem.span(child);
+                    if (std.mem.eql(u8, span, ".") or std.mem.eql(u8, span, "..")) continue;
+                    var st: c.struct_stat = undefined;
+                    if (c.fstatat(inner, child, &st, c.AT_SYMLINK_NOFOLLOW) != 0) continue;
+                    if ((st.st_mode & c.S_IFMT) == c.S_IFDIR)
+                        removeTree(inner, child, depth + 1)
+                    else
+                        _ = c.unlinkat(inner, child, 0);
+                }
+            } else _ = c.close(fd);
+        }
+    }
+    _ = c.unlinkat(parent, name, c.AT_REMOVEDIR);
+}
+
 /// Test scaffolding: an empty file with the given mtime.
 fn touchAt(dir: []const u8, name: []const u8, mtime: i64) !void {
     var pz: [4352:0]u8 = undefined;
@@ -136,4 +201,38 @@ test "sweep removes only aged own regular files with the named shape, and trims 
     try t.expect(present(dir, "t3.thumb"));
     try t.expect(present(dir, "t4.thumb"));
     try t.expect(present(dir, "open-new"));
+}
+
+test "sweepTrees removes only aged own prefixed directories, whole, without following links" {
+    const t = std.testing;
+    const td = @import("pathz.zig").TempDir.make("dirsweep-trees") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
+    const now = c.time(null);
+    const ancient = now - 10_000;
+    var pz: [4352:0]u8 = undefined;
+
+    // An outside file a planted symlink points at: it must survive.
+    try touchAt(dir, "outside", now);
+    for ([_][]const u8{ "drag-old", "drag-old/sub", "drag-new", "other-old" }) |rel| {
+        const p = try std.fmt.bufPrintSentinel(&pz, "{s}/{s}", .{ dir, rel }, 0);
+        try t.expect(c.mkdir(p.ptr, 0o700) == 0);
+    }
+    try touchAt(dir, "drag-old/sub/f", ancient);
+    try touchAt(dir, "drag-old/g", ancient);
+    const target = try std.fmt.bufPrintSentinel(&pz, "{s}/outside", .{dir}, 0);
+    var link_buf: [4352:0]u8 = undefined;
+    const link = try std.fmt.bufPrintSentinel(&link_buf, "{s}/drag-old/link", .{dir}, 0);
+    try t.expect(c.symlink(target.ptr, link.ptr) == 0);
+    // Age the directories last: adding children refreshed their mtimes.
+    for ([_][]const u8{ "drag-old", "other-old" }) |rel| {
+        const p = try std.fmt.bufPrintSentinel(&pz, "{s}/{s}", .{ dir, rel }, 0);
+        const times = [2]c.struct_timespec{ .{ .tv_sec = ancient, .tv_nsec = 0 }, .{ .tv_sec = ancient, .tv_nsec = 0 } };
+        try t.expect(c.utimensat(c.AT_FDCWD, p.ptr, &times, 0) == 0);
+    }
+    sweepTrees(td.pathZ(), .{ .prefix = "drag-", .max_age_secs = 3600 });
+    try t.expect(!present(dir, "drag-old"));
+    try t.expect(present(dir, "drag-new"));
+    try t.expect(present(dir, "other-old"));
+    try t.expect(present(dir, "outside"));
 }
