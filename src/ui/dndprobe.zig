@@ -1,5 +1,6 @@
 //! Verification-only drop receiver for the `dnd-probe` command
-//! (`smoke-dragout`): a second toplevel of the GUI with two drop zones.
+//! (`smoke-dragout`): a second toplevel of the GUI with two drop zones
+//! and one drag source.
 //!
 //! The left zone reads the drop exactly as a foreign application such
 //! as Chromium does: raw `text/uri-list` bytes through
@@ -7,6 +8,11 @@
 //! GTK serializer all run. The right zone lists the gtypes sketerm's
 //! own file-list targets list (pane, editor, viewer) and records which
 //! one GTK picked, proving an in-sketerm drop still gets specs.
+//!
+//! The bottom strip is the other direction: a drag SOURCE offering only
+//! a GdkFileList of the paths `data:"source:<paths>"` named (one per
+//! line), the way a foreign file manager's drag reaches sketerm's own
+//! targets without the specs flavor.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -26,6 +32,13 @@ var window: ?*c.GtkWidget = null;
 var external: Result = .{};
 var internal: Result = .{};
 var drops: u32 = 0;
+/// Paths the source strip drags, newline-separated (c_allocator-owned).
+var source_paths: []const u8 = "";
+
+/// Set what the source strip drags: newline-separated local paths.
+pub fn setSource(paths: []const u8) void {
+    setText(&source_paths, paths);
+}
 
 fn setText(slot: *[]const u8, text: []const u8) void {
     if (slot.len > 0) std.heap.c_allocator.free(slot.*);
@@ -61,7 +74,8 @@ pub fn ensure(reset: bool) Report {
 fn build() void {
     const win = c.gtk_window_new() orelse return;
     c.gtk_window_set_title(@ptrCast(win), TITLE);
-    c.gtk_window_set_default_size(@ptrCast(win), 640, 320);
+    c.gtk_window_set_default_size(@ptrCast(win), 640, 380);
+    const column = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
     const box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
     const left = c.gtk_label_new("external: text/uri-list");
     const right = c.gtk_label_new("internal: sketerm targets");
@@ -71,7 +85,11 @@ fn build() void {
         c.gtk_widget_set_size_request(zone, 300, 300);
         c.gtk_box_append(@ptrCast(box), zone);
     }
-    c.gtk_window_set_child(@ptrCast(win), box);
+    c.gtk_box_append(@ptrCast(column), box);
+    const source = c.gtk_label_new("source: a foreign file list");
+    c.gtk_widget_set_size_request(source, 600, 60);
+    c.gtk_box_append(@ptrCast(column), source);
+    c.gtk_window_set_child(@ptrCast(win), column);
 
     const mimes = [_][*c]const u8{ "text/uri-list", null };
     const formats = c.gdk_content_formats_new(@ptrCast(@constCast(&mimes)), 1);
@@ -85,8 +103,34 @@ fn build() void {
     _ = c.g_signal_connect_data(int, "drop", @ptrCast(&onInternalDrop), null, null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(right, @ptrCast(int));
 
+    const drag = c.gtk_drag_source_new();
+    c.gtk_drag_source_set_actions(drag, c.GDK_ACTION_COPY);
+    _ = c.g_signal_connect_data(drag, "prepare", @ptrCast(&onSourcePrepare), null, null, c.G_CONNECT_DEFAULT);
+    c.gtk_widget_add_controller(source, @ptrCast(drag));
+
     window = win;
     c.gtk_window_present(@ptrCast(win));
+}
+
+/// A GdkFileList of `source_paths` and nothing else.
+fn onSourcePrepare(_: *c.GtkDragSource, _: f64, _: f64, _: ?*anyopaque) callconv(.c) ?*c.GdkContentProvider {
+    var list: [*c]c.GSList = null;
+    var it = std.mem.splitScalar(u8, source_paths, '\n');
+    while (it.next()) |p| {
+        if (p.len == 0) continue;
+        const z = std.heap.c_allocator.dupeSentinel(u8, p, 0) catch continue;
+        defer std.heap.c_allocator.free(z);
+        list = c.g_slist_prepend(list, c.g_file_new_for_path(z.ptr));
+    }
+    if (list == null) return null;
+    list = c.g_slist_reverse(list);
+    const flist = c.gdk_file_list_new_from_list(list);
+    c.g_slist_free_full(list, @ptrCast(&c.g_object_unref));
+    var value = std.mem.zeroes(c.GValue);
+    _ = c.g_value_init(&value, c.gdk_file_list_get_type());
+    c.g_value_take_boxed(&value, flist);
+    defer c.g_value_unset(&value);
+    return c.gdk_content_provider_new_for_value(&value);
 }
 
 fn onExternalDrop(_: *c.GtkDropTargetAsync, drop: *c.GdkDrop, _: f64, _: f64, _: ?*anyopaque) callconv(.c) c.gboolean {

@@ -710,6 +710,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return fail("web drop: {s}", .{why});
     }
 
+    // ── 11. another app's file list opens in the editor ────────────
+    if (editorDropStage(app, rt)) |why| return fail("editor drop: {s}", .{why});
+
+    // ── 12. a dropped file whose type query hangs ──────────────────
+    if (hungDropStage(app, rt, remote_dir)) |why| return fail("hung drop: {s}", .{why});
+
     say("PASS: dragged and copied files reach other applications as files, local and remote", .{});
     teardown();
     return 0;
@@ -932,4 +938,166 @@ fn webDropStage(app: *appdrive.App, rt: [:0]const u8, local_dir: [:0]const u8, l
     }
     say("PASS a drop the page does not handle opens the file, as a browser does", .{});
     return null;
+}
+
+const EditorTabsReply = struct { ok: bool = false, tabs: []?[]const u8 = &.{} };
+
+/// The documents open in the editor on `pane`, as basenames joined by
+/// '|' into `buf` (untitled tabs left out).
+fn editorTabs(app: *appdrive.App, pane: u32, buf: []u8) ?[]const u8 {
+    var req_buf: [96]u8 = undefined;
+    const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"editor-tabs\",\"pane\":{d}}}\n", .{pane}) catch return null;
+    const reply = ctlsock.roundtrip(g_alloc, app, g_gui_sock, req) orelse return null;
+    defer g_alloc.free(reply);
+    const parsed = std.json.parseFromSlice(EditorTabsReply, g_alloc, reply, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return null;
+    defer parsed.deinit();
+    if (!parsed.value.ok) return null;
+    var w = std.Io.Writer.fixed(buf);
+    for (parsed.value.tabs) |t| {
+        const spec = t orelse continue;
+        if (w.buffered().len > 0) w.writeByte('|') catch return null;
+        w.writeAll(std.fs.path.basename(spec)) catch return null;
+    }
+    return w.buffered();
+}
+
+/// A file list from another application (the probe's source strip
+/// offers ONLY a GdkFileList, as a foreign file manager does) dropped
+/// on an editor opens its files as tabs in drop order and skips the
+/// folder, the folder check running as an async type query. Null on
+/// success, else why.
+fn editorDropStage(app: *appdrive.App, rt: [:0]const u8) ?[]const u8 {
+    var dir_buf: [200]u8 = undefined;
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/edrop", .{rt}, 0) catch return "dir path";
+    _ = c.mkdir(dir.ptr, 0o755);
+    var p_buf: [300]u8 = undefined;
+    for ([_][]const u8{ "second.txt", "first.txt" }) |name| {
+        if (!writeFile(std.fmt.bufPrintSentinel(&p_buf, "{s}/{s}", .{ dir, name }, 0) catch return "path", "text\n")) return "writing a file";
+    }
+    _ = c.mkdir((std.fmt.bufPrintSentinel(&p_buf, "{s}/a folder", .{dir}, 0) catch return "path").ptr, 0o755);
+
+    const opened = ctlsock.roundtrip(g_alloc, app, g_gui_sock, "{\"cmd\":\"new-editor-tab\",\"pane\":1}\n") orelse return "new-editor-tab never answered";
+    defer g_alloc.free(opened);
+    const Created = struct { ok: bool = false, created: struct { pane: u32 = 0 } = .{} };
+    const created = std.json.parseFromSlice(Created, g_alloc, opened, .{ .ignore_unknown_fields = true }) catch return "new-editor-tab reply";
+    defer created.deinit();
+    if (!created.value.ok) {
+        say("new-editor-tab: {s}", .{opened});
+        return "new-editor-tab refused";
+    }
+    const pane = created.value.created.pane;
+    g_editor_pane = pane;
+    pumpFor(app, 1500);
+
+    // Drop order deliberately not alphabetical; the folder sits between.
+    var src_buf: [900]u8 = undefined;
+    const src_req = std.fmt.bufPrint(&src_buf, "{{\"cmd\":\"dnd-probe\",\"data\":\"source:{s}/second.txt\\n{s}/a folder\\n{s}/first.txt\"}}\n", .{ dir, dir, dir }) catch return "probe request";
+    const set = ctlsock.roundtrip(g_alloc, app, g_gui_sock, src_req) orelse return "dnd-probe source never answered";
+    g_alloc.free(set);
+
+    var tabs_buf: [512]u8 = undefined;
+    var attempt: u32 = 0;
+    while (attempt < 2) : (attempt += 1) {
+        say("dragging a foreign file list onto the editor (pane {d}){s}", .{ pane, if (attempt > 0) " (again: nothing opened)" else "" });
+        if (!dragProbeSource(app)) return "the drag failed";
+        const t0 = clock.nowMs();
+        while (clock.nowMs() - t0 < 10_000) {
+            pumpFor(app, 200);
+            const got = editorTabs(app, pane, &tabs_buf) orelse return "editor-tabs refused";
+            if (got.len == 0) continue;
+            if (std.mem.indexOf(u8, got, "a folder") != null) return "the dropped folder was opened";
+            if (std.mem.eql(u8, got, "second.txt|first.txt")) {
+                say("PASS a foreign file list opens in the editor in drop order, its folder skipped", .{});
+                return null;
+            }
+            if (!std.mem.eql(u8, got, "second.txt")) {
+                say("editor tabs: {s}", .{got});
+                return "the dropped files opened out of order";
+            }
+        }
+        if (if (editorTabs(app, pane, &tabs_buf)) |t| t.len > 0 else false) break;
+    }
+    say("editor tabs: {s}", .{editorTabs(app, pane, &tabs_buf) orelse @as([]const u8, "?")});
+    return "the dropped files never opened";
+}
+
+var g_editor_pane: u32 = 0;
+
+/// Drag the probe's source strip onto the middle of the main window.
+fn dragProbeSource(app: *appdrive.App) bool {
+    const pw = app.winById(g_probe) orelse return false;
+    const mw = app.winById(g_win) orelse return false;
+    app.dragDndBetween(
+        g_probe,
+        @as(f64, @floatFromInt(pw.w)) * 0.5,
+        @as(f64, @floatFromInt(pw.h)) - 25,
+        g_win,
+        @as(f64, @floatFromInt(mw.w)) * 0.5,
+        @as(f64, @floatFromInt(mw.h)) * 0.6,
+        1,
+    ) catch |err| {
+        say("drag failed: {s}", .{@errorName(err)});
+        return false;
+    };
+    return true;
+}
+
+/// A dropped file whose type query HANGS (a path on the GUI's FUSE mount
+/// of the fake host while that host's daemon is stopped) must not freeze
+/// the GUI: its control socket keeps answering promptly the whole time,
+/// and the file opens once the host answers again. Null on success.
+fn hungDropStage(app: *appdrive.App, rt: [:0]const u8, remote_dir: [:0]const u8) ?[]const u8 {
+    var mnt_buf: [300]u8 = undefined;
+    const mnt = std.fmt.bufPrint(&mnt_buf, "{s}/sketerm/mnt/{d}/" ++ HOST, .{ rt, child_pid }) catch return "mount path";
+    {
+        const mounts = readFile("/proc/mounts") orelse return "reading /proc/mounts";
+        defer g_alloc.free(mounts);
+        if (std.mem.indexOf(u8, mounts, mnt) == null) {
+            say("SKIP the hung-mount drop stage (no FUSE mount of " ++ HOST ++ " at {s})", .{mnt});
+            return null;
+        }
+    }
+    // A file the kernel has never looked up, so the type query must ask
+    // the mount (and so the stopped host) rather than a cached entry.
+    var p_buf: [400]u8 = undefined;
+    if (!writeFile(std.fmt.bufPrintSentinel(&p_buf, "{s}/hung.txt", .{remote_dir}, 0) catch return "path", "late\n")) return "writing hung.txt";
+    var src_buf: [700]u8 = undefined;
+    const src_req = std.fmt.bufPrint(&src_buf, "{{\"cmd\":\"dnd-probe\",\"data\":\"source:{s}{s}/hung.txt\"}}\n", .{ mnt, remote_dir }) catch return "probe request";
+    const set = ctlsock.roundtrip(g_alloc, app, g_gui_sock, src_req) orelse return "dnd-probe source never answered";
+    g_alloc.free(set);
+
+    say("stopping the " ++ HOST ++ " daemon (pid {d}) and dropping a file on its mount", .{remote_pid});
+    if (c.kill(remote_pid, c.SIGSTOP) != 0) return "SIGSTOP of the remote daemon";
+    var resumed = false;
+    defer if (!resumed) {
+        _ = c.kill(remote_pid, c.SIGCONT);
+    };
+    if (!dragProbeSource(app)) return "the drag failed";
+    var worst: i64 = 0;
+    const t0 = clock.nowMs();
+    while (clock.nowMs() - t0 < 4_000) {
+        pumpFor(app, 150);
+        const s = clock.nowMs();
+        const r = ctlsock.roundtrip(g_alloc, app, g_gui_sock, "{\"cmd\":\"list\"}\n") orelse return "the control socket failed while the query hung";
+        g_alloc.free(r);
+        worst = @max(worst, clock.nowMs() - s);
+    }
+    var tabs_buf: [512]u8 = undefined;
+    const during = editorTabs(app, g_editor_pane, &tabs_buf) orelse return "editor-tabs refused";
+    const opened_early = std.mem.indexOf(u8, during, "hung.txt") != null;
+    _ = c.kill(remote_pid, c.SIGCONT);
+    resumed = true;
+    say("slowest control round trip while the type query hung: {d} ms", .{worst});
+    if (worst > 1_000) return "the GUI stopped answering while a dropped file's type query hung";
+    if (opened_early) return "the file opened before its type query could have answered";
+    const t1 = clock.nowMs();
+    while (clock.nowMs() - t1 < 30_000) {
+        pumpFor(app, 300);
+        const got = editorTabs(app, g_editor_pane, &tabs_buf) orelse continue;
+        if (std.mem.indexOf(u8, got, "hung.txt") != null) {
+            say("PASS a drop whose type query hangs leaves the GUI responsive, and opens once it answers", .{});
+            return null;
+        }
+    }
+    return "the file never opened after the host came back";
 }

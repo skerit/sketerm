@@ -924,10 +924,12 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
     } else if (eql(u8, req.cmd, "dnd-probe")) {
         // Verification hook for smoke rigs: a second toplevel whose
         // drop zones read a drag as a foreign app and as sketerm's own
-        // targets would; `data:"reset"` forgets earlier drops.
+        // targets would; `data:"reset"` forgets earlier drops, and
+        // `data:"source:<paths>"` sets what its source strip drags.
         if (c.getenv("SKETERM_VERIFY_TREE") == null)
             return ipc_protocol.writeErr(out, allocator, .unavailable, "the drag probe exists only under SKETERM_VERIFY_TREE");
         const probe = @import("dndprobe.zig");
+        if (req.data) |d| if (std.mem.startsWith(u8, d, "source:")) probe.setSource(d["source:".len..]);
         const rep = probe.ensure(if (req.data) |d| eql(u8, d, "reset") else false);
         try ipc_protocol.writeOk(out, allocator, "probe", .{
             .drops = rep.drops,
@@ -935,6 +937,15 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
             .internal = rep.internal,
             .fetches = @import("browser/dragout.zig").fetches_started,
         });
+    } else if (eql(u8, req.cmd, "editor-tabs")) {
+        // The pane's editor documents in tab order (null = untitled).
+        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
+        const view = @import("editorview.zig").EditorView.fromPane(pane) orelse
+            return ipc_protocol.writeErr(out, allocator, .unsupported, "pane has no editor face");
+        var specs: std.ArrayList(?[]const u8) = .empty;
+        defer specs.deinit(allocator);
+        for (view.tabs.items) |t| try specs.append(allocator, t.spec);
+        try ipc_protocol.writeOk(out, allocator, "tabs", specs.items);
     } else if (eql(u8, req.cmd, "focus")) {
         if (req.pane != null or req.session != null) {
             const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
