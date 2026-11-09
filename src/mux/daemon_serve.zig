@@ -27,6 +27,7 @@ const wsproto = @import("../winstream/proto.zig");
 const capabilities = @import("capabilities.zig");
 const daemon_adopt = @import("daemon_adopt.zig");
 const wlvcodec = @import("../wlhost/vcodec.zig");
+const pathz = @import("../util/pathz.zig");
 
 const daemon_apps = @import("daemon_apps.zig");
 const daemon_browse = @import("daemon_browse.zig");
@@ -140,6 +141,8 @@ const WelcomeBase = struct {
     video: bool,
     video_codecs: []const []const u8,
     panel_rpc: u8,
+    /// pdftoppm is on this host's PATH (see `capabilities.preview_tools`).
+    pdf_preview: bool,
 };
 
 /// The client's hello. Every field defaults to what a client predating
@@ -275,6 +278,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 // future clients may share it with no snapshot/event
                 // profile overlap.
                 .panel_rpc = wire.PANEL_RPC_VERSION,
+                .pdf_preview = pathz.executableOnPath("pdftoppm"),
             }, capabilities.all));
         },
         .spawn => self.handleSpawn(cl, frame.payload),

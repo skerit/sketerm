@@ -662,12 +662,17 @@ const WireThumbRes = struct {
     path_len: usize = 0,
     err: [256]u8 = undefined,
     err_len: usize = 0,
+    kind: [32]u8 = undefined,
+    kind_len: usize = 0,
 
     fn assetPath(self: *const WireThumbRes) []const u8 {
         return self.path[0..self.path_len];
     }
     fn errMsg(self: *const WireThumbRes) []const u8 {
         return self.err[0..self.err_len];
+    }
+    fn errKind(self: *const WireThumbRes) []const u8 {
+        return self.kind[0..self.kind_len];
     }
 };
 
@@ -687,6 +692,7 @@ fn wireThumbRequest(allocator: std.mem.Allocator, fs: *fsdrive.Fs, op: []const u
         ev: []const u8 = "",
         path: []const u8 = "",
         message: []const u8 = "",
+        kind: []const u8 = "",
         keep: bool = false,
     };
     const Rep = struct { req: u32 = 0, ok: bool = false, job: u64 = 0, @"error": []const u8 = "" };
@@ -718,6 +724,8 @@ fn wireThumbRequest(allocator: std.mem.Allocator, fs: *fsdrive.Fs, op: []const u
             if (std.mem.eql(u8, ev.ev, "error")) {
                 res.err_len = @min(ev.message.len, res.err.len);
                 @memcpy(res.err[0..res.err_len], ev.message[0..res.err_len]);
+                res.kind_len = @min(ev.kind.len, res.kind.len);
+                @memcpy(res.kind[0..res.kind_len], ev.kind[0..res.kind_len]);
                 return res;
             }
         }
@@ -1696,6 +1704,50 @@ fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: [
                 const wb = wireThumbRequest(allocator, &fs, "preview", bad, 9202);
                 if (wb.ok or !std.mem.startsWith(u8, wb.errMsg(), "pdftoppm failed: "))
                     fail("a broken PDF's wire preview error does not carry pdftoppm's reason");
+            }
+
+            // preview_tools: the welcome says whether pdftoppm is on the
+            // daemon's PATH, and a generator missing from it fails with a
+            // machine-readable kind a client renders around
+            // (filebrowser/pdflocal.zig). Old daemons say neither.
+            if (!fs.conn.caps.preview_tools) fail("daemon does not advertise preview_tools");
+            if (fs.conn.pdf_preview != pathz.executableOnPath("pdftoppm")) fail("welcome pdf_preview disagrees with this host's PATH");
+            {
+                var fnp: [4096]u8 = undefined;
+                const pdf = std.fmt.bufPrint(&fnp, "{s}/nopath.pdf", .{sdir}) catch unreachable;
+                writeMinimalPdf(pdf);
+                const saved_path: ?[]u8 = if (c.getenv("PATH")) |p| allocator.dupe(u8, std.mem.span(p)) catch fail("dup PATH") else null;
+                defer if (saved_path) |p| allocator.free(p);
+                // The daemon and its job helpers read PATH when they
+                // need it: a welcome and a job started now see none.
+                _ = c.setenv("PATH", "/nonexistent-sketerm-smoke-fs", 1);
+                defer {
+                    if (saved_path) |p| {
+                        var pz: [8192:0]u8 = undefined;
+                        const old = std.fmt.bufPrintSentinel(&pz, "{s}", .{p}, 0) catch fail("PATH too long to restore");
+                        _ = c.setenv("PATH", old.ptr, 1);
+                    } else _ = unsetEnv("PATH");
+                }
+                var bare = fsdrive.Fs.connect(allocator, sock_path) catch fail("PATH-less fs connect");
+                defer bare.deinit();
+                if (!bare.conn.caps.preview_tools or bare.conn.pdf_preview)
+                    fail("a host without pdftoppm on PATH still claims PDF previews");
+                const nj = bare.startPreviewCodecs(pdf, "png") catch failErr("start PATH-less pdf preview", bare.lastErr());
+                var nev = bare.waitJobTerminal(nj, 20_000) catch failErr("PATH-less pdf preview wait", bare.lastErr());
+                defer nev.deinit();
+                if (!std.mem.eql(u8, nev.ev, "error") or !std.mem.eql(u8, nev.kind, fsjob.NO_GENERATOR_KIND) or
+                    !std.mem.startsWith(u8, nev.message, "pdftoppm is not installed"))
+                {
+                    std.debug.print("smoke-fs: PATH-less pdf event {s} kind={s}: {s}\n", .{ nev.ev, nev.kind, nev.message });
+                    fail("a missing pdftoppm is not reported as kind no_generator");
+                }
+                // The file browser's wire-cache request says the same.
+                const wn = wireThumbRequest(allocator, &bare, "preview", pdf, 9203);
+                if (wn.ok or !std.mem.eql(u8, wn.errKind(), fsjob.NO_GENERATOR_KIND))
+                    fail("a missing pdftoppm is not kind no_generator on the wire-cache path");
+                // A broken PDF on a host WITH pdftoppm keeps an unkinded
+                // error (checked above by message): only a missing tool
+                // is something a client may route around.
             }
         }
 

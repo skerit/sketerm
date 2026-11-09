@@ -205,6 +205,12 @@ pub const Flag = enum {
     /// ignores both and serves its 512 px PNG, so a client sends the
     /// legacy request.
     preview_bound,
+    /// The welcome's `pdf_preview` says whether this host can render
+    /// PDF previews (pdftoppm on the daemon's PATH, looked up per
+    /// welcome), and a preview whose generator is missing fails with
+    /// kind `fsjob.NO_GENERATOR_KIND`. Absent = unknown: ask the host,
+    /// and its failure is not machine-readable, so nothing falls back.
+    preview_tools,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

@@ -452,6 +452,9 @@ pub const Conn = struct {
     /// older daemon reached after a reconnect never inherits a newer
     /// one's flags.
     caps: capabilities.Set = .{},
+    /// The host can render PDF previews (welcome `pdf_preview`);
+    /// meaningful only with `caps.preview_tools`.
+    pdf_preview: bool = false,
     /// The daemon's announced build id (git describe). Empty = a
     /// daemon that predates the announce — stale by definition.
     server_build: [72]u8 = undefined,
@@ -717,6 +720,7 @@ pub const Conn = struct {
         // Parsed apart from the profile fields: a malformed flag value
         // costs the flags, never the negotiated profile.
         self.caps = capabilities.parse(allocator, payload);
+        self.pdf_preview = false;
         self.panel_rpc = 0;
         self.attach_identity_pending = false;
         self.server_build_len = 0;
@@ -729,6 +733,7 @@ pub const Conn = struct {
             panel_rpc: u8 = 0,
             build: []const u8 = "",
             version: []const u8 = "",
+            pdf_preview: bool = false,
         };
         if (std.json.parseFromSlice(Probe, allocator, payload, .{ .ignore_unknown_fields = true })) |parsed| {
             defer parsed.deinit();
@@ -741,6 +746,7 @@ pub const Conn = struct {
                 0;
             self.server_proto = parsed.value.server_proto orelse reported;
             self.panel_rpc = @min(parsed.value.panel_rpc, wire.PANEL_RPC_VERSION);
+            self.pdf_preview = parsed.value.pdf_preview;
             self.server_build_len = @min(parsed.value.build.len, self.server_build.len);
             @memcpy(self.server_build[0..self.server_build_len], parsed.value.build[0..self.server_build_len]);
             self.server_version_len = @min(parsed.value.version.len, self.server_version.len);

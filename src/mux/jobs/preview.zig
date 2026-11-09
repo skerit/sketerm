@@ -240,7 +240,7 @@ fn runSizedPreview(job: *const Job, source: [:0]const u8, bound: u32, mtime_sec:
         const r = std.fmt.bufPrintSentinel(&raw_buf, "/tmp/.sketerm-thumbgen-{d}-sized.png", .{c.getpid()}, 0) catch return job.emitError("preview path too long");
         var why: Why = .{};
         if (!generateThumbPng(allocator, spec.src, source, r, @intCast(bound), &why))
-            return job.emitError(why.text());
+            return why.emit(job);
         raw = r;
         break :blk loadScaledRgba(allocator, r, bound) orelse return job.emitError("preview generator produced an unreadable image");
     };
@@ -627,6 +627,9 @@ fn fileHasBytes(path: [*:0]const u8) bool {
 const Why = struct {
     buf: [320]u8 = undefined,
     len: usize = 0,
+    /// The generator itself is not installed: the job fails with
+    /// `fsjob.NO_GENERATOR_KIND`, which a client may route around.
+    missing: bool = false,
 
     fn set(self: *Why, comptime fmt: []const u8, args: anytype) void {
         var w: std.Io.Writer = .fixed(&self.buf);
@@ -637,6 +640,11 @@ const Why = struct {
 
     fn text(self: *const Why) []const u8 {
         return if (self.len == 0) "the preview generator failed" else self.buf[0..self.len];
+    }
+
+    /// End `job` with this reason.
+    fn emit(self: *const Why, job: *const Job) u8 {
+        return if (self.missing) job.emitErrorKind(fsjob.NO_GENERATOR_KIND, self.text()) else job.emitError(self.text());
     }
 };
 
@@ -666,6 +674,7 @@ fn runGenerator(argv: []const ?[*:0]const u8, why: *Why) bool {
     const tool = std.mem.span(argv[0].?);
     if (!binaryExists(tool)) {
         why.set("{s} is not installed on the host{s}", .{ tool, toolHint(tool) });
+        why.missing = true;
         return false;
     }
     var pipefd: [2]c_int = undefined;
@@ -882,7 +891,7 @@ fn runWireThumb(job: *const Job, thumbnail_only: bool, mtime_sec: i64, cache_roo
         const r = std.fmt.bufPrintSentinel(&raw_buf, "/tmp/.sketerm-thumbgen-{d}.png", .{c.getpid()}, 0) catch return job.emitError("thumbnail path too long");
         var why: Why = .{};
         if (!generateThumbPng(allocator, spec.src, source, r, if (thumbnail_only) 128 else 512, &why))
-            return job.emitError(why.text());
+            return why.emit(job);
         raw = r;
         break :blk r;
     };
@@ -1011,7 +1020,7 @@ pub fn runPreview(job: *const Job, thumbnail_only: bool) u8 {
         const bound: c_int = if (thumbnail_only) 128 else 512;
         var why: Why = .{};
         if (!generateThumbPng(allocator, spec.src, source, raw, bound, &why))
-            return job.emitError(why.text());
+            return why.emit(job);
         thumbs.installPng(allocator, raw, final, uri, mtime_sec) catch return job.emitError("cannot install thumbnail cache entry");
     }
 
@@ -1169,11 +1178,14 @@ test "runGenerator names a missing tool, the failing line, and drains a chatty s
     const missing = [_:null]?[*:0]const u8{ "sketerm-no-such-generator", null };
     try t.expect(!runGenerator(&missing, &why));
     try t.expectEqualStrings("sketerm-no-such-generator is not installed on the host", why.text());
+    try t.expect(why.missing);
 
     why = .{};
     const failing = [_:null]?[*:0]const u8{ "sh", "-c", "echo warning >&2; echo 'Syntax Error: boom' >&2; exit 3", null };
     try t.expect(!runGenerator(&failing, &why));
     try t.expectEqualStrings("sh failed: Syntax Error: boom", why.text());
+    // A tool that ran and failed is not a missing one: no fallback kind.
+    try t.expect(!why.missing);
 
     why = .{};
     const silent = [_:null]?[*:0]const u8{ "sh", "-c", "exit 4", null };

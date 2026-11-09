@@ -295,6 +295,11 @@ pub fn emitError(msg: []const u8) u8 {
     return 1;
 }
 
+/// Error kind of a preview job whose generator (pdftoppm, ffmpeg,
+/// rsvg-convert) is not installed on the host. A client may render the
+/// file elsewhere instead (filebrowser/pdflocal.zig does for PDFs).
+pub const NO_GENERATOR_KIND = "no_generator";
+
 /// Error whose CAUSE the caller may act on structurally.
 /// "unreachable" = a cross_copy side never answered the dial — the
 /// browser retries the same job through a different coordinator
