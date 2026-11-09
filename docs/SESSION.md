@@ -1,5 +1,25 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-09: collapsing a folder moves a hidden selection onto it
+
+Collapsing a tree folder (chevron click or Left) while an entry inside it
+was selected left that hidden entry selected: the first Down only
+selected the folder and the second moved on, and every verb (trash,
+copy, drag) still acted on a row nobody could see. Now, as in Nemo, the
+selected descendants (any depth) are deselected and the folder is
+selected instead; other visible selected rows stay selected, the folder
+is added to them. `SelectionSet.collapseInto` holds the rule (a strict
+descendant by `dirWithin`, so `/a/bc` is not under `/a/b`) and
+`colview.takeCursor` puts the keyboard cursor, the selection and GTK's
+Shift-range anchor on the folder without scrolling or rebinding (only
+`GTK_LIST_SCROLL_SELECT` moves that anchor). The preview pane and side
+card follow. Nothing changes when no hidden entry was selected. An inline
+rename in progress is cancelled by the collapse's render, as by any
+render; the cut/copy clipboard is not touched (a cut child still moves on
+paste). smoke-tree's collapse stages now expect selection == [folder],
+and cover Left after Ctrl+Up (Shift+Down then selects folder + next) and
+a multi-selection with Ctrl+Space.
+
 ## 2026-11-09: a remote host without pdftoppm gets its PDFs previewed here
 
 A host without pdftoppm (a NAS, a minimal server) answered every PDF
