@@ -1,5 +1,36 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-09: copying files in Sketerm Files hands other apps files
+
+Ctrl+C in the file browser offered a remote entry as path text only, and
+a local one as LF-separated URIs with no portal type, so pasting into
+Slack gave a path (or nothing). `ops.exportClipToGdk` now offers, besides
+the unchanged path text, the specs flavor (host-qualified records plus a
+`~cut` record old readers skip) and the drag's own `SketermFileExport`
+(`browser/dragout.zig`, which gained x-special/gnome-copied-files for the
+clipboard) plus KDE's cut flag: CRLF text/uri-list and the portal types
+come from GTK's GdkFileList serializer, as for a drag. Remote files are
+fetched into the drag staging cache only when a receiver reads a file
+type; a request after the staged copy vanished or aged past an hour
+fetches again, since a clipboard outlives its first paste. Decision:
+clipboard managers (KDE's Klipper) read text/uri-list on every clipboard
+change, which would turn every Ctrl+C of a remote file into a download,
+so a remote copy offers files only when it holds no directory, every
+entry has listing facts and the total is at most 64 MiB
+(`dragout.clipOffer`); otherwise it stays path text and the status line
+says to drag instead (a drop is always a deliberate request). A remote
+cut is announced to other apps as a copy, so a file manager that "moves"
+the staged copy can never delete the original; only sketerm's own paste
+moves. Sketerm's own paste is unchanged: in-process it pastes the board
+while GDK still owns the export and reads no format; another sketerm
+process's External Paste now reads the specs flavor first and transfers
+host to host rather than pasting a staged copy. `smoke-dragout` reads the
+GUI's selection over `wl_data_source.send` as another Wayland client
+(`appdrive.getClipboardMime`): local copy (CRLF URI list, GNOME, KDE),
+remote copy fetched once on the first file read, sketerm's paste of it
+with no staging, a remote cut whose original survives, a 65 MiB copy
+offered as text only. A real Slack, Nautilus or Dolphin was not run.
+
 ## 2026-11-09: dragging files out of Sketerm Files hands other apps files
 
 Report: dragging files from a folder onto Slack did nothing. The browser
