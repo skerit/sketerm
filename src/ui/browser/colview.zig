@@ -1152,6 +1152,29 @@ fn scrollToFixed(tab: *BTab, pos: c.guint, flags: c.GtkListScrollFlags) void {
     c.gtk_column_view_scroll_to(tab.colview, pos, null, flags, info); // takes info
 }
 
+/// Put the keyboard cursor, GTK's Shift-range anchor and the selection
+/// on `path`'s row without scrolling or rebinding, then restore the rest
+/// of `tab.selected` onto the rows. For a selection handed to a row by
+/// the model (a collapse), not by a user gesture: the mirror is already
+/// right, so GTK's selection-changed is not read back into it.
+pub fn takeCursor(tab: *BTab, path: []const u8) void {
+    if (tab.view.widgets_dead) return;
+    const pos = positionForPath(tab, path) orelse return;
+    const was_rendering = tab.rendering;
+    tab.rendering = true;
+    defer tab.rendering = was_rendering;
+    // SELECT is what moves GtkListBase's range anchor (its `selected`
+    // tracker); focusing alone leaves it on the hidden row's old place,
+    // and selecting the item through the model moves neither.
+    scrollToFixed(tab, pos, c.GTK_LIST_SCROLL_FOCUS | c.GTK_LIST_SCROLL_SELECT);
+    // SELECT selected the row exclusively; other visible selected rows
+    // come back from the mirror.
+    syncSelectionFromPaths(tab);
+    const cvw: *c.GtkWidget = @ptrCast(@alignCast(tab.colview));
+    if (c.gtk_widget_get_state_flags(cvw) & c.GTK_STATE_FLAG_FOCUS_WITHIN == 0)
+        _ = c.gtk_widget_grab_focus(cvw);
+}
+
 /// Point the chevron of `path`'s bound row at its current expansion
 /// state, without rebinding the row. Expanding or collapsing leaves
 /// that row's identity alone, so the windowed splice keeps its item --

@@ -547,10 +547,19 @@ pub fn toggleExpand(self: *BrowserView, tab: *BTab, dir_path: []const u8) void {
     // last clicked row, which may sit further down).
     colview.anchorRow(tab, dir_path);
     if (tab.subdirByPath(dir_path)) |_| {
+        // Selected entries inside the folder go out of sight with it;
+        // the selection moves to the folder (Nemo), so the next Down
+        // steps on from the folder and no verb acts on hidden rows.
+        // Visible selected rows stay selected.
+        const handed = tab.selected.collapseInto(self.allocator, dir_path);
         colview.invalidateBackingRefs(tab);
         tab.dropSubdirsUnder(dir_path);
         self.renderTab(tab);
         colview.refreshExpander(tab, dir_path);
+        if (handed) {
+            colview.takeCursor(tab, dir_path);
+            self.updatePreview();
+        }
         return;
     }
     const d = self.makeDir(dir_path) orelse return;

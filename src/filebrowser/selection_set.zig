@@ -10,10 +10,12 @@
 //!
 //! One visibility rule lives with the set: `retain` drops the paths a
 //! caller can prove HIDDEN, and only those. A path no listing carries
-//! yet (a restored selection, a mutation that has not landed, a
-//! collapsed branch) stays selected until a listing proves it hidden
-//! or a delete proves it gone -- absence from a partial listing is not
-//! evidence of either.
+//! yet (a restored selection, a mutation that has not landed) stays
+//! selected until a listing proves it hidden or a delete proves it gone
+//! -- absence from a partial listing is not evidence of either. A
+//! collapsed tree branch is the one exception, and it is explicit:
+//! `collapseInto` hands the selection of hidden descendants to the
+//! collapsed folder (Nemo's rule) at the moment of the collapse.
 //!
 //! Unmanaged like the repo's other containers: every mutation takes
 //! the allocator the set was filled with.
@@ -161,7 +163,33 @@ pub const SelectionSet = struct {
             }
         }.keep);
     }
+
+    /// Collapsing `folder` hides its descendants: drop every selected
+    /// one and, when any was dropped, select `folder` instead (appended,
+    /// unless it already was). Visible selected paths are kept, so a
+    /// multi-selection loses only what went out of sight.
+    /// @return true when a hidden descendant was deselected.
+    pub fn collapseInto(self: *SelectionSet, allocator: std.mem.Allocator, folder: []const u8) bool {
+        const before = self.order.items.len;
+        self.retain(allocator, folder, struct {
+            fn keep(f: []const u8, p: []const u8) bool {
+                return !hiddenByCollapse(p, f);
+            }
+        }.keep);
+        if (self.order.items.len == before) return false;
+        _ = self.add(allocator, folder);
+        return true;
+    }
 };
+
+/// Whether collapsing `folder` hides `path`: a strict descendant at any
+/// depth, never the folder itself or a sibling that merely shares its
+/// name prefix ("/a/bc" is not under "/a/b"). Both are paths on the same
+/// host, the way a tab's selection stores them; host-qualified specs
+/// ("host:/a/b") compare correctly as well, and never across hosts.
+pub fn hiddenByCollapse(path: []const u8, folder: []const u8) bool {
+    return path.len > folder.len and dirWithin(path, folder);
+}
 
 test "a set holds each path once, in order, with O(1) membership" {
     const t = std.testing;
@@ -219,6 +247,68 @@ test "retain and removeWithin keep the index consistent" {
         }
     }.keep);
     try t.expectEqual(gen, s.generation);
+}
+
+test "only strict descendants of a collapsed folder are hidden" {
+    const t = std.testing;
+    try t.expect(hiddenByCollapse("/a/b/c", "/a/b"));
+    try t.expect(hiddenByCollapse("/a/b/c/d/e", "/a/b"));
+    try t.expect(!hiddenByCollapse("/a/b", "/a/b"));
+    try t.expect(!hiddenByCollapse("/a/bc", "/a/b"));
+    try t.expect(!hiddenByCollapse("/a/bc/d", "/a/b"));
+    try t.expect(!hiddenByCollapse("/a", "/a/b"));
+    try t.expect(!hiddenByCollapse("/x/a/b/c", "/a/b"));
+    // A remote tab's paths are paths on that host: the same rule.
+    try t.expect(hiddenByCollapse("/home/me/src/main.zig", "/home/me/src"));
+    try t.expect(!hiddenByCollapse("/home/me/src2/main.zig", "/home/me/src"));
+    // Host-qualified specs: under the folder on the same host only.
+    try t.expect(hiddenByCollapse("box:/srv/www/index.html", "box:/srv/www"));
+    try t.expect(!hiddenByCollapse("box:/srv/www", "box:/srv/www"));
+    try t.expect(!hiddenByCollapse("box:/srv/wwwx/a", "box:/srv/www"));
+    try t.expect(!hiddenByCollapse("other:/srv/www/index.html", "box:/srv/www"));
+    try t.expect(!hiddenByCollapse("box:/srv/www/index.html", "/srv/www"));
+}
+
+test "collapsing hands a hidden selection to the folder" {
+    const t = std.testing;
+    const a = t.allocator;
+    var s: SelectionSet = .empty;
+    defer s.deinit(a);
+    // Nothing hidden selected: unchanged, generation included.
+    _ = s.add(a, "/r/a");
+    _ = s.add(a, "/r/bc/x");
+    const gen = s.generation;
+    try t.expect(!s.collapseInto(a, "/r/b"));
+    try t.expectEqual(gen, s.generation);
+    try t.expectEqual(@as(usize, 2), s.count());
+
+    // A single hidden child becomes the folder.
+    s.replace(a, &.{"/r/b/child"});
+    try t.expect(s.collapseInto(a, "/r/b"));
+    try t.expectEqual(@as(usize, 1), s.count());
+    try t.expectEqualStrings("/r/b", s.items[0]);
+    try t.expect(s.contains("/r/b"));
+
+    // Multi-selection: visible entries stay in order, every hidden one
+    // (any depth) goes, the folder is appended once.
+    s.replace(a, &.{ "/r/a", "/r/b/x", "/r/bc", "/r/b/deep/y", "/r/z" });
+    try t.expect(s.collapseInto(a, "/r/b"));
+    try t.expectEqual(@as(usize, 4), s.count());
+    try t.expectEqualStrings("/r/a", s.items[0]);
+    try t.expectEqualStrings("/r/bc", s.items[1]);
+    try t.expectEqualStrings("/r/z", s.items[2]);
+    try t.expectEqualStrings("/r/b", s.last().?);
+    try t.expect(!s.contains("/r/b/x"));
+    try t.expect(!s.contains("/r/b/deep/y"));
+
+    // The folder already selected keeps its place.
+    s.replace(a, &.{ "/r/b", "/r/b/x", "/r/a" });
+    try t.expect(s.collapseInto(a, "/r/b"));
+    try t.expectEqual(@as(usize, 2), s.count());
+    try t.expectEqualStrings("/r/b", s.items[0]);
+    try t.expectEqualStrings("/r/a", s.items[1]);
+    try t.expect(s.remove(a, "/r/a"));
+    try t.expect(s.contains("/r/b"));
 }
 
 test "a large folder derives in linear time" {

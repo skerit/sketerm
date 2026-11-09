@@ -9,8 +9,11 @@
 //! that actually changed may rebind, and the next Up/Down must step
 //! from the expanded row rather than from the top of the listing.
 //! Collapse (click and Left), a nested expand, an empty directory and a
-//! descending sort are covered the same way. Every step is read back
-//! through the `browser-rows` verification command.
+//! descending sort are covered the same way, and so is a collapse that
+//! hides selected rows: the selection moves to the collapsed directory
+//! (Nemo's rule), visible selected rows stay, and Down and Shift+Down
+//! step on from the directory. Every step is read back through the
+//! `browser-rows` verification command.
 //!
 //! Screenshots land in zig-out/smoke-tree-*.png. Everything created here
 //! is destroyed by exact pid / session name.
@@ -212,8 +215,9 @@ fn stripes(l: Listing) ?[]const u8 {
 }
 
 /// Expand a directory with Right, step Down onto its first child, then
-/// collapse the directory by its chevron: the cursor's row is gone, so
-/// the cursor lands on the directory and Down moves on from there.
+/// collapse the directory by its chevron: the selected child is hidden,
+/// so the selection and the cursor move to the directory, and the first
+/// Down moves on to the row below it.
 fn collapseUnderStage(app: *appdrive.App) ?[]const u8 {
     const s0 = rows(app, "collapse under the cursor") orelse return "no rows";
     defer s0.deinit();
@@ -237,23 +241,140 @@ fn collapseUnderStage(app: *appdrive.App) ?[]const u8 {
     if (stable(s2.value.listing, s3.value.listing, path)) |why| return why;
     const t3 = findRow(s3.value.listing, path).?;
     if (t3.expanded) return "the directory did not collapse";
-    if (!std.mem.eql(u8, s3.value.listing.focus_path, path))
-        return std.fmt.bufPrint(&why_buf, "keyboard focus is on '{s}' (row {d}), not the collapsed directory", .{ s3.value.listing.focus_path, s3.value.listing.focus }) catch "focus elsewhere";
+    if (cursorOn(s3.value.listing, path)) |why| return why;
     const next = rowAt(s3.value.listing, t3.pos + 1) orelse return "no row below";
     var next_buf: [512]u8 = undefined;
     const next_path = next_buf[0..next.path.len];
     @memcpy(next_path, next.path);
-    // The hidden child stays selected (a collapse is not a deletion),
-    // so GTK's first Down selects the unselected cursor row in place,
-    // and the second one moves on.
     const s4 = key(app, "Down", 500, "  Down") orelse return "no rows after Down";
     defer s4.deinit();
-    if (cursorOn(s4.value.listing, path)) |why| return why;
+    if (cursorOn(s4.value.listing, next_path)) |why| return why;
     if (@abs(s4.value.listing.scroll - s3.value.listing.scroll) > 1) return "Down scrolled the listing";
-    const s5 = key(app, "Down", 500, "  Down") orelse return "no rows after Down";
-    defer s5.deinit();
-    if (cursorOn(s5.value.listing, next_path)) |why| return why;
     return null;
+}
+
+/// Expand a directory with Right, step Down onto its first child, move
+/// the cursor back up with Ctrl+Up (the child stays the selection), then
+/// collapse with Left: the selection follows the cursor to the directory,
+/// and Shift+Down extends the range from the directory, not from the
+/// hidden child.
+fn collapseLeftStage(app: *appdrive.App) ?[]const u8 {
+    const s0 = rows(app, "collapse with Left") orelse return "no rows";
+    defer s0.deinit();
+    var pb: [512]u8 = undefined;
+    const path = pickDir(s0.value.listing, 3, &pb) orelse return "no suitable directory on screen";
+    const t = findRow(s0.value.listing, path).?;
+    say("collapse with Left: {s}, Right, Down, Ctrl+Up, Left, Shift+Down", .{std.fs.path.basename(path)});
+    app.click(g_win, t.label_x, t.y, 1) catch return "click failed";
+    pumpFor(app, 600);
+    const s1 = key(app, "Right", EXPAND_MS, "  Right") orelse return "no rows after Right";
+    defer s1.deinit();
+    const s2 = key(app, "Down", 500, "  Down") orelse return "no rows after Down";
+    defer s2.deinit();
+    const t2 = findRow(s2.value.listing, path) orelse return "the directory left the screen";
+    const child = rowAt(s2.value.listing, t2.pos + 1) orelse return "no child row";
+    var child_buf: [512]u8 = undefined;
+    const child_path = child_buf[0..child.path.len];
+    @memcpy(child_path, child.path);
+    if (cursorOn(s2.value.listing, child_path)) |why| return why;
+    const s3 = key(app, "ctrl+Up", 500, "  Ctrl+Up") orelse return "no rows after Ctrl+Up";
+    defer s3.deinit();
+    if (!std.mem.eql(u8, s3.value.listing.focus_path, path)) return "Ctrl+Up did not move the cursor to the directory";
+    if (selectionIs(s3.value.listing, &.{child_path})) |why| return why;
+    const s4 = key(app, "Left", 800, "  Left") orelse return "no rows after Left";
+    defer s4.deinit();
+    if (stable(s3.value.listing, s4.value.listing, path)) |why| return why;
+    const t4 = findRow(s4.value.listing, path).?;
+    if (t4.expanded) return "Left did not collapse the directory";
+    if (cursorOn(s4.value.listing, path)) |why| return why;
+    const next = rowAt(s4.value.listing, t4.pos + 1) orelse return "no row below";
+    var next_buf: [512]u8 = undefined;
+    const next_path = next_buf[0..next.path.len];
+    @memcpy(next_path, next.path);
+    const s5 = key(app, "shift+Down", 500, "  Shift+Down") orelse return "no rows after Shift+Down";
+    defer s5.deinit();
+    if (!std.mem.eql(u8, s5.value.listing.focus_path, next_path)) return "Shift+Down did not move the cursor to the next row";
+    if (selectionIs(s5.value.listing, &.{ path, next_path })) |why| return why;
+    if (@abs(s5.value.listing.scroll - s4.value.listing.scroll) > 1) return "Shift+Down scrolled the listing";
+    return null;
+}
+
+/// A multi-selection across a collapse: select the row above a
+/// directory, Ctrl+Down to the directory, Right, Ctrl+Down onto its
+/// first child and mark it with Ctrl+Space, then click the directory's
+/// chevron. The visible row stays selected, the hidden child is
+/// replaced by the directory, the cursor is on the directory, and Down
+/// moves on to the next row alone.
+fn collapseMultiStage(app: *appdrive.App) ?[]const u8 {
+    const s0 = rows(app, "collapse a multi-selection") orelse return "no rows";
+    defer s0.deinit();
+    var pb: [512]u8 = undefined;
+    const path = pickDir(s0.value.listing, 3, &pb) orelse return "no suitable directory on screen";
+    const t = findRow(s0.value.listing, path).?;
+    const above = (if (t.pos == 0) null else rowAt(s0.value.listing, t.pos - 1)) orelse return "no row above the directory";
+    var above_buf: [512]u8 = undefined;
+    const above_path = above_buf[0..above.path.len];
+    @memcpy(above_path, above.path);
+    say("collapse a multi-selection: {s} and a child of {s}", .{ std.fs.path.basename(above_path), std.fs.path.basename(path) });
+    app.click(g_win, above.label_x, above.y, 1) catch return "click failed";
+    pumpFor(app, 600);
+    const s1 = key(app, "ctrl+Down", 500, "  Ctrl+Down") orelse return "no rows after Ctrl+Down";
+    defer s1.deinit();
+    if (!std.mem.eql(u8, s1.value.listing.focus_path, path)) return "Ctrl+Down did not move the cursor to the directory";
+    if (selectionIs(s1.value.listing, &.{above_path})) |why| return why;
+    const s2 = key(app, "Right", EXPAND_MS, "  Right") orelse return "no rows after Right";
+    defer s2.deinit();
+    const t2 = findRow(s2.value.listing, path) orelse return "the directory left the screen";
+    if (!t2.expanded) return "Right did not expand the directory";
+    const child = rowAt(s2.value.listing, t2.pos + 1) orelse return "no child row";
+    var child_buf: [512]u8 = undefined;
+    const child_path = child_buf[0..child.path.len];
+    @memcpy(child_path, child.path);
+    const s3 = key(app, "ctrl+Down", 500, "  Ctrl+Down") orelse return "no rows after Ctrl+Down";
+    defer s3.deinit();
+    if (!std.mem.eql(u8, s3.value.listing.focus_path, child_path)) return "Ctrl+Down did not reach the child";
+    const s4 = key(app, "ctrl+space", 500, "  Ctrl+Space") orelse return "no rows after Ctrl+Space";
+    defer s4.deinit();
+    if (selectionIs(s4.value.listing, &.{ above_path, child_path })) |why| return why;
+    const t4 = findRow(s4.value.listing, path) orelse return "the directory left the screen";
+    app.click(g_win, t4.expander_x, t4.expander_y, 1) catch return "click failed";
+    pumpFor(app, 800);
+    const s5 = rows(app, "  collapsed") orelse return "no rows after collapse";
+    defer s5.deinit();
+    if (stable(s4.value.listing, s5.value.listing, path)) |why| return why;
+    const t5 = findRow(s5.value.listing, path).?;
+    if (t5.expanded) return "the directory did not collapse";
+    if (!std.mem.eql(u8, s5.value.listing.focus_path, path))
+        return std.fmt.bufPrint(&why_buf, "keyboard focus is on '{s}', not the collapsed directory", .{s5.value.listing.focus_path}) catch "focus elsewhere";
+    if (selectionIs(s5.value.listing, &.{ above_path, path })) |why| return why;
+    const next = rowAt(s5.value.listing, t5.pos + 1) orelse return "no row below";
+    var next_buf: [512]u8 = undefined;
+    const next_path = next_buf[0..next.path.len];
+    @memcpy(next_path, next.path);
+    const s6 = key(app, "Down", 500, "  Down") orelse return "no rows after Down";
+    defer s6.deinit();
+    if (cursorOn(s6.value.listing, next_path)) |why| return why;
+    return null;
+}
+
+/// Null when the selection is exactly the paths in `want`, in any order.
+fn selectionIs(l: Listing, want: []const []const u8) ?[]const u8 {
+    var ok = l.selected.len == want.len;
+    for (want) |w| {
+        var found = false;
+        for (l.selected) |s| found = found or std.mem.eql(u8, s, w);
+        ok = ok and found;
+    }
+    if (ok) return null;
+    var list_buf: [400]u8 = undefined;
+    var n: usize = 0;
+    for (l.selected) |s| {
+        const piece = std.fmt.bufPrint(list_buf[n..], "{s} ", .{std.fs.path.basename(s)}) catch break;
+        n += piece.len;
+    }
+    return std.fmt.bufPrint(&why_buf, "the selection is [{s}] ({d} rows), want {d} rows ending '{s}'", .{
+        list_buf[0..n], l.selected.len, want.len, std.fs.path.basename(want[want.len - 1]),
+    }) catch "selection differs";
 }
 
 /// With the cursor on a row BELOW a one-child directory, click that
@@ -704,6 +825,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (emptyStage(app)) |why| return fail("empty directory: {s}", .{why});
     if (aboveStage(app)) |why| return fail("expand above the cursor: {s} (zig-out/smoke-tree-above-expanded.png)", .{why});
     if (collapseUnderStage(app)) |why| return fail("collapse under the cursor: {s}", .{why});
+    if (collapseLeftStage(app)) |why| return fail("collapse a selected child with Left: {s}", .{why});
+    if (collapseMultiStage(app)) |why| return fail("collapse a multi-selection: {s}", .{why});
 
     // ── the same under a descending sort ──────────────────────────
     {
