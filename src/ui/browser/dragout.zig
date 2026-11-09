@@ -9,8 +9,9 @@
 //! also offers x-special/gnome-copied-files, written here from the same
 //! file list. Nothing is fetched until a receiver asks for one of those
 //! types: a drag that is cancelled, or dropped on a sketerm surface
-//! (those read `dragspecs`), and a copy pasted only inside sketerm (the
-//! process-wide board), never download anything.
+//! (those read `dragspecs`; only a web page asks for files, at its
+//! drop), and a copy pasted only inside sketerm (the process-wide
+//! board), never download anything.
 //!
 //! A remote entry is fetched on that first request through the
 //! transfer service (`submitDelivery`, a daemon `cross_copy` into
@@ -328,8 +329,11 @@ fn refFormats(provider: [*c]c.GdkContentProvider) callconv(.c) ?*c.GdkContentFor
 
 const GNOME_MIME = "x-special/gnome-copied-files";
 
-/// In-process readers only: a local drag answers at once; a remote one
-/// refuses rather than fetch for a sketerm surface (they read `dragspecs`).
+/// In-process readers: a local drag answers at once. A remote one
+/// answers NOT_SUPPORTED, which makes GDK fall through to the MIME
+/// transfer (`writeMimeTypeAsync`), so an in-process reader that asks
+/// for FILES (a web page drop) gets them fetched like any other
+/// receiver; sketerm's other surfaces read `dragspecs` and never ask.
 fn getValue(provider: [*c]c.GdkContentProvider, value: [*c]c.GValue, err: [*c][*c]c.GError) callconv(.c) c.gboolean {
     const inst = instanceOf(provider);
     if (c.g_type_check_value_holds(value, c.gdk_file_list_get_type()) != 0) {
@@ -343,7 +347,7 @@ fn getValue(provider: [*c]c.GdkContentProvider, value: [*c]c.GValue, err: [*c][*
                 return 1;
             }
             if (state.hasRemote()) {
-                c.g_set_error_literal(err, c.g_io_error_quark(), c.G_IO_ERROR_FAILED, "remote entries are fetched only for other applications");
+                c.g_set_error_literal(err, c.g_io_error_quark(), c.G_IO_ERROR_NOT_SUPPORTED, "remote entries are fetched through the MIME transfer");
                 return 0;
             }
         }

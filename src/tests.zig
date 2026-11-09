@@ -246,6 +246,7 @@ comptime {
     _ = @import("ui/webface/containers.zig");
     _ = @import("ui/webface/cookiesync.zig");
     _ = @import("ui/webface/screen.zig");
+    _ = @import("ui/webface/dropdata.zig");
     _ = @import("ui/webaction.zig");
     _ = @import("ui/webext.zig");
     _ = @import("ui/webremote.zig");

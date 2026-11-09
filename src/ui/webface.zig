@@ -225,6 +225,7 @@ const wf_dl = @import("webface/downloads.zig");
 const wf_client = @import("webface/client.zig");
 const wf_ctn = @import("webface/containers.zig");
 const wf_cksync = @import("webface/cookiesync.zig");
+const wf_drag = @import("webface/dragdrop.zig");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const widgetshot = @import("widgetshot.zig");
@@ -253,7 +254,6 @@ const socksbridge = @import("../ipc/socksbridge.zig");
 const mux_cli = @import("../ipc/mux_cli.zig");
 const socks5_client = @import("../mux/socks5_client.zig");
 const clipboard = @import("clipboard.zig");
-const dragspecs = @import("dragspecs.zig");
 const webreader = @import("webreader.zig");
 const fpicker = @import("../filebrowser/picker.zig");
 const webstore = @import("webstore.zig");
@@ -1181,6 +1181,8 @@ pub const WebFace = struct {
     /// no coordinates of their own.
     last_x: i32 = 0,
     last_y: i32 = 0,
+    /// The external drag over the page, while one is (`webface/dragdrop.zig`).
+    drag: ?*wf_drag.Session = null,
 
     /// Latency-probe timer (`SKETERM_WEB_LAT`), 0 when absent.
     lat_timer: c.guint = 0,
@@ -1744,6 +1746,7 @@ pub const WebFace = struct {
         // included, and the ONLY place the surface watch is severed
         // besides the area's own unrealize.
         self.detachScaleWatch();
+        wf_drag.sever(self);
         // The reader's own controllers carry the READER as user-data,
         // so the disconnect loop below (which matches on this face)
         // cannot reach them; its `sever` is the same mechanism applied
@@ -1834,6 +1837,7 @@ pub const WebFace = struct {
         webstore.cancelFor(@ptrCast(self));
         self.axTeardown();
         self.detachScaleWatch();
+        wf_drag.sever(self);
         self.stopLatProbe();
         if (self.reader) |r| {
             r.sever(self.widgets_dead);
@@ -2638,13 +2642,13 @@ pub const WebFace = struct {
             self.track(ctrls.focus);
         }
 
-        // File drag & drop -> navigate to the file's URI (a dropped
-        // text is treated as an address). Mirrors pane.zig's target,
-        // sketerm browser drags included (`dragspecs`).
-        const drop = c.gtk_drop_target_new(c.G_TYPE_INVALID, @intCast(c.GDK_ACTION_COPY));
-        var drop_types = [_]c.GType{ dragspecs.gtype(), c.gdk_file_list_get_type(), c.G_TYPE_STRING };
-        c.gtk_drop_target_set_gtypes(drop, &drop_types, drop_types.len);
-        _ = c.g_signal_connect_data(@ptrCast(drop), "drop", @ptrCast(&onFileDrop), self, null, 0);
+        // External drag & drop: the page gets a real DOM drop (files,
+        // links, text), and what it leaves unhandled the engine opens.
+        const drop = c.gtk_drop_target_async_new(wf_drag.targetFormats(), @intCast(c.GDK_ACTION_COPY | c.GDK_ACTION_LINK));
+        _ = c.g_signal_connect_data(@ptrCast(drop), "drag-enter", @ptrCast(&wf_drag.onDragEnter), self, null, 0);
+        _ = c.g_signal_connect_data(@ptrCast(drop), "drag-motion", @ptrCast(&wf_drag.onDragMotion), self, null, 0);
+        _ = c.g_signal_connect_data(@ptrCast(drop), "drag-leave", @ptrCast(&wf_drag.onDragLeave), self, null, 0);
+        _ = c.g_signal_connect_data(@ptrCast(drop), "drop", @ptrCast(&wf_drag.onDrop), self, null, 0);
         c.gtk_widget_add_controller(self.view_area, @ptrCast(drop));
         self.track(drop);
     }
@@ -3629,41 +3633,6 @@ pub const WebFace = struct {
         cast.userData(WebFace, user).closeFind();
     }
 
-    /// A dropped file navigates to its URI; dropped text is treated as
-    /// an address (pane.zig's target shape, different verb).
-    fn onFileDrop(_: *c.GtkDropTarget, value: [*c]const c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self = cast.userData(WebFace, user);
-        if (dragspecs.holds(value)) {
-            // The quoted-spec text this target always got from a
-            // browser drag, before the drag also offered a file list.
-            const txt = dragspecs.quotedText(self.allocator, value) catch return 0;
-            defer self.allocator.free(txt);
-            self.navigate(txt);
-            return 1;
-        }
-        if (c.g_type_check_value_holds(value, c.gdk_file_list_get_type()) != 0) {
-            const flist: ?*c.GdkFileList = @ptrCast(c.g_value_get_boxed(value));
-            // get_files is transfer-container: free the list, not the GFiles.
-            const files = c.gdk_file_list_get_files(flist);
-            defer c.g_slist_free(files);
-            if (files == null) return 0;
-            // One page per view: the FIRST dropped file is the one opened.
-            const gfile: ?*c.GFile = @ptrCast(files.*.data);
-            const uri_c = c.g_file_get_uri(gfile);
-            if (uri_c == null) return 0;
-            defer c.g_free(uri_c);
-            self.navigate(std.mem.span(@as([*:0]const u8, @ptrCast(uri_c))));
-            return 1;
-        }
-        if (c.g_type_check_value_holds(value, c.G_TYPE_STRING) != 0) {
-            const s = c.g_value_get_string(value);
-            if (s == null) return 0;
-            self.navigate(std.mem.span(@as([*:0]const u8, @ptrCast(s))));
-            return 1;
-        }
-        return 0;
-    }
-
     /// A blank tab's address bar takes focus the moment it can.
     fn onEntryMap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(WebFace, user);
@@ -3913,24 +3882,31 @@ pub const WebFace = struct {
         }
     };
 
+    /// A controller point in the page's logical space.
+    pub fn pagePoint(self: *const WebFace, x: f64, y: f64) [2]i32 {
+        if (self.observed) {
+            // The frame is letterboxed at the owner's size: map
+            // through the fit into the owner's logical space.
+            const fw = if (self.frame_lw != 0) self.frame_lw else self.obs_w;
+            const fh = if (self.frame_lh != 0) self.frame_lh else self.obs_h;
+            const pt = self.obs_fit.toFrame(x, y, fw, fh);
+            return .{ pt.x, pt.y };
+        }
+        // Controller coordinates are view-area space; the page is
+        // drawn `snap_dx/dy` further in (the pixel-grid nudge), so
+        // page space subtracts it.
+        return .{
+            @max(0, @as(i32, @intFromFloat(@round(x))) - @as(i32, self.snap_dx)),
+            @max(0, @as(i32, @intFromFloat(@round(y))) - @as(i32, self.snap_dy)),
+        };
+    }
+
     fn sendPointer(self: *WebFace, kind: proto.PointerKind, x: f64, y: f64, button: u8, clicks: u8, mods: u32) void {
         if (!self.view_live) return;
         if (kind != .leave) {
-            if (self.observed) {
-                // The frame is letterboxed at the owner's size: map
-                // through the fit into the owner's logical space.
-                const fw = if (self.frame_lw != 0) self.frame_lw else self.obs_w;
-                const fh = if (self.frame_lh != 0) self.frame_lh else self.obs_h;
-                const pt = self.obs_fit.toFrame(x, y, fw, fh);
-                self.last_x = pt.x;
-                self.last_y = pt.y;
-            } else {
-                // Controller coordinates are view-area space; the page is
-                // drawn `snap_dx/dy` further in (the pixel-grid nudge), so
-                // page space subtracts it.
-                self.last_x = @max(0, @as(i32, @intFromFloat(@round(x))) - @as(i32, self.snap_dx));
-                self.last_y = @max(0, @as(i32, @intFromFloat(@round(y))) - @as(i32, self.snap_dy));
-            }
+            const pt = self.pagePoint(x, y);
+            self.last_x = pt[0];
+            self.last_y = pt[1];
         }
         self.cl.post(proto.InputPointer{
             .view = self.view,
