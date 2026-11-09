@@ -1,5 +1,34 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-09: dragging files out of Sketerm Files hands other apps files
+
+Report: dragging files from a folder onto Slack did nothing. The browser
+drag offered a GStrv and a G_TYPE_STRING of quoted specs, so every other
+process saw plain text and no file. `dnd.provider` now adds two flavors
+behind those: `ui/dragspecs.zig` (`application/x-sketerm-drag-specs`,
+kind + host-qualified spec, with (de)serializers so it crosses sketerm
+processes) and the file export in `browser/dragout.zig`, a GdkContentProvider
+subclass offering what a GdkFileList serializes to minus text/plain
+(text/uri-list, and the document portal's types for sandboxed receivers)
+and answering through `gdk_content_serialize_async`, so the URIs and the
+portal export are GTK's own. Local entries go out in place. Remote entries
+are fetched only when a receiver requests one of those types: a transfer
+service `submitDelivery` into `$XDG_CACHE_HOME/sketerm/dnd/drag-*/<name>`,
+visible and cancellable in the Transfer Center; the request completes when
+all entries landed, a failure fails the write (receivers read an empty
+offer), a requested fetch finishes even after the drag ends, a finished
+copy of an unchanged file serves re-drags for an hour, and staged trees
+are swept after 24 h (`dirsweep.sweepTrees`, detached worker). Pane,
+editor, viewer, webface and wlapp drop targets list the specs type first:
+without it GTK prefers the file list, which would have changed the pane
+paste and fetched remote files for in-sketerm drops; the editor and the
+viewer now accept browser drags too, remote specs opened natively.
+`zig build smoke-dragout` drags a local file, a remote file (fake ssh), a
+remote directory, a re-drag and an unreadable file onto the `dnd-probe`
+window, whose left zone reads raw text/uri-list as Chromium does; the
+compositor does within-app dnd only, so the bytes cross GDK's in-process
+pipe, not a wl_data_offer. A real Slack/Electron receiver was not run.
+
 ## 2026-11-07: performance pass over the file browser, viewer and mux IO
 
 Every change below was measured before and after; ideas that did not
