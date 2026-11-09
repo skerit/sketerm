@@ -1,5 +1,35 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-09: files dropped on a web page reach it as files
+
+Report: dropping a file (from Sketerm Files, or from Dolphin/Nautilus)
+onto a web view navigated the page to the shell-quoted path text, e.g.
+`'/path'`. Decision: a drop on a page behaves as in Chromium, because it
+IS Chromium's own drop now. The helper gained `input_drag` (capability
+`drag-drop`, tag 0x28): enter/over/leave/drop are played into CEF's
+windowless drag-target API (`cefhost/dragdrop.zig`), so a page with a
+drop zone gets real `dragenter`/`dragover`/`drop` events and `File`
+objects, and a drop the page does not handle is the engine's: Blink
+opens a dropped file or link (Chromium's default, kept; text and link
+drops follow the engine's own rules, unverified here beyond files). The
+GUI side (`webface/dragdrop.zig`, a `GtkDropTargetAsync`)
+reads the specs flavor while a sketerm drag hovers, so a remote entry is
+offered by name under a stand-in path and nothing is fetched for a drag
+that passes by; at the drop it reads the drag's file list, which runs
+`browser/dragout.zig`'s fetch into the drag cache (its in-process
+`getValue` now answers NOT_SUPPORTED for remote entries so GDK falls
+through to that fetch), and the drop then re-enters with the staged
+paths. A link dragged from another browser is the drop's link, never a
+file. Limits: a helper on another host (`route on:`) gets no files (a
+toast says so); untrusted helpers withhold the capability like the
+clipboard; a helper without it makes the GUI open the first file as a
+file:// URI, a link, or a one-line text as an address. `smoke-dragout`
+stage 10 drags from the file browser onto a real CEF page: a never-
+fetched remote file arrives with its content after exactly one fetch, a
+local one in place with none, and a drop on the page's unhandled half
+opens the file. A drag from Dolphin/Nautilus (another process) was not
+run: the test compositor does within-app dnd only.
+
 ## 2026-11-09: copying files in Sketerm Files hands other apps files
 
 Ctrl+C in the file browser offered a remote entry as path text only, and
