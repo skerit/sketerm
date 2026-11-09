@@ -141,6 +141,8 @@ fn onSharedFailed(ctx: *anyopaque) void {
     view.setStatusFmt("cannot connect to {s}", .{hc.label()});
     if (hc.host) |h| view.scheduleReconnect(h);
     view.pumpCopyAcks();
+    // Local PDF renders parked on this connection will never start.
+    view.previewHostDied(hc);
     // The listings queued while connecting will never be answered.
     // Without this the tabs that asked for them sit at "Listing..."
     // for good, which reads like a slow host rather than a dead one.
@@ -270,6 +272,7 @@ pub fn wireReady(self: *BrowserView, hc: *HostConn) void {
     }
     self.requestHostDirs(hc);
     @import("mountbypass.zig").hostReady(self, hc);
+    @import("preview.zig").previewHostReady(self, hc);
     self.pumpTransferQueue();
     self.pumpCopyQueue();
     self.pumpDeferredTransfers();
@@ -613,7 +616,7 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
     i = 0;
     while (i < self.remote_thumbs.items.len) {
         const rt = self.remote_thumbs.items[i];
-        if (rt.hc == hc) {
+        if (rt.hc == hc or rt.via == hc) {
             _ = self.remote_thumbs.orderedRemove(i);
             rt.destroy(self.allocator);
         } else i += 1;

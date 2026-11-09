@@ -410,6 +410,7 @@ comptime {
     _ = @import("filebrowser/desktop.zig");
     _ = @import("filebrowser/hexdump.zig");
     _ = @import("filebrowser/previewers.zig");
+    _ = @import("filebrowser/pdflocal.zig");
     _ = @import("filebrowser/grouping.zig");
     _ = @import("filebrowser/viewmem.zig");
     _ = @import("filebrowser/registers.zig");

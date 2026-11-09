@@ -684,6 +684,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
             \\for a in "$@"; do case "$a" in hosta|hostb) exec '{s}/route-ssh' "$@";; esac; done
             \\case "$*" in *unreachable-host*) exit 255;; esac
+            \\case "$*" in *nopdfhost*)
+            \\    for a in "$@"; do case "$a" in *--udp-listen*) exec '{s}' --udp-listen --socket '{s}/n/sketerm/mux.sock';; esac; done
+            \\    exec '{s}' --proxy --socket '{s}/n/sketerm/mux.sock';;
+            \\esac
             \\printf 'dial wall_ms=%s argv=[%s]\n' "$(date +%s%3N)" "$*" >> '{s}/ssh-dials'
             \\if [ -e '{s}/ssh-delay' ]; then sleep 2; fi
             \\export XDG_RUNTIME_DIR='{s}'
@@ -697,7 +701,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             \\printf '%s\n' "$$" > '{s}/ssh-child-'"$SKETERM_APP_ID"
             \\exec '{s}' --proxy --socket '{s}'
             \\
-        , .{ rt, rt, rt, rrt, rrt, rrt, mux_abs, rsock, rt, mux_abs, rsock }) catch return fail("fake ssh body");
+        , .{ rt, mux_abs, rt, mux_abs, rt, rt, rt, rrt, rrt, rrt, mux_abs, rsock, rt, mux_abs, rsock }) catch return fail("fake ssh body");
         const fp = c.fopen(ssh_path.ptr, "wb") orelse return fail("fake ssh open");
         const wrote = c.fwrite(body.ptr, 1, body.len, fp) == body.len;
         _ = c.fclose(fp);
@@ -969,6 +973,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         say("viewer reuse: stepping through a remote batch rode the connection the first load dialed");
         if (viewerRemoteImageStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
         say("viewer remote images: a small original arrives at full resolution, a large one as a display-sized preview, PDFs as page-1 posters (a broken one says why)");
+        if (pdfFallbackStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+        say("pdf fallback: a host without pdftoppm gets its small PDFs rendered here and its big ones refused by size");
         teardown();
         return 0;
     }
@@ -8339,6 +8345,227 @@ fn viewerRemoteImageStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: 
         return viewerWhy("viewer pdf: a broken PDF did not report the host's pdftoppm error");
     }
     viewerShot(allocator, app, vwin, "viewer-broken-pdf");
+    return null;
+}
+
+/// The staged local copy of `host`'s PDF at `path` (the file sits on this
+/// disk; fake-SSH hosts share it) is in the staging cache.
+fn stagedCopyExists(rt: []const u8, host: []const u8, path: [:0]const u8) bool {
+    var st: c.struct_stat = undefined;
+    if (c.stat(path.ptr, &st) != 0) return false;
+    const ts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
+    const mtime_ms = @as(i64, @intCast(ts.tv_sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
+    var buf: [4096]u8 = undefined;
+    const staged = @import("filebrowser/pdflocal.zig").stagedPath(&buf, rt, host, path, @intCast(st.st_size), mtime_ms) orelse return false;
+    return @import("filebrowser/pdflocal.zig").isStaged(staged, @intCast(st.st_size));
+}
+
+/// PDFs in the local staging cache (filebrowser/pdflocal.zig), which
+/// this run's XDG_CACHE_HOME (= rt) puts under rt.
+fn stagedPdfCount(rt: []const u8) usize {
+    var dir_buf: [600:0]u8 = undefined;
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/sketerm/pdf-local", .{rt}, 0) catch return 0;
+    const d = c.opendir(dir.ptr) orelse return 0;
+    defer _ = c.closedir(d);
+    var n: usize = 0;
+    while (c.readdir(d)) |ent| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (std.mem.endsWith(u8, name, ".pdf")) n += 1;
+    }
+    return n;
+}
+
+/// A remote host WITHOUT pdftoppm (filebrowser/pdflocal.zig), reached as
+/// `nopdfhost` through the fake ssh: a third private daemon whose PATH is
+/// an empty directory. A small PDF there is fetched once and rendered by
+/// the LOCAL daemon, in the viewer and in the file browser's preview
+/// pane; a PDF over 2 MiB is never fetched and its error names the
+/// limit; the fake-SSH host that HAS pdftoppm still renders its own PDF.
+fn pdfFallbackStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: [:0]const u8, wl: [*:0]const u8) ?[]const u8 {
+    const pathz = @import("util/pathz.zig");
+    if (!@import("util/ocr.zig").available()) {
+        say("pdf fallback: tesseract unavailable; skipping");
+        return null;
+    }
+    if (!pathz.executableOnPath("pdftoppm")) {
+        say("pdf fallback: pdftoppm unavailable here too; skipping");
+        return null;
+    }
+    if (remote_mux_pid <= 0) return "pdf fallback: the fake-SSH daemon is not running";
+
+    // ── the host without pdftoppm ──────────────────────────────────
+    var nrt_buf: [300:0]u8 = undefined;
+    const nrt = std.fmt.bufPrintSentinel(&nrt_buf, "{s}/n", .{rt}, 0) catch return "pdf fallback: path";
+    _ = c.mkdir(nrt.ptr, 0o700);
+    var nbin_buf: [320:0]u8 = undefined;
+    const nbin = std.fmt.bufPrintSentinel(&nbin_buf, "{s}/bin", .{nrt}, 0) catch return "pdf fallback: path";
+    _ = c.mkdir(nbin.ptr, 0o700);
+    const npid = c.fork();
+    if (npid < 0) return "pdf fallback: fork";
+    if (npid == 0) {
+        platform.dieWithParent();
+        inline for (.{ "XDG_RUNTIME_DIR", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME" }) |name|
+            _ = c.setenv(name, nrt.ptr, 1);
+        _ = c.setenv("PATH", nbin.ptr, 1);
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.@"sketerm-mux"), null };
+        _ = c.execv(bindir.path(.@"sketerm-mux"), @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    defer reap(npid, c.SIGTERM, 2000);
+    {
+        var sock_buf: [340:0]u8 = undefined;
+        const sock = std.fmt.bufPrintSentinel(&sock_buf, "{s}/sketerm/mux.sock", .{nrt}, 0) catch return "pdf fallback: path";
+        var waited: u32 = 0;
+        while (c.access(sock.ptr, c.F_OK) != 0) : (waited += 1) {
+            if (waited > 100) return "pdf fallback: the pdftoppm-less daemon never listened (5s)";
+            _ = c.usleep(50_000);
+        }
+    }
+
+    // ── the files: a small PDF, one over 2 MiB, and one for the host
+    // that renders its own ─────────────────────────────────────────
+    var dir_buf: [512:0]u8 = undefined;
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/vpdf", .{rt}, 0) catch return "pdf fallback: dir path";
+    _ = c.mkdir(dir.ptr, 0o700);
+    var pdf_bytes: [2048]u8 = undefined;
+    const pdf = @import("util/minipdf.zig").build(&pdf_bytes);
+    var p: [3][600:0]u8 = undefined;
+    const small = std.fmt.bufPrintSentinel(&p[0], "{s}/smallpaper.pdf", .{dir}, 0) catch return "pdf fallback: path";
+    const big = std.fmt.bufPrintSentinel(&p[1], "{s}/hugepaper.pdf", .{dir}, 0) catch return "pdf fallback: path";
+    const ref = std.fmt.bufPrintSentinel(&p[2], "{s}/hostpaper.pdf", .{dir}, 0) catch return "pdf fallback: path";
+    if (!writeFile(small, pdf) or !writeFile(ref, pdf)) return "pdf fallback: seed";
+    {
+        // Over the cap by a page; content past %%EOF is never read.
+        const padded = allocator.alloc(u8, (2 << 20) + 4096) catch return "pdf fallback: oom";
+        defer allocator.free(padded);
+        @memset(padded, '\n');
+        @memcpy(padded[0..pdf.len], pdf);
+        if (!writeFile(big, padded)) return "pdf fallback: seed big";
+    }
+    const staged_before = stagedPdfCount(rt);
+
+    // ── the viewer ─────────────────────────────────────────────────
+    {
+        var specs: [3][640:0]u8 = undefined;
+        _ = std.fmt.bufPrintSentinel(&specs[0], "nopdfhost:{s}", .{small}, 0) catch return "pdf fallback: spec";
+        _ = std.fmt.bufPrintSentinel(&specs[1], "nopdfhost:{s}", .{big}, 0) catch return "pdf fallback: spec";
+        _ = std.fmt.bufPrintSentinel(&specs[2], "localhost:{s}", .{ref}, 0) catch return "pdf fallback: spec";
+        _ = app.drainLive(2_000);
+        var known: [32]u32 = undefined;
+        var n_known: usize = 0;
+        for (app.windows.items) |w| {
+            if (w.popup or n_known >= known.len) continue;
+            known[n_known] = w.id;
+            n_known += 1;
+        }
+        const pid = c.fork();
+        if (pid < 0) return "pdf fallback: fork";
+        if (pid == 0) {
+            platform.dieWithParent();
+            _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2evpdf", 1);
+            _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
+            _ = c.setenv("GDK_BACKEND", "wayland", 1);
+            _ = unsetEnv("DISPLAY");
+            _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+            _ = c.setenv("GTK_A11Y", "none", 1);
+            const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "view", &specs[0], &specs[1], &specs[2], null };
+            _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
+            c._exit(127);
+        }
+        vcast_pid = pid;
+        defer if (vcast_pid > 0) {
+            reap(vcast_pid, c.SIGTERM, 3000);
+            vcast_pid = -1;
+        };
+        var waited: u32 = 0;
+        const vwin = while (waited < 25_000) : (waited += 200) {
+            if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
+            pumpFor(app, 200);
+        } else return "pdf fallback: sketerm view never mapped a window";
+
+        // pdftoppm's page 1 at the legacy 512 px bound, drawn HERE.
+        if (!viewerWaitOcr(allocator, app, vwin, "Preview 512 x 359", 40_000)) {
+            viewerShot(allocator, app, vwin, "pdf-fallback-viewer-small");
+            return viewerWhy("pdf fallback: a small PDF on a host without pdftoppm was not rendered on this computer");
+        }
+        if (stagedPdfCount(rt) != staged_before + 1 or !stagedCopyExists(rt, "nopdfhost", small))
+            return "pdf fallback: the viewer's local render did not stage exactly one copy of the PDF";
+        app.pressKey(vwin, "Right") catch return "pdf fallback: injecting Right failed";
+        if (!viewerWaitOcr(allocator, app, vwin, "2 MiB limit", 40_000)) {
+            viewerShot(allocator, app, vwin, "pdf-fallback-viewer-big");
+            return viewerWhy("pdf fallback: a PDF over 2 MiB did not say it is over the limit");
+        }
+        if (stagedPdfCount(rt) != staged_before + 1 or stagedCopyExists(rt, "nopdfhost", big)) return "pdf fallback: the PDF over 2 MiB was fetched";
+        app.pressKey(vwin, "Right") catch return "pdf fallback: injecting Right failed";
+        if (!viewerWaitOcr(allocator, app, vwin, "Preview 512 x 359", 40_000)) {
+            viewerShot(allocator, app, vwin, "pdf-fallback-viewer-host");
+            return viewerWhy("pdf fallback: a host with pdftoppm no longer showed its own PDF poster");
+        }
+        if (stagedPdfCount(rt) != staged_before + 1)
+            return "pdf fallback: a host with pdftoppm had its PDF rendered locally instead";
+        say("pdf fallback: viewer rendered the small PDF here, refused the big one by size, left the capable host alone");
+    }
+
+    // ── the file browser's preview pane ───────────────────────────
+    var spec_buf: [560:0]u8 = undefined;
+    const spec = std.fmt.bufPrintSentinel(&spec_buf, "nopdfhost:{s}", .{dir}, 0) catch return "pdf fallback: spec";
+    const child = launchRenameFiles(app, spec, "pdffb", "", wl) orelse
+        return "pdf fallback: the Files window never appeared";
+    defer if (renamefiles_pid > 0) reap(renamefiles_pid, c.SIGTERM, 3000);
+    if (!viewerWaitOcr(allocator, app, child.win, "smallpaper", 40_000))
+        return "pdf fallback: the remote listing never rendered";
+    {
+        const launched = app.windowGeometry(child.win) orelse return "pdf fallback: the window has no size";
+        app.resizeWindow(child.win, 1400, launched.h) catch return "pdf fallback: widening the window failed";
+        const deadline = clock.nowMs() + 10_000;
+        while ((app.windowGeometry(child.win) orelse return "pdf fallback: window vanished").w < 1400) {
+            if (clock.nowMs() >= deadline) return "pdf fallback: the window never took the wider size";
+            pumpFor(app, 100);
+        }
+        _ = app.waitVisualSettle(child.win, 400, 10_000, 0.002, null);
+    }
+    const win = app.winById(child.win) orelse return "pdf fallback: window vanished";
+    const w = @as(f64, @floatFromInt(win.w));
+    // The toolbar's Information toggle (as filesBrowserBugsStage finds
+    // it); with nothing selected the panel summarizes the folder.
+    app.clickEx(child.win, w - 37 - 120, 138, 1, 80, 1) catch return "pdf fallback: info toggle click failed";
+    if (!viewerWaitOcr(allocator, app, child.win, "Directory", 15_000)) {
+        viewerShot(allocator, app, child.win, "pdf-fallback-infotoggle");
+        return "pdf fallback: the Information toggle opened no panel";
+    }
+    // Row thumbnails may already be blue (they take the same local
+    // route); the panel's poster is far larger than all of them.
+    pumpFor(app, 3_000);
+    const blue_before = blk: {
+        const shot = app.snapshotRgba(child.win, null) catch return "pdf fallback: snapshot";
+        defer allocator.free(shot.px);
+        break :blk pixelBox(shot, .{ 0, 0, 255 }).n;
+    };
+    const small_row = ocrRowCenter(allocator, app, child.win, "smallpaper", 10_000) orelse return "pdf fallback: smallpaper row not found";
+    app.clickEx(child.win, small_row.x, small_row.y, 1, 60, 1) catch return "pdf fallback: selecting smallpaper failed";
+    const Grew = struct {
+        fn done(before: usize, box: PixelBox) bool {
+            return box.n > before + 4000;
+        }
+    };
+    if (waitPixelBox(allocator, app, child.win, .{ 0, 0, 255 }, blue_before, Grew.done) == null) {
+        viewerShot(allocator, app, child.win, "pdf-fallback-pane-small");
+        return "pdf fallback: the preview pane did not show the small PDF rendered on this computer";
+    }
+    const big_row = ocrRowCenter(allocator, app, child.win, "hugepaper", 10_000) orelse return "pdf fallback: hugepaper row not found";
+    app.clickEx(child.win, big_row.x, big_row.y, 1, 60, 1) catch return "pdf fallback: selecting hugepaper failed";
+    if (!viewerWaitOcr(allocator, app, child.win, "2 MiB limit", 20_000)) {
+        viewerShot(allocator, app, child.win, "pdf-fallback-pane-big");
+        return "pdf fallback: the preview pane did not say the PDF is over the 2 MiB limit";
+    }
+    // The small PDF reuses the viewer's copy (one identity, one file);
+    // hostpaper.pdf's row thumbnail on this host staged the second one.
+    if (stagedPdfCount(rt) != staged_before + 2 or !stagedCopyExists(rt, "nopdfhost", ref) or stagedCopyExists(rt, "nopdfhost", big)) {
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: pdf fallback: %zu staged copies (expected %zu)\n", stagedPdfCount(rt), staged_before + 2);
+        return "pdf fallback: the file browser staged other copies than the two small PDFs (a refetch, or the PDF over 2 MiB)";
+    }
+    say("pdf fallback: preview pane showed the small PDF from the staged copy and refused the big one by size");
+    if (!closeRenameFiles(app, child)) return "pdf fallback: the Files window did not close cleanly";
     return null;
 }
 

@@ -87,6 +87,7 @@ comptime {
     _ = @import("mux/tagindex.zig");
     _ = @import("filebrowser/places.zig");
     _ = @import("filebrowser/previewers.zig");
+    _ = @import("filebrowser/pdflocal.zig");
     _ = @import("filebrowser/progress.zig");
     _ = @import("filebrowser/query.zig");
     _ = @import("filebrowser/registers.zig");

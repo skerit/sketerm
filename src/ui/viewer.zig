@@ -28,6 +28,8 @@ const appmenu = @import("appmenu.zig");
 const remotestream = @import("remotestream.zig");
 const crashlog = @import("../util/crashlog.zig");
 const imagepolicy = @import("../util/imagepolicy.zig");
+const pdflocal = @import("../filebrowser/pdflocal.zig");
+const fsjob = @import("../mux/fsjob.zig");
 
 pub const Variant = enum { preview, original, external_copy, head };
 const PREVIEW_BYTES_MAX: usize = 2 << 20;
@@ -55,7 +57,7 @@ pub const LoadResult = struct {
     summary: [96]u8 = undefined,
     summary_len: usize = 0,
     source_bytes: usize = 0,
-    message: [160]u8 = undefined,
+    message: [320]u8 = undefined,
     message_len: usize = 0,
     metadata: [1024]u8 = undefined,
     metadata_len: usize = 0,
@@ -64,6 +66,9 @@ pub const LoadResult = struct {
     /// A quick low-resolution stand-in shown while this load's real
     /// preview is still on its way; it never chains further loads.
     interim: bool = false,
+    /// The host's preview job failed because its generator is not
+    /// installed (`fsjob.NO_GENERATOR_KIND`).
+    no_generator: bool = false,
 
     pub fn messageText(self: *const LoadResult) []const u8 {
         return self.message[0..self.message_len];
@@ -606,6 +611,15 @@ fn fetchOn(work: *LoadWork, fs: *fsdrive.Fs, resource: model.Resource) !FetchPay
         },
         .preview => |p| p,
     };
+    // A remote PDF whose host is known to lack pdftoppm is rendered
+    // here without asking it first (filebrowser/pdflocal.zig).
+    const remote = resource.host != null;
+    const host_pdf = pdflocal.hostPdf(fs.conn.caps.preview_tools, fs.conn.pdf_preview);
+    switch (pdflocal.routeBefore(remote, resource.name(), host_pdf, source.size)) {
+        .host => {},
+        .local => return renderPdfHere(work, fs, resource, source),
+        .too_large => return pdfTooLarge(work, resource, source.size),
+    }
     // Every job starts in one round trip: the host renders the previews
     // on parallel helpers, and the quick one is on screen while the
     // sized one crosses the link.
@@ -626,10 +640,70 @@ fn fetchOn(work: *LoadWork, fs: *fsdrive.Fs, resource: model.Resource) !FetchPay
             if (isTransportError(err)) return err;
         }
     }
-    const bytes = try fetchSidecar(fs, job, &work.result);
+    const bytes = fetchSidecar(fs, job, &work.result) catch |err| {
+        const kind: []const u8 = if (work.result.no_generator) fsjob.NO_GENERATOR_KIND else "";
+        const route = if (err == error.PreviewFailed) pdflocal.routeAfterFailure(remote, resource.name(), kind, source.size) else null;
+        switch (route orelse return err) {
+            .host => return err,
+            .local => {
+                fs.cancelSubmitted();
+                work.result.message_len = 0;
+                work.result.no_generator = false;
+                return renderPdfHere(work, fs, resource, source);
+            },
+            .too_large => return pdfTooLarge(work, resource, source.size),
+        }
+    };
     var payload = FetchPayload{ .source_size = @intCast(source.size), .bytes = bytes };
     finishMetadata(fs, meta, &payload);
     return payload;
+}
+
+/// A remote PDF its host cannot render, over the size fetched to render here.
+fn pdfTooLarge(work: *LoadWork, resource: model.Resource, size: u64) error{PreviewFailed} {
+    var buf: [320]u8 = undefined;
+    work.result.setMessage(pdflocal.tooLargeMessage(&buf, resource.host orelse "the host", size));
+    return error.PreviewFailed;
+}
+
+/// Fetch a remote PDF its host cannot render into the staging cache
+/// (unless an identical copy is already there) and have the LOCAL daemon
+/// render its poster.
+fn renderPdfHere(work: *LoadWork, remote: *fsdrive.Fs, resource: model.Resource, source: fsdrive.ReadInfo) !FetchPayload {
+    const allocator = std.heap.c_allocator;
+    const host = resource.host orelse "the host";
+    const cache = c.g_get_user_cache_dir() orelse return error.NoCacheDirectory;
+    var staged_buf: [4096]u8 = undefined;
+    const mtime_ms = @divTrunc(source.mtime_ns, std.time.ns_per_ms);
+    const staged = pdflocal.stagedPath(&staged_buf, std.mem.span(cache), host, resource.path, source.size, mtime_ms) orelse
+        return error.PathTooLong;
+    if (!pdflocal.isStaged(staged, source.size)) {
+        const bytes = readAll(remote, resource.path, pdflocal.LOCAL_RENDER_MAX_BYTES) catch |err| return fsError(work, remote, err);
+        defer allocator.free(bytes);
+        pdflocal.stage(staged, bytes) catch |err| {
+            work.result.setMessage("cannot stage the PDF to preview it on this computer");
+            return err;
+        };
+    }
+    if (!work.target.current(work.generation)) return error.Canceled;
+    var local = try connectFs(null);
+    defer local.deinit();
+    // The local socket is what a cancel must shut down now; the remote
+    // one is handed back for whatever this load still asks of it.
+    if (!work.target.registerFd(work.generation, local.conn.fd)) return error.Canceled;
+    defer {
+        work.target.clearFd(work.generation, local.conn.fd);
+        _ = work.target.registerFd(work.generation, remote.conn.fd);
+    }
+    const job = try local.awaitJob(try local.previewSubmit(staged, "png", 0));
+    const bytes = fetchSidecar(&local, job, &work.result) catch |err| {
+        if (work.result.no_generator) {
+            var buf: [320]u8 = undefined;
+            work.result.setMessage(pdflocal.neitherMessage(&buf, host));
+        }
+        return err;
+    };
+    return .{ .source_size = @intCast(source.size), .bytes = bytes };
 }
 
 /// Wait for a preview job and read (then release) its sidecar; a job
@@ -638,12 +712,15 @@ fn fetchSidecar(fs: *fsdrive.Fs, job: u64, result: ?*LoadResult) ![]u8 {
     var event = try fs.waitJobTerminal(job, LOAD_TIMEOUT_MS);
     defer event.deinit();
     if (!std.mem.eql(u8, event.ev, "done") or event.path.len == 0) {
-        if (result) |r| r.setMessage(if (event.message.len > 0)
-            event.message
-        else if (std.mem.eql(u8, event.ev, "done"))
-            "the host produced no preview image"
-        else
-            "the host's preview job failed");
+        if (result) |r| {
+            r.no_generator = std.mem.eql(u8, event.kind, fsjob.NO_GENERATOR_KIND);
+            r.setMessage(if (event.message.len > 0)
+                event.message
+            else if (std.mem.eql(u8, event.ev, "done"))
+                "the host produced no preview image"
+            else
+                "the host's preview job failed");
+        }
         return error.PreviewFailed;
     }
     // Released without waiting: the reply is not worth a round trip
@@ -1975,7 +2052,7 @@ fn onHeadLoaded(self: *ViewerWindow, result: *LoadResult) void {
     // guards a head that raced a same-item mode change.
     if (self.content != .text) return;
     const head = result.head orelse {
-        var message: [256:0]u8 = undefined;
+        var message: [512:0]u8 = undefined;
         const text = std.fmt.bufPrintSentinel(&message, "Unable to load the file: {s}", .{result.messageText()}, 0) catch
             "Unable to load the file";
         c.gtk_label_set_text(self.status, text.ptr);
@@ -2079,7 +2156,7 @@ fn onLoaded(user: ?*anyopaque, result: *LoadResult) void {
                 if (self.target.start(resource.spec, .original)) return;
             };
         }
-        var message: [256:0]u8 = undefined;
+        var message: [512:0]u8 = undefined;
         const text = std.fmt.bufPrintSentinel(&message, "Unable to load {s}: {s}", .{
             if (result.variant == .preview) "preview" else "full resolution",
             result.messageText(),

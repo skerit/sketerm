@@ -42,6 +42,8 @@ const image_canvas = @import("../image_canvas.zig");
 const image_decoder = @import("../image_decoder.zig");
 const viewer_ui = @import("../viewer.zig");
 const paths_mod = @import("../../filebrowser/paths.zig");
+const pdflocal = @import("../../filebrowser/pdflocal.zig");
+const fsjob = @import("../../mux/fsjob.zig");
 
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
@@ -195,7 +197,11 @@ pub const RemoteThumb = struct {
     hc: *HostConn,
     path: []u8,
     mtime_ms: i64,
-    phase: enum { start_job, wait_job, read_thumb } = .start_job,
+    /// The entry's size; gates rendering a PDF here (pdflocal.zig).
+    size: u64 = 0,
+    /// `fetch_source` pulls a PDF its host cannot render, `local_wait`
+    /// waits for the local daemon that renders it instead.
+    phase: enum { start_job, wait_job, read_thumb, fetch_source, local_wait } = .start_job,
     req: u32 = 0,
     job: u64 = 0,
     buf: std.ArrayList(u8) = .empty,
@@ -207,12 +213,24 @@ pub const RemoteThumb = struct {
     /// Monotonic ms of the last frame that belonged to this fetch;
     /// what REMOTE_THUMB_SILENCE_MS is measured from.
     last_ms: i64 = 0,
+    /// The local daemon rendering a staged copy of this PDF instead of
+    /// `hc`; every op and frame after the staging rides it, while `hc`
+    /// and `path` stay the entry's identity.
+    via: ?*HostConn = null,
+    /// The staged local copy `via` renders (owned).
+    staged: []u8 = &.{},
 
     pub fn destroy(self: *RemoteThumb, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
         if (self.asset.len > 0) allocator.free(self.asset);
+        if (self.staged.len > 0) allocator.free(self.staged);
         self.buf.deinit(allocator);
         allocator.destroy(self);
+    }
+
+    /// The connection this fetch's ops and frames currently use.
+    pub fn wire(self: *const RemoteThumb) *HostConn {
+        return self.via orelse self.hc;
     }
 
     /// A frame for this fetch arrived: the host is alive on it.
@@ -235,6 +253,10 @@ pub const PreviewRead = struct {
     path: []u8,
     /// Cache identity, "host\x00path\x00mtime" (owned).
     key: []u8,
+    /// The entry's size and mtime (0 = unknown); a PDF its host cannot
+    /// render is fetched and rendered here only up to pdflocal's cap.
+    size: u64 = 0,
+    mtime_ms: i64 = 0,
     /// Host-side scratch file to unlink once read (owned; empty for
     /// producers that read the source or the thumbnail cache).
     temp: []u8 = &.{},
@@ -258,22 +280,36 @@ pub const PreviewRead = struct {
     /// Generation allowed to paint this result; 0 for a preload.
     generation: u64,
     /// `job_start` waits for the id, `job_wait` for its events,
-    /// `read_file` streams the bytes to show.
-    phase: enum { job_start, job_wait, read_file } = .job_start,
+    /// `read_file` streams the bytes to show. `fetch_source` pulls a
+    /// PDF its host cannot render and `local_wait` waits for the local
+    /// daemon that renders it instead (pdflocal.zig).
+    phase: enum { job_start, job_wait, read_file, fetch_source, local_wait } = .job_start,
     job: u64 = 0,
     /// Metadata the generator reported alongside its image (owned).
     note: []u8 = &.{},
     buf: std.ArrayList(u8) = .empty,
     /// A host-command image needs one second job to resize/transcode it.
     needs_transport: bool = false,
+    /// The local daemon rendering a staged copy of this PDF instead of
+    /// `hc`; every op and frame after the staging rides it, while the
+    /// key stays the entry's.
+    via: ?*HostConn = null,
+    /// The staged local copy `via` renders (owned).
+    staged: []u8 = &.{},
 
     pub fn destroy(self: *PreviewRead, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
         allocator.free(self.key);
         if (self.temp.len > 0) allocator.free(self.temp);
         if (self.note.len > 0) allocator.free(self.note);
+        if (self.staged.len > 0) allocator.free(self.staged);
         self.buf.deinit(allocator);
         allocator.destroy(self);
+    }
+
+    /// The connection this read's ops and frames currently use.
+    pub fn wire(self: *const PreviewRead) *HostConn {
+        return self.via orelse self.hc;
     }
 };
 
@@ -310,6 +346,7 @@ pub const PreloadItem = struct {
     path: []u8,
     key: []u8,
     mtime_ms: i64,
+    size: u64 = 0,
 
     fn deinit(self: *PreloadItem, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -793,7 +830,7 @@ pub fn thumbLookup(self: *BrowserView, hc: *HostConn, full: []const u8, e: Entry
         // A remote entry may already be on the local disk cache from
         // an earlier visit: decode that instead of paying the wire.
         if (hc.host != null and remoteThumbFromDisk(self, full, identity, e.mtime_ms)) return null;
-        self.enqueueRemoteThumb(hc, full, e.mtime_ms);
+        self.enqueueRemoteThumb(hc, full, e.mtime_ms, e.size);
     }
     return null;
 }
@@ -968,7 +1005,7 @@ fn sweepRemoteThumbCache(dirz: [*:0]const u8) void {
     });
 }
 
-pub fn enqueueRemoteThumb(self: *BrowserView, hc: *HostConn, path: []const u8, mtime_ms: i64) void {
+pub fn enqueueRemoteThumb(self: *BrowserView, hc: *HostConn, path: []const u8, mtime_ms: i64, size: u64) void {
     for (self.remote_thumbs.items) |rt| {
         if (rt.hc == hc and std.mem.eql(u8, rt.path, path)) return;
     }
@@ -988,6 +1025,7 @@ pub fn enqueueRemoteThumb(self: *BrowserView, hc: *HostConn, path: []const u8, m
             return;
         },
         .mtime_ms = mtime_ms,
+        .size = size,
     };
     self.remote_thumb_queue.append(self.allocator, rt) catch {
         rt.destroy(self.allocator);
@@ -1005,6 +1043,13 @@ pub fn pumpRemoteThumbs(self: *BrowserView) void {
             rt.destroy(self.allocator);
             continue;
         }
+        const route = pdflocal.routeBefore(rt.hc.host != null, std.fs.path.basename(rt.path), hostPdfOf(rt.hc), rt.size);
+        if (route == .too_large) {
+            // Thumbnails stay silent: no fetch, no note, just no picture.
+            self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
+            rt.destroy(self.allocator);
+            continue;
+        }
         rt.req = self.nextReq();
         rt.phase = .start_job;
         rt.touch();
@@ -1013,6 +1058,10 @@ pub fn pumpRemoteThumbs(self: *BrowserView) void {
             return;
         };
         armRemoteThumbWatch(self);
+        if (route == .local) {
+            startLocalThumb(self, rt);
+            continue;
+        }
         // Generation happens on the file-owning host. Only the
         // bounded JXL/WebP sidecar returns over the wire. Remote
         // hosts cache the codec bytes themselves (wire_cache) —
@@ -1026,6 +1075,70 @@ pub fn pumpRemoteThumbs(self: *BrowserView) void {
             .image_codecs = wireImageCodecs(rt.hc),
             .wire_cache = rt.hc.host != null,
         });
+    }
+}
+
+/// What `hc`'s daemon said about rendering PDFs.
+fn hostPdfOf(hc: *HostConn) pdflocal.HostPdf {
+    const conn = hc.io();
+    return pdflocal.hostPdf(conn.caps.preview_tools, conn.pdf_preview);
+}
+
+/// The staged local copy of `hc`'s PDF at `path` (pdflocal.stagedPath).
+fn stagedPdfPath(buf: []u8, hc: *HostConn, path: []const u8, size: u64, mtime_ms: i64) ?[]const u8 {
+    const cache = c.g_get_user_cache_dir() orelse return null;
+    return pdflocal.stagedPath(buf, std.mem.span(@as([*:0]const u8, @ptrCast(cache))), hc.host orelse return null, path, size, mtime_ms);
+}
+
+/// The local daemon's connection for rendering a staged PDF, or null
+/// when it cannot be reached.
+fn localDaemon(self: *BrowserView) ?*HostConn {
+    const local = self.hostConnFor(null) orelse return null;
+    return if (local.state == .dead) null else local;
+}
+
+fn failThumb(self: *BrowserView, rt: *RemoteThumb) void {
+    self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
+    self.finishRemoteThumb(rt);
+}
+
+/// Render the thumbnail of a PDF its host cannot render on the local
+/// daemon: from the staged copy when there is one, else fetch it first.
+fn startLocalThumb(self: *BrowserView, rt: *RemoteThumb) void {
+    var buf: [4096]u8 = undefined;
+    const staged = stagedPdfPath(&buf, rt.hc, rt.path, rt.size, rt.mtime_ms) orelse return failThumb(self, rt);
+    rt.staged = self.allocator.dupe(u8, staged) catch return failThumb(self, rt);
+    if (pdflocal.isStaged(rt.staged, rt.size)) return renderStagedThumb(self, rt);
+    // One read carries the whole PDF (pdflocal's cap is one MAX_READ).
+    rt.phase = .fetch_source;
+    rt.req = self.nextReq();
+    rt.buf.clearRetainingCapacity();
+    self.sendOp(rt.hc, .{ .req = rt.req, .op = "read", .path = rt.path, .off = @as(u64, 0), .len = pdflocal.LOCAL_RENDER_MAX_BYTES });
+}
+
+fn renderStagedThumb(self: *BrowserView, rt: *RemoteThumb) void {
+    rt.via = localDaemon(self) orelse return failThumb(self, rt);
+    if (rt.via.?.state != .ready) {
+        rt.phase = .local_wait;
+        return;
+    }
+    sendLocalThumb(self, rt);
+}
+
+fn sendLocalThumb(self: *BrowserView, rt: *RemoteThumb) void {
+    rt.phase = .start_job;
+    rt.req = self.nextReq();
+    rt.touch();
+    self.sendOp(rt.via.?, .{ .req = rt.req, .op = "thumbnail", .path = rt.staged, .image_codecs = "png", .wire_cache = false });
+}
+
+/// A connection came up: start the local renders that waited for it.
+pub fn previewHostReady(self: *BrowserView, hc: *HostConn) void {
+    for (self.remote_thumbs.items) |rt| {
+        if (rt.phase == .local_wait and rt.via == hc) sendLocalThumb(self, rt);
+    }
+    inline for (.{ &self.preview_read, &self.preview_state.preload_read }) |slot| {
+        if (slot.*) |pr| if (pr.phase == .local_wait and pr.via == hc) sendLocalPreview(self, pr);
     }
 }
 
@@ -1065,14 +1178,14 @@ pub fn onRemoteThumbWatch(user: ?*anyopaque) callconv(.c) c.gboolean {
             i += 1;
             continue;
         }
-        if (rt.phase == .wait_job and rt.job != 0 and rt.hc.state == .ready)
-            self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "job_cancel", .job = rt.job });
+        if (rt.phase == .wait_job and rt.job != 0 and rt.wire().state == .ready)
+            self.sendOp(rt.wire(), .{ .req = @as(u32, 0), .op = "job_cancel", .job = rt.job });
         self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
         // Removed WITHOUT pumping: the pump below runs once, after
         // every timed-out slot is gone.
         _ = self.remote_thumbs.orderedRemove(i);
-        if (rt.asset.len > 0 and !rt.keep and rt.hc.state == .ready)
-            self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "unlink", .path = rt.asset });
+        if (rt.asset.len > 0 and !rt.keep and rt.wire().state == .ready)
+            self.sendOp(rt.wire(), .{ .req = @as(u32, 0), .op = "unlink", .path = rt.asset });
         rt.destroy(self.allocator);
     }
     self.pumpRemoteThumbs();
@@ -1091,8 +1204,8 @@ pub fn finishRemoteThumb(self: *BrowserView, rt: *RemoteThumb) void {
             break;
         }
     }
-    if (rt.asset.len > 0 and !rt.keep and rt.hc.state == .ready)
-        self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "unlink", .path = rt.asset });
+    if (rt.asset.len > 0 and !rt.keep and rt.wire().state == .ready)
+        self.sendOp(rt.wire(), .{ .req = @as(u32, 0), .op = "unlink", .path = rt.asset });
     rt.destroy(self.allocator);
     self.pumpRemoteThumbs();
 }
@@ -1157,7 +1270,20 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
                     }
                     return true;
                 },
-                .wait_job => return false,
+                .fetch_source => {
+                    if (!rep.ok or !rep.eof or rep.size > pdflocal.LOCAL_RENDER_MAX_BYTES or rt.buf.items.len != rep.size) {
+                        failThumb(self, rt);
+                        return true;
+                    }
+                    pdflocal.stage(rt.staged, rt.buf.items) catch {
+                        failThumb(self, rt);
+                        return true;
+                    };
+                    rt.buf.clearRetainingCapacity();
+                    renderStagedThumb(self, rt);
+                    return true;
+                },
+                .wait_job, .local_wait => return false,
             }
         },
         .fs_job => {
@@ -1176,10 +1302,17 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
                 rt.req = self.nextReq();
                 rt.phase = .read_thumb;
                 rt.buf.clearRetainingCapacity();
-                self.sendOp(rt.hc, .{ .req = rt.req, .op = "read", .path = ev.path, .off = @as(u64, 0), .len = @as(u64, 2 << 20) });
+                self.sendOp(rt.wire(), .{ .req = rt.req, .op = "read", .path = ev.path, .off = @as(u64, 0), .len = @as(u64, 2 << 20) });
             } else if (std.mem.eql(u8, ev.ev, "error") or std.mem.eql(u8, ev.ev, "canceled")) {
-                self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
-                self.finishRemoteThumb(rt);
+                // A host without the PDF generator: render it here.
+                const route = if (rt.via == null)
+                    pdflocal.routeAfterFailure(rt.hc.host != null, std.fs.path.basename(rt.path), ev.kind, rt.size)
+                else
+                    null;
+                if (route == .local) {
+                    rt.job = 0;
+                    startLocalThumb(self, rt);
+                } else failThumb(self, rt);
             }
             return true;
         },
@@ -1189,7 +1322,7 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
 
 fn thumbByReq(self: *BrowserView, hc: *HostConn, req: u32) ?*RemoteThumb {
     for (self.remote_thumbs.items) |rt| {
-        if (rt.hc == hc and rt.req == req) return rt;
+        if (rt.wire() == hc and rt.req == req) return rt;
     }
     return null;
 }
@@ -1197,7 +1330,7 @@ fn thumbByReq(self: *BrowserView, hc: *HostConn, req: u32) ?*RemoteThumb {
 fn thumbByJob(self: *BrowserView, hc: *HostConn, job: u64) ?*RemoteThumb {
     if (job == 0) return null;
     for (self.remote_thumbs.items) |rt| {
-        if (rt.hc == hc and rt.phase == .wait_job and rt.job == job) return rt;
+        if (rt.wire() == hc and rt.phase == .wait_job and rt.job == job) return rt;
     }
     return null;
 }
@@ -1296,10 +1429,10 @@ pub fn severPreviewAnimation(self: *BrowserView) void {
 /// Drop everything this host owed the preview pipeline.
 pub fn previewHostDied(self: *BrowserView, hc: *HostConn) void {
     if (self.preview_read) |pr| {
-        if (pr.hc == hc) self.abandonPreviewRead();
+        if (pr.hc == hc or pr.via == hc) self.abandonPreviewRead();
     }
     if (self.preview_state.preload_read) |pr| {
-        if (pr.hc == hc) self.abandonPreload();
+        if (pr.hc == hc or pr.via == hc) self.abandonPreload();
     }
     var i: usize = 0;
     while (i < self.preview_state.preload_queue.items.len) {
@@ -1325,10 +1458,10 @@ pub fn abandonPreload(self: *BrowserView) void {
 fn endRead(self: *BrowserView, slot: *?*PreviewRead) void {
     const pr = slot.* orelse return;
     slot.* = null;
-    if (pr.phase == .job_wait and pr.job != 0 and pr.hc.state == .ready)
-        self.sendOp(pr.hc, .{ .req = @as(u32, 0), .op = "job_cancel", .job = pr.job });
-    if (pr.temp.len > 0 and !pr.keep and pr.hc.state == .ready)
-        self.sendOp(pr.hc, .{ .req = @as(u32, 0), .op = "unlink", .path = pr.temp });
+    if (pr.phase == .job_wait and pr.job != 0 and pr.wire().state == .ready)
+        self.sendOp(pr.wire(), .{ .req = @as(u32, 0), .op = "job_cancel", .job = pr.job });
+    if (pr.temp.len > 0 and !pr.keep and pr.wire().state == .ready)
+        self.sendOp(pr.wire(), .{ .req = @as(u32, 0), .op = "unlink", .path = pr.temp });
     pr.destroy(self.allocator);
 }
 
@@ -1341,10 +1474,10 @@ pub fn shutdownTransfers(self: *BrowserView) void {
         self.remote_thumb_watch = 0;
     }
     for (self.remote_thumbs.items) |rt| {
-        if (rt.phase == .wait_job and rt.job != 0 and rt.hc.state == .ready)
-            self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "job_cancel", .job = rt.job });
-        if (rt.asset.len > 0 and !rt.keep and rt.hc.state == .ready)
-            self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "unlink", .path = rt.asset });
+        if (rt.phase == .wait_job and rt.job != 0 and rt.wire().state == .ready)
+            self.sendOp(rt.wire(), .{ .req = @as(u32, 0), .op = "job_cancel", .job = rt.job });
+        if (rt.asset.len > 0 and !rt.keep and rt.wire().state == .ready)
+            self.sendOp(rt.wire(), .{ .req = @as(u32, 0), .op = "unlink", .path = rt.asset });
         rt.destroy(self.allocator);
     }
     self.remote_thumbs.clearRetainingCapacity();
@@ -2097,6 +2230,8 @@ fn startPreview(
             self.allocator.destroy(pr);
             return;
         },
+        .size = size,
+        .mtime_ms = mtime_ms,
         .output = handler.output,
         .force_hex = handler.producer == .builtin and handler.producer.builtin == .hex,
         .cast_meta = handler.producer == .builtin and handler.producer.builtin == .cast,
@@ -2124,7 +2259,11 @@ fn startPreview(
                     .off = @as(u64, 0),
                     .len = @as(u64, PREVIEW_ANIM_CAP),
                 });
-            } else self.sendOp(hc, .{ .req = pr.req, .op = "preview", .path = pr.path, .image_codecs = wireImageCodecs(hc), .wire_cache = hc.host != null }),
+            } else switch (pdflocal.routeBefore(hc.host != null, name, hostPdfOf(hc), size)) {
+                .host => self.sendOp(hc, .{ .req = pr.req, .op = "preview", .path = pr.path, .image_codecs = wireImageCodecs(hc), .wire_cache = hc.host != null }),
+                .local => startLocalPreview(self, pr),
+                .too_large => failPdfTooLarge(self, pr, size),
+            },
             .head, .hex, .cast => {
                 pr.phase = .read_file;
                 self.sendOp(hc, .{
@@ -2264,7 +2403,7 @@ fn feedReadSlot(
     payload: []const u8,
 ) bool {
     const pr = slot.* orelse return false;
-    if (pr.hc != hc) return false;
+    if (pr.wire() != hc) return false;
     switch (ftype) {
         .fs_data => {
             if (payload.len < 12) return false;
@@ -2297,7 +2436,7 @@ fn feedReadSlot(
                         .fetch_more => {
                             pr.last_len = pr.buf.items.len;
                             pr.req = self.nextReq();
-                            self.sendOp(pr.hc, .{
+                            self.sendOp(pr.wire(), .{
                                 .req = pr.req,
                                 .op = "read",
                                 .path = pr.path,
@@ -2327,7 +2466,24 @@ fn feedReadSlot(
                     endSlot(self, slot);
                     return true;
                 },
-                .job_wait => return false,
+                .fetch_source => {
+                    if (!rep.ok) {
+                        failRead(self, pr, errorPhrase(rep.@"error"));
+                    } else if (!rep.eof or rep.size > pdflocal.LOCAL_RENDER_MAX_BYTES or pr.buf.items.len != rep.size) {
+                        // Grown past the cap since it was listed.
+                        failPdfTooLarge(self, pr, @max(rep.size, pr.buf.items.len));
+                        return true;
+                    } else if (pdflocal.stage(pr.staged, pr.buf.items)) |_| {
+                        pr.buf.clearRetainingCapacity();
+                        renderStagedPreview(self, pr);
+                        return true;
+                    } else |_| {
+                        failRead(self, pr, "cannot stage the PDF to preview it on this computer");
+                    }
+                    endSlot(self, slot);
+                    return true;
+                },
+                .job_wait, .local_wait => return false,
             }
         },
         .fs_job => {
@@ -2377,7 +2533,7 @@ fn feedReadSlot(
                         return true;
                     };
                     if (pr.temp.len > 0) {
-                        if (!pr.keep) self.sendOp(pr.hc, .{ .req = @as(u32, 0), .op = "unlink", .path = pr.temp });
+                        if (!pr.keep) self.sendOp(pr.wire(), .{ .req = @as(u32, 0), .op = "unlink", .path = pr.temp });
                         self.allocator.free(pr.temp);
                     }
                     pr.temp = replacement;
@@ -2387,11 +2543,11 @@ fn feedReadSlot(
                     pr.needs_transport = false;
                     pr.phase = .job_start;
                     pr.req = self.nextReq();
-                    self.sendOp(pr.hc, .{
+                    self.sendOp(pr.wire(), .{
                         .req = pr.req,
                         .op = "preview_transport",
                         .path = asset,
-                        .image_codecs = wireImageCodecs(pr.hc),
+                        .image_codecs = wireImageCodecs(pr.wire()),
                         .delete_source = true,
                     });
                     self.allocator.free(pr.temp);
@@ -2401,7 +2557,7 @@ fn feedReadSlot(
                 pr.phase = .read_file;
                 pr.req = self.nextReq();
                 pr.buf.clearRetainingCapacity();
-                self.sendOp(pr.hc, .{
+                self.sendOp(pr.wire(), .{
                     .req = pr.req,
                     .op = "read",
                     .path = asset,
@@ -2411,13 +2567,81 @@ fn feedReadSlot(
                 return true;
             }
             if (std.mem.eql(u8, ev.ev, "error") or std.mem.eql(u8, ev.ev, "canceled")) {
-                failRead(self, pr, if (ev.message.len > 0) ev.message else "preview unavailable");
+                // A host without the PDF generator: render it here.
+                const route = if (pr.via == null and std.mem.eql(u8, ev.ev, "error"))
+                    pdflocal.routeAfterFailure(pr.hc.host != null, std.fs.path.basename(pr.path), ev.kind, pr.size)
+                else
+                    null;
+                if (route) |r| switch (r) {
+                    .local => {
+                        pr.job = 0;
+                        startLocalPreview(self, pr);
+                        return true;
+                    },
+                    .too_large => {
+                        failPdfTooLarge(self, pr, pr.size);
+                        return true;
+                    },
+                    .host => {},
+                };
+                if (pr.via != null and std.mem.eql(u8, ev.kind, fsjob.NO_GENERATOR_KIND)) {
+                    var buf: [320]u8 = undefined;
+                    failRead(self, pr, pdflocal.neitherMessage(&buf, pr.hc.label()));
+                } else failRead(self, pr, if (ev.message.len > 0) ev.message else "preview unavailable");
                 endSlot(self, slot);
             }
             return true;
         },
         else => return false,
     }
+}
+
+/// The slot `pr` occupies.
+fn readSlot(self: *BrowserView, pr: *PreviewRead) *?*PreviewRead {
+    return if (pr.preload) &self.preview_state.preload_read else &self.preview_read;
+}
+
+/// Show and cache `message` for `pr`, then release its slot.
+fn failSlot(self: *BrowserView, pr: *PreviewRead, message: []const u8) void {
+    failRead(self, pr, message);
+    endSlot(self, readSlot(self, pr));
+}
+
+/// A PDF its host cannot render is over the size fetched to render here.
+fn failPdfTooLarge(self: *BrowserView, pr: *PreviewRead, size: u64) void {
+    var buf: [320]u8 = undefined;
+    failSlot(self, pr, pdflocal.tooLargeMessage(&buf, pr.hc.label(), size));
+}
+
+/// Render the preview of a PDF its host cannot render on the local
+/// daemon: from the staged copy when there is one, else fetch it first.
+fn startLocalPreview(self: *BrowserView, pr: *PreviewRead) void {
+    var buf: [4096]u8 = undefined;
+    const staged = stagedPdfPath(&buf, pr.hc, pr.path, pr.size, pr.mtime_ms) orelse
+        return failSlot(self, pr, "cannot name a local copy of the PDF");
+    pr.staged = self.allocator.dupe(u8, staged) catch return failSlot(self, pr, "out of memory");
+    if (pdflocal.isStaged(pr.staged, pr.size)) return renderStagedPreview(self, pr);
+    // One read carries the whole PDF (pdflocal's cap is one MAX_READ).
+    pr.phase = .fetch_source;
+    pr.req = self.nextReq();
+    pr.buf.clearRetainingCapacity();
+    self.sendOp(pr.hc, .{ .req = pr.req, .op = "read", .path = pr.path, .off = @as(u64, 0), .len = pdflocal.LOCAL_RENDER_MAX_BYTES });
+}
+
+fn renderStagedPreview(self: *BrowserView, pr: *PreviewRead) void {
+    pr.via = localDaemon(self) orelse
+        return failSlot(self, pr, "the local daemon is unreachable, so the PDF cannot be previewed on this computer");
+    if (pr.via.?.state != .ready) {
+        pr.phase = .local_wait;
+        return;
+    }
+    sendLocalPreview(self, pr);
+}
+
+fn sendLocalPreview(self: *BrowserView, pr: *PreviewRead) void {
+    pr.phase = .job_start;
+    pr.req = self.nextReq();
+    self.sendOp(pr.via.?, .{ .req = pr.req, .op = "preview", .path = pr.staged, .image_codecs = "png", .wire_cache = false });
 }
 
 /// Demote an in-flight animated original fetch to the ordinary
@@ -2429,12 +2653,12 @@ fn restartAsThumbnail(self: *BrowserView, pr: *PreviewRead) void {
     pr.phase = .job_start;
     pr.req = self.nextReq();
     pr.buf.clearRetainingCapacity();
-    self.sendOp(pr.hc, .{
+    self.sendOp(pr.wire(), .{
         .req = pr.req,
         .op = "preview",
         .path = pr.path,
-        .image_codecs = wireImageCodecs(pr.hc),
-        .wire_cache = pr.hc.host != null,
+        .image_codecs = wireImageCodecs(pr.wire()),
+        .wire_cache = pr.wire().host != null,
     });
 }
 
@@ -2737,6 +2961,7 @@ pub fn schedulePreload(self: *BrowserView, tab: *BTab, current: []const u8) void
             .path = owned_path,
             .key = owned_key,
             .mtime_ms = entry.mtime_ms,
+            .size = entry.size,
         }) catch {
             self.allocator.free(owned_path);
             self.allocator.free(owned_key);
@@ -2754,7 +2979,7 @@ pub fn pumpPreload(self: *BrowserView) void {
         defer item.deinit(self.allocator);
         if (item.hc.state != .ready) continue;
         if (previewCached(self, item.key)) continue;
-        startPreview(self, item.hc, item.path, item.mtime_ms, 0, false, true);
+        startPreview(self, item.hc, item.path, item.mtime_ms, item.size, false, true);
         if (self.preview_state.preload_read != null) return;
     }
 }
