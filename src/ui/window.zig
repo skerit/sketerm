@@ -1414,6 +1414,24 @@ pub const Window = struct {
     pub const installBrowserHooks = winfaces.installBrowserHooks;
 
     pub fn newShellTabWithProfile(self: *Window, title_opt: ?[*:0]const u8, profile_name: ?[]const u8) !void {
+        _ = try self.spawnShellTab(title_opt, profile_name);
+    }
+
+    /// The user's "New Tab" command (header and sidebar "+", the `new_tab` keybind): a browser owning the sidebar takes it, else a terminal tab.
+    pub fn newTabCommand(self: *Window) !void {
+        if (self.newTabInBrowser()) return;
+        try self.newTerminalTab();
+    }
+
+    /// A user-requested shell tab, split left/right when `new_tab_split` is set.
+    fn newTerminalTab(self: *Window) !void {
+        const pane = try self.spawnShellTab(null, null);
+        if (self.config.new_tab_split)
+            try self.splitPane(pane, @intCast(c.GTK_ORIENTATION_HORIZONTAL));
+    }
+
+    /// @return the tab's only pane.
+    fn spawnShellTab(self: *Window, title_opt: ?[*:0]const u8, profile_name: ?[]const u8) !*Pane {
         var num_buf: [32]u8 = undefined;
         const title = if (title_opt) |t| t else blk: {
             self.tab_counter += 1;
@@ -1425,7 +1443,7 @@ pub const Window = struct {
         // kitty / wezterm convention. Falls back to inherited cwd
         // when no focused pane has reported one.
         const cwd = self.focusedPaneCwd();
-        try self.addTabWithProfile(title, cwd, profile_name);
+        return self.addTabWithProfile(title, cwd, profile_name);
     }
 
     /// Spawn a tab via spawnShellPaneOpts (which honours the profile)
@@ -1436,7 +1454,7 @@ pub const Window = struct {
         title_z: [*:0]const u8,
         cwd: ?[]const u8,
         profile_name: ?[]const u8,
-    ) !void {
+    ) !*Pane {
         const pane = try self.spawnShellPaneOpts(cwd, profile_name);
         // spawnShellPaneOpts already appended to self.panes / .terminals.
         // Wrap pane.widget() in a Box so layout reparenting on splits
@@ -1449,6 +1467,7 @@ pub const Window = struct {
         const page = self.appendOrInsertTab(wrapper, .{ .leaf = pane }, false);
         c.adw_tab_page_set_title(page, title_z);
         c.adw_tab_page_set_tooltip(page, title_z);
+        return pane;
     }
 
     /// Host-qualified browser location for `pane`: its last-reported
@@ -2384,7 +2403,9 @@ pub const Window = struct {
         c.gtk_gl_area_queue_render(@ptrCast(new_pane.surface.area));
         c.gtk_widget_queue_resize(@ptrCast(paned));
 
-        _ = c.gtk_widget_grab_focus(focused_w);
+        // focused_w is the pane's wrapper Box, which cannot take focus;
+        // the reparent dropped focus, so give it back to the GLArea.
+        _ = c.gtk_widget_grab_focus(@ptrCast(focused_pane.surface.area));
     }
 
     pub fn closeCurrentTab(self: *Window) void {
@@ -2811,7 +2832,7 @@ pub const Window = struct {
     fn onOverviewCreateTab(_: *c.AdwTabOverview, user: ?*anyopaque) callconv(.c) ?*c.AdwTabPage {
         const self = cast.userData(Window, user);
         self.last_created_page = null;
-        self.newShellTab(null) catch |err| {
+        self.newTerminalTab() catch |err| {
             logActionError("overview_create_tab", err);
             return null;
         };
@@ -3491,8 +3512,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
     const self = cast.userData(Window, ctx);
     switch (action) {
         // A browser owning the sidebar takes "new tab" for itself.
-        .new_tab => if (!self.newTabInBrowser())
-            self.newShellTab(null) catch |err| logActionError("new_tab", err),
+        .new_tab => self.newTabCommand() catch |err| logActionError("new_tab", err),
         .close_tab => self.closeCurrentTreeItem(),
         .next_tab => self.nextTab(),
         .prev_tab => self.prevTab(),
@@ -3836,8 +3856,7 @@ fn onNewTabAction(_: *c.GSimpleAction, _: ?*c.GVariant, user: ?*anyopaque) callc
         };
         return;
     }
-    if (self.newTabInBrowser()) return;
-    self.newShellTab(null) catch |err| {
+    self.newTabCommand() catch |err| {
         std.debug.print("sketerm: new-tab action failed: {s}\n", .{@errorName(err)});
     };
 }
