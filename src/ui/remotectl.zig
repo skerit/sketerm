@@ -770,7 +770,7 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
                 const s = std.fmt.bufPrintSentinel(&num_buf, "Tab {d}", .{target.tab_counter}, 0) catch "shell";
                 break :tdef s.ptr;
             };
-            try target.addTabWithProfile(t, cwd, null);
+            _ = try target.addTabWithProfile(t, cwd, null);
         } else {
             try target.newShellTab(title_z);
         }

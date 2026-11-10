@@ -1009,6 +1009,9 @@ pub const Config = struct {
     /// Insert new tabs immediately after the focused one instead of
     /// appending at the end of the tab bar.
     new_tab_after_current: bool = false,
+    /// Split every new tab the user opens (the "+" buttons, the
+    /// `new_tab` keybind) into two side-by-side panes.
+    new_tab_split: bool = false,
     /// Confirm-on-close policy. Default: ask only if there's more
     /// than one pane being lost (matches Terminator's default).
     confirm_close: ConfirmClose = .multiple,
@@ -2804,6 +2807,7 @@ pub const keys = [_]Key{
     .{ .name = "close_button_on_tab", .codec = .bool },
     .{ .name = "always_on_top", .codec = .bool },
     .{ .name = "new_tab_after_current", .codec = .bool },
+    .{ .name = "new_tab_split", .codec = .bool },
     .{ .name = "confirm_close", .codec = .{ .enum_ = .{} } },
     // Mouse + hints.
     .{ .name = "mouse_autohide", .codec = .bool },
@@ -3878,6 +3882,20 @@ test "config: variants written by the prefs helpers survive a save/load round-tr
     try std.testing.expectEqual(false, s.variantCursorDefault(.dark));
     try std.testing.expectEqual(true, s.variantCursorDefault(.light));
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), s.variantColor(.dark, .cursor_color)[0], 0.005);
+}
+
+test "config: new_tab_split parses and round-trips" {
+    var parsed = try Config.loadFromBytes(std.testing.allocator, "new_tab_split = true\n");
+    defer parsed.deinit();
+    try std.testing.expectEqual(true, parsed.new_tab_split);
+    try std.testing.expectEqual(false, (Config{}).new_tab_split);
+
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try parsed.serialise(&w);
+    var again = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer again.deinit();
+    try std.testing.expectEqual(true, again.new_tab_split);
 }
 
 test "config: palette + scheme + new keys round-trip" {

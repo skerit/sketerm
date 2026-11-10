@@ -2125,6 +2125,7 @@ fn windowPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(tabs_group)), "Tabs");
     addTabPositionRow(@ptrCast(@alignCast(tabs_group)), ctx);
     addSwitchRow(@ptrCast(@alignCast(tabs_group)), ctx, "New tab after current", "Insert new tabs immediately after the focused one.", &ctx.cfg.new_tab_after_current, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(tabs_group)), ctx, "Split new tabs", "Open each new tab as two side-by-side panes.", &ctx.cfg.new_tab_split, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(tabs_group)), ctx, "Close button on tabs", "Show an X on each unpinned tab. Middle-click and the menus close tabs either way.", &ctx.cfg.close_button_on_tab, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(tabs_group)));
 

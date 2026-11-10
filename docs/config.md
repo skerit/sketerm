@@ -501,6 +501,7 @@ They are still accepted and ignored, so old files do not warn; use
 | `tab_child_insert` | enum | `last` | Where a new child tab lands among its siblings: `last` or `first`. |
 | `always_on_top` | bool | `false` | |
 | `new_tab_after_current` | bool | `false` | Insert new tabs after the focused one instead of appending. |
+| `new_tab_split` | bool | `false` | A new tab from the "+" buttons or the `new_tab` keybind opens split into two side-by-side panes. Tabs opened by other paths (CLI, layout restore, duplicate, profile picker) are unaffected. |
 | `confirm_close` | enum | `multiple` | `never`, `multiple` (only when more than one pane is being lost), `always` |
 | `show_titlebar` | bool | `false` | Per-pane title bar carrying the OSC 0/1/2 title. |
 | `title_active_fg` | colour | `#ffffff` | |
