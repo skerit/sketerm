@@ -23750,3 +23750,12 @@ is escaped. web_eval resolves a returned promise by default (`await:false` opts 
 used to answer `[object Promise]`. Snapshot listings leave out a text leaf repeating its
 parent, a label repeating the control after it, a container's name repeated by its only
 child, and `{n children}`; the model keeps every node and id.
+
+## 2026-11-10: new_tab_split; splits keep keyboard focus
+
+`new_tab_split = true` (Preferences > Window > Tabs, "Split new tabs") opens every
+user-requested new tab (header and sidebar "+", the overview "+" tile, the `new_tab`
+keybind) as two side-by-side panes; `Window.newTabCommand` is the one entry point those
+share. Every split used to leave no widget focused, because `splitPane` grabbed focus on
+the pane's non-focusable wrapper box: the first keystrokes typed after a split were lost.
+It now focuses the pane's GLArea.
