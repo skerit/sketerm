@@ -697,6 +697,20 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         say("smoke-mcp: focused concurrent web calls ok");
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_MCP_HANGUP_ONLY") != null) {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the stdin hangup stage");
+        _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+        defer _ = unsetEnv("SKETERM_WEB_BIN");
+        // Both engine owners: the MCP server's own helper, then the
+        // broker-owned one a default run uses.
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+        webHangupStage(allocator, exe, rt);
+        _ = unsetEnv("SKETERM_WEB_BROKER_ENGINE");
+        webHangupStage(allocator, exe, rt);
+        say("smoke-mcp: focused stdin hangup ok");
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBREAD_ONLY") != null) {
         var bin_buf: [4096:0]u8 = undefined;
         const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the reading stage");
@@ -2356,6 +2370,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             say("smoke-mcp: broker-owned shared profiles (real CEF) ok");
             webEngineLifecycleStage(allocator, exe, rt);
             say("smoke-mcp: broker-owned engine lifecycle (real CEF) ok");
+            webHangupStage(allocator, exe, rt);
+            say("smoke-mcp: stdin hangup ends calls in flight (real CEF) ok");
             webPresenterStage(allocator, exe, rt);
             say("smoke-mcp: watch-along presenter (real CEF) ok");
             // Last: a red audit must not hide the stages above.
@@ -8014,6 +8030,85 @@ fn webConcStage(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
     m.closeStdinWait();
 }
 
+/// Stage hu: web_eval answers by the timeout it is given (a never-settled
+/// promise, a blocked main thread, the 100ms floor), and a client that
+/// closes stdin during a call ends the server at once, the call's browser
+/// and instance dir with it — also while a call is blocked inside a step.
+fn webHangupStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var args: [512]u8 = undefined;
+    var path_buf: [1024]u8 = undefined;
+    const PAGE = "{\"url\":\"data:text/html,<title>hu</title>still here\",\"snapshot\":\"none\"}";
+    // Exit after the hangup, generously above the ~0.2s it takes.
+    const EXIT_MS: i64 = 1_500;
+    const engines_before = countPrimaryWebengines(allocator, rt);
+
+    // (1) web_eval past its timeout, then a hangup while a text wait is
+    // blocked on that page's first snapshot (the main thread is busy).
+    {
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        {
+            const caps = capSc(arena, m.callTool("capabilities", "{}"), "hu: capabilities", false);
+            for ([_][]const u8{ "web_eval_timeout_exact", "stdin_eof_ends_session" }) |fact| {
+                const v = caps.get(fact) orelse fail("hu: capabilities lacks a hangup/eval fact");
+                if (v != .bool or !v.bool) fail("hu: a hangup/eval capability fact is not true");
+            }
+        }
+        const pane = capInt(capSc(arena, m.callToolTimeout("web_open", PAGE, 60_000), "hu: open", false), "view");
+        const Case = struct { body: []const u8, timeout: i64, limit: i64, code: []const u8 };
+        const cases = [_]Case{
+            // The page answers: its own timer reports first.
+            .{ .body = "await new Promise(() => {});", .timeout = 1500, .limit = 2_000, .code = "timeout" },
+            // The main thread blocks: only the client-side deadline can.
+            .{ .body = "setTimeout(() => { for (;;) {} }, 20); await new Promise(() => {});", .timeout = 1500, .limit = 2_000, .code = "timeout" },
+            // Below the floor: 100ms.
+            .{ .body = "return 1;", .timeout = 1, .limit = 600, .code = "timeout" },
+        };
+        for (cases) |k| {
+            const t0 = nowMs();
+            const line = m.callToolTimeout("web_eval", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"body\":\"{s}\",\"timeout_ms\":{d}}}", .{ pane, k.body, k.timeout }) catch unreachable, 20_000);
+            const took = nowMs() - t0;
+            say(std.fmt.allocPrint(arena, "smoke-mcp: hu timing: web_eval timeout_ms={d} answered in {d}ms", .{ k.timeout, took }) catch "");
+            const sc = capSc(arena, line, "hu: an eval past its timeout", true);
+            expectFact(sc.get("error").?.object, "code", k.code, "hu: an eval past its timeout answered with the wrong code");
+            if (took > k.limit) fail("hu: web_eval answered well after its timeout_ms");
+        }
+        m.sendTool("web_wait", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"for\":\"text\",\"arg\":\"never there\",\"timeout_ms\":60000}}", .{pane}) catch unreachable);
+        _ = c.usleep(1_000_000);
+        const pid = m.pid;
+        const took = m.closeStdinTimed(20_000) orelse fail("hu: the server outlived its stdin by 20s during a blocked web_wait");
+        say(std.fmt.allocPrint(arena, "smoke-mcp: hu timing: exit {d}ms after stdin closed (blocked step)", .{took}) catch "");
+        if (took > EXIT_MS) fail("hu: closing stdin during a blocked web_wait did not end the server at once");
+        if (fileExists(std.fmt.bufPrint(&path_buf, "{s}/sketerm/mcp-tmp-{d}", .{ rt, pid }) catch unreachable))
+            fail("hu: the instance dir survived a hangup during a blocked call");
+    }
+
+    // (2) The report's case: a 60s web_wait on a page that never has the
+    // element, stdin closed after 1s.
+    {
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        const pane = capInt(capSc(arena, m.callToolTimeout("web_open", PAGE, 60_000), "hu: open", false), "view");
+        m.sendTool("web_wait", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"for\":\"selector\",\"arg\":\"#never\",\"timeout_ms\":60000}}", .{pane}) catch unreachable);
+        _ = c.usleep(1_000_000);
+        const pid = m.pid;
+        const took = m.closeStdinTimed(20_000) orelse fail("hu: the server outlived its stdin by 20s during web_wait");
+        say(std.fmt.allocPrint(arena, "smoke-mcp: hu timing: exit {d}ms after stdin closed (web_wait)", .{took}) catch "");
+        if (took > EXIT_MS) fail("hu: closing stdin during web_wait did not end the server at once");
+        if (fileExists(std.fmt.bufPrint(&path_buf, "{s}/sketerm/mcp-tmp-{d}", .{ rt, pid }) catch unreachable))
+            fail("hu: the instance dir survived a hangup during web_wait");
+    }
+
+    // No browser of either server is left behind (the broker-owned helper
+    // exits with its daemon a moment after the server).
+    var waited: u32 = 0;
+    while (countPrimaryWebengines(allocator, rt) > engines_before and waited < 50) : (waited += 1) _ = c.usleep(100_000);
+    if (countPrimaryWebengines(allocator, rt) > engines_before) fail("hu: a browser helper outlived the server whose stdin closed");
+}
+
 /// Stage wf's loopback site. Every connection is served on its own
 /// thread, and the slow paths count how many requests are in flight at
 /// once: the fixture, not the server's own report, proves the tab caps.
@@ -9005,6 +9100,8 @@ fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u
     say("smoke-mcp: focused web_fetch ok");
     webConcStage(allocator, exe);
     say("smoke-mcp: focused concurrent web calls ok");
+    webHangupStage(allocator, exe, rt);
+    say("smoke-mcp: focused stdin hangup ok");
     webReadStage(allocator, exe, rt);
     say("smoke-mcp: focused web reading ok");
     webPersistStage(allocator, exe, rt);

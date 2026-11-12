@@ -363,6 +363,12 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         // Calls on different tabs overlap; a consumer driving several
         // tabs over one connection plans on this.
         try res.fact("web_concurrent_tabs", @import("mcp_webjobs.zig").capability());
+        // web_eval's timeout_ms bounds the whole call, a blocked page
+        // included, and an await past it is code `timeout`.
+        try res.fact("web_eval_timeout_exact", true);
+        // Closing stdin ends this server at once, a call in flight too:
+        // a caller needs no short-slice polling to bound an orphan.
+        try res.fact("stdin_eof_ends_session", true);
         // Reading several urls without driving a tab: its limits are
         // what a caller plans a batch around.
         const fetch = @import("mcp_webfetch.zig").capability();

@@ -1634,6 +1634,7 @@ pub const Driver = union(enum) {
             .headless => |e| {
                 const deadline = clock.nowMs() + ms;
                 while (clock.nowMs() < deadline) {
+                    if (mcp.callerGone()) return;
                     const left = deadline - clock.nowMs();
                     e.pumpOnce(@intCast(std.math.clamp(left, 1, 40)));
                 }
@@ -2131,7 +2132,7 @@ pub const OpFlight = struct {
                     req.kind = .eval;
                     req.arg = op.data orelse "";
                     req.flags = if (op.await_promise) web_proto.eval_flag_await else 0;
-                    req.timeout_ms = @intCast(@min(@max(op.timeout_ms orelse 10_000, 100), mcp.WAIT_CAP_MS));
+                    req.timeout_ms = @intCast(@min(@max(op.timeout_ms orelse 10_000, 1), mcp.WAIT_CAP_MS));
                     req.max_str = op.max_chars;
                 } else return .{ .err = fail(.invalid_args, "unknown web-request op") };
 
@@ -4635,6 +4636,11 @@ pub fn webTool(arena: std.mem.Allocator, backend: mcp.Backend, name: []const u8,
             return err;
         };
         if (r) |reply| return reply;
+        // The client closed stdin: stop waiting for an answer nobody reads.
+        if (mcp.callerGone()) {
+            p.abandon();
+            return error.CallerGone;
+        }
         p.drv.sleep(p.pollMs());
     }
 }
@@ -5292,11 +5298,11 @@ fn webBody(
             .op = "eval",
             .data = code,
             .await_promise = want_await,
-            .timeout_ms = budget,
+            .timeout_ms = evalPageTimeout(budget),
             .max_chars = page_budget,
-            // The page-side budget is the caller's; this side allows a
-            // little more so a helper-side timeout REPORT still lands.
-        }, budget + 3000)) {
+            // The caller's timeout bounds the whole call; the page-side
+            // await timer runs a little inside it so its report lands.
+        }, budget)) {
             .err => |e| return failRes(arena, e),
             .flight => |f| f,
         };
@@ -5764,6 +5770,41 @@ fn waitReply(drv: Driver, arena: std.mem.Allocator, o: WaitOutcome, what_s: []co
     };
 }
 
+/// The most a page-side await timer runs short of web_eval's timeout.
+const EVAL_REPORT_MARGIN_MS: i64 = 500;
+
+/// web_eval's page-side await timer for a call timeout of `budget`: a
+/// fifth inside it, at most `EVAL_REPORT_MARGIN_MS`, so the page's own
+/// "never settled" report arrives before the client gives up at `budget`
+/// (which a page with a blocked main thread is what answers).
+fn evalPageTimeout(budget: i64) i64 {
+    return budget - @min(@divTrunc(budget, 5), EVAL_REPORT_MARGIN_MS);
+}
+
+test "web_eval's page-side timer runs inside the call timeout" {
+    try std.testing.expectEqual(@as(i64, 9500), evalPageTimeout(10_000));
+    try std.testing.expectEqual(@as(i64, 1200), evalPageTimeout(1500));
+    try std.testing.expectEqual(@as(i64, 80), evalPageTimeout(100));
+}
+
+/// Whether a failed eval's payload is the bridge's await-timer report.
+/// Its `note` is written by the bridge, never by page code.
+fn evalNeverSettled(arena: std.mem.Allocator, payload: []const u8) bool {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, payload, .{}) catch return false;
+    if (v != .object) return false;
+    const note = v.object.get("note") orelse return false;
+    return note == .string and std.mem.eql(u8, note.string, "the promise never settled");
+}
+
+test "web_eval tells its await timer from a rejection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expect(evalNeverSettled(a, "{\"error\":\"await timed out after 9500ms\",\"stack\":\"\",\"note\":\"the promise never settled\"}"));
+    try std.testing.expect(!evalNeverSettled(a, "{\"error\":\"boom\",\"stack\":\"\",\"note\":\"the promise rejected\"}"));
+    try std.testing.expect(!evalNeverSettled(a, "not json"));
+}
+
 /// `web_eval` once its script is out.
 const EvalRun = struct {
     flight: OpFlight,
@@ -5787,6 +5828,13 @@ const EvalRun = struct {
             arena,
             .timeout,
             "the page never answered the evaluation (a blocked main thread, or a view that went away)",
+        );
+        // The page's own await timer fired: a timeout like the client-side
+        // one, not something the page threw.
+        if (!r.ok and evalNeverSettled(arena, r.payload)) return try mcp.errRes(
+            arena,
+            .timeout,
+            "the returned promise did not settle within timeout_ms",
         );
         // A thrown exception: the payload IS the description (message +
         // stack), so it becomes the error message.

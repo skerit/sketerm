@@ -242,6 +242,26 @@ pub fn Mcp(comptime fail: anytype) type {
             self.rbuf.deinit(self.allocator);
         }
 
+        /// Close stdin and time the exit. @return ms until the child was
+        /// reaped, or null when it was still running at `limit_ms` (it is
+        /// then SIGKILLed and reaped).
+        pub fn closeStdinTimed(self: *Self, limit_ms: i64) ?i64 {
+            const t0 = nowMs();
+            _ = c.close(self.to_child);
+            defer {
+                _ = c.close(self.from_child);
+                self.rbuf.deinit(self.allocator);
+            }
+            var st: c_int = 0;
+            while (nowMs() - t0 <= limit_ms) {
+                if (c.waitpid(self.pid, &st, c.WNOHANG) == self.pid) return nowMs() - t0;
+                _ = c.usleep(20_000);
+            }
+            _ = c.kill(self.pid, c.SIGKILL);
+            _ = c.waitpid(self.pid, &st, 0);
+            return null;
+        }
+
         /// Stop a child that does not read its stdin (an `agent-wait`
         /// follower): SIGTERM to its exact pid, reaped.
         pub fn terminate(self: *Self) void {

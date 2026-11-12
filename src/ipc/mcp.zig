@@ -51,6 +51,7 @@ const mcp_hook = @import("mcp_hook.zig");
 const mcp_setup = @import("mcp_setup.zig");
 const peer_cli = @import("peer_cli.zig");
 const agentpush = @import("agentpush.zig");
+const stdinrelay = @import("stdinrelay.zig");
 const mcp_testkit = @import("mcp_testkit.zig");
 const FakeBackend = mcp_testkit.FakeBackend;
 const Journal = mcp_app.Journal;
@@ -624,6 +625,9 @@ pub const Watchdog = struct {
     pub var fs_fd: muxclient.FdCancel = .{};
     pub var fired: std.atomic.Value(bool) = .init(false);
     pub var hard_ms: i64 = 150_000;
+    /// The client closed stdin: the call in flight was aborted, and any
+    /// call started from now on is aborted at `begin`.
+    pub var caller_gone: std.atomic.Value(bool) = .init(false);
 
     pub fn begin() void {
         mu.lock();
@@ -659,6 +663,27 @@ pub const Watchdog = struct {
         }
         fired.store(false, .release);
         started_ms = clock.nowMs();
+        // Nobody is left to read this call's answer: it ends at once
+        // instead of running to its own timeout.
+        if (caller_gone.load(.acquire)) abortLocked();
+    }
+
+    /// The client's stdin reached EOF (stdin relay thread): abort the
+    /// call in flight the way the hard timeout does.
+    pub fn hangup() void {
+        caller_gone.store(true, .release);
+        mu.lock();
+        defer mu.unlock();
+        if (started_ms != 0) abortLocked();
+    }
+
+    /// Shut down every connection the current call holds; `mu` held.
+    fn abortLocked() void {
+        for (fds[0..fd_count]) |fd| _ = c.shutdown(fd, c.SHUT_RDWR);
+        // A panel socket may have been created after begin() and can
+        // still be in connect/hello/attach. Pool exposes that call's
+        // fd atomically so the watchdog covers establishment too.
+        cancelDynamicFds();
     }
 
     pub fn addFd(fd: c_int) void {
@@ -687,11 +712,7 @@ pub const Watchdog = struct {
             const overdue = started_ms != 0 and !fired.load(.acquire) and clock.nowMs() - started_ms > hard_ms;
             if (overdue) {
                 fired.store(true, .release);
-                for (fds[0..fd_count]) |fd| _ = c.shutdown(fd, c.SHUT_RDWR);
-                // A panel socket may have been created after begin() and can
-                // still be in connect/hello/attach. Pool exposes that call's
-                // fd atomically so the watchdog covers establishment too.
-                cancelDynamicFds();
+                abortLocked();
             }
             mu.unlock();
             if (overdue) {
@@ -702,6 +723,11 @@ pub const Watchdog = struct {
         }
     }
 };
+
+/// The client closed stdin: a call should stop waiting and answer now.
+pub fn callerGone() bool {
+    return Watchdog.caller_gone.load(.acquire);
+}
 
 var quit_flag: bool = false;
 
@@ -1149,6 +1175,12 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
 
     // The loop: one JSON-RPC message per stdin line, and between them the
     // agents (and their waiters) keep being observed.
+    // Stdin is read by a relay thread, so a client that closes it during
+    // a call ends that call at once (Watchdog.hangup), not after it.
+    const input_fd: c_int = if (stdinrelay.Relay.start(0, Watchdog.hangup)) |r| r.read_fd else |_| blk: {
+        if (mcp_log) |*l| l.logNote("stdin relay unavailable: a client closing stdin is noticed only between calls");
+        break :blk 0;
+    };
     var input: std.ArrayList(u8) = .empty;
     defer input.deinit(allocator);
     serve: while (!quit_flag) {
@@ -1158,7 +1190,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             input.shrinkRetainingCapacity(input.items.len - nl - 1);
             if (quit_flag) break :serve;
         }
-        switch (waitInput(&input, allocator)) {
+        switch (waitInput(input_fd, &input, allocator)) {
             .more => {},
             .eof => {
                 // A last line without a newline still counts, as it did
@@ -1246,9 +1278,9 @@ fn minDue(a: ?i64, b: ?i64) ?i64 {
 /// every agent and waiter fd, wake for the agents' timers, then read what
 /// stdin has. EINTR (a quit signal) is `.more`, so the caller re-checks
 /// quit_flag.
-fn waitInput(input: *std.ArrayList(u8), allocator: std.mem.Allocator) InputWait {
+fn waitInput(input_fd: c_int, input: *std.ArrayList(u8), allocator: std.mem.Allocator) InputWait {
     var pfds: [129]c.struct_pollfd = undefined;
-    pfds[0] = .{ .fd = 0, .events = c.POLLIN, .revents = 0 };
+    pfds[0] = .{ .fd = input_fd, .events = c.POLLIN, .revents = 0 };
     var n = 1 + mcp_agent.pollFds(pfds[1..]);
     n += mcp_peer.pollFds(pfds[n..]);
     const now = clock.nowMs();
@@ -1278,7 +1310,7 @@ fn waitInput(input: *std.ArrayList(u8), allocator: std.mem.Allocator) InputWait 
     }
     if (pfds[0].revents == 0) return .more;
     var buf: [65536]u8 = undefined;
-    const got = c.read(0, &buf, buf.len);
+    const got = c.read(input_fd, &buf, buf.len);
     if (got < 0) return switch (std.posix.errno(got)) {
         .INTR, .AGAIN => .more,
         else => .failed,
@@ -1333,10 +1365,14 @@ pub const RealBackend = struct {
     /// Deadline-bounded exchange whose failure keeps its delivery phase.
     pub fn talkFor(ctx: *anyopaque, allocator: std.mem.Allocator, line: []const u8, timeout_ms: i64) DirectTalkResult {
         const self: *RealBackend = @ptrCast(@alignCast(ctx));
+        // The client closed stdin: no GUI round trip (each of which is a
+        // polling loop's next step) is worth starting for nobody.
+        if (callerGone()) return .{ .failure = .{ .err = error.CallerGone, .delivery = .pre_delivery } };
         return self.client.exchange(allocator, self.sock_path, line, timeout_ms);
     }
 
     fn sleepMs(_: *anyopaque, ms: u32) void {
+        if (callerGone()) return;
         var ts: c.struct_timespec = .{
             .tv_sec = ms / 1000,
             .tv_nsec = @as(c_long, ms % 1000) * 1_000_000,
