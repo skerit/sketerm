@@ -1,5 +1,25 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-12: closing stdin ends `sketerm mcp` mid-call; web_eval keeps its timeout
+
+A client that died or closed the pipe during a long call left the
+server, and its browser view, alive until the call answered by itself.
+The deferred web calls already noticed the EOF between steps, but a step
+that blocked (a `text`/`idle` wait's first snapshot peek on a busy page)
+held on for 12s, and every blocking tool for its full timeout. Stdin is
+now read by a relay thread (`ipc/stdinrelay.zig`) that reports EOF the
+moment it reads it; `Watchdog.hangup` aborts the in-flight call's
+connections the way the hard timeout does, later calls are aborted at
+`begin`, GUI round trips are refused, and the server exits in ~0.12s with
+no helper or instance dir left (both engine owners). Lines received
+before the EOF are still answered, so a piped batch of quick requests
+works as before. web_eval also answered a blocked page at timeout+3s (a
+1500ms eval after 4.5s): `timeout_ms` is now the whole call's deadline,
+the page-side await timer runs inside it so its report lands first, and
+that report is code `timeout` instead of `failed`. Facts
+`stdin_eof_ends_session` and `web_eval_timeout_exact`; smoke-mcp stage hu
+(`SKETERM_SMOKE_MCP_HANGUP_ONLY`) covers both.
+
 ## 2026-11-09: collapsing a folder moves a hidden selection onto it
 
 Collapsing a tree folder (chevron click or Left) while an entry inside it
