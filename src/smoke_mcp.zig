@@ -664,6 +664,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         say("smoke-mcp: focused perf stage ok");
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBTRACE_ONLY") != null) {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the trace stage");
+        _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+        defer _ = unsetEnv("SKETERM_WEB_BIN");
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+        defer _ = unsetEnv("SKETERM_WEB_BROKER_ENGINE");
+        webTraceStage(allocator, exe, rt);
+        say("smoke-mcp: focused trace stage ok");
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBTABS_ONLY") != null) {
         var bin_buf: [4096:0]u8 = undefined;
         const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the tab-targeting stage");
@@ -6157,6 +6168,196 @@ fn webPerfStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8
     _ = capSc(arena, thr, "throttle refusal", true);
     const caps = capSc(arena, old.callTool("capabilities", "{}"), "old capabilities", false);
     if ((caps.get("web_perf") orelse fail("no web_perf fact")) != .bool or caps.get("web_perf").?.bool) fail("capabilities reports web_perf true for a helper without it");
+    _ = old.callTool("web_close", "{}");
+}
+
+/// The trace fixture: `thrash` forces layout in a loop, `slow` is one busy task, a `:has()` rule
+/// costs style time; every function sits on its own line of a minified script with a map.
+const TraceHttp = struct {
+    lis: tcpserver.Listener = .{ .backlog = 32, .poll_ms = 100 },
+
+    const page = "<!doctype html><html><head><title>trace</title><style>#root{width:10px}.card:has(> .needle-zz9){color:rgb(1,2,3)}.flip .card{padding:1px}</style><script src=\"/trace.min.js\"></script></head><body><div id=\"root\">r</div>" ++ cards ++ "</body></html>";
+    const cards = repeat("<div class=\"card\"><span>a</span><span>b</span></div>", 200);
+    const script =
+        \\function thrash(n){const r=document.getElementById('root');for(let i=0;i<n;i++){r.style.width=(100+i%50)+'px';void r.offsetHeight}return n}
+        \\function slow(ms){const end=performance.now()+ms;let s=0;while(performance.now()<end)s+=Math.sqrt(s+1);return s}
+        \\function restyle(n){for(let i=0;i<n;i++){document.body.classList.toggle('flip');void getComputedStyle(document.body.lastElementChild).paddingTop}}
+        \\function bgwork(ms){const end=performance.now()+ms;let s=0;while(performance.now()<end)s+=Math.sqrt(s+1);return s}
+        \\//# sourceMappingURL=trace.min.js.map
+    ;
+    /// thrash -> src/trace.ts:5 thrashOriginal; slow -> src/trace.ts:15 slowOriginal.
+    const map = "{\"version\":3,\"file\":\"trace.min.js\",\"sources\":[\"src/trace.ts\"],\"names\":[\"thrashOriginal\",\"slowOriginal\"],\"mappings\":\"AAIAA;AAUAC\"}";
+
+    fn start(self: *TraceHttp) bool {
+        return self.lis.start(self, &onConn);
+    }
+
+    fn onConn(_: ?*anyopaque, afd: c_int) bool {
+        var buf: [8192]u8 = undefined;
+        const raw = tcpserver.readRequest(afd, &buf, 3000);
+        const path_start = (std.mem.indexOfScalar(u8, raw, ' ') orelse return false) + 1;
+        const path_end = std.mem.indexOfScalarPos(u8, raw, path_start, ' ') orelse return false;
+        const path = raw[path_start..path_end];
+        if (std.mem.eql(u8, path, "/trace.min.js")) {
+            tcpserver.respondOk(afd, "text/javascript", script, "");
+        } else if (std.mem.eql(u8, path, "/trace.min.js.map")) {
+            tcpserver.respondOk(afd, "application/json", map, "");
+        } else tcpserver.respondOk(afd, "text/html", page, "");
+        return true;
+    }
+};
+
+fn traceText(arena: std.mem.Allocator, line: []const u8) []const u8 {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch fail("web_trace: reply is not JSON");
+    const content = v.object.get("result").?.object.get("content").?.array.items;
+    return content[0].object.get("text").?.string;
+}
+
+fn traceObj(o: std.json.ObjectMap, key: []const u8) std.json.ObjectMap {
+    const v = o.get(key) orelse fail("web_trace result lacks a section");
+    if (v != .object) fail("web_trace section is not an object");
+    return v.object;
+}
+
+fn traceArr(o: std.json.ObjectMap, key: []const u8) []std.json.Value {
+    const v = o.get(key) orelse fail("web_trace result lacks a list");
+    if (v != .array) fail("web_trace list is not an array");
+    return v.array.items;
+}
+
+fn strEql(v: ?std.json.Value, want: []const u8) bool {
+    const s = v orelse return false;
+    return s == .string and std.mem.eql(u8, s.string, want);
+}
+
+/// Stage wt: web_trace through the real MCP tool on the real helper: forced reflows, long tasks,
+/// selector stats, user timing, the saved file, a concurrent CPU profile, the tab's renderer only,
+/// a cross-process navigation, one-shot, refusals, and a helper that withholds web-trace.
+fn webTraceStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var http = TraceHttp{};
+    if (!http.start()) fail("could not bind the loopback trace fixture");
+    defer http.lis.deinit();
+    var args_buf: [4096]u8 = undefined;
+    var m = Mcp.spawn(allocator, exe, &.{});
+    m.initialize();
+    const pa = capSc(arena, m.callTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://127.0.0.1:{d}/page\",\"snapshot\":\"none\"}}", .{http.lis.port}) catch unreachable), "trace open", false).get("view").?.integer;
+    {
+        const caps = capSc(arena, m.callTool("capabilities", "{}"), "capabilities", false);
+        const f = caps.get("web_trace") orelse fail("capabilities lacks web_trace");
+        if (f != .bool or !f.bool) fail("capabilities reports web_trace false with a capable local helper");
+    }
+    // Another site's tab keeps its own renderer busy: none of it may reach this tab's summary.
+    const pb = capSc(arena, m.callTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://localhost:{d}/page\",\"snapshot\":\"none\"}}", .{http.lis.port}) catch unreachable), "trace open other", false).get("view").?.integer;
+    _ = capSc(arena, m.callTool("web_eval", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d},\"body\":\"setInterval(()=>bgwork(70),100);return 1;\"}}", .{pb}) catch unreachable), "other tab busy", false);
+
+    _ = capSc(arena, m.callTool("web_trace", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d},\"action\":\"stop\"}}", .{pa}) catch unreachable), "stop without a trace", true);
+    // A CPU profile runs alongside the trace.
+    _ = capSc(arena, m.callTool("web_cpu_profile", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d},\"action\":\"start\"}}", .{pa}) catch unreachable), "profile start", false);
+    _ = capSc(arena, m.callTool("web_trace", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d},\"action\":\"start\",\"selector_stats\":true}}", .{pa}) catch unreachable), "trace start", false);
+    _ = capSc(arena, m.callTool("web_trace", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d},\"action\":\"start\"}}", .{pa}) catch unreachable), "second trace start", true);
+    const loops = 40;
+    _ = capSc(arena, m.callTool("web_eval", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d},\"body\":\"performance.mark('act-start');setTimeout(thrash,0,{d});setTimeout(slow,5,200);setTimeout(restyle,10,1);setTimeout(()=>{{performance.mark('act-end');performance.measure('act','act-start','act-end')}},300);return new Promise(r=>setTimeout(()=>r(1),600));\",\"timeout_ms\":5000}}", .{ pa, loops }) catch unreachable), "trace actions", false);
+    const prof_save = std.fmt.allocPrint(arena, "{s}/home/trace-side.cpuprofile", .{rt}) catch unreachable;
+    _ = capSc(arena, m.callTool("web_cpu_profile", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d},\"action\":\"stop\",\"top\":3,\"save\":\"{s}\"}}", .{ pa, prof_save }) catch unreachable), "concurrent profile stop", false);
+    const save = std.fmt.allocPrint(arena, "{s}/home/run.trace.json", .{rt}) catch unreachable;
+    const stop_line = m.callTool("web_trace", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d},\"action\":\"stop\",\"save\":\"{s}\"}}", .{ pa, save }) catch unreachable);
+    std.debug.print("smoke-mcp: web_trace: {s}\n", .{stop_line});
+    const t = capSc(arena, stop_line, "trace stop", false);
+    if (t.get("truncated").?.bool) fail("a short trace was reported truncated");
+    if (!strEql(traceObj(t, "main_thread").get("source"), "tracing_started")) fail("the trace did not name the tab's renderer");
+    {
+        const fr = traceObj(t, "forced_reflows");
+        const top = traceArr(fr, "top");
+        if (top.len == 0) fail("no forced reflows in a trace of a layout-thrashing function");
+        const head = top[0].object;
+        if (!strEql(head.get("function"), "thrash")) fail("the top forced reflow is not thrash");
+        if (head.get("count").?.integer < loops) fail("thrash forced fewer reflows than its loop ran");
+        if (!strEql(head.get("source"), "src/trace.ts") or head.get("source_line").?.integer != 5) fail("thrash was not resolved through its source map");
+    }
+    {
+        const lt = traceObj(t, "long_tasks");
+        if (lt.get("count").?.integer < 1) fail("no long task in a trace of a 200ms task");
+        if (jnum(lt.get("max_ms").?) < 150) fail("the longest task is shorter than the 200ms busy function");
+        var named = false;
+        for (traceArr(lt, "top")) |item| {
+            if (strEql(item.object.get("function"), "bgwork")) fail("another tab's renderer reached this tab's summary");
+            if (strEql(item.object.get("cause"), "script") and strEql(item.object.get("function"), "slow")) named = true;
+        }
+        if (!named) fail("no long task names slow as its cause");
+    }
+    {
+        var found = false;
+        for (traceArr(t, "selector_stats")) |s| {
+            if (strEql(s.object.get("selector"), ".card:has(> .needle-zz9)")) found = true;
+        }
+        if (!found) fail("the :has() selector is missing from selector_stats");
+    }
+    {
+        var measured = false;
+        for (traceArr(t, "user_timing")) |u| {
+            if (strEql(u.object.get("name"), "act") and strEql(u.object.get("kind"), "measure") and jnum(u.object.get("duration_ms").?) >= 250) measured = true;
+        }
+        if (!measured) fail("the performance.measure around the action is missing from user_timing");
+    }
+    if (traceText(arena, stop_line).len > 4000) fail("web_trace's text reply is not short");
+    {
+        var rb: [4096:0]u8 = undefined;
+        const sz = std.fmt.bufPrintSentinel(&rb, "{s}", .{save}, 0) catch unreachable;
+        const fp = c.fopen(sz.ptr, "rb") orelse fail("the saved trace is missing");
+        defer _ = c.fclose(fp);
+        var list: std.ArrayList(u8) = .empty;
+        var chunk: [65536]u8 = undefined;
+        while (true) {
+            const n = c.fread(&chunk, 1, chunk.len, fp);
+            if (n == 0) break;
+            list.appendSlice(arena, chunk[0..n]) catch fail("oom");
+        }
+        const pj = std.json.parseFromSliceLeaky(std.json.Value, arena, list.items, .{}) catch fail("the saved trace is not JSON");
+        if (pj != .object or (pj.object.get("traceEvents") orelse fail("the saved trace has no traceEvents")) != .array) fail("traceEvents is not an array");
+        if (pj.object.get("traceEvents").?.array.items.len != @as(usize, @intCast(t.get("events").?.integer))) fail("the summary's event count disagrees with the file");
+    }
+
+    // One-shot: a busy task scheduled to land inside the window.
+    _ = capSc(arena, m.callTool("web_eval", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d},\"body\":\"setTimeout(slow,150,120);return 1;\"}}", .{pa}) catch unreachable), "one-shot schedule", false);
+    const one_save = std.fmt.allocPrint(arena, "{s}/home/oneshot.trace.json", .{rt}) catch unreachable;
+    const one = capSc(arena, m.callTool("web_trace", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d},\"duration_ms\":800,\"save\":\"{s}\",\"source_maps\":false}}", .{ pa, one_save }) catch unreachable), "one-shot trace", false);
+    if (traceObj(one, "long_tasks").get("count").?.integer < 1) fail("the one-shot trace missed the task scheduled inside it");
+    if (traceArr(one, "selector_stats").len != 0) fail("selector stats were recorded without selector_stats:true");
+
+    // A cross-process navigation inside the trace: the new renderer is the tab's too.
+    _ = capSc(arena, m.callTool("web_trace", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d},\"action\":\"start\"}}", .{pa}) catch unreachable), "nav trace start", false);
+    _ = capSc(arena, m.callTool("web_navigate", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d},\"url\":\"http://localhost:{d}/page2\",\"snapshot\":\"none\"}}", .{ pa, http.lis.port }) catch unreachable), "nav during trace", false);
+    _ = capSc(arena, m.callTool("web_eval", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d},\"body\":\"setTimeout(slow,0,120);return new Promise(r=>setTimeout(()=>r(1),300));\"}}", .{pa}) catch unreachable), "work after nav", false);
+    const nav_save = std.fmt.allocPrint(arena, "{s}/home/nav.trace.json", .{rt}) catch unreachable;
+    const nav = capSc(arena, m.callTool("web_trace", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d},\"action\":\"stop\",\"save\":\"{s}\",\"source_maps\":false}}", .{ pa, nav_save }) catch unreachable), "nav trace stop", false);
+    if (nav.get("navigations").?.integer < 1) fail("the trace did not report the navigation");
+    {
+        var after = false;
+        for (traceArr(traceObj(nav, "long_tasks"), "top")) |item| {
+            if (strEql(item.object.get("function"), "slow")) after = true;
+        }
+        if (!after) fail("work in the renderer the tab navigated to is missing from the trace summary");
+    }
+    _ = m.callTool("web_close", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d}}}", .{pb}) catch unreachable);
+    _ = m.callTool("web_close", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d}}}", .{pa}) catch unreachable);
+    m.closeStdinWait();
+
+    // A web-perf helper that predates tracing: refused by name, never sent the op.
+    _ = c.setenv("SKETERM_WEB_DISABLE_TRACE", "1", 1);
+    defer _ = unsetEnv("SKETERM_WEB_DISABLE_TRACE");
+    var old = Mcp.spawn(allocator, exe, &.{});
+    defer old.closeStdinWait();
+    old.initialize();
+    _ = capSc(arena, old.callTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://127.0.0.1:{d}/page\",\"snapshot\":\"none\"}}", .{http.lis.port}) catch unreachable), "old open", false);
+    const refused = old.callTool("web_trace", "{\"duration_ms\":100}");
+    _ = capSc(arena, refused, "trace refusal", true);
+    if (std.mem.indexOf(u8, refused, "web-trace") == null) fail("the trace refusal does not name the missing capability");
+    const caps = capSc(arena, old.callTool("capabilities", "{}"), "old capabilities", false);
+    if ((caps.get("web_trace") orelse fail("no web_trace fact")) != .bool or caps.get("web_trace").?.bool) fail("capabilities reports web_trace true for a helper without it");
+    if (!caps.get("web_perf").?.bool) fail("withholding web-trace also withheld web-perf");
     _ = old.callTool("web_close", "{}");
 }
 

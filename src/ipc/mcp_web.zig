@@ -886,12 +886,13 @@ pub fn printCapability() struct { supported: bool, css_page: ?bool } {
 }
 
 /// What `capabilities` reports about the perf tools: null until a helper handshake says, false for the GUI.
-pub fn perfCapability() struct { perf: ?bool, profile: ?bool } {
-    if (guiDrivesWeb() or g_headless_alloc == null) return .{ .perf = false, .profile = false };
-    const e = currentEngine() orelse return .{ .perf = null, .profile = null };
-    if (e.state != .ready) return .{ .perf = null, .profile = null };
+pub fn perfCapability() struct { perf: ?bool, profile: ?bool, trace: ?bool } {
+    if (guiDrivesWeb() or g_headless_alloc == null) return .{ .perf = false, .profile = false, .trace = false };
+    const e = currentEngine() orelse return .{ .perf = null, .profile = null, .trace = null };
+    if (e.state != .ready) return .{ .perf = null, .profile = null, .trace = null };
     const p = e.has(.web_perf);
-    return .{ .perf = p, .profile = p and e.route_kind != .remote_browser };
+    const local = e.route_kind != .remote_browser;
+    return .{ .perf = p, .profile = p and local, .trace = e.has(.web_trace) and local };
 }
 
 /// Stream support is a code fact before startup and negotiated thereafter; audio is unknown before the handshake.
@@ -5345,7 +5346,7 @@ fn webBody(
     if (eql(u8, name, "web_network")) return networkTool(drv, arena, args, view);
     if (eql(u8, name, "web_download")) return downloadTool(drv, arena, args, view);
     if (eql(u8, name, "web_print_pdf")) return printTool(drv, arena, args, view);
-    if (eql(u8, name, "web_perf") or eql(u8, name, "web_cpu_profile"))
+    if (eql(u8, name, "web_perf") or eql(u8, name, "web_cpu_profile") or eql(u8, name, "web_trace"))
         return @import("mcp_webperf.zig").tool(drv, arena, name, args, view);
 
     if (eql(u8, name, "web_screenshot")) {
@@ -11427,7 +11428,43 @@ test "every tool this module serves declares an output schema" {
             return error.MissingOutputSchema;
         }
     }
-    try std.testing.expectEqual(@as(usize, 36), seen);
+    try std.testing.expectEqual(@as(usize, 37), seen);
+}
+
+test "web_trace's output schema names every field its summary emits" {
+    const t = std.testing;
+    const mcp_tools = @import("mcp_tools.zig");
+    const perf = @import("mcp_webperf.zig");
+    const trace = @import("perf/trace.zig");
+    const tool = for (mcp_tools.TOOLS) |tl| {
+        if (std.mem.eql(u8, tl.name, "web_trace")) break tl;
+    } else return error.NoTraceTool;
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, tool.output_schema.?, .{});
+    defer parsed.deinit();
+    const props = parsed.value.object.get("properties").?.object;
+    const Check = struct {
+        fn fields(comptime T: type, schema: std.json.Value) !void {
+            const p = schema.object.get("properties").?.object;
+            inline for (reflect.fields(T)) |f| {
+                if (comptime std.mem.eql(u8, f.name, "frame")) continue;
+                if (p.get(f.name) == null) {
+                    std.debug.print("web_trace schema lacks {s}.{s}\n", .{ @typeName(T), f.name });
+                    return error.SchemaDrift;
+                }
+            }
+        }
+        fn items(v: std.json.Value) std.json.Value {
+            return v.object.get("items").?;
+        }
+    };
+    try Check.fields(trace.MainThread, props.get("main_thread").?);
+    try Check.fields(trace.Frames, props.get("frames").?);
+    try Check.fields(trace.Selector, Check.items(props.get("selector_stats").?));
+    try Check.fields(trace.Timing, Check.items(props.get("user_timing").?));
+    try Check.fields(perf.TraceReflow, Check.items(props.get("forced_reflows").?.object.get("properties").?.object.get("top").?));
+    try Check.fields(perf.TraceLongTask, Check.items(props.get("long_tasks").?.object.get("properties").?.object.get("top").?));
+    for ([_][]const u8{ "window_ms", "cpu_throttle", "trace_path", "events", "truncated", "main_thread", "long_tasks", "forced_reflows", "selector_stats", "frames", "user_timing" }) |k|
+        try t.expect(props.get(k) != null);
 }
 
 test "parsePolicy fails closed on unknown names and invalid host authorities" {

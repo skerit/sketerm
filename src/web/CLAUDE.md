@@ -1038,7 +1038,7 @@ When reproducing on a real site from an agent session, unset the session's
 `HTTPS_PROXY`/`SSL_CERT_FILE`: the helper honours the proxy and its mitm
 CA is not in the engine's store (`ERR_CERT_AUTHORITY_INVALID`).
 
-## The DevTools session and perf ops (0xA6/0xA7, capability "web-perf")
+## The DevTools session and perf ops (0xA6/0xA7, capabilities "web-perf", "web-trace")
 
 `cefhost/devtools_session.zig` is the ONE `cef_dev_tools_message_observer_t`
 of a view (`View.devtools`, created by `Host.devtoolsFor` on first use): it
@@ -1065,6 +1065,15 @@ Rules:
   `Tracing.dataCollected` + `Tracing.tracingComplete` arrive; the method
   RESULT of `Tracing.end` did not arrive within 10s, so a tracing client must
   finish on `tracingComplete`, not on that result.
+- Tracing (`cefhost/trace.zig`, ops `trace_start`/`trace_stop` behind their
+  own capability `web-trace`, so a `web-perf`-only helper is never sent one)
+  is the session's ONLY `EventSink` user while a trace runs, and a start is
+  refused if another sink is installed. Chunks are appended to a staged file
+  from the event callback; everything that sends a method (the end at the
+  time limit or the 256 MiB cap, finishing the file) happens in `perf.pump`,
+  never inside the callback. The category preset is fixed and never includes
+  the V8 sampler, which is why a CPU profile may run alongside. The trace is
+  scoped to the view's target: another tab's renderer does not appear.
 - The helper root sets `std_options.signal_stack_size = null`: std's 256 KiB
   per-thread alternate signal stack is static TLS, glibc takes static TLS out
   of every thread's stack, and V8's 64 KiB profiler thread then failed to

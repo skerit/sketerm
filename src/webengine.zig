@@ -32,5 +32,6 @@ test {
     _ = @import("web/cefhost/untrusted.zig");
     _ = @import("web/cefhost/emulation.zig");
     _ = @import("web/cefhost/devtools_session.zig");
+    _ = @import("web/cefhost/trace.zig");
     _ = @import("web/cefhost/dragdrop.zig");
 }

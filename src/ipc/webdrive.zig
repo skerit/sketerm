@@ -3813,7 +3813,7 @@ pub const Engine = struct {
     /// Ask `view_id`'s helper for one perf op; poll `perfState`, then `takePerf`.
     pub fn startPerf(self: *Engine, view_id: u32, op: proto.PerfOp, arg: u32, limit_ms: u32) PerfError!u32 {
         if (!self.ensure()) return error.Unavailable;
-        if (!self.has(.web_perf)) return error.Unsupported;
+        if (!self.has(op.capability())) return error.Unsupported;
         if (self.findView(view_id) == null) return error.NoView;
         const req = self.next_perf_req;
         self.next_perf_req +%= 1;
@@ -5593,6 +5593,9 @@ test "perf requests need web-perf, correlate by req and deliver a staged profile
     try t.expectError(error.Unsupported, pair.eng.startPerf(view.id, .metrics, 0, 0));
     try t.expectEqual(@as(usize, 0), pair.drain(&buf).len);
     pair.eng.caps.insert(.web_perf);
+    // A web-perf helper predating tracing is never sent a trace op.
+    try t.expectError(error.Unsupported, pair.eng.startPerf(view.id, .trace_start, 0, 0));
+    try t.expectEqual(@as(usize, 0), pair.drain(&buf).len);
     const a = try pair.eng.startPerf(view.id, .metrics, 0, 0);
     const b = try pair.eng.startPerf(view.id, .profile_stop, 0, 0);
     var reader = proto.Reader.init(pair.drain(&buf));

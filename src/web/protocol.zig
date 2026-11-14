@@ -422,6 +422,10 @@ pub const CAP_WEB_EMULATION = "web-emulation";
 /// The helper attaches a DevTools agent to a view only once one of these is
 /// asked for, and never sends `Runtime.enable` or `Debugger.enable`.
 pub const CAP_WEB_PERF = "web-perf";
+/// `perf_req` also serves `trace_start`/`trace_stop` (`Tracing.*` into a
+/// staged `{"traceEvents":[...]}` file). Its own token because a
+/// `web-perf` helper predating it answers those ops as unknown.
+pub const CAP_WEB_TRACE = "web-trace";
 /// The helper pushes one view's pixels, cursor and (with
 /// `stream-audio`) audio over a private per-view socket and takes input
 /// back on it (0xF8 block, `src/web/stream.zig` is the V1 stream format).
@@ -589,6 +593,7 @@ pub const Cap = enum {
     view_screen_early,
     drag_drop,
     web_perf,
+    web_trace,
 
     /// The wire name `hello_ack` carries.
     pub fn name(self: Cap) []const u8 {
@@ -4309,7 +4314,32 @@ pub const PerfOp = enum(u8) {
     profile_start = 3,
     /// `Profiler.stop`; the profile JSON lands in the helper-private file `staged`.
     profile_stop = 4,
+    /// `Tracing.start` (capability `web-trace`) with `arg` = `TRACE_*` flags, auto-ended after `limit_ms`.
+    trace_start = 5,
+    /// End the trace; `staged` is a `{"traceEvents":[...]}` file and `text` is `TraceStop` JSON.
+    trace_stop = 6,
     _,
+
+    /// The capability a helper must advertise before a client sends this op.
+    pub fn capability(self: PerfOp) Cap {
+        return switch (self) {
+            .trace_start, .trace_stop => .web_trace,
+            else => .web_perf,
+        };
+    }
+};
+
+/// `trace_start` flag: add the expensive selector-statistics category.
+pub const TRACE_SELECTOR_STATS: u32 = 1;
+
+/// The `text` of a successful `trace_stop`: JSON, so the answer frame stays the one `EvPerfResult`.
+pub const TraceStop = struct {
+    /// The helper stopped collecting at its size cap (or the engine never said the trace was complete).
+    truncated: bool = false,
+    /// Bytes of the staged file.
+    bytes: u64 = 0,
+    /// Why the trace ended early or is partial; empty otherwise.
+    note: []const u8 = "",
 };
 
 /// Highest CPU throttling rate x100 a helper applies.
@@ -7514,11 +7544,29 @@ test "perf frames are a fresh append-only pair with one op vocabulary" {
     try std.testing.expectEqual(@as(u8, 0xA6), @intFromEnum(Tag.perf_req));
     try std.testing.expectEqual(@as(u8, 0xA7), @intFromEnum(Tag.ev_perf_result));
     try std.testing.expectEqualStrings("web-perf", Cap.web_perf.name());
+    try std.testing.expectEqualStrings("web-trace", Cap.web_trace.name());
     try std.testing.expectEqual(@as(u8, 4), @intFromEnum(PerfOp.profile_stop));
+    try std.testing.expectEqual(@as(u8, 5), @intFromEnum(PerfOp.trace_start));
+    try std.testing.expectEqual(@as(u8, 6), @intFromEnum(PerfOp.trace_stop));
+    try std.testing.expectEqual(Cap.web_perf, PerfOp.profile_stop.capability());
+    try std.testing.expectEqual(Cap.web_trace, PerfOp.trace_start.capability());
+    try std.testing.expectEqual(Cap.web_trace, PerfOp.trace_stop.capability());
+    try roundTrip(PerfReq, .{ .view = 3, .req = 10, .op = @intFromEnum(PerfOp.trace_start), .arg = TRACE_SELECTOR_STATS, .limit_ms = 30_000 });
     try roundTrip(PerfReq, .{ .view = 3, .req = 9, .op = @intFromEnum(PerfOp.profile_start), .arg = 1000, .limit_ms = 120_000 });
     try roundTrip(EvPerfResult, .{ .view = 3, .req = 9, .op = 4, .ok = 1, .throttle = 400, .paints = 12, .navigations = 1, .text = "auto-stopped", .staged = "/tmp/sketerm-cpuprofile-x" });
     try std.testing.expect(!observerAllows(.perf_req, true));
     try std.testing.expect(!untrustedWithheld(.perf_req));
+    // A trace_stop's text is JSON a newer helper may extend: unknown members are skipped, absent ones default.
+    const gpa = std.testing.allocator;
+    const stop = try std.json.parseFromSlice(TraceStop, gpa, "{\"truncated\":true,\"bytes\":42,\"note\":\"cap\",\"later\":1}", .{ .ignore_unknown_fields = true });
+    defer stop.deinit();
+    try std.testing.expect(stop.value.truncated);
+    try std.testing.expectEqual(@as(u64, 42), stop.value.bytes);
+    const bare = try std.json.parseFromSlice(TraceStop, gpa, "{}", .{ .ignore_unknown_fields = true });
+    defer bare.deinit();
+    try std.testing.expect(!bare.value.truncated);
+    // An op this build does not know stays representable, so a helper refuses it instead of failing to decode.
+    try std.testing.expect(std.enums.fromInt(PerfOp, 77) != null);
 }
 
 test "an untrusted helper refuses the request frames of every capability it withholds" {

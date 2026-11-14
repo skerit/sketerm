@@ -171,6 +171,7 @@ const unconditional_caps = [_]proto.Cap{
     .view_screen_early,
     .drag_drop,
     .web_perf,
+    .web_trace,
 };
 
 /// Test-only negotiation seam: an environment switch that withholds one
@@ -186,6 +187,8 @@ fn withheld(cap: proto.Cap) bool {
         .untrusted_web => "SKETERM_WEB_DISABLE_UNTRUSTED",
         .web_emulation => "SKETERM_WEB_DISABLE_EMULATION",
         .web_perf => "SKETERM_WEB_DISABLE_PERF",
+        // A web-perf helper predating tracing: the client must never send it a trace op.
+        .web_trace => if (withheld(.web_perf)) return true else "SKETERM_WEB_DISABLE_TRACE",
         .web_stream => "SKETERM_WEB_DISABLE_STREAM",
         .stream_audio => "SKETERM_WEB_DISABLE_STREAM_AUDIO",
         .stream_encoded => "SKETERM_WEB_DISABLE_STREAM_ENCODED",

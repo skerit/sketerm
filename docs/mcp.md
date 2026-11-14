@@ -257,6 +257,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 - `web_print_pdf`: Print a headless web view's page to a PDF FILE, rendered by its own browser: vector text, embedded fonts, the page's print CSS.
 - `web_perf`: Cheap fixed-shape performance sample of a headless tab from the engine's own counters (Performance.getMetrics); nothing runs in the page.
 - `web_cpu_profile`: Sampling CPU profile of a headless tab's main thread (V8 Profiler): time per JS function.
+- `web_trace`: Record the engine's own performance trace of a headless tab and get a SHORT summary to act on; the raw trace is saved for DevTools/Perfetto ('save', else a temp file; trace_path).
 - `web_network`: Content blocking + a network request log for a web view.
 - `web_capture` (read-only): HEADLESS ONLY: read what a view's CAPTURE recorded (web_open 'capture' installs one), the response bodies the page itself received, exactly as it received them (decompressed; request bodies and response headers too).
 - `web_capture_set`: HEADLESS ONLY: NARROW a view's live capture, never widen it (the same rule a live network policy follows).

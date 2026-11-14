@@ -1,9 +1,9 @@
-//! `web_perf` and `web_cpu_profile`: page performance through the view's DevTools session (helper capability `web-perf`).
+//! `web_perf`, `web_cpu_profile` and `web_trace`: page performance through the view's DevTools session (helper capabilities `web-perf`, `web-trace`).
 //!
-//! Headless only, like emulation: the GUI's tabs answer `unavailable`. The raw
-//! profile reaches this process as a STAGED helper file, never a frame, and is
-//! summarized here; a helper on another host is refused because its staging
-//! file is on that host.
+//! Headless only, like emulation: the GUI's tabs answer `unavailable`. A raw
+//! profile or trace reaches this process as a STAGED helper file, never a
+//! frame, and is summarized here; a helper on another host is refused because
+//! its staging file is on that host.
 
 const std = @import("std");
 const mcp = @import("mcp.zig");
@@ -13,9 +13,11 @@ const web_proto = @import("../web/protocol.zig");
 const clock = @import("../util/clock.zig");
 const reflect = @import("../util/reflect.zig");
 const readfile = @import("../util/readfile.zig");
+const c = @import("../c.zig").c;
 const metrics = @import("perf/metrics.zig");
 const cpuprofile = @import("perf/cpuprofile.zig");
 const sourcemap = @import("perf/sourcemap.zig");
+const trace = @import("perf/trace.zig");
 
 pub const MAX_PERF_WINDOW_MS: i64 = 60_000;
 pub const MAX_PROFILE_MS: i64 = 120_000;
@@ -51,8 +53,11 @@ pub fn tool(drv: web.Driver, arena: std.mem.Allocator, name: []const u8, args: s
         .gui => return mcp.errRes(arena, .unavailable, try std.fmt.allocPrint(arena, "{s} is headless only: a tab of the sketerm GUI has no DevTools session this server may attach to", .{name})),
         .headless => |engine| engine,
     };
-    if (!e.has(.web_perf))
-        return mcp.errRes(arena, .unavailable, "this browser helper predates web-perf (capabilities web_perf), so it cannot measure the page; nothing was measured");
+    const needed: web_proto.Cap = if (std.mem.eql(u8, name, "web_trace")) .web_trace else .web_perf;
+    if (!e.has(needed)) return mcp.errRes(arena, .unavailable, if (needed == .web_trace)
+        "this browser helper predates web-trace (capabilities web_trace), so it cannot trace the page; nothing was traced"
+    else
+        "this browser helper predates web-perf (capabilities web_perf), so it cannot measure the page; nothing was measured");
     if (mcp.argValue(args, "cpu_throttle")) |v| {
         const rate: f64 = switch (v) {
             .integer => |n| @floatFromInt(n),
@@ -66,6 +71,7 @@ pub fn tool(drv: web.Driver, arena: std.mem.Allocator, name: []const u8, args: s
         }
     }
     if (std.mem.eql(u8, name, "web_perf")) return perfTool(drv, arena, e, args, view);
+    if (std.mem.eql(u8, name, "web_trace")) return traceTool(drv, arena, e, args, view);
     return profileTool(drv, arena, e, args, view);
 }
 
@@ -75,7 +81,7 @@ const PerfResult = union(enum) { ok: Done, err: []const u8 };
 /// Run one perf op to its answer; `deliver_to` moves a staged result there before the record is dropped.
 fn perfOp(drv: web.Driver, arena: std.mem.Allocator, e: *webdrive.Engine, pane: u32, op: web_proto.PerfOp, arg: u32, limit_ms: u32, timeout_ms: i64, deliver_to: ?[]const u8) !PerfResult {
     const req = e.startPerf(pane, op, arg, limit_ms) catch |err| return .{ .err = switch (err) {
-        error.Unsupported => try mcp.errRes(arena, .unavailable, "this browser helper predates web-perf"),
+        error.Unsupported => try mcp.errRes(arena, .unavailable, if (op.capability() == .web_trace) "this browser helper predates web-trace" else "this browser helper predates web-perf"),
         else => try web.failRes(arena, try web.headlessFail(arena, e, err)),
     } };
     defer e.takePerf(req);
@@ -155,29 +161,54 @@ fn perfTool(drv: web.Driver, arena: std.mem.Allocator, e: *webdrive.Engine, args
 // web_cpu_profile
 // ---------------------------------------------------------------------
 
+/// The start/stop/one-shot arguments both recording tools share.
+const Recording = struct {
+    duration: ?i64,
+    starting: bool,
+    stopping: bool,
+    top: usize,
+    /// Where the raw file goes on a stop; empty on a start.
+    save: []const u8,
+
+    fn parse(arena: std.mem.Allocator, args: std.json.Value, comptime tool_name: []const u8, comptime max_ms: i64, comptime default_top: i64, comptime max_top: i64, comptime ext: []const u8) !union(enum) { ok: Recording, err: []const u8 } {
+        const action = mcp.argStr(args, "action");
+        const duration = mcp.argInt(args, "duration_ms");
+        if ((action == null) == (duration == null))
+            return .{ .err = try mcp.errRes(arena, .invalid_args, tool_name ++ " needs either action:\"start\"|\"stop\" or duration_ms for a one-shot") };
+        if (action) |a| if (!std.mem.eql(u8, a, "start") and !std.mem.eql(u8, a, "stop"))
+            return .{ .err = try mcp.errRes(arena, .invalid_args, "action must be start or stop") };
+        if (duration) |d| if (d < 1 or d > max_ms) return .{ .err = try mcp.errRes(arena, .invalid_args, std.fmt.comptimePrint("duration_ms must be from 1 through {d}", .{max_ms})) };
+        const top = mcp.argInt(args, "top") orelse default_top;
+        if (top < 1 or top > max_top) return .{ .err = try mcp.errRes(arena, .invalid_args, std.fmt.comptimePrint("top must be from 1 through {d}", .{max_top})) };
+        var out: Recording = .{
+            .duration = duration,
+            .starting = duration != null or std.mem.eql(u8, action.?, "start"),
+            .stopping = duration != null or std.mem.eql(u8, action.?, "stop"),
+            .top = @intCast(top),
+            .save = "",
+        };
+        if (out.stopping) {
+            out.save = mcp.argStr(args, "save") orelse try tempPath(arena, ext);
+            if (out.save.len == 0 or out.save[0] != '/') return .{ .err = try mcp.errRes(arena, .invalid_args, "'save' must be an absolute file path") };
+        }
+        return .{ .ok = out };
+    }
+};
+
 fn profileTool(drv: web.Driver, arena: std.mem.Allocator, e: *webdrive.Engine, args: std.json.Value, view: web.View) ![]const u8 {
-    const action = mcp.argStr(args, "action");
-    const duration = mcp.argInt(args, "duration_ms");
-    if ((action == null) == (duration == null))
-        return mcp.errRes(arena, .invalid_args, "web_cpu_profile needs either action:\"start\"|\"stop\" or duration_ms for a one-shot");
-    if (action) |a| if (!std.mem.eql(u8, a, "start") and !std.mem.eql(u8, a, "stop"))
-        return mcp.errRes(arena, .invalid_args, "action must be start or stop");
-    if (duration) |d| if (d < 1 or d > MAX_PROFILE_MS) return mcp.errRes(arena, .invalid_args, "duration_ms must be from 1 through 120000");
+    const rec = switch (try Recording.parse(arena, args, "web_cpu_profile", MAX_PROFILE_MS, DEFAULT_TOP, MAX_TOP, "cpuprofile")) {
+        .err => |r| return r,
+        .ok => |r| r,
+    };
+    const duration = rec.duration;
     const interval = mcp.argInt(args, "interval_us") orelse DEFAULT_INTERVAL_US;
     if (interval < web_proto.PERF_INTERVAL_MIN_US or interval > 1_000_000) return mcp.errRes(arena, .invalid_args, "interval_us must be from 100 through 1000000");
-    const top = mcp.argInt(args, "top") orelse DEFAULT_TOP;
-    if (top < 1 or top > MAX_TOP) return mcp.errRes(arena, .invalid_args, "top must be from 1 through 100");
     // The profile is staged on the helper's host and moved here.
     if (e.route_kind == .remote_browser)
         return mcp.errRes(arena, .unavailable, "this view's browser runs on another host, where its profile would be staged; web_cpu_profile profiles views of a local browser helper (web_perf works there)");
-    const starting = duration != null or std.mem.eql(u8, action.?, "start");
-    const stopping = duration != null or std.mem.eql(u8, action.?, "stop");
-    var save: []const u8 = "";
-    if (stopping) {
-        save = mcp.argStr(args, "save") orelse try tempProfilePath(arena);
-        if (save.len == 0 or save[0] != '/') return mcp.errRes(arena, .invalid_args, "'save' must be an absolute file path");
-    }
-    if (starting) {
+    const save = rec.save;
+    const top: i64 = @intCast(rec.top);
+    if (rec.starting) {
         const limit: u32 = @intCast(if (duration) |d| @min(d + 5_000, MAX_PROFILE_MS) else MAX_PROFILE_MS);
         const started = switch (try perfOp(drv, arena, e, view.pane, .profile_start, @intCast(interval), limit, 10_000, null)) {
             .err => |r| return r,
@@ -206,15 +237,231 @@ fn profileTool(drv: web.Driver, arena: std.mem.Allocator, e: *webdrive.Engine, a
     if (sum.sample_count == 0)
         return mcp.errRes(arena, .failed, try std.fmt.allocPrint(arena, "the profile at {s} holds no samples{s}", .{ save, if (done.navigations != 0) " (the page navigated while profiling; a renderer swap ends a profile)" else "" }));
     // A stop knows nothing of the start's interval; the profile's own mean is the honest figure.
-    return summaryResult(drv, arena, e, args, view, sum, done, save, @intCast(top), if (duration != null) interval else @intCast(sum.interval_us));
+    return summaryResult(drv, arena, args, view, sum, done, save, @intCast(top), if (duration != null) interval else @intCast(sum.interval_us));
 }
 
-fn tempProfilePath(arena: std.mem.Allocator) ![]const u8 {
-    const c = @import("../c.zig").c;
+/// A fresh temp file name with extension `ext`.
+fn tempPath(arena: std.mem.Allocator, comptime ext: []const u8) ![]const u8 {
     const dir: []const u8 = if (c.getenv("TMPDIR")) |t| std.mem.span(t) else "/tmp";
     var rnd: [4]u8 = undefined;
     _ = c.getentropy(&rnd, rnd.len);
-    return std.fmt.allocPrint(arena, "{s}/sketerm-{d}-{x}.cpuprofile", .{ if (dir.len > 0 and dir[0] == '/') dir else "/tmp", clock.wallMs(), std.mem.readInt(u32, &rnd, .little) });
+    return std.fmt.allocPrint(arena, "{s}/sketerm-{d}-{x}." ++ ext, .{ if (dir.len > 0 and dir[0] == '/') dir else "/tmp", clock.wallMs(), std.mem.readInt(u32, &rnd, .little) });
+}
+
+// ---------------------------------------------------------------------
+// web_trace
+// ---------------------------------------------------------------------
+
+pub const MAX_TRACE_MS: i64 = 30_000;
+pub const DEFAULT_TRACE_TOP: i64 = 10;
+pub const MAX_TRACE_TOP: i64 = 50;
+
+fn traceTool(drv: web.Driver, arena: std.mem.Allocator, e: *webdrive.Engine, args: std.json.Value, view: web.View) ![]const u8 {
+    const rec = switch (try Recording.parse(arena, args, "web_trace", MAX_TRACE_MS, DEFAULT_TRACE_TOP, MAX_TRACE_TOP, "trace.json")) {
+        .err => |r| return r,
+        .ok => |r| r,
+    };
+    const selector_stats = if (mcp.argValue(args, "selector_stats")) |v| v == .bool and v.bool else false;
+    if (e.route_kind == .remote_browser)
+        return mcp.errRes(arena, .unavailable, "this view's browser runs on another host, where its trace would be staged; web_trace traces views of a local browser helper (web_perf works there)");
+    if (rec.starting) {
+        const limit: u32 = @intCast(if (rec.duration) |d| @min(d + 5_000, MAX_TRACE_MS) else MAX_TRACE_MS);
+        const started = switch (try perfOp(drv, arena, e, view.pane, .trace_start, if (selector_stats) web_proto.TRACE_SELECTOR_STATS else 0, limit, 15_000, null)) {
+            .err => |r| return r,
+            .ok => |d| d,
+        };
+        if (rec.duration == null) {
+            var res = mcp.Res.init(arena);
+            try web.head(&res, arena, drv.mode(), view);
+            try res.fact("tracing", true);
+            try res.fact("selector_stats_requested", selector_stats);
+            try res.fact("max_duration_ms", MAX_TRACE_MS);
+            try res.fact("cpu_throttle", throttleOf(started.throttle));
+            try res.textf("trace started (cpu_throttle {d}x{s}); it ends by itself after {d}s. Stop it with web_trace action:\"stop\"", .{ throttleOf(started.throttle), if (selector_stats) ", selector stats" else "", @divTrunc(MAX_TRACE_MS, 1000) });
+            return res.finish();
+        }
+        wait(drv, rec.duration.?);
+    }
+    const done = switch (try perfOp(drv, arena, e, view.pane, .trace_stop, 0, 0, 90_000, rec.save)) {
+        .err => |r| return r,
+        .ok => |d| d,
+    };
+    const stop = std.json.parseFromSliceLeaky(web_proto.TraceStop, arena, done.text, .{ .ignore_unknown_fields = true }) catch web_proto.TraceStop{};
+    var file = FileSource.open(rec.save) orelse
+        return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "the trace was saved to {s} but could not be read back for the summary", .{rec.save}));
+    defer file.close();
+    const sum = trace.summarize(arena, file.source(), rec.top) catch |err| return mcp.errRes(arena, .failed, try std.fmt.allocPrint(arena, "the trace at {s} could not be summarized: {s}", .{ rec.save, @errorName(err) }));
+    return traceResult(drv, arena, args, view, sum, done, stop, rec.save);
+}
+
+/// A file read through libc, rewindable for the summarizer's two passes.
+const FileSource = struct {
+    fp: *c.FILE,
+
+    fn open(path: []const u8) ?FileSource {
+        var z: [4096:0]u8 = undefined;
+        const p = std.fmt.bufPrintSentinel(&z, "{s}", .{path}, 0) catch return null;
+        return .{ .fp = c.fopen(p.ptr, "rb") orelse return null };
+    }
+
+    fn close(self: *FileSource) void {
+        _ = c.fclose(self.fp);
+    }
+
+    fn source(self: *FileSource) trace.Source {
+        return .{ .ctx = self, .readFn = read, .rewindFn = rewind };
+    }
+
+    fn read(ctx: *anyopaque, buf: []u8) error{ReadFailed}!usize {
+        const self: *FileSource = @ptrCast(@alignCast(ctx));
+        const n = c.fread(buf.ptr, 1, buf.len, self.fp);
+        if (n == 0 and c.ferror(self.fp) != 0) return error.ReadFailed;
+        return n;
+    }
+
+    fn rewind(ctx: *anyopaque) error{ReadFailed}!void {
+        const self: *FileSource = @ptrCast(@alignCast(ctx));
+        if (c.fseek(self.fp, 0, c.SEEK_SET) != 0) return error.ReadFailed;
+    }
+};
+
+/// A JS location in a trace list, flat so source-map resolution and the schema read it like `TopFn`.
+pub const TraceReflow = struct {
+    function: []const u8,
+    url: []const u8,
+    line: u32,
+    column: u32,
+    count: u32,
+    total_ms: f64,
+    style_count: u32,
+    layout_count: u32,
+    source: ?[]const u8 = null,
+    source_line: ?u32 = null,
+    source_name: ?[]const u8 = null,
+};
+
+pub const TraceLongTask = struct {
+    start_ms: f64,
+    duration_ms: f64,
+    cause: trace.Cause,
+    /// The heaviest JS entry when the cause is script; empty otherwise.
+    function: []const u8 = "",
+    url: []const u8 = "",
+    line: u32 = 0,
+    column: u32 = 0,
+    source: ?[]const u8 = null,
+    source_line: ?u32 = null,
+    source_name: ?[]const u8 = null,
+};
+
+fn shownName(f: []const u8) []const u8 {
+    return if (f.len != 0) f else "(anonymous)";
+}
+
+fn traceResult(drv: web.Driver, arena: std.mem.Allocator, args: std.json.Value, view: web.View, sum: trace.Summary, done: Done, stop: web_proto.TraceStop, save: []const u8) ![]const u8 {
+    const reflows = try arena.alloc(TraceReflow, sum.forced_reflows.top.len);
+    for (sum.forced_reflows.top, reflows) |r, *o| o.* = .{
+        .function = shownName(r.frame.function),
+        .url = r.frame.url,
+        .line = r.frame.line,
+        .column = r.frame.column,
+        .count = r.count,
+        .total_ms = r.total_ms,
+        .style_count = r.style_count,
+        .layout_count = r.layout_count,
+    };
+    const longs = try arena.alloc(TraceLongTask, sum.long_tasks.top.len);
+    for (sum.long_tasks.top, longs) |l, *o| {
+        o.* = .{ .start_ms = l.start_ms, .duration_ms = l.duration_ms, .cause = l.cause };
+        if (l.frame) |f| {
+            o.function = shownName(f.function);
+            o.url = f.url;
+            o.line = f.line;
+            o.column = f.column;
+        }
+    }
+    const maps_line: ?[]const u8 = if (wantMaps(args)) try resolveMaps(drv, arena, args, view, .{ reflows, longs }) else null;
+    const truncated = stop.truncated or sum.cut;
+    const opts: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
+    const mt = sum.main_thread;
+
+    var res = mcp.Res.init(arena);
+    try web.head(&res, arena, drv.mode(), view);
+    try res.fact("window_ms", sum.window_ms);
+    try res.fact("cpu_throttle", throttleOf(done.throttle));
+    try res.fact("trace_path", save);
+    try res.fact("bytes", stop.bytes);
+    try res.fact("events", sum.events);
+    try res.fact("truncated", truncated);
+    try res.fact("navigations", done.navigations);
+    try res.fact("main_thread", .{
+        .source = @tagName(sum.main_source),
+        .task_ms = mt.task_ms,
+        .script_ms = mt.script_ms,
+        .style_ms = mt.style_ms,
+        .style_count = mt.style_count,
+        .layout_ms = mt.layout_ms,
+        .layout_count = mt.layout_count,
+        .paint_ms = mt.paint_ms,
+        .gc_ms = mt.gc_ms,
+    });
+    try res.raw("long_tasks", try std.json.Stringify.valueAlloc(arena, .{ .count = sum.long_tasks.count, .total_ms = sum.long_tasks.total_ms, .max_ms = sum.long_tasks.max_ms, .top = longs }, opts));
+    try res.raw("forced_reflows", try std.json.Stringify.valueAlloc(arena, .{ .count = sum.forced_reflows.count, .total_ms = sum.forced_reflows.total_ms, .top = reflows }, opts));
+    try res.raw("selector_stats", try std.json.Stringify.valueAlloc(arena, sum.selector_stats, opts));
+    try res.raw("frames", try std.json.Stringify.valueAlloc(arena, sum.frames, opts));
+    try res.raw("user_timing", try std.json.Stringify.valueAlloc(arena, sum.user_timing, opts));
+    if (maps_line) |l| try res.fact("source_maps", l);
+    try web.fileFacts(&res, save);
+
+    try res.textf("trace {d}ms, {d} events, cpu_throttle {d}x: tasks {d}ms, script {d}ms, style {d}ms ({d}x), layout {d}ms ({d}x), paint {d}ms, gc {d}ms; raw trace at {s}", .{
+        sum.window_ms, sum.events, throttleOf(done.throttle), mt.task_ms, mt.script_ms, mt.style_ms, mt.style_count, mt.layout_ms, mt.layout_count, mt.paint_ms, mt.gc_ms, save,
+    });
+    if (truncated) try res.textf("TRUNCATED: {s}", .{if (stop.note.len != 0) stop.note else "the file ended inside the event list; the summary covers what it holds"});
+    if (sum.main_source != .tracing_started) try res.textf("main thread: {s}", .{if (sum.main_source == .none) "no renderer main thread in this trace; every section is empty" else "the trace does not name the tab's renderer; every renderer's main thread is counted"});
+    if (done.navigations != 0) try res.textf("the page navigated {d}x while tracing; every renderer the tab used is counted", .{done.navigations});
+    if (maps_line) |l| try res.textf("source maps: {s}", .{l});
+    if (sum.frames) |f| try res.textf("frames drawn {d} ({d} fps)", .{ f.count, f.fps });
+    var body: std.Io.Writer.Allocating = .init(arena);
+    const w = &body.writer;
+    if (sum.long_tasks.count != 0) {
+        try w.print("{d} long tasks, {d}ms in all, max {d}ms\n", .{ sum.long_tasks.count, sum.long_tasks.total_ms, sum.long_tasks.max_ms });
+        for (longs, 1..) |l, i| {
+            try w.print("{d}. {d}ms at +{d}ms {s}", .{ i, l.duration_ms, l.start_ms, @tagName(l.cause) });
+            if (l.url.len != 0 or l.function.len != 0) try writeSite(w, l.function, l.url, l.line, l.column, l.source, l.source_line, l.source_name);
+            try w.writeByte('\n');
+        }
+        try res.section("long_tasks", body.written());
+        body.clearRetainingCapacity();
+    }
+    if (sum.forced_reflows.count != 0) {
+        try w.print("{d} forced style/layout runs inside JS, {d}ms in all\n", .{ sum.forced_reflows.count, sum.forced_reflows.total_ms });
+        for (reflows, 1..) |r, i| {
+            try w.print("{d}. {d}x {d}ms ({d} style, {d} layout)", .{ i, r.count, r.total_ms, r.style_count, r.layout_count });
+            try writeSite(w, r.function, r.url, r.line, r.column, r.source, r.source_line, r.source_name);
+            try w.writeByte('\n');
+        }
+        try res.section("forced_reflows", body.written());
+        body.clearRetainingCapacity();
+    }
+    if (sum.selector_stats.len != 0) {
+        for (sum.selector_stats, 1..) |s, i| try w.print("{d}. {d}ms attempts {d} matches {d} {s} ({s})\n", .{ i, s.elapsed_ms, s.match_attempts, s.match_count, s.selector, s.style_sheet });
+        try res.section("selector_stats", body.written());
+        body.clearRetainingCapacity();
+    }
+    if (sum.user_timing.len != 0) {
+        for (sum.user_timing) |t| switch (t.kind) {
+            .mark => try w.print("mark {s} +{d}ms\n", .{ t.name, t.start_ms }),
+            .measure => try w.print("measure {s} +{d}ms {d}ms\n", .{ t.name, t.start_ms, t.duration_ms }),
+        };
+        try res.section("user_timing", body.written());
+    }
+    return res.finish();
+}
+
+fn writeSite(w: *std.Io.Writer, function: []const u8, url: []const u8, line: u32, column: u32, source: ?[]const u8, source_line: ?u32, source_name: ?[]const u8) !void {
+    try w.print(" {s} {s}:{d}:{d}", .{ function, if (url.len != 0) url else "(no url)", line, column });
+    if (source) |s| try w.print(" -> {s}:{d}", .{ s, source_line orelse 0 });
+    if (source_name) |n| try w.print(" {s}", .{n});
 }
 
 const TopFn = struct {
@@ -253,11 +500,11 @@ fn topList(arena: std.mem.Allocator, fns: []const cpuprofile.Fn, n: usize, busy_
     return out.items;
 }
 
-fn summaryResult(drv: web.Driver, arena: std.mem.Allocator, e: *webdrive.Engine, args: std.json.Value, view: web.View, sum: cpuprofile.Summary, done: Done, save: []const u8, top: usize, interval: i64) ![]const u8 {
+fn summaryResult(drv: web.Driver, arena: std.mem.Allocator, args: std.json.Value, view: web.View, sum: cpuprofile.Summary, done: Done, save: []const u8, top: usize, interval: i64) ![]const u8 {
     const busy = sum.busyUs();
     const top_self = try topList(arena, sum.by_self, top, busy);
     const top_total = try topList(arena, sum.by_total, top, busy);
-    const maps_line: ?[]const u8 = if (mcp.argValue(args, "source_maps")) |v| (if (v == .bool and !v.bool) null else try resolveMaps(drv, arena, e, args, view, top_self, top_total)) else try resolveMaps(drv, arena, e, args, view, top_self, top_total);
+    const maps_line: ?[]const u8 = if (wantMaps(args)) try resolveMaps(drv, arena, args, view, .{ top_self, top_total }) else null;
 
     var res = mcp.Res.init(arena);
     try web.head(&res, arena, drv.mode(), view);
@@ -287,9 +534,8 @@ fn writeTop(res: *mcp.Res, arena: std.mem.Allocator, name: []const u8, list: []c
     var body: std.Io.Writer.Allocating = .init(arena);
     const w = &body.writer;
     for (list, 1..) |t, i| {
-        try w.print("{d}. {s} self {d}ms ({d}%) total {d}ms {s}:{d}:{d}", .{ i, t.function, t.self_ms, t.self_pct, t.total_ms, if (t.url.len != 0) t.url else "(no url)", t.line, t.column });
-        if (t.source) |s| try w.print(" -> {s}:{d}", .{ s, t.source_line orelse 0 });
-        if (t.source_name) |n| try w.print(" {s}", .{n});
+        try w.print("{d}. self {d}ms ({d}%) total {d}ms", .{ i, t.self_ms, t.self_pct, t.total_ms });
+        try writeSite(w, t.function, t.url, t.line, t.column, t.source, t.source_line, t.source_name);
         try w.writeByte('\n');
     }
     try res.section(name, body.written());
@@ -301,14 +547,19 @@ fn writeTop(res: *mcp.Res, arena: std.mem.Allocator, name: []const u8, list: []c
 
 const MapEntry = struct { url: []const u8, map: ?sourcemap.Map, why: []const u8 };
 
-/// Resolve the top lists' functions through their scripts' source maps; returns the status line.
-fn resolveMaps(drv: web.Driver, arena: std.mem.Allocator, e: *webdrive.Engine, args: std.json.Value, view: web.View, a: []TopFn, b: []TopFn) ![]const u8 {
-    _ = e;
+fn wantMaps(args: std.json.Value) bool {
+    const v = mcp.argValue(args, "source_maps") orelse return true;
+    return !(v == .bool and !v.bool);
+}
+
+/// Resolve the listed functions through their scripts' source maps; `lists` is a tuple of slices of structs with
+/// `url`/`line`/`column` (1-based) and optional `source`/`source_line`/`source_name`. Returns the status line.
+fn resolveMaps(drv: web.Driver, arena: std.mem.Allocator, args: std.json.Value, view: web.View, lists: anytype) ![]const u8 {
     var cache: std.ArrayList(MapEntry) = .empty;
     var wanted: usize = 0;
     var resolved: usize = 0;
     var reasons: std.ArrayList(u8) = .empty;
-    for ([_][]TopFn{ a, b }) |list| for (list) |*t| {
+    inline for (lists) |list| for (list) |*t| {
         if (t.url.len == 0 or t.line == 0) continue;
         wanted += 1;
         const entry = blk: {

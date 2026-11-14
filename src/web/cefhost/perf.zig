@@ -9,6 +9,7 @@ const cef = @import("cef");
 const proto = @import("../protocol.zig");
 const host_mod = @import("../cefhost.zig");
 const devtools = @import("devtools_session.zig");
+const host_trace = @import("trace.zig");
 const clock = @import("../../util/clock.zig");
 
 const Host = host_mod.Host;
@@ -47,6 +48,7 @@ pub const State = struct {
     auto_staged: ?[]u8 = null,
     auto_note: []const u8 = "",
     jobs: [4]?Job = @splat(null),
+    trace: host_trace.State = .{},
 
     /// Release what the state owns, removing an uncollected profile, and reset it.
     pub fn deinit(self: *State, gpa: std.mem.Allocator) void {
@@ -64,7 +66,7 @@ fn unlinkPath(gpa: std.mem.Allocator, p: []const u8) void {
     _ = @import("cbindings").unlink(z.ptr);
 }
 
-fn answer(host: *Host, v: *const View, req: u32, op: u8, ok: bool, text: []const u8, staged: []const u8, navigations: u32) void {
+pub fn answer(host: *Host, v: *const View, req: u32, op: u8, ok: bool, text: []const u8, staged: []const u8, navigations: u32) void {
     if (req == 0) return;
     host.post(proto.EvPerfResult{
         .view = v.id,
@@ -79,7 +81,7 @@ fn answer(host: *Host, v: *const View, req: u32, op: u8, ok: bool, text: []const
     });
 }
 
-fn refuse(host: *Host, view: u32, req: proto.PerfReq, why: []const u8) void {
+pub fn refuse(host: *Host, view: u32, req: proto.PerfReq, why: []const u8) void {
     host.post(proto.EvPerfResult{ .view = view, .req = req.req, .op = req.op, .ok = 0, .throttle = 100, .paints = 0, .navigations = 0, .text = why, .staged = "" });
 }
 
@@ -88,6 +90,10 @@ pub fn perfReq(host: *Host, req: proto.PerfReq) void {
     const v = host.find(req.view) orelse return refuse(host, req.view, req, "no such view");
     const browser = v.browser orelse return refuse(host, v.id, req, "the view has no live browser (discarded or closing)");
     const op = std.enums.fromInt(proto.PerfOp, req.op) orelse return refuse(host, v.id, req, "unknown perf op");
+    if (op == .trace_start or op == .trace_stop) {
+        const session = host.devtoolsFor(v) catch return refuse(host, v.id, req, "the engine refused a DevTools session for this view");
+        return host_trace.request(host, v, session, browser, req, op);
+    }
     const slot = freeSlot(v) orelse return refuse(host, v.id, req, "too many perf requests in flight on this view");
     const session = host.devtoolsFor(v) catch return refuse(host, v.id, req, "the engine refused a DevTools session for this view");
     var job: Job = .{ .req = req.req, .op = op };
@@ -141,6 +147,7 @@ pub fn perfReq(host: *Host, req: proto.PerfReq) void {
             push(&job, session.send(browser, "Profiler.stop", null, stop_timeout_ms, .staged, "profile")) catch
                 return refuse(host, v.id, req, "the engine refused Profiler.stop");
         },
+        .trace_start, .trace_stop => unreachable,
         _ => return refuse(host, v.id, req, "unknown perf op"),
     }
     slot.* = job;
@@ -179,6 +186,7 @@ pub fn browserGone(host: *Host, v: *View) void {
         entry.* = null;
         answer(host, v, job.req, @intFromEnum(job.op), false, "the view's browser went away (closed, discarded or crashed)", "", 0);
     }
+    host_trace.browserGone(host, v);
     v.perf.deinit(host.gpa);
 }
 
@@ -199,6 +207,7 @@ pub fn pump(host: *Host, now_ms: i64) void {
     for (host.views.items) |v| {
         const session = v.devtools orelse continue;
         session.expire(now_ms);
+        host_trace.pump(host, v, session, now_ms);
         if (v.perf.profiling and v.perf.auto_staged == null and profileJob(v) == null and
             now_ms - v.perf.profile_started_ms >= v.perf.profile_limit_ms)
         {
@@ -286,7 +295,7 @@ fn step(host: *Host, v: *View, session: *devtools.Session, job: *Job) bool {
             // Release the V8 profiler; nobody waits on the answer.
             if (v.browser) |b| if (session.send(b, "Profiler.disable", null, method_timeout_ms, .memory, "")) |id| session.forget(id) else |_| {};
         },
-        _ => unreachable,
+        else => unreachable,
     }
     for (job.ids[0..job.n]) |id| session.forget(id);
     return true;

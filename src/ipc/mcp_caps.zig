@@ -401,7 +401,9 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("web_perf", perf.perf);
         try res.fact("web_cpu_profile", perf.profile);
         try res.fact("web_cpu_throttle", perf.perf);
+        try res.fact("web_trace", perf.trace);
         try verdicts.add(arena, "perf/cpu profile", perf.perf);
+        try verdicts.add(arena, "trace", perf.trace);
         // Response-body capture: a fail-closed open option, so a
         // consumer must be able to preflight it rather than trip over
         // the refusal.
