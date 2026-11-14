@@ -255,6 +255,8 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 - `web_fetch`: Fetch the CONTENT of several urls in one call, through real browser tabs (the page renders, its JavaScript runs, JS challenges pass) that you never see or drive: background tabs, opened for this call and closed as soon as each result is read (also on error, timeout or cancel), never in web_tabs, never a target, never shown to a watching user.
 - `web_download`: Download a url to a FILE, fetched by the web view's own browser — so it carries that browser's cookies, session and route, and a file behind a login needs no token, no signed url and no cookie copying.
 - `web_print_pdf`: Print a headless web view's page to a PDF FILE, rendered by its own browser: vector text, embedded fonts, the page's print CSS.
+- `web_perf`: Cheap fixed-shape performance sample of a headless tab from the engine's own counters (Performance.getMetrics); nothing runs in the page.
+- `web_cpu_profile`: Sampling CPU profile of a headless tab's main thread (V8 Profiler): time per JS function.
 - `web_network`: Content blocking + a network request log for a web view.
 - `web_capture` (read-only): HEADLESS ONLY: read what a view's CAPTURE recorded (web_open 'capture' installs one), the response bodies the page itself received, exactly as it received them (decompressed; request bodies and response headers too).
 - `web_capture_set`: HEADLESS ONLY: NARROW a view's live capture, never widen it (the same rule a live network policy follows).

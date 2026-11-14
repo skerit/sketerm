@@ -170,6 +170,7 @@ const unconditional_caps = [_]proto.Cap{
     .motion_drift,
     .view_screen_early,
     .drag_drop,
+    .web_perf,
 };
 
 /// Test-only negotiation seam: an environment switch that withholds one
@@ -184,6 +185,7 @@ fn withheld(cap: proto.Cap) bool {
         .capture => "SKETERM_WEB_DISABLE_CAPTURE",
         .untrusted_web => "SKETERM_WEB_DISABLE_UNTRUSTED",
         .web_emulation => "SKETERM_WEB_DISABLE_EMULATION",
+        .web_perf => "SKETERM_WEB_DISABLE_PERF",
         .web_stream => "SKETERM_WEB_DISABLE_STREAM",
         .stream_audio => "SKETERM_WEB_DISABLE_STREAM_AUDIO",
         .stream_encoded => "SKETERM_WEB_DISABLE_STREAM_ENCODED",
@@ -945,6 +947,7 @@ pub const Server = struct {
             .view_hide => self.host.showView((try self.dec(cn, proto.ViewHide, frame.payload)).view, false),
             .view_max_fps => self.host.setMaxFps(try self.dec(cn, proto.ViewMaxFps, frame.payload)),
             .view_emulation => try self.host.setEmulation(try self.dec(cn, proto.ViewEmulation, frame.payload)),
+            .perf_req => self.host.perfReq(try self.dec(cn, proto.PerfReq, frame.payload)),
             .view_screen => try self.host.setScreen(try self.dec(cn, proto.ViewScreen, frame.payload), !withheld(.view_screen_early)),
             .cert_decision => self.host.certDecision(try self.dec(cn, proto.CertDecision, frame.payload)),
             .permission_decision => self.host.permissionDecision(try self.dec(cn, proto.PermissionDecision, frame.payload)),

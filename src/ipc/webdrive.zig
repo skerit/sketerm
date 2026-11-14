@@ -520,6 +520,28 @@ pub const Print = struct {
     fail_reason: []const u8 = "",
 };
 
+/// One `perf_req` this client asked for, correlated by `req`.
+pub const Perf = struct {
+    req: u32,
+    view: u32,
+    state: enum { pending, done, failed } = .pending,
+    /// The view's throttle rate x100 the answer reported.
+    throttle: u32 = 100,
+    paints: u32 = 0,
+    navigations: u32 = 0,
+    /// Owned: metrics JSON, a note, or the failure reason.
+    text: []u8 = &.{},
+    /// Owned: the helper-private staging file of a stopped profile.
+    staged: []u8 = &.{},
+
+    fn deinit(self: *Perf, gpa: std.mem.Allocator) void {
+        gpa.free(self.text);
+        gpa.free(self.staged);
+    }
+};
+
+pub const PerfError = error{ Unavailable, NoView, Unsupported, OutOfMemory };
+
 pub const PrintError = error{
     Unavailable,
     NoView,
@@ -757,6 +779,8 @@ pub const Emulation = struct {
     color_scheme: ?proto.ColorScheme = null,
     reduced_motion: ?proto.ReducedMotion = null,
     device_scale_factor: ?f64 = null,
+    /// CPU slowdown factor (1 = off, max 20), a perf op (capability `web-perf`) sent right after the create.
+    cpu_throttle: ?f64 = null,
 
     pub fn present(self: Emulation) bool {
         return self.color_scheme != null or self.reduced_motion != null or self.device_scale_factor != null;
@@ -768,6 +792,7 @@ pub const Emulation = struct {
 
     pub fn valid(self: Emulation) bool {
         if (self.color_scheme == .unchanged or self.reduced_motion == .unchanged) return false;
+        if (self.cpu_throttle) |r| if (!std.math.isFinite(r) or r < 1 or r > 20) return false;
         if (self.device_scale_factor) |s| return std.math.isFinite(s) and s >= 0.5 and s <= 4;
         return true;
     }
@@ -1219,6 +1244,9 @@ pub const Engine = struct {
     next_download_req: u32 = 1,
     /// Prints asked for and not yet collected by `takePrint`.
     prints: std.ArrayList(Print) = .empty,
+    /// Perf requests asked for and not yet collected by `takePerf`.
+    perfs: std.ArrayList(Perf) = .empty,
+    next_perf_req: u32 = 1,
     next_sem_request: u32 = 1,
     next_stream_request: u32 = 1,
     /// Stamps every `net_policy_set`; `ev_net_policy` echoes it so a
@@ -1434,6 +1462,8 @@ pub const Engine = struct {
         self.downloads.deinit(self.gpa);
         self.clearPrints();
         self.prints.deinit(self.gpa);
+        self.clearPerfs();
+        self.perfs.deinit(self.gpa);
         self.in.deinit(self.gpa);
         self.rx_fds.deinit(self.gpa);
         // Persistent contexts are deliberately NEVER destroyed at
@@ -1859,6 +1889,7 @@ pub const Engine = struct {
         // waiting on the file, instead of a wait that runs out.
         self.failDownloads(LOST_MSG);
         self.failPrints(LOST_MSG);
+        self.failPerfs(LOST_MSG);
         self.removePresence();
         self.state = .unavailable;
         self.owner = .none;
@@ -2518,6 +2549,7 @@ pub const Engine = struct {
         errdefer if (self.untrusted and self.views.items.len == 0) self.stopUntrusted();
         if (wants_untrusted and !self.has(.untrusted_web)) return error.UntrustedUnsupported;
         if (emulation.present() and !self.has(.web_emulation)) return error.EmulationUnsupported;
+        if (emulation.cpu_throttle != null and !self.has(.web_perf)) return error.PerfUnsupported;
         if (requested_fps != null and !self.has(.view_max_fps)) return error.FrameRateUnsupported;
         if (bg) |b| if (b.no_redirect and !self.backgroundHonoured()) return error.FlagsUnsupported;
         // A routed helper that refused its route says so right after
@@ -2645,6 +2677,13 @@ pub const Engine = struct {
                 .max_fps = v.max_fps orelse 0,
             }) catch return error.Unavailable;
         }
+        // Nobody waits on it (req 0): every perf result reports the throttle that is really active.
+        if (emulation.cpu_throttle) |r| if (r != 1) self.send(proto.PerfReq{
+            .view = v.id,
+            .req = 0,
+            .op = @intFromEnum(proto.PerfOp.throttle),
+            .arg = @intFromFloat(@round(r * 100)),
+        }) catch return error.Unavailable;
         // Otherwise right after it, before view_show and any navigate
         // (a no-op when the early report went out).
         self.syncScreen(v) catch return error.Unavailable;
@@ -3718,14 +3757,13 @@ pub const Engine = struct {
         p.state = .done;
     }
 
-    /// Move an untrusted helper's staged print to the client's `dest`; the
-    /// staging file is gone afterwards either way.
-    /// @return why it failed, or null once `dest` holds the PDF.
-    fn deliverStaged(self: *const Engine, staged: []const u8, dest: []const u8) ?[]const u8 {
+    /// Move a staged helper file to the client's `dest`; the staging file is gone afterwards either way.
+    /// @return why it failed, or null once `dest` holds the file.
+    pub fn deliverStaged(self: *const Engine, staged: []const u8, dest: []const u8) ?[]const u8 {
         var real: [4096:0]u8 = undefined;
-        const root = self.private_dir orelse return "the untrusted helper has no private root to print into";
+        const root = self.stagingRoot() orelse return "the untrusted helper has no private root to stage into";
         const from = stagedWithin(root, staged, &real) orelse
-            return "the untrusted helper named no staging file inside its private root; nothing was written";
+            return "the helper named no staging file inside its staging root; nothing was written";
         var dest_z: [4096:0]u8 = undefined;
         const to = std.fmt.bufPrintSentinel(&dest_z, "{s}", .{dest}, 0) catch {
             _ = c.unlink(from.ptr);
@@ -3733,16 +3771,87 @@ pub const Engine = struct {
         };
         if (pathz.moveFile(from, to)) return null;
         _ = c.unlink(from.ptr);
-        return "the browser engine printed the PDF but it could not be moved to that path";
+        return "the helper staged the file but it could not be moved to that path";
     }
 
-    /// Remove an untrusted print nobody collects (its call timed out or
-    /// the helper lost); the private root's supervisor is only the backstop.
+    /// Where this helper stages files (`cefhost.stagingDir`'s answer, on this host).
+    fn stagingRoot(self: *const Engine) ?[]const u8 {
+        return if (self.untrusted) self.private_dir else "/tmp";
+    }
+
+    /// Remove a staged file nobody collects (its call timed out or the helper lost);
+    /// the private root's supervisor is only the backstop.
     fn dropStaged(self: *const Engine, staged: []const u8) void {
-        if (!self.untrusted) return;
-        const root = self.private_dir orelse return;
+        const root = self.stagingRoot() orelse return;
         var real: [4096:0]u8 = undefined;
         if (stagedWithin(root, staged, &real)) |from| _ = c.unlink(from.ptr);
+    }
+
+    // ---- performance (capability "web-perf") -------------------------
+
+    fn clearPerfs(self: *Engine) void {
+        for (self.perfs.items) |*p| {
+            self.dropStaged(p.staged);
+            p.deinit(self.gpa);
+        }
+        self.perfs.clearRetainingCapacity();
+    }
+
+    fn failPerfs(self: *Engine, reason: []const u8) void {
+        for (self.perfs.items) |*p| {
+            if (p.state != .pending) continue;
+            p.state = .failed;
+            p.text = self.gpa.dupe(u8, reason) catch &.{};
+        }
+    }
+
+    fn perfIndex(self: *const Engine, req: u32) ?usize {
+        for (self.perfs.items, 0..) |p, i| if (p.req == req) return i;
+        return null;
+    }
+
+    /// Ask `view_id`'s helper for one perf op; poll `perfState`, then `takePerf`.
+    pub fn startPerf(self: *Engine, view_id: u32, op: proto.PerfOp, arg: u32, limit_ms: u32) PerfError!u32 {
+        if (!self.ensure()) return error.Unavailable;
+        if (!self.has(.web_perf)) return error.Unsupported;
+        if (self.findView(view_id) == null) return error.NoView;
+        const req = self.next_perf_req;
+        self.next_perf_req +%= 1;
+        if (self.next_perf_req == 0) self.next_perf_req = 1;
+        try self.perfs.append(self.gpa, .{ .req = req, .view = view_id });
+        self.send(proto.PerfReq{ .view = view_id, .req = req, .op = @intFromEnum(op), .arg = arg, .limit_ms = limit_ms }) catch {
+            _ = self.perfs.pop();
+            return error.Unavailable;
+        };
+        return req;
+    }
+
+    pub fn perfState(self: *const Engine, req: u32) ?Perf {
+        const i = self.perfIndex(req) orelse return null;
+        return self.perfs.items[i];
+    }
+
+    /// Forget `req`, answered or not; a staged file nobody moved is removed.
+    pub fn takePerf(self: *Engine, req: u32) void {
+        const i = self.perfIndex(req) orelse return;
+        var p = self.perfs.orderedRemove(i);
+        self.dropStaged(p.staged);
+        p.deinit(self.gpa);
+    }
+
+    fn onPerfResult(self: *Engine, ev: proto.EvPerfResult) void {
+        const i = self.perfIndex(ev.req) orelse return self.dropStaged(ev.staged);
+        const p = &self.perfs.items[i];
+        if (p.state != .pending) return self.dropStaged(ev.staged);
+        p.state = if (ev.ok != 0) .done else .failed;
+        p.throttle = ev.throttle;
+        p.paints = ev.paints;
+        p.navigations = ev.navigations;
+        p.text = self.gpa.dupe(u8, ev.text) catch &.{};
+        p.staged = self.gpa.dupe(u8, ev.staged) catch blk: {
+            self.dropStaged(ev.staged);
+            break :blk &.{};
+        };
     }
 
     fn nextDownloadReq(self: *Engine) u32 {
@@ -4709,6 +4818,10 @@ pub const Engine = struct {
                 const ev = proto.decode(proto.EvPrintPdfDone, frame.payload) catch return;
                 self.onPrintDone(ev);
             },
+            .ev_perf_result => {
+                const ev = proto.decode(proto.EvPerfResult, frame.payload) catch return;
+                self.onPerfResult(ev);
+            },
             .ev_console => {
                 const ev = proto.decode(proto.EvConsole, frame.payload) catch return;
                 if (self.findView(ev.view)) |v| self.pushConsole(v, ev.level, ev.msg);
@@ -5465,6 +5578,61 @@ test "print_pdf: layout flags need print-pdf-css-page, answers join by path, a l
     const lost = pair.eng.printState("/tmp/deck.pdf").?;
     try t.expect(lost.state == .failed);
     try t.expectEqualStrings("gone", lost.fail_reason);
+}
+
+test "perf requests need web-perf, correlate by req and deliver a staged profile" {
+    const t = std.testing;
+    const root = pathz.TempDir.make("wd-perf") orelse return error.SkipZigTest;
+    defer root.remove();
+    var pair = try Pair.init(t.allocator);
+    defer pair.deinit();
+    var buf: [4096]u8 = undefined;
+    const view = try pair.eng.openView("about:blank", 800, 600);
+    _ = pair.drain(&buf);
+    // An older helper never advertised it: nothing is sent.
+    try t.expectError(error.Unsupported, pair.eng.startPerf(view.id, .metrics, 0, 0));
+    try t.expectEqual(@as(usize, 0), pair.drain(&buf).len);
+    pair.eng.caps.insert(.web_perf);
+    const a = try pair.eng.startPerf(view.id, .metrics, 0, 0);
+    const b = try pair.eng.startPerf(view.id, .profile_stop, 0, 0);
+    var reader = proto.Reader.init(pair.drain(&buf));
+    const sent = try proto.decode(proto.PerfReq, (try reader.next()).?.payload);
+    try t.expectEqual(a, sent.req);
+    try t.expectEqual(@as(u8, @intFromEnum(proto.PerfOp.metrics)), sent.op);
+    // Answers land on their own request, whatever the order; an unknown req is ignored.
+    pair.eng.onPerfResult(.{ .view = view.id, .req = 999, .op = 1, .ok = 1, .throttle = 100, .paints = 0, .navigations = 0, .text = "x", .staged = "" });
+    pair.eng.onPerfResult(.{ .view = view.id, .req = a, .op = 1, .ok = 1, .throttle = 400, .paints = 7, .navigations = 0, .text = "{\"metrics\":[]}", .staged = "" });
+    try t.expect(pair.eng.perfState(b).?.state == .pending);
+    const got = pair.eng.perfState(a).?;
+    try t.expectEqual(@as(u32, 400), got.throttle);
+    try t.expectEqualStrings("{\"metrics\":[]}", got.text);
+    pair.eng.takePerf(a);
+    try t.expect(pair.eng.perfState(a) == null);
+    // A staged profile is moved only from inside the staging root.
+    pair.eng.untrusted = true;
+    pair.eng.private_dir = try t.allocator.dupe(u8, root.path());
+    var staged_buf: [256:0]u8 = undefined;
+    const staged = try std.fmt.bufPrintSentinel(&staged_buf, "{s}/sketerm-devtools-x", .{root.path()}, 0);
+    const fd = c.open(staged.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
+    if (fd < 0) return error.SkipZigTest;
+    _ = c.write(fd, "{}", 2);
+    _ = c.close(fd);
+    pair.eng.onPerfResult(.{ .view = view.id, .req = b, .op = 4, .ok = 1, .throttle = 100, .paints = 0, .navigations = 1, .text = "", .staged = staged });
+    var dest_buf: [256]u8 = undefined;
+    const dest = try std.fmt.bufPrint(&dest_buf, "{s}/moved.cpuprofile", .{root.path()});
+    try t.expect(pair.eng.deliverStaged(pair.eng.perfState(b).?.staged, dest) == null);
+    try t.expectEqual(@as(u32, 1), pair.eng.perfState(b).?.navigations);
+    try t.expect(pair.eng.deliverStaged("/etc/passwd", dest) != null);
+    pair.eng.takePerf(b);
+    var st: c.struct_stat = undefined;
+    var dz: [256:0]u8 = undefined;
+    try t.expect(c.stat((try std.fmt.bufPrintSentinel(&dz, "{s}", .{dest}, 0)).ptr, &st) == 0);
+    _ = c.unlink(&dz);
+    // A lost helper answers every pending request.
+    const pending = try pair.eng.startPerf(view.id, .metrics, 0, 0);
+    pair.eng.failPerfs("gone");
+    try t.expect(pair.eng.perfState(pending).?.state == .failed);
+    pair.eng.takePerf(pending);
 }
 
 test "an untrusted print is staged in the private root and moved to the client's path" {

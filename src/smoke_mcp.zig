@@ -653,6 +653,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         say("smoke-mcp: focused response-body capture ok");
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBPERF_ONLY") != null) {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the perf stage");
+        _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+        defer _ = unsetEnv("SKETERM_WEB_BIN");
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+        defer _ = unsetEnv("SKETERM_WEB_BROKER_ENGINE");
+        webPerfStage(allocator, exe, rt);
+        say("smoke-mcp: focused perf stage ok");
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBTABS_ONLY") != null) {
         var bin_buf: [4096:0]u8 = undefined;
         const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the tab-targeting stage");
@@ -5979,6 +5990,174 @@ fn capSc(arena: std.mem.Allocator, line: []const u8, comptime what: []const u8, 
 fn capInt(o: std.json.ObjectMap, key: []const u8) i64 {
     const v = o.get(key) orelse return -1;
     return if (v == .integer) v.integer else -1;
+}
+
+/// Loopback fixture for the perf stage: a page, a minified script with named
+/// `hot`/`cold` functions on their own generated lines, and its hand-made map.
+const PerfHttp = struct {
+    lis: tcpserver.Listener = .{ .backlog = 32, .poll_ms = 100 },
+
+    const page = "<!doctype html><html><head><title>perf</title><script src=\"/app.min.js\"></script></head><body><p>perf</p></body></html>";
+    const script =
+        \\function hot(n){let s=0;for(let i=0;i<n;i++)s+=Math.sqrt(i)*Math.sin(i);return s}
+        \\function cold(n){let s=0;for(let i=0;i<n;i++)s+=i%7;return s}
+        \\function work(ms){const end=performance.now()+ms;let s=0;while(performance.now()<end){s+=hot(200000);s+=cold(2000)}return s}
+        \\//# sourceMappingURL=app.min.js.map
+    ;
+    /// hot -> src/app.ts:10 hotOriginal, cold -> src/app.ts:20 coldOriginal; line 2 maps nowhere.
+    const map = "{\"version\":3,\"file\":\"app.min.js\",\"sources\":[\"src/app.ts\"],\"names\":[\"hotOriginal\",\"coldOriginal\"],\"mappings\":\"AASAA;AAUAC\"}";
+
+    fn start(self: *PerfHttp) bool {
+        return self.lis.start(self, &onConn);
+    }
+
+    fn onConn(_: ?*anyopaque, afd: c_int) bool {
+        var buf: [8192]u8 = undefined;
+        const raw = tcpserver.readRequest(afd, &buf, 3000);
+        const path_start = (std.mem.indexOfScalar(u8, raw, ' ') orelse return false) + 1;
+        const path_end = std.mem.indexOfScalarPos(u8, raw, path_start, ' ') orelse return false;
+        const path = raw[path_start..path_end];
+        if (std.mem.eql(u8, path, "/app.min.js")) {
+            tcpserver.respondOk(afd, "text/javascript", script, "");
+        } else if (std.mem.eql(u8, path, "/app.min.js.map")) {
+            tcpserver.respondOk(afd, "application/json", map, "");
+        } else tcpserver.respondOk(afd, "text/html", page, "");
+        return true;
+    }
+};
+
+fn jnum(v: std.json.Value) f64 {
+    return switch (v) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => -1,
+    };
+}
+
+fn evalNum(arena: std.mem.Allocator, m: *Mcp, body: []const u8, comptime what: []const u8) f64 {
+    var buf: [1024]u8 = undefined;
+    const args = std.fmt.bufPrint(&buf, "{{\"body\":\"{s}\",\"timeout_ms\":60000}}", .{body}) catch fail(what ++ ": args");
+    const v = capSc(arena, m.callTool("web_eval", args), what, false).get("value").?.object.get("value").?;
+    return switch (v) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => fail(what ++ ": not a number"),
+    };
+}
+
+/// The fastest of three runs of a fixed busy loop, in ms of the page's own clock.
+fn busyMs(arena: std.mem.Allocator, m: *Mcp) f64 {
+    var best: f64 = std.math.inf(f64);
+    for (0..3) |_| best = @min(best, evalNum(arena, m, "const t=performance.now();let s=0;for(let i=0;i<20000000;i++)s+=i%3;window.__sink=s;return performance.now()-t;", "busy loop"));
+    return best;
+}
+
+/// Stage wp: web_perf, web_cpu_profile (with source maps) and cpu_throttle
+/// through the real MCP tools on the real helper; then the refusal of a
+/// helper that withholds web-perf.
+fn webPerfStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var http = PerfHttp{};
+    if (!http.start()) fail("could not bind the loopback perf fixture");
+    defer http.lis.deinit();
+    var args_buf: [2048]u8 = undefined;
+    var m = Mcp.spawn(allocator, exe, &.{});
+    m.initialize();
+
+    const opened = m.callTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://127.0.0.1:{d}/page\",\"snapshot\":\"none\"}}", .{http.lis.port}) catch unreachable);
+    _ = capSc(arena, opened, "perf open", false);
+    {
+        const caps = capSc(arena, m.callTool("capabilities", "{}"), "capabilities", false);
+        for ([_][]const u8{ "web_perf", "web_cpu_profile", "web_cpu_throttle" }) |k| {
+            const f = caps.get(k) orelse fail("capabilities lacks a perf fact");
+            if (f != .bool or !f.bool) fail("capabilities reports a perf fact false with a capable local helper");
+        }
+    }
+
+    // (1) cpu_throttle: a fixed loop is >= 2.5x slower at 4x, before and after a cross-origin navigation.
+    _ = capSc(arena, m.callTool("web_perf", "{\"cpu_throttle\":1}"), "throttle off", false);
+    const base = busyMs(arena, &m);
+    const set = capSc(arena, m.callTool("web_perf", "{\"cpu_throttle\":4}"), "throttle 4", false);
+    if (jnum(set.get("cpu_throttle") orelse fail("web_perf has no cpu_throttle")) != 4) fail("web_perf does not echo the active cpu_throttle 4");
+    const slow = busyMs(arena, &m);
+    std.debug.print("smoke-mcp: MEASURED busy loop {d:.1}ms at 1x, {d:.1}ms at 4x ({d:.2}x)\n", .{ base, slow, slow / base });
+    if (slow < base * 2.5) fail("cpu_throttle 4 did not slow the page's busy loop 2.5x");
+    _ = capSc(arena, m.callTool("web_navigate", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://localhost:{d}/page\",\"snapshot\":\"none\"}}", .{http.lis.port}) catch unreachable), "cross-origin navigate", false);
+    const after = busyMs(arena, &m);
+    std.debug.print("smoke-mcp: MEASURED busy loop after a cross-origin navigation {d:.1}ms ({d:.2}x)\n", .{ after, after / base });
+    if (after < base * 2.5) fail("cpu_throttle was lost across a cross-origin navigation");
+    _ = capSc(arena, m.callTool("web_perf", "{\"cpu_throttle\":1}"), "throttle off again", false);
+
+    // (2) web_perf: N forced layouts and new nodes between two calls; one key set.
+    const first = capSc(arena, m.callTool("web_perf", "{}"), "perf first", false);
+    _ = evalNum(arena, &m, "for(let i=0;i<12;i++){const d=document.createElement('div');d.textContent='n'+i;d.style.width=(10+i)+'px';document.body.appendChild(d);void document.body.offsetHeight;}return 1;", "forced layouts");
+    const second_line = m.callTool("web_perf", "{}");
+    const second = capSc(arena, second_line, "perf second", false);
+    std.debug.print("smoke-mcp: web_perf: {s}\n", .{second_line});
+    if (first.count() != second.count()) fail("web_perf's key set changed between calls");
+    for (first.keys()) |k| if (second.get(k) == null) fail("web_perf's key set changed between calls");
+    if (capInt(second, "layout_count") < 12) fail("web_perf counted fewer layouts than the page forced");
+    if (capInt(second, "dom_nodes_delta") <= 0) fail("web_perf did not see the appended nodes");
+    if ((second.get("baseline") orelse fail("no baseline key")).bool) fail("the second web_perf call claimed to be a baseline");
+
+    // (3) web_cpu_profile with source maps: hot dominates and resolves to its original.
+    _ = capSc(arena, m.callTool("web_cpu_profile", "{\"action\":\"start\",\"interval_us\":200}"), "profile start", false);
+    _ = capSc(arena, m.callTool("web_cpu_profile", "{\"action\":\"start\"}"), "second start", true);
+    _ = evalNum(arena, &m, "return work(1500);", "profiled work");
+    const save = std.fmt.allocPrint(arena, "{s}/home/perf.cpuprofile", .{rt}) catch unreachable;
+    const stop_line = m.callTool("web_cpu_profile", std.fmt.bufPrint(&args_buf, "{{\"action\":\"stop\",\"save\":\"{s}\",\"top\":5}}", .{save}) catch unreachable);
+    std.debug.print("smoke-mcp: web_cpu_profile: {s}\n", .{stop_line});
+    const prof = capSc(arena, stop_line, "profile stop", false);
+    const top = (prof.get("top_self") orelse fail("no top_self")).array.items;
+    if (top.len == 0) fail("top_self is empty");
+    const head_fn = top[0].object;
+    if (!std.mem.eql(u8, head_fn.get("function").?.string, "hot")) fail("hot is not first in top_self");
+    const script_ms = prof.get("buckets").?.object.get("script_ms").?;
+    const hot_self = head_fn.get("self_ms").?;
+    const script_f = jnum(script_ms);
+    const hot_f = jnum(hot_self);
+    if (hot_f * 2 <= script_f) fail("hot holds no more than half of script time");
+    if (!std.mem.eql(u8, (head_fn.get("source") orelse fail("hot was not resolved through its source map")).string, "src/app.ts")) fail("hot resolved to the wrong source");
+    if (head_fn.get("source_line").?.integer != 10) fail("hot resolved to the wrong source line");
+    if (!std.mem.eql(u8, head_fn.get("source_name").?.string, "hotOriginal")) fail("hot resolved to the wrong original name");
+    {
+        var rb: [4096:0]u8 = undefined;
+        const sz = std.fmt.bufPrintSentinel(&rb, "{s}", .{save}, 0) catch unreachable;
+        const fp = c.fopen(sz.ptr, "rb") orelse fail("the saved .cpuprofile is missing");
+        defer _ = c.fclose(fp);
+        var list: std.ArrayList(u8) = .empty;
+        var chunk: [65536]u8 = undefined;
+        while (true) {
+            const n = c.fread(&chunk, 1, chunk.len, fp);
+            if (n == 0) break;
+            list.appendSlice(arena, chunk[0..n]) catch fail("oom");
+        }
+        const pj = std.json.parseFromSliceLeaky(std.json.Value, arena, list.items, .{}) catch fail("the saved .cpuprofile is not JSON");
+        if (pj != .object or pj.object.get("nodes") == null or pj.object.get("samples") == null) fail("the saved .cpuprofile lacks nodes/samples");
+    }
+    _ = capSc(arena, m.callTool("web_cpu_profile", "{\"action\":\"stop\"}"), "stop without a profile", true);
+    _ = m.callTool("web_close", "{}");
+    m.closeStdinWait();
+
+    // (4) A helper that withholds web-perf: every perf tool is refused, and web_open's cpu_throttle too.
+    _ = c.setenv("SKETERM_WEB_DISABLE_PERF", "1", 1);
+    defer _ = unsetEnv("SKETERM_WEB_DISABLE_PERF");
+    var old = Mcp.spawn(allocator, exe, &.{});
+    defer old.closeStdinWait();
+    old.initialize();
+    _ = capSc(arena, old.callTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://127.0.0.1:{d}/page\",\"snapshot\":\"none\"}}", .{http.lis.port}) catch unreachable), "old open", false);
+    for ([_][]const u8{ "web_perf", "web_cpu_profile" }) |tool| {
+        const line = old.callTool(tool, if (std.mem.eql(u8, tool, "web_perf")) "{}" else "{\"duration_ms\":100}");
+        _ = capSc(arena, line, "perf refusal", true);
+        if (std.mem.indexOf(u8, line, "web-perf") == null) fail("the perf refusal does not name the missing capability");
+    }
+    const thr = old.callTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://127.0.0.1:{d}/page\",\"snapshot\":\"none\",\"cpu_throttle\":4}}", .{http.lis.port}) catch unreachable);
+    _ = capSc(arena, thr, "throttle refusal", true);
+    const caps = capSc(arena, old.callTool("capabilities", "{}"), "old capabilities", false);
+    if ((caps.get("web_perf") orelse fail("no web_perf fact")) != .bool or caps.get("web_perf").?.bool) fail("capabilities reports web_perf true for a helper without it");
+    _ = old.callTool("web_close", "{}");
 }
 
 /// Stage wc: web_open capture, web_capture (list, body, out_file,

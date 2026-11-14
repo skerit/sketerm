@@ -5,7 +5,7 @@ const c = @import("cbindings");
 const cef = @import("cef");
 const proto = @import("../protocol.zig");
 const host_mod = @import("../cefhost.zig");
-const clock = @import("../../util/clock.zig");
+const devtools = @import("devtools_session.zig");
 
 pub const timeout_ms: i64 = 5_000;
 
@@ -27,12 +27,8 @@ pub fn hasMedia(req: proto.ViewEmulation) bool {
     return req.color_scheme != 0 or req.reduced_motion != 0;
 }
 
-/// CEF owns a transferred observer reference; the view owns another plus the registration.
-pub const Observer = struct {
-    observer: cef.cef_dev_tools_message_observer_t,
-    refs: std.atomic.Value(u32) = .init(2),
-    gpa: std.mem.Allocator,
-    registration: ?*cef.cef_registration_t = null,
+/// The acknowledgment state of a view's media override, read from its DevTools session.
+pub const Media = struct {
     view: u32,
     generation: u64,
     browser_id: c_int,
@@ -41,103 +37,59 @@ pub const Observer = struct {
     acknowledged: bool = false,
     failure: []const u8 = "",
     active: bool = true,
-    browser_closed: bool = false,
+    /// The fault seam swallowed this message's result.
+    dropped: bool = false,
 
-    pub fn create(gpa: std.mem.Allocator, browser: *cef.cef_browser_t, view: u32, generation: u64) !*Observer {
-        const bh: *cef.cef_browser_host_t = (browser.get_host orelse return error.EmulationRefused)(browser) orelse return error.EmulationRefused;
-        defer host_mod.release(&bh.base);
-        const add = bh.add_dev_tools_message_observer orelse return error.EmulationRefused;
-        const id = (browser.get_identifier orelse return error.EmulationRefused)(browser);
-        const self = try gpa.create(Observer);
-        self.* = .{
-            .observer = .{
-                .base = Ref.base(),
-                .on_dev_tools_method_result = onResult,
-                .on_dev_tools_agent_detached = onDetached,
-            },
-            .gpa = gpa,
-            .view = view,
-            .generation = generation,
-            .browser_id = id,
-        };
-        // add consumes one reference even when registration is refused.
-        self.registration = add(bh, &self.observer);
-        if (self.registration == null) {
-            self.stop();
-            return error.EmulationRefused;
-        }
-        return self;
-    }
-
-    pub fn submit(self: *Observer, browser: *cef.cef_browser_t, req: proto.ViewEmulation, now_ms: i64) bool {
+    pub fn submit(self: *Media, session: *devtools.Session, browser: *cef.cef_browser_t, req: proto.ViewEmulation, now_ms: i64) bool {
         if (!self.active or self.failure.len != 0) return false;
+        if (self.message_id > 0) session.forget(self.message_id);
         self.acknowledged = false;
+        self.dropped = false;
         self.message_id = apply(browser, req);
         self.deadline_ms = now_ms + timeout_ms;
-        if (self.message_id <= 0) self.failure = "media emulation submission was refused";
+        if (self.message_id <= 0 or !session.track(self.message_id, 2 * timeout_ms, .memory, "")) self.failure = "media emulation submission was refused";
         return self.failure.len == 0;
     }
 
-    pub fn expired(self: *const Observer, now_ms: i64) bool {
+    pub fn expired(self: *const Media, now_ms: i64) bool {
         return self.message_id > 0 and !self.acknowledged and now_ms >= self.deadline_ms;
     }
 
-    pub fn closed(self: *Observer) void {
-        self.browser_closed = true;
-        self.failure = "browser destroyed before media emulation could be retained";
-    }
-
-    pub fn stop(self: *Observer) void {
-        self.active = false;
-        if (self.registration) |r| {
-            self.registration = null;
-            host_mod.release(&r.base);
-        }
-        host_mod.release(&self.observer.base);
-    }
-
-    pub fn destroyOwned(self: *Observer) void {
-        self.gpa.destroy(self);
-    }
-
-    fn matches(self: *const Observer, browser: [*c]cef.cef_browser_t) bool {
-        if (!self.active or browser == null) return false;
-        const get_id = browser.*.get_identifier orelse return false;
-        return get_id(browser) == self.browser_id;
-    }
-
-    fn onResult(arg: [*c]cef.cef_dev_tools_message_observer_t, browser: [*c]cef.cef_browser_t, id: c_int, success: c_int, _: ?*const anyopaque, _: usize) callconv(.c) void {
-        defer host_mod.releaseArg(browser);
-        const self = Ref.owner(@ptrCast(arg));
-        if (!self.matches(browser) or self.failure.len != 0 or id <= 0 or id != self.message_id or self.acknowledged) return;
-        // Ignore only this native result; the transferred browser reference still retires.
-        if (self.browser_id == fault_media_browser and id == fault_media_message) {
-            host_mod.logLine("fault media drop browser={d} message={d} success={d}", .{ self.browser_id, id, success });
+    /// Take what the session learned since the last call.
+    pub fn refresh(self: *Media, session: *devtools.Session) void {
+        if (!self.active or self.failure.len != 0) return;
+        if (session.browser_closed) {
+            self.failure = "browser destroyed before media emulation could be retained";
             return;
         }
-        if (self.expired(clock.nowMs())) {
-            self.failure = "media emulation execution acknowledgment timed out";
+        if (session.detached) {
+            self.failure = "DevTools agent detached; media emulation is no longer guaranteed";
             return;
         }
-        if (success != 0) self.acknowledged = true else self.failure = "engine rejected media emulation";
-    }
-
-    fn onDetached(arg: [*c]cef.cef_dev_tools_message_observer_t, browser: [*c]cef.cef_browser_t) callconv(.c) void {
-        defer host_mod.releaseArg(browser);
-        const self = Ref.owner(@ptrCast(arg));
-        if (self.matches(browser)) self.failure = "DevTools agent detached; media emulation is no longer guaranteed";
+        if (self.message_id <= 0 or self.acknowledged or self.dropped) return;
+        const out = session.outcome(self.message_id);
+        if (out == .pending) return;
+        // Ignore only this native result; it stays unanswered until the deadline.
+        if (self.browser_id == fault_media_browser and self.message_id == fault_media_message) {
+            host_mod.logLine("fault media drop browser={d} message={d} success={d}", .{ self.browser_id, self.message_id, @intFromBool(out == .ok) });
+            self.dropped = true;
+            return;
+        }
+        switch (out) {
+            .pending => {},
+            .ok => if (session.answeredAt(self.message_id) > self.deadline_ms) {
+                self.failure = "media emulation execution acknowledgment timed out";
+            } else {
+                self.acknowledged = true;
+            },
+            .failed => self.failure = "engine rejected media emulation",
+        }
     }
 };
 
-const Ref = host_mod.HeapRef(Observer, "observer");
-
-/// A positive ID means queued only; Observer waits for the matching execution result.
+/// A positive ID means queued only; `Media` waits for the matching execution result.
 pub fn apply(browser: *cef.cef_browser_t, req: proto.ViewEmulation) c_int {
     if (!req.valid() or !hasMedia(req)) return 0;
-    const get_host = browser.get_host orelse return 0;
-    const bh: *cef.cef_browser_host_t = get_host(browser) orelse return 0;
-    defer host_mod.release(&bh.base);
-    const execute = bh.execute_dev_tools_method orelse return 0;
     const Fault = enum { reject, drop };
     const fault: ?Fault = blk: {
         const ordinal = c.getenv("SKETERM_WEB_FAULT_MEDIA_APPLY") orelse break :blk null;
@@ -167,18 +119,7 @@ pub fn apply(browser: *cef.cef_browser_t, req: proto.ViewEmulation) c_int {
             "{{\"name\":\"prefers-reduced-motion\",\"value\":\"{s}\"}}]}}",
         .{ color, motion },
     ) catch return 0;
-    const val: *cef.cef_value_t = cef.cef_parse_json_buffer(json.ptr, json.len, cef.JSON_PARSER_RFC) orelse return 0;
-    defer host_mod.release(&val.base);
-    const params: *cef.cef_dictionary_value_t = (val.get_dictionary orelse return 0)(val) orelse return 0;
-    var transferred = false;
-    defer if (!transferred) host_mod.release(&params.base);
-    var method = std.mem.zeroes(cef.cef_string_t);
-    host_mod.setStr(if (fault == .reject) "SketermFault.invalidMediaMethod" else "Emulation.setEmulatedMedia", &method);
-    defer cef.cef_string_utf16_clear(&method);
-    if (method.length == 0) return 0;
-    // CEF consumes the dictionary reference even if submission fails.
-    transferred = true;
-    const id = execute(bh, 0, &method, params);
+    const id = devtools.execute(browser, if (fault == .reject) "SketermFault.invalidMediaMethod" else "Emulation.setEmulatedMedia", json);
     if (fault) |mode| {
         const browser_id = (browser.get_identifier orelse return id)(browser);
         host_mod.logLine("fault media {s} browser={d} message={d}", .{ @tagName(mode), browser_id, id });

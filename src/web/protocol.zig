@@ -417,6 +417,11 @@ pub const CAP_OBSERVE_NOTIFY = "observe-notify";
 pub const CAP_LOAD_RETRY = "load-retry";
 pub const CAP_UNTRUSTED_WEB = "untrusted-web";
 pub const CAP_WEB_EMULATION = "web-emulation";
+/// DevTools-protocol performance ops on one view (`perf_req`/`ev_perf_result`,
+/// 0xA6/0xA7): metrics samples, CPU throttling and the sampling CPU profiler.
+/// The helper attaches a DevTools agent to a view only once one of these is
+/// asked for, and never sends `Runtime.enable` or `Debugger.enable`.
+pub const CAP_WEB_PERF = "web-perf";
 /// The helper pushes one view's pixels, cursor and (with
 /// `stream-audio`) audio over a private per-view socket and takes input
 /// back on it (0xF8 block, `src/web/stream.zig` is the V1 stream format).
@@ -583,6 +588,7 @@ pub const Cap = enum {
     motion_drift,
     view_screen_early,
     drag_drop,
+    web_perf,
 
     /// The wire name `hello_ack` carries.
     pub fn name(self: Cap) []const u8 {
@@ -860,6 +866,9 @@ pub const Tag = enum(u8) {
     ev_devtools_view = 0xA3,
     print_pdf = 0xA4,
     ev_print_pdf_done = 0xA5,
+    // Capability "web-perf" (see CAP_WEB_PERF).
+    perf_req = 0xA6,
+    ev_perf_result = 0xA7,
     webext_set = 0xB0,
     webext_remove = 0xB1,
     webext_list_req = 0xB2,
@@ -4288,6 +4297,57 @@ pub const EvPrintPdfDone = struct {
     }
 };
 
+// -- performance (0xA6 block, capability "web-perf") -------------------
+
+/// THE perf op vocabulary; an op a helper does not know is answered `ok = 0`.
+pub const PerfOp = enum(u8) {
+    /// `Performance.getMetrics`; the result's `text` is its JSON.
+    metrics = 1,
+    /// `Emulation.setCPUThrottlingRate` with `arg / 100`, kept across navigations.
+    throttle = 2,
+    /// `Profiler.start` sampling every `arg` microseconds, auto-stopped after `limit_ms`.
+    profile_start = 3,
+    /// `Profiler.stop`; the profile JSON lands in the helper-private file `staged`.
+    profile_stop = 4,
+    _,
+};
+
+/// Highest CPU throttling rate x100 a helper applies.
+pub const PERF_THROTTLE_MAX: u32 = 2000;
+/// Shortest sampling interval, in microseconds.
+pub const PERF_INTERVAL_MIN_US: u32 = 100;
+
+pub const PerfReq = struct {
+    pub const tag: Tag = .perf_req;
+    view: u32,
+    /// Client correlation id, echoed by the answer.
+    req: u32,
+    op: u8,
+    /// throttle: rate x100 (100 = off); profile_start: interval in microseconds.
+    arg: u32 = 0,
+    /// profile_start: the helper stops the profiler itself after this many ms.
+    limit_ms: u32 = 0,
+};
+
+/// Every `perf_req` is answered exactly once with this.
+pub const EvPerfResult = struct {
+    pub const tag: Tag = .ev_perf_result;
+    view: u32,
+    req: u32,
+    op: u8,
+    ok: u8,
+    /// The view's CPU throttling rate x100 after this op (100 = off).
+    throttle: u32,
+    /// Paints of the view since its browser was created.
+    paints: u32,
+    /// Main-frame loads started since the profiler started (profile_stop only).
+    navigations: u32,
+    /// metrics: the `getMetrics` result JSON; a failure: the reason; profile_stop: a note.
+    text: []const u8,
+    /// profile_stop: the helper-private file holding the profile JSON, on the helper's host.
+    staged: []const u8,
+};
+
 // -- scroll position (0xC2 block, capability "scroll") ----------------
 
 /// Where the document is scrolled, straight from Chromium's own
@@ -7448,6 +7508,17 @@ test "emulation frame is append-only and validates wire values" {
     try std.testing.expectEqualStrings("web-emulation", Cap.web_emulation.name());
     try std.testing.expectEqual(@as(u32, 2), NetPolicySet.flag_untrusted);
     try std.testing.expect(!observerAllows(.view_emulation, true));
+}
+
+test "perf frames are a fresh append-only pair with one op vocabulary" {
+    try std.testing.expectEqual(@as(u8, 0xA6), @intFromEnum(Tag.perf_req));
+    try std.testing.expectEqual(@as(u8, 0xA7), @intFromEnum(Tag.ev_perf_result));
+    try std.testing.expectEqualStrings("web-perf", Cap.web_perf.name());
+    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(PerfOp.profile_stop));
+    try roundTrip(PerfReq, .{ .view = 3, .req = 9, .op = @intFromEnum(PerfOp.profile_start), .arg = 1000, .limit_ms = 120_000 });
+    try roundTrip(EvPerfResult, .{ .view = 3, .req = 9, .op = 4, .ok = 1, .throttle = 400, .paints = 12, .navigations = 1, .text = "auto-stopped", .staged = "/tmp/sketerm-cpuprofile-x" });
+    try std.testing.expect(!observerAllows(.perf_req, true));
+    try std.testing.expect(!untrustedWithheld(.perf_req));
 }
 
 test "an untrusted helper refuses the request frames of every capability it withholds" {

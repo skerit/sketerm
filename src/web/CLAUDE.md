@@ -1038,6 +1038,41 @@ When reproducing on a real site from an agent session, unset the session's
 `HTTPS_PROXY`/`SSL_CERT_FILE`: the helper honours the proxy and its mitm
 CA is not in the engine's store (`ERR_CERT_AUTHORITY_INVALID`).
 
+## The DevTools session and perf ops (0xA6/0xA7, capability "web-perf")
+
+`cefhost/devtools_session.zig` is the ONE `cef_dev_tools_message_observer_t`
+of a view (`View.devtools`, created by `Host.devtoolsFor` on first use): it
+matches method results by message id and KEEPS their payload (in memory, or
+streamed into a staging file for a large result), delivers events through an
+`EventSink`, fails pending requests on their deadline, on agent detach and on
+browser close, and names the method in every failure. Media emulation
+(`emulation.Media`) reads its acknowledgment from it; a second observer per
+view must not come back. The perf ops (`cefhost/perf.zig`) are metrics
+(`Performance.enable`, answered first, then `getMetrics`: pipelined, the
+engine answered an EMPTY list), throttle (re-applied at every main-frame load
+start) and the profiler (a profile's `{"profile":...}` result is unwrapped
+into a private staging file, moved by the client like a staged print).
+Rules:
+
+- Registering the observer attaches nothing; the first method does. Nothing
+  may send `Runtime.enable` or `Debugger.enable` (see the section above), and
+  nothing may run a perf op by default: the dt stage is the check.
+- No remote debugging port, ever.
+- `SKETERM_WEB_DEVTOOLS_TRACE=1` logs every method, result and event to
+  stderr; an absolute path appends there instead (the MCP lane captures the
+  helper's stderr for `web_diagnostic`, so a file is how to read it live).
+- Measured: `Tracing.start` through this per-view session succeeds and
+  `Tracing.dataCollected` + `Tracing.tracingComplete` arrive; the method
+  RESULT of `Tracing.end` did not arrive within 10s, so a tracing client must
+  finish on `tracingComplete`, not on that result.
+- The helper root sets `std_options.signal_stack_size = null`: std's 256 KiB
+  per-thread alternate signal stack is static TLS, glibc takes static TLS out
+  of every thread's stack, and V8's 64 KiB profiler thread then failed to
+  start (`CHECK` in `CpuProfiler::StartProcessorIfNotStarted`, renderer
+  SIGTRAP at `Profiler.start`). Never give this binary a large `threadlocal`.
+
+`docs/web-perf.md` has the tools.
+
 ## The headful audit: "looks headful" is a gate (smoke-mcp)
 
 Jelle's direction (2026-10-12): by default the headless helper looks as

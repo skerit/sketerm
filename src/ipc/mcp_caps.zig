@@ -396,6 +396,12 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("web_print_pdf_css_page", pr.css_page);
         try verdicts.add(arena, "print_pdf", pr.supported);
         if (pr.supported) if (pr.css_page) |css| if (!css) try res.text("web_print_pdf: this helper predates css_page_size and no_margins");
+        // Perf tools: a consumer preflights them rather than tripping over the refusal.
+        const perf = @import("mcp_web.zig").perfCapability();
+        try res.fact("web_perf", perf.perf);
+        try res.fact("web_cpu_profile", perf.profile);
+        try res.fact("web_cpu_throttle", perf.perf);
+        try verdicts.add(arena, "perf/cpu profile", perf.perf);
         // Response-body capture: a fail-closed open option, so a
         // consumer must be able to preflight it rather than trip over
         // the refusal.

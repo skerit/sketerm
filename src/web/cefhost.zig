@@ -61,6 +61,8 @@ const host_dragdrop = @import("cefhost/dragdrop.zig");
 const streamsrv = @import("streamsrv.zig");
 pub const untrusted = @import("cefhost/untrusted.zig");
 const emulation = @import("cefhost/emulation.zig");
+const devtools_session = @import("cefhost/devtools_session.zig");
+const host_perf = @import("cefhost/perf.zig");
 const SpinLock = @import("../util/spinlock.zig").SpinLock;
 const builtin = @import("builtin");
 const cef = @import("cef");
@@ -423,7 +425,13 @@ pub const View = struct {
     /// reported (`view_screen`); null keeps the engine's view-is-the-
     /// screen answer, which is what every client without the frame gets.
     screen: ?proto.ViewScreen = null,
-    media_observer: ?*emulation.Observer = null,
+    /// Media override acknowledgment, read from `devtools`.
+    media_ack: ?emulation.Media = null,
+    /// The view's one DevTools session, created by the first feature that needs it.
+    devtools: ?*devtools_session.Session = null,
+    perf: host_perf.State = .{},
+    /// Main-view paints of this view, counted for the perf metrics.
+    paints: u32 = 0,
     media_generation: u64 = 0,
     /// Bootstrap blank callbacks cannot settle the deferred requested document.
     initial_url: ?[]u8 = null,
@@ -1823,11 +1831,20 @@ pub const Host = struct {
     fn submitEmulation(self: *Host, v: *View) !void {
         if (!emulation.hasMedia(v.media)) return;
         const browser = v.browser orelse return error.EmulationRefused;
-        if (v.media_observer == null) {
-            v.media_observer = emulation.Observer.create(self.gpa, browser, v.id, v.media_generation) catch return error.EmulationRefused;
-        }
-        if (!v.media_observer.?.submit(browser, v.media, nowMs())) return error.EmulationRefused;
+        const session = self.devtoolsFor(v) catch return error.EmulationRefused;
+        if (v.media_ack == null) v.media_ack = .{ .view = v.id, .generation = v.media_generation, .browser_id = v.cef_id };
+        if (!v.media_ack.?.submit(session, browser, v.media, nowMs())) return error.EmulationRefused;
     }
+
+    /// The view's DevTools session, registered on first use.
+    pub fn devtoolsFor(self: *Host, v: *View) !*devtools_session.Session {
+        if (v.devtools) |s| return s;
+        const browser = v.browser orelse return error.DevToolsRefused;
+        v.devtools = try devtools_session.Session.create(self.gpa, browser, v.id);
+        return v.devtools.?;
+    }
+
+    pub const perfReq = host_perf.perfReq;
 
     /// Post while ownership still exists, then retire only this view.
     pub fn failView(self: *Host, id: u32, reason: []const u8) void {
@@ -1835,7 +1852,7 @@ pub const Host = struct {
         self.post(proto.EvViewCreateFailed{ .view = id, .context = context, .reason = reason });
         if (self.findAny(id)) |v| {
             self.clearInitialUrl(v);
-            if (v.media_observer) |observer| observer.active = false;
+            if (v.media_ack) |*m| m.active = false;
         }
         self.destroyView(id);
     }
@@ -2889,10 +2906,12 @@ pub const Host = struct {
         });
         self.clearInitialUrl(v);
         var browser_closed = false;
-        if (v.media_observer) |observer| {
-            v.media_observer = null;
-            browser_closed = observer.browser_closed;
-            observer.stop();
+        v.media_ack = null;
+        host_perf.browserGone(self, v);
+        if (v.devtools) |session| {
+            v.devtools = null;
+            browser_closed = session.browser_closed;
+            session.stop();
         }
         // The toplevel mirrors THIS browser's frame buffer, which goes
         // away below; a revived view paints again and gets a new one.
@@ -3122,7 +3141,8 @@ pub const Host = struct {
         var mi: usize = 0;
         while (mi < self.views.items.len) {
             const v = self.views.items[mi];
-            const observer = v.media_observer orelse {
+            if (v.devtools) |session| if (v.media_ack) |*m| m.refresh(session);
+            const observer = v.media_ack orelse {
                 mi += 1;
                 continue;
             };
@@ -3147,6 +3167,7 @@ pub const Host = struct {
             }
             mi += 1;
         }
+        host_perf.pump(self, now_ms);
         filterSubPump(self, now_ms);
         filterSubTick(self, now_ms);
         // A scroll that STOPPED left its resting position behind the
@@ -3437,7 +3458,8 @@ pub const Host = struct {
     pub fn navigate(self: *Host, req: proto.Navigate) void {
         const v = self.find(req.view) orelse return;
         if (!v.discarded and !self.restoreDiscardedBuffer(v, &system_browser_spawn_ops)) return;
-        const waiting_media = if (v.media_observer) |observer| !observer.acknowledged else false;
+        if (v.devtools) |session| if (v.media_ack) |*m| m.refresh(session);
+        const waiting_media = if (v.media_ack) |observer| !observer.acknowledged else false;
         if (v.initial_url != null or waiting_media) {
             const url = self.gpa.dupe(u8, req.url) catch {
                 self.failView(v.id, "could not retain initial media emulation navigation");
@@ -4654,7 +4676,7 @@ test "media initial navigation waits for execution success and hides bootstrap b
     try std.testing.expectEqual(@as(u8, 2), v.media.color_scheme);
     try std.testing.expectEqual(@as(u8, 1), v.media.reduced_motion);
     try std.testing.expectEqual(@as(usize, 0), MediaTest.navigations);
-    try std.testing.expect(!v.media_observer.?.acknowledged);
+    try std.testing.expect(!v.media_ack.?.acknowledged);
     onLoadStart(null, &MediaTest.browser, &MediaTest.frame, 0);
     onLoadEnd(null, &MediaTest.browser, &MediaTest.frame, 200);
     onLoadingStateChange(null, &MediaTest.browser, 0, 0, 0);
@@ -4673,12 +4695,12 @@ test "media initial navigation waits for execution success and hides bootstrap b
         }
         out.advance(msg.bytes.len);
     }
-    const first_id = v.media_observer.?.message_id;
+    const first_id = v.media_ack.?.message_id;
     try host.setEmulation(.{ .view = 51, .color_scheme = 1 });
     try host.setEmulation(.{ .view = 51 });
     try std.testing.expectEqual(@as(u16, 1500), v.media.scale_x1000);
     try std.testing.expectEqual(@as(u8, 1), v.media.reduced_motion);
-    try std.testing.expect(v.media_observer.?.message_id != first_id);
+    try std.testing.expect(v.media_ack.?.message_id != first_id);
     MediaTest.result(first_id, true);
     var other_browser = MediaTest.browser;
     other_browser.get_identifier = MediaTest.otherIdentifier;
@@ -4747,9 +4769,9 @@ test "media rejection timeout detach browser destruction and submission refusal 
         defer if (held) |obs| release(&obs.base);
         switch (case) {
             .rejection => MediaTest.result(MediaTest.queued_id, false),
-            .timeout => host.watchdog(host.find(62).?.media_observer.?.deadline_ms),
+            .timeout => host.watchdog(host.find(62).?.media_ack.?.deadline_ms),
             .late_result => {
-                host.find(62).?.media_observer.?.deadline_ms = nowMs() - 1;
+                host.find(62).?.media_ack.?.deadline_ms = nowMs() - 1;
                 MediaTest.result(MediaTest.queued_id, true);
             },
             .generation => host.find(62).?.media_generation += 1,
@@ -4944,7 +4966,7 @@ test "a discard during a live media acknowledgment keeps the view and reports no
         const v = host.find(91).?;
         host.setUrl(v, "https://live.test/");
         try host.setEmulation(.{ .view = 91, .color_scheme = 2 });
-        try std.testing.expect(!v.media_observer.?.acknowledged);
+        try std.testing.expect(!v.media_ack.?.acknowledged);
         if (deferred_nav) {
             host.navigate(.{ .view = 91, .url = "https://patched.test/" });
             try std.testing.expect(v.initial_live);
@@ -7415,6 +7437,7 @@ fn onPaint(
     if (ptype != cef.PET_VIEW) return;
     const v = viewOf(browser) orelse return;
     if (v.map.len == 0) return;
+    v.paints +%= 1;
     // A paint for the pre-resize geometry: the resize triggers its own
     // full repaint, so dropping this one loses nothing. The comparison
     // is against the PHYSICAL size — OnPaint's width/height and its
@@ -7505,6 +7528,7 @@ fn onAcceleratedPaint(
     const v = viewOf(browser) orelse return;
     // A hidden background page is never announced to the client.
     if (v.webext_bg or v.webext_popup) return;
+    v.paints +%= 1;
     // `[*c]` field access leaks back into C-pointer land (`&x.*.planes`
     // is a pointer to the whole array), so bind a real Zig pointer once.
     const inf: *const cef.cef_accelerated_paint_info_t = @ptrCast(info orelse return);
@@ -7801,7 +7825,7 @@ fn onBeforeClose(
     // `pending orelse adopting` fallback would hand back a LIVE
     // unrelated view and we would close the wrong tab.
     const v = host.findCef(browserInt(browser, "get_identifier")) orelse return;
-    if (v.media_observer) |observer| observer.closed();
+    if (v.devtools) |session| session.closed();
     if (v.browser != null and (v.webext_popup or v.page_popup or v.devtools_of != 0))
         host.retireView(v.id, .{ .close_browser = false, .reason = "the browser closed itself" });
 }
@@ -7981,6 +8005,7 @@ fn onLoadStart(
     if (main) {
         v.exec_nav_pending = false;
         host.flushExecAtStart(v, f);
+        host_perf.onMainLoadStart(host, v);
     }
     host.injectMatchingExtensions(v, f, .document_start);
     // CEF reports a document only once it COMMITS, so the two events

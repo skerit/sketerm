@@ -79,7 +79,7 @@ const DEFAULT_TIMEOUT_MS: i64 = 15_000;
 
 /// How often the GUI token is polled. Fast enough that a snapshot feels
 /// immediate, slow enough that a long wait is not a busy loop.
-const POLL_MS: u32 = 40;
+pub const POLL_MS: u32 = 40;
 
 /// Characters of an eval result returned inline by default; the rest is
 /// paged with `web_expand [0]`, the same affordance snapshots use for
@@ -885,6 +885,15 @@ pub fn printCapability() struct { supported: bool, css_page: ?bool } {
     return .{ .supported = can, .css_page = can and e.has(.print_pdf_css_page) };
 }
 
+/// What `capabilities` reports about the perf tools: null until a helper handshake says, false for the GUI.
+pub fn perfCapability() struct { perf: ?bool, profile: ?bool } {
+    if (guiDrivesWeb() or g_headless_alloc == null) return .{ .perf = false, .profile = false };
+    const e = currentEngine() orelse return .{ .perf = null, .profile = null };
+    if (e.state != .ready) return .{ .perf = null, .profile = null };
+    const p = e.has(.web_perf);
+    return .{ .perf = p, .profile = p and e.route_kind != .remote_browser };
+}
+
 /// Stream support is a code fact before startup and negotiated thereafter; audio is unknown before the handshake.
 /// `encoded` likewise: whether the helper honours an encoded open.
 pub fn streamCapability() struct { supported: bool, audio: ?bool, encoded: ?bool, popups: ?bool } {
@@ -1602,7 +1611,7 @@ pub const Driver = union(enum) {
     gui: mcp.Backend,
     headless: *webdrive.Engine,
 
-    fn mode(self: Driver) Mode {
+    pub fn mode(self: Driver) Mode {
         return switch (self) {
             .gui => .gui,
             .headless => .headless,
@@ -2360,6 +2369,7 @@ fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []co
 fn openViewConfigured(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []const u8, w: u16, h: u16, spec: webdrive.ProfileSpec, policy: ?*const webdrive.NetPolicy, cap: ?*const webdrive.CaptureFilter, route: ?[]const u8, emulation: webdrive.Emulation, max_fps: ?u16, browser_name: ?[]const u8) !OpenOutcome {
     if (drv == .gui and max_fps != null) return .{ .err = fail(.unavailable, "max_fps is headless only; GUI monitor-driven pacing is unchanged") };
     if (drv == .gui and emulation.present()) return .{ .err = fail(.unavailable, "web emulation is headless only; nothing was opened") };
+    if (drv == .gui and emulation.cpu_throttle != null) return .{ .err = fail(.unavailable, "cpu_throttle is headless only; nothing was opened") };
     if (drv == .gui and spec != .default) return .{ .err = fail(.invalid_args, GUI_PROFILE_REFUSAL) };
     if (drv == .gui and policy != null) return .{ .err = fail(.unavailable, GUI_POLICY_REFUSAL) };
     if (drv == .gui and cap != null) return .{ .err = fail(.unavailable, GUI_CAPTURE_REFUSAL) };
@@ -2423,6 +2433,7 @@ fn openViewConfigured(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, w
                     error.UntrustedModeConflict => fail(.conflict, "a running ordinary helper cannot switch to untrusted mode; use a new dedicated engine"),
                     error.UntrustedUnsupported => fail(.unavailable, "the helper did not advertise untrusted-web; nothing was opened"),
                     error.EmulationUnsupported => fail(.unavailable, "the helper did not advertise web-emulation; nothing was opened"),
+                    error.PerfUnsupported => fail(.unavailable, "the helper did not advertise web-perf, so cpu_throttle cannot be applied; nothing was opened"),
                     error.InvalidEmulation => fail(.invalid_args, "invalid web emulation options; nothing was opened"),
                     error.FrameRateUnsupported => fail(.unavailable, "the helper did not advertise view-max-fps; nothing was opened"),
                     error.InvalidFrameRate => fail(.invalid_args, "max_fps must be an integer from 1 to 240; nothing was opened"),
@@ -2610,7 +2621,7 @@ pub fn tabEcho(res: *mcp.Res, mode: Mode, v: View) !void {
 
 /// Structured facts + the one-line text header every web result opens
 /// with: `view 12: "Example Domain" - https://example.com`.
-fn head(res: *mcp.Res, arena: std.mem.Allocator, mode: Mode, v: View) !void {
+pub fn head(res: *mcp.Res, arena: std.mem.Allocator, mode: Mode, v: View) !void {
     try tabEcho(res, mode, v);
     try res.fact("origin", originOf(v.url));
     try res.fact("title", v.title);
@@ -3089,6 +3100,10 @@ fn openResult(
         if (v.emulation.color_scheme) |value| try res.fact("color_scheme", @tagName(value));
         if (v.emulation.reduced_motion) |value| try res.fact("reduced_motion", if (value == .reduce) "reduce" else "no-preference");
         if (v.emulation.device_scale_factor != null) try res.fact("device_scale_factor", @as(f64, @floatFromInt(v.emulation.scale())) / 1000);
+        if (v.emulation.cpu_throttle) |r| {
+            try res.fact("cpu_throttle", r);
+            try res.textf("cpu throttle {d}x requested (applied right after the first navigation started; web_perf and web_cpu_profile report the active rate)", .{r});
+        }
         try res.fact("policy_active", policy != null);
         try res.fact("policy_source", policy_source);
         if (policy) |p| {
@@ -5330,6 +5345,8 @@ fn webBody(
     if (eql(u8, name, "web_network")) return networkTool(drv, arena, args, view);
     if (eql(u8, name, "web_download")) return downloadTool(drv, arena, args, view);
     if (eql(u8, name, "web_print_pdf")) return printTool(drv, arena, args, view);
+    if (eql(u8, name, "web_perf") or eql(u8, name, "web_cpu_profile"))
+        return @import("mcp_webperf.zig").tool(drv, arena, name, args, view);
 
     if (eql(u8, name, "web_screenshot")) {
         const png = switch (try capturePng(drv, arena, view, timeoutOf(args, 3000))) {
@@ -6262,6 +6279,14 @@ fn parseEmulation(arena: std.mem.Allocator, args: std.json.Value) !EmulationPars
             .float => |n| n,
             else => return .{ .err = fail(.invalid_args, "device_scale_factor must be numeric, from 0.5 through 4") },
         };
+    }
+    if (args.object.get("cpu_throttle")) |v| {
+        out.cpu_throttle = switch (v) {
+            .integer => |n| @floatFromInt(n),
+            .float => |n| n,
+            else => return .{ .err = fail(.invalid_args, "cpu_throttle must be a number from 1 (off) through 20") },
+        };
+        if (!out.valid()) return .{ .err = fail(.invalid_args, "cpu_throttle must be a number from 1 (off) through 20") };
     }
     if (!out.valid()) return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "device_scale_factor must be finite and from {d} through {d}", .{ @as(f64, 0.5), @as(f64, 4) })) };
     return .{ .value = out };
@@ -11402,7 +11427,7 @@ test "every tool this module serves declares an output schema" {
             return error.MissingOutputSchema;
         }
     }
-    try std.testing.expectEqual(@as(usize, 34), seen);
+    try std.testing.expectEqual(@as(usize, 36), seen);
 }
 
 test "parsePolicy fails closed on unknown names and invalid host authorities" {
