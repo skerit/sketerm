@@ -61,8 +61,11 @@ pub const Session = struct {
     browser_id: c_int,
     active: bool = true,
     browser_closed: bool = false,
-    /// The agent detached at least once; every request pending then failed.
-    detached: bool = false,
+    /// Agent detaches seen. CEF detaches when the inspected contents' agent host closes
+    /// (`CefDevToolsController::AgentHostClosed`: the contents going away or every client forced off), and the next
+    /// method attaches a FRESH agent without the old one's overrides or enabled domains, so an owner that retained
+    /// state re-applies it when this moves; every request pending at the detach failed.
+    detaches: u32 = 0,
     requests: std.ArrayList(Request) = .empty,
     events: ?EventSink = null,
     /// Events received, for diagnostics.
@@ -273,7 +276,7 @@ pub const Session = struct {
         const self = Ref.owner(@ptrCast(arg));
         if (!self.matches(browser)) return;
         if (trace()) host_mod.logLine("devtools view={d} agent detached", .{self.view});
-        self.detached = true;
+        self.detaches +%= 1;
         for (self.requests.items) |*r| if (r.state == .pending) self.fail(r, "the DevTools agent detached before the method was answered");
     }
 };
@@ -456,7 +459,7 @@ test "session requests match by id, keep payloads, expire and fail on detach" {
     try t.expect(std.mem.indexOf(u8, s.outcome(refused).failed, "nope") != null);
     const cut = try s.send(&browser, "Profiler.stop", null, 5_000, .staged, "profile");
     Fake.observer.?.on_dev_tools_agent_detached.?(Fake.observer.?, &browser);
-    try t.expect(s.detached);
+    try t.expectEqual(@as(u32, 1), s.detaches);
     try t.expect(std.mem.indexOf(u8, s.outcome(cut).failed, "detached") != null);
     // A staged result lands in a private file holding the member only.
     const staged = try s.send(&browser, "Profiler.stop", null, 5_000, .staged, "profile");

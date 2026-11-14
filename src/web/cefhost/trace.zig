@@ -307,6 +307,18 @@ pub fn pump(host: *Host, v: *View, session: *devtools.Session, now_ms: i64) void
     }
 }
 
+/// The DevTools agent detached: its event subscription is gone, so `tracingComplete` never comes. A running or
+/// ending trace is finished now with what arrived; a starting one fails through its failed `Tracing.start`.
+pub fn agentDetached(host: *Host, v: *View, session: *devtools.Session) void {
+    const s = &v.perf.trace;
+    if (s.phase != .running and s.phase != .ending) return;
+    session.events = null;
+    s.phase = .idle;
+    s.truncated = true;
+    if (s.note.len == 0) s.note = "the DevTools agent detached; the trace holds what had arrived before it";
+    finish(host, v, false);
+}
+
 /// The browser is going away: answer what waits and remove every file.
 pub fn browserGone(host: *Host, v: *View) void {
     const s = &v.perf.trace;

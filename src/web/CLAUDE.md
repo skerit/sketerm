@@ -1067,6 +1067,14 @@ Rules:
   may send `Runtime.enable` or `Debugger.enable` (see the section above), and
   nothing may run a perf op by default: the dt stage is the check.
 - No remote debugging port, ever.
+- An agent DETACH is not a dead view. CEF detaches when the contents' agent
+  host closes (`CefDevToolsController::AgentHostClosed`); the next method
+  attaches a fresh agent WITHOUT the old one's overrides and enabled domains.
+  `Session.detaches` counts them: pending methods fail naming the detach,
+  `emulation.Media` re-submits the view's media override (navigations wait
+  for its new acknowledgment), `perf.pump` re-applies a non-default throttle,
+  forgets `Performance.enable` and finishes a running trace with what had
+  arrived. Only an override that cannot be re-submitted fails the view.
 - `SKETERM_WEB_DEVTOOLS_TRACE=1` logs every method, result and event to
   stderr (`SKETERM_WEB_STDERR`, under "Measuring anything here", puts it in
   a file you can read live).

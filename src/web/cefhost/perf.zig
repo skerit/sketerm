@@ -48,6 +48,8 @@ pub const State = struct {
     auto_staged: ?[]u8 = null,
     auto_note: []const u8 = "",
     jobs: [4]?Job = @splat(null),
+    /// `Session.detaches` already handled.
+    detaches_seen: u32 = 0,
     trace: host_trace.State = .{},
 
     /// Release what the state owns, removing an uncollected profile, and reset it.
@@ -192,20 +194,34 @@ pub fn browserGone(host: *Host, v: *View) void {
 
 /// A main-frame load started: count it, and keep a throttle the engine may have dropped with a renderer swap.
 pub fn onMainLoadStart(host: *Host, v: *View) void {
+    _ = host;
     v.perf.loads +%= 1;
-    if (v.perf.throttle_x100 == 100) return;
     const session = v.devtools orelse return;
+    reapplyThrottle(v, session);
+}
+
+fn reapplyThrottle(v: *View, session: *devtools.Session) void {
+    if (v.perf.throttle_x100 == 100) return;
     const browser = v.browser orelse return;
     const id = sendThrottle(session, browser, v.perf.throttle_x100) catch return;
     // Nobody waits on the re-application; its answer is dropped when it lands.
-    _ = host;
     session.forget(id);
+}
+
+/// The agent detached: its enabled domains and overrides went with it. The throttle is re-applied, a trace (whose
+/// events can no longer arrive) is finished with what it has; pending methods already failed in the session.
+fn agentDetached(host: *Host, v: *View, session: *devtools.Session) void {
+    v.perf.detaches_seen = session.detaches;
+    v.perf.perf_enabled = false;
+    reapplyThrottle(v, session);
+    host_trace.agentDetached(host, v, session);
 }
 
 /// Advance every view's perf jobs; called from the host watchdog.
 pub fn pump(host: *Host, now_ms: i64) void {
     for (host.views.items) |v| {
         const session = v.devtools orelse continue;
+        if (session.detaches != v.perf.detaches_seen) agentDetached(host, v, session);
         session.expire(now_ms);
         host_trace.pump(host, v, session, now_ms);
         if (v.perf.profiling and v.perf.auto_staged == null and profileJob(v) == null and
@@ -244,7 +260,7 @@ fn step(host: *Host, v: *View, session: *devtools.Session, job: *Job) bool {
                 if (job.op == .profile_stop) {
                     v.perf.profiling = false;
                     const msg = if (std.mem.indexOf(u8, text, "not started") != null)
-                        "the profiler was no longer running in this page's renderer (a cross-process navigation or a renderer crash ends a profile)"
+                        "the profiler was no longer running in this page's renderer (a cross-process navigation, a renderer crash or a DevTools agent detach ends a profile)"
                     else
                         text;
                     if (job.req == 0) {

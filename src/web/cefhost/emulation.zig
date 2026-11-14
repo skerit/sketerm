@@ -39,12 +39,18 @@ pub const Media = struct {
     active: bool = true,
     /// The fault seam swallowed this message's result.
     dropped: bool = false,
+    /// `Session.detaches` when this override was last submitted.
+    detaches_seen: u32 = 0,
+    /// The agent detached since, taking the override with it: the host submits it again.
+    reapply: bool = false,
 
     pub fn submit(self: *Media, session: *devtools.Session, browser: *cef.cef_browser_t, req: proto.ViewEmulation, now_ms: i64) bool {
         if (!self.active or self.failure.len != 0) return false;
         if (self.message_id > 0) session.forget(self.message_id);
         self.acknowledged = false;
         self.dropped = false;
+        self.reapply = false;
+        self.detaches_seen = session.detaches;
         self.message_id = apply(browser, req);
         self.deadline_ms = now_ms + timeout_ms;
         if (self.message_id <= 0 or !session.track(self.message_id, 2 * timeout_ms, .memory, "")) self.failure = "media emulation submission was refused";
@@ -62,8 +68,10 @@ pub const Media = struct {
             self.failure = "browser destroyed before media emulation could be retained";
             return;
         }
-        if (session.detached) {
-            self.failure = "DevTools agent detached; media emulation is no longer guaranteed";
+        if (session.detaches != self.detaches_seen) {
+            // Not acknowledged until re-applied, so a navigation waits for it like for a live change.
+            self.acknowledged = false;
+            self.reapply = true;
             return;
         }
         if (self.message_id <= 0 or self.acknowledged or self.dropped) return;

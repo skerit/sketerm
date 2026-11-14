@@ -3141,7 +3141,14 @@ pub const Host = struct {
         var mi: usize = 0;
         while (mi < self.views.items.len) {
             const v = self.views.items[mi];
-            if (v.devtools) |session| if (v.media_ack) |*m| m.refresh(session);
+            if (v.devtools) |session| if (v.media_ack) |*m| {
+                m.refresh(session);
+                // A detached agent took the override with it; the live browser gets it back, the view goes on.
+                if (m.reapply) self.submitEmulation(v) catch {
+                    self.failView(v.id, "could not re-apply media emulation after the DevTools agent detached");
+                    continue;
+                };
+            };
             const observer = v.media_ack orelse {
                 mi += 1;
                 continue;
@@ -4470,6 +4477,7 @@ const MediaTest = struct {
     var frame_url: []const u8 = "about:blank";
     var loaded_url: [128]u8 = undefined;
     var loaded_len: usize = 0;
+    var throttles: usize = 0;
 
     fn reset() void {
         browser = std.mem.zeroes(cef.cef_browser_t);
@@ -4496,6 +4504,7 @@ const MediaTest = struct {
         create_url_empty = false;
         frame_url = "about:blank";
         loaded_len = 0;
+        throttles = 0;
     }
 
     fn identifier(_: [*c]cef.cef_browser_t) callconv(.c) c_int {
@@ -4533,9 +4542,12 @@ const MediaTest = struct {
         release(&obs.base);
         return 1;
     }
-    fn execute(_: [*c]cef.cef_browser_host_t, _: c_int, _: [*c]const cef.cef_string_t, params: [*c]cef.cef_dictionary_value_t) callconv(.c) c_int {
+    fn execute(_: [*c]cef.cef_browser_host_t, _: c_int, method: [*c]const cef.cef_string_t, params: [*c]cef.cef_dictionary_value_t) callconv(.c) c_int {
         defer releaseArg(params);
         if (refused_submission) return 0;
+        var name = Utf8.init(method);
+        defer name.free();
+        if (std.mem.eql(u8, name.slice(), "Emulation.setCPUThrottlingRate")) throttles += 1;
         queued_id += 1;
         return queued_id;
     }
@@ -4737,9 +4749,9 @@ test "media initial navigation waits for execution success and hides bootstrap b
     try std.testing.expectEqual(@as(usize, 1), MediaTest.registration_releases);
 }
 
-test "media rejection timeout detach browser destruction and submission refusal preserve unrelated views" {
+test "media rejection timeout browser destruction and submission refusal preserve unrelated views" {
     try std.testing.expect(apiHash());
-    const Case = enum { rejection, timeout, late_result, generation, detach, browser_destroyed, submission, registration, teardown, stop };
+    const Case = enum { rejection, timeout, late_result, generation, browser_destroyed, submission, registration, teardown, stop };
     for (std.enums.values(Case)) |case| {
         MediaTest.reset();
         var out = proto.Outbox.init(std.testing.allocator);
@@ -4775,7 +4787,6 @@ test "media rejection timeout detach browser destruction and submission refusal 
                 MediaTest.result(MediaTest.queued_id, true);
             },
             .generation => host.find(62).?.media_generation += 1,
-            .detach => MediaTest.observer.?.on_dev_tools_agent_detached.?(MediaTest.observer.?, &MediaTest.browser),
             .browser_destroyed => onBeforeClose(null, &MediaTest.browser),
             .teardown => host.destroyView(62),
             .stop => host.navAction(.{ .view = 62, .action = @intFromEnum(proto.NavAct.stop) }),
@@ -4837,6 +4848,57 @@ test "live media patches defer navigation and contain submission failures to the
     try std.testing.expect(host.find(72) == other);
     try MediaTest.expectFailure(&out, 71);
     try std.testing.expectEqual(@as(usize, 1), MediaTest.registration_releases);
+}
+
+test "a DevTools agent detach re-applies media emulation and the throttle instead of failing the view" {
+    try std.testing.expect(apiHash());
+    MediaTest.reset();
+    var out = proto.Outbox.init(std.testing.allocator);
+    defer out.deinit();
+    var host = Host.init(std.testing.allocator, &out);
+    defer host.deinit();
+    host.inline_mode = true;
+    g_host = &host;
+    defer g_host = null;
+    var ops = system_browser_spawn_ops;
+    ops.create_browser = MediaTest.create;
+    try host.setEmulation(.{ .view = 81, .color_scheme = 2 });
+    try host.createViewAtWith(ViewConstructionTest.req(81, 0), "https://first.test/", &ops);
+    const v = host.find(81).?;
+    // A detach while the first acknowledgment is pending: it is re-sent, the first document still waits for it.
+    const first = MediaTest.queued_id;
+    MediaTest.observer.?.on_dev_tools_agent_detached.?(MediaTest.observer.?, &MediaTest.browser);
+    host.watchdog(nowMs());
+    try std.testing.expect(host.find(81) == v);
+    try std.testing.expect(MediaTest.queued_id > first);
+    try std.testing.expectEqual(@as(usize, 0), MediaTest.navigations);
+    MediaTest.result(MediaTest.queued_id, true);
+    host.watchdog(nowMs());
+    try std.testing.expectEqual(@as(usize, 1), MediaTest.navigations);
+    // A detach on a settled view re-applies media and a non-default throttle; a navigation meanwhile waits.
+    v.perf.throttle_x100 = 400;
+    const settled = MediaTest.queued_id;
+    MediaTest.observer.?.on_dev_tools_agent_detached.?(MediaTest.observer.?, &MediaTest.browser);
+    host.watchdog(nowMs());
+    try std.testing.expect(host.find(81) == v);
+    try std.testing.expect(MediaTest.queued_id > settled);
+    try std.testing.expectEqual(@as(usize, 1), MediaTest.throttles);
+    host.navigate(.{ .view = 81, .url = "https://second.test/" });
+    try std.testing.expectEqual(@as(usize, 1), MediaTest.navigations);
+    MediaTest.result(v.media_ack.?.message_id, true);
+    host.watchdog(nowMs());
+    try std.testing.expectEqual(@as(usize, 2), MediaTest.navigations);
+    try std.testing.expectEqualStrings("https://second.test/", MediaTest.loaded_url[0..MediaTest.loaded_len]);
+    // Handled once: another watchdog sends nothing more.
+    const quiet = MediaTest.queued_id;
+    host.watchdog(nowMs());
+    try std.testing.expectEqual(quiet, MediaTest.queued_id);
+    // Only an override that cannot be re-submitted fails the view.
+    MediaTest.refused_submission = true;
+    MediaTest.observer.?.on_dev_tools_agent_detached.?(MediaTest.observer.?, &MediaTest.browser);
+    host.watchdog(nowMs());
+    try std.testing.expect(host.find(81) == null);
+    try MediaTest.expectFailure(&out, 81);
 }
 
 const DeferredSettleTest = struct {
