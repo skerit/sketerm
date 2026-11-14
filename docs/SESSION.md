@@ -1,5 +1,20 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-14: cell borders (draft `DCS 1 + b cell-border` protocol)
+
+Apps can draw panel outlines and underlines on cell edges without
+spending columns: the version 1 baseline of the draft cell-border
+protocol (`q`, `pen`, `pen-clear`, `set`, `clear`; twelve segments;
+`RRGGBB`/`pN`/`fg`; inside or centred; below or above text; shared-edge
+merging). The pen is a border-set ID inside the style entry, so print,
+erase, scroll, reflow and DECSC carry it unchanged; `grid/borders.zig`
+is the vocabulary and parser, `render/border_pass.zig` the one renderer
+for CellPass and GridPass rows, `render/scene.zig` the paint order.
+Snapshot v13 carries the border table; v12 bodies restore without one.
+`smoke-cell` asserts inside/centred pixels, the shared-edge winner, both
+layers against a block glyph and CellPass/GridPass parity;
+`docs/cell-borders.md` lists what is and is not supported.
+
 ## 2026-11-12: closing stdin ends `sketerm mcp` mid-call; web_eval keeps its timeout
 
 A client that died or closed the pipe during a long call left the
