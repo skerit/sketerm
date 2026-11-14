@@ -562,15 +562,16 @@ fn resolveMaps(drv: web.Driver, arena: std.mem.Allocator, args: std.json.Value, 
     inline for (lists) |list| for (list) |*t| {
         if (t.url.len == 0 or t.line == 0) continue;
         wanted += 1;
-        const entry = blk: {
-            for (cache.items) |*m| if (std.mem.eql(u8, m.url, t.url)) break :blk m;
+        // By value: `MapEntry` is all slices, and a pointer into `cache` would dangle at the next append.
+        const found: ?sourcemap.Map = blk: {
+            for (cache.items) |m| if (std.mem.eql(u8, m.url, t.url)) break :blk m.map;
             const fresh = try loadMap(drv, arena, args, view, t.url);
             try cache.append(arena, fresh);
             if (fresh.map == null and fresh.why.len != 0)
                 try reasons.print(arena, "{s}{s}: {s}", .{ if (reasons.items.len != 0) "; " else "", fresh.url, fresh.why });
-            break :blk &cache.items[cache.items.len - 1];
+            break :blk fresh.map;
         };
-        const map = entry.map orelse continue;
+        const map = found orelse continue;
         const o = map.lookup(t.line - 1, if (t.column > 0) t.column - 1 else 0) orelse continue;
         t.source = o.source;
         t.source_line = o.line;
