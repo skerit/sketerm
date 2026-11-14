@@ -18,6 +18,7 @@ const Entry = style_pool.Entry;
 const Attrs = style_pool.Attrs;
 const Color = style_pool.Color;
 const borders = @import("borders.zig");
+const overlay = @import("overlay.zig");
 const Event = @import("../parser/event.zig").Event;
 const utf8 = @import("../util/utf8.zig");
 const palette_default_256 = @import("palette.zig").default_256;
@@ -186,9 +187,17 @@ pub const Screen = struct {
     /// Saved OSC 8 link state. Apps that nest OSC 8 across DECSC/DECRC
     /// boundaries get the right link reapplied on restore.
     saved_link_id: u8 = 0,
+    /// Saved overstrike flag; DECSC saves it with the rendition.
+    saved_overstrike: bool = false,
 
     /// Current SGR-derived style index.
     cur_style: u16 = 0,
+    /// Overstrike (`CSI 8:7 m`, DECSET 20): prints add a layer on top of
+    /// the cell under the cursor instead of replacing it (`overlay.zig`).
+    /// Cursor rendition state like `cur_style`, but kept out of the
+    /// style entry so it never multiplies entries: SGR 0/28 clear it,
+    /// DECSC/DECRC save and restore it.
+    overstrike: bool = false,
 
     /// Scroll region (DECSTBM). Inclusive bounds.
     scroll_top: u16 = 0,
@@ -3754,13 +3763,14 @@ pub const Screen = struct {
     // `cur_style` (print, BCE erase, DECSC/DECRC, SGR 0 resetting the
     // entry) carries or clears it without knowing borders exist.
 
-    /// `entry` with border set `set`, interned; on a full pool one
-    /// reclaim and a retry, then null. Takes values, never an index,
-    /// because a reclaim renumbers every style.
-    fn internStyle(self: *Screen, entry: Entry, set: borders.Set) ?u16 {
-        return self.pool.internWithBorders(entry, set) catch |err| switch (err) {
+    /// `entry` with border set `set` and layer list `list`, interned; on
+    /// a full pool one reclaim and a retry, then null. Takes values,
+    /// never an index or side-table ID, because a reclaim renumbers
+    /// every style and frees unreferenced side values.
+    fn internStyle(self: *Screen, entry: Entry, set: borders.Set, list: overlay.List) ?u16 {
+        return self.pool.internStyle(entry, set, list) catch |err| switch (err) {
             error.PoolFull => if (self.reclaimStyles())
-                self.pool.internWithBorders(entry, set) catch null
+                self.pool.internStyle(entry, set, list) catch null
             else
                 null,
             else => null,
@@ -3773,7 +3783,7 @@ pub const Screen = struct {
         const entry = self.pool.get(source);
         const set = cmd.apply(self.pool.borderSet(entry.border));
         if (entry.border == 0 and borders.isEmpty(set)) return source;
-        return self.internStyle(entry, set);
+        return self.internStyle(entry, set, self.pool.overlayList(entry.overlay));
     }
 
     /// `source` without the `mask` segments (the source itself when the
@@ -3789,7 +3799,7 @@ pub const Screen = struct {
     pub fn blankStyle(self: *Screen) u16 {
         const border = self.pool.get(self.cur_style).border;
         if (border == 0) return Pool.default_index;
-        return self.internStyle(.{}, self.pool.borderSet(border)) orelse Pool.default_index;
+        return self.internStyle(.{}, self.pool.borderSet(border), overlay.empty) orelse Pool.default_index;
     }
 
     fn cellBorder(self: *Screen, body: []const u8) void {
@@ -3990,7 +4000,7 @@ pub const Screen = struct {
             // SGR query: the current style as a reset-then-set
             // sequence, xterm's shape (`0;1;31m` for bold red).
             var params_buf: [screen_ops.sgr_params_max_len]u8 = undefined;
-            const params = screen_ops.sgrParams(self.pool.get(self.cur_style), &params_buf) catch return;
+            const params = screen_ops.sgrParams(self.pool.get(self.cur_style), self.overstrike, &params_buf) catch return;
             const s = std.fmt.bufPrint(&resp_buf, "\x1bP1$r{s}m\x1b\\", .{params}) catch return;
             self.respond(s);
             return;
@@ -4304,12 +4314,53 @@ pub const Screen = struct {
     /// Used by Tier 2.5 to decide whether an ASCII subrange in a
     /// mixed run can take the cell-array fast path.
     fn fastAsciiEligible(self: *const Screen) bool {
-        if (self.insert_mode) return false;
+        if (self.insert_mode or self.overstrike) return false;
         if (self.pending_wrap) return false;
         if (self.clusters.count() != 0) return false;
         const active = if (self.active_charset == .g0) self.charset_g0 else self.charset_g1;
         if (active != .ascii) return false;
         return true;
+    }
+
+    /// An overstrike print, mintty's `write_char` under ATTR_OVERSTRIKE:
+    /// a pending wrap is taken first (only with autowrap on, and never
+    /// for a zero-width codepoint), the struck cell is the one under the
+    /// cursor or the base of the wide pair whose right half it is, the
+    /// codepoint becomes a layer in the CURRENT rendition on top of that
+    /// cell's own glyph and rendition (a blank cell keeps its blank base),
+    /// insert mode shifts nothing, and the cursor then advances one column
+    /// as a narrow print does, wide codepoints included. A pool with no
+    /// room even after a reclaim drops the layer; the cursor still moves.
+    fn overstrikeCp(self: *Screen, cp: u32) void {
+        if (self.pending_wrap) {
+            if (self.autowrap and !isExtendingCp(cp)) {
+                self.lineFeed();
+                self.col = 0;
+                self.line(self.row).continues_above = true;
+            }
+            self.pending_wrap = false;
+        }
+        if (self.cols == 0 or self.rows == 0) return;
+        if (self.col >= self.cols) self.col = self.cols - 1;
+        const ln = self.line(self.row);
+        var target = self.col;
+        if (target > 0 and (ln.cells[target].flags & cell_mod.FLAG_WIDE_CONT) != 0) target -= 1;
+        if (cp != 0 and cp <= 0x10FFFF) {
+            const entry = self.pool.get(ln.cells[target].style_ref);
+            const layer = overlay.Layer.init(@intCast(cp), self.pool.get(self.cur_style));
+            const list = overlay.withLayer(self.pool.overlayList(entry.overlay), layer);
+            if (self.internStyle(entry, self.pool.borderSet(entry.border), list)) |ref| {
+                ln.cells[target].style_ref = ref;
+                ln.dirty = true;
+            }
+        }
+        self.last_print_key = cellKey(self.row, target);
+        self.last_print_cp = cp;
+        self.col += 1;
+        if (self.col >= self.cols) {
+            self.col = self.cols - 1;
+            if (self.autowrap) self.pending_wrap = true;
+        }
     }
 
     pub fn printCp(self: *Screen, cp_in: u32) void {
@@ -4350,6 +4401,14 @@ pub const Screen = struct {
                 self.appendCluster(row, col, cp);
                 return;
             }
+        }
+
+        // Overstrike draws every codepoint, combining marks included, as
+        // a layer on the cell under the cursor (mintty forces width 0).
+        if (self.overstrike) {
+            if (self.ph_pending != null) self.flushPlaceholder();
+            self.overstrikeCp(cp);
+            return;
         }
 
         if (self.last_print_cp != 0 and isExtendingCp(cp)) {

@@ -24,6 +24,7 @@ const Line = @import("../grid/line.zig").Line;
 const Scaling = @import("../grid/line.zig").Scaling;
 const palette_default = @import("../grid/palette.zig").default_256;
 const style_util = @import("style.zig");
+const overlay = @import("../grid/overlay.zig");
 const blend = @import("blend.zig");
 
 /// Per-cell instance data. Layout matches the vertex attribs
@@ -290,7 +291,11 @@ pub const CellPass = struct {
     dim_fg: f32 = 1.0,
     dim_bg: f32 = 1.0,
 
-    /// Persistent instance buffer (rows × cols instances).
+    /// Persistent instance buffer: `rows × cols` cell instances, then
+    /// the overstrike layer instances of every row (`layer_rows`
+    /// concatenated). The background draw covers only the cells, so a
+    /// layer never paints a background; the glyph and decoration draws
+    /// cover both, so every layer stacks above every base glyph.
     instances: std.ArrayList(Instance) = .empty,
     /// Allocated rows / cols — re-init the buffer when these change.
     cap_rows: u16 = 0,
@@ -298,6 +303,10 @@ pub const CellPass = struct {
     /// Per-row "needs upload" flag — set when a row's instance data
     /// in `instances` changed since the last GL upload.
     row_needs_upload: std.ArrayList(bool) = .empty,
+    /// Per-row overstrike layer instances, rebuilt with their row and
+    /// copied behind the cell instances after a rebuild. Empty (and
+    /// never filled) while the pool holds no layer list.
+    layer_rows: std.ArrayList(std.ArrayList(Instance)) = .empty,
 
     /// Default fg/bg used when style.fg/bg is .default.
     default_fg: [4]f32 = .{ 0.92, 0.92, 0.92, 1.0 },
@@ -368,6 +377,8 @@ pub const CellPass = struct {
         self.instances.deinit(self.allocator);
         self.row_needs_upload.deinit(self.allocator);
         self.rebuilt_rows.deinit(self.allocator);
+        for (self.layer_rows.items) |*l| l.deinit(self.allocator);
+        self.layer_rows.deinit(self.allocator);
     }
 
     pub fn forgetGL(self: *CellPass) void {
@@ -431,22 +442,46 @@ pub const CellPass = struct {
 
     /// Re-allocate the instance buffer when grid size changes.
     fn ensureCapacity(self: *CellPass, rows: u16, cols: u16) !void {
-        if (rows == self.cap_rows and cols == self.cap_cols and self.instances.items.len == @as(usize, rows) * @as(usize, cols)) return;
         const total: usize = @as(usize, rows) * @as(usize, cols);
+        if (rows == self.cap_rows and cols == self.cap_cols and self.instances.items.len >= total) return;
         try self.instances.resize(self.allocator, total);
         @memset(self.instances.items, .{});
         try self.row_needs_upload.resize(self.allocator, rows);
         for (self.row_needs_upload.items) |*r| r.* = true;
         try self.rebuilt_rows.resize(self.allocator, rows);
         for (self.rebuilt_rows.items) |*r| r.* = true;
+        for (self.layer_rows.items) |*l| l.clearRetainingCapacity();
+        if (self.layer_rows.items.len > rows) {
+            for (self.layer_rows.items[rows..]) |*l| l.deinit(self.allocator);
+            self.layer_rows.shrinkRetainingCapacity(rows);
+        }
+        while (self.layer_rows.items.len < rows) try self.layer_rows.append(self.allocator, .empty);
         self.cap_rows = rows;
         self.cap_cols = cols;
+    }
+
+    /// Cell instances; the overstrike layers follow them.
+    fn gridLen(self: *const CellPass) usize {
+        return @as(usize, self.cap_rows) * @as(usize, self.cap_cols);
     }
 
     fn rowSlice(self: *CellPass, row: u16) []Instance {
         const cols: usize = self.cap_cols;
         const start: usize = @as(usize, row) * cols;
         return self.instances.items[start .. start + cols];
+    }
+
+    /// Copy every row's layer instances behind the cell instances.
+    fn packLayers(self: *CellPass) !void {
+        var n: usize = 0;
+        for (self.layer_rows.items) |l| n += l.items.len;
+        const grid = self.gridLen();
+        try self.instances.resize(self.allocator, grid + n);
+        var at = grid;
+        for (self.layer_rows.items) |l| {
+            @memcpy(self.instances.items[at .. at + l.items.len], l.items);
+            at += l.items.len;
+        }
     }
 
     /// Rebuild dirty rows + sync GL buffer. Called from the render path.
@@ -553,6 +588,7 @@ pub const CellPass = struct {
         // frames where we're only here for cursor blink / overlay
         // state changes.
         if (!any_built) return;
+        try self.packLayers();
         if (profile_mod.enabled) {
             const now = profile_mod.nanoTimestamp();
             profile_mod.record(.cell_rebuild_loop, @intCast(now - t_loop_start));
@@ -577,6 +613,8 @@ pub const CellPass = struct {
     ) !void {
         const slice = self.rowSlice(row);
         @memset(slice, .{});
+        const layers = &self.layer_rows.items[row];
+        layers.clearRetainingCapacity();
 
         // Bidi rows + DH/DW rows are rendered by GridPass (overlay
         // pipeline), not here — the cell-aligned LTR layout this
@@ -671,6 +709,63 @@ pub const CellPass = struct {
         // when any non-ASCII is present.
         if (self.enable_ligatures and atlas.hb_font != null and ln.scaling == .single) {
             try self.applyLigatures(slice, cells, atlas, pool, cw, y, ascent, pad, row);
+        }
+
+        if (pool.hasOverlays()) try self.appendLayers(layers, slice[0..cells.len], cells, atlas, pool, glossary, ascent);
+    }
+
+    /// One glyph-and-decoration instance per overstrike layer of every
+    /// cell in the row, at its cell's rect over its cell's background.
+    fn appendLayers(
+        self: *CellPass,
+        out: *std.ArrayList(Instance),
+        slice: []const Instance,
+        cells: []const Cell,
+        atlas: *Atlas,
+        pool: *const StylePool,
+        glossary: *const @import("../grid/glyph_glossary.zig").Glossary,
+        ascent: f32,
+    ) !void {
+        const resolver = self.styleResolver();
+        for (cells, slice) |cell, base| {
+            const entry = pool.get(cell.style_ref);
+            if (entry.overlay == 0) continue;
+            const under = resolver.resolve(entry).eff_bg;
+            const list = pool.overlayList(entry.overlay);
+            for (list[0..overlay.count(list)]) |layer| {
+                const r = layer.rendition();
+                const resolved = resolver.resolveOver(r, under);
+                const bold = r.attrs.bold and self.allow_bold;
+                var inst = Instance{
+                    .cell_xy = base.cell_xy,
+                    .cell_size = base.cell_size,
+                    // Never drawn (layers sit past the background draw);
+                    // the glyph stage remaps coverage against it.
+                    .bg = base.bg,
+                    .fg = resolved.fg,
+                    .has_glyph = 1.0,
+                    .deco = @floatFromInt(@intFromEnum(style_util.decoKind(r.attrs))),
+                    .deco_color = resolved.deco,
+                    .italic = if (r.attrs.italic and !atlas.hasItalic()) 1.0 else 0.0,
+                    .bold = if (bold) 1.0 else 0.0,
+                };
+                if (atlas.lookupGlyph(glossary, layer.cp, bold, r.attrs.italic, resolved.fg)) |g| {
+                    if (g.w > 0 and g.h > 0) {
+                        inst.glyph_xy = .{
+                            base.cell_xy[0] + @as(f32, @floatFromInt(g.bearing_x)),
+                            base.cell_xy[1] + ascent - @as(f32, @floatFromInt(g.bearing_y)),
+                        };
+                        inst.glyph_size = .{ @floatFromInt(g.w), @floatFromInt(g.h) };
+                        inst.glyph_uv0 = .{ g.u0, g.v0 };
+                        inst.glyph_uv1 = .{ g.u1, g.v1 };
+                        inst.glyph_layer = @floatFromInt(g.layer);
+                        inst.has_glyph = 0.0;
+                        inst.colored = if (g.colored) 1.0 else 0.0;
+                        if (g.colored) inst.italic = 0.0;
+                    }
+                } else |_| {}
+                try out.append(self.allocator, inst);
+            }
         }
     }
 
@@ -823,7 +918,7 @@ pub const CellPass = struct {
     pub fn drawBackgrounds(self: *CellPass, atlas: *Atlas, viewport_w: i32, viewport_h: i32) void {
         if (!self.beginDraw(atlas, viewport_w, viewport_h)) return;
         c.glUniform1i(self.u_kind, 0);
-        c.glDrawArraysInstanced(c.GL_TRIANGLES, 0, 6, @intCast(self.instances.items.len));
+        c.glDrawArraysInstanced(c.GL_TRIANGLES, 0, 6, @intCast(@min(self.gridLen(), self.instances.items.len)));
         endDraw();
     }
 

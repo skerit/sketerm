@@ -140,6 +140,15 @@ pub const Resolver = struct {
     }
 
     pub fn resolve(self: Resolver, style: Entry) Resolved {
+        return self.resolveOver(style, null);
+    }
+
+    /// `style` as text drawn over `under` instead of over its own
+    /// background: an overstrike layer on its cell. `under` (the cell's
+    /// `eff_bg`) is what min-contrast and coverage measure against, and
+    /// the result never paints a background (`has_bg` false); the
+    /// layer's own bg still matters as the text colour under reverse.
+    pub fn resolveOver(self: Resolver, style: Entry, under: ?[4]f32) Resolved {
         var fg_color = style.fg;
         if (style.attrs.bold and self.bold_is_bright) {
             if (fg_color == .palette and fg_color.palette < 8) {
@@ -156,13 +165,13 @@ pub const Resolver = struct {
         if (style.attrs.dim) {
             for (fg[0..3]) |*ch| ch.* *= DIM_FG_SCALE;
         }
-        const eff_bg = if (has_bg) bg else self.default_bg;
+        const eff_bg = under orelse if (has_bg) bg else self.default_bg;
         fg = applyMinContrast(fg, eff_bg, self.min_contrast);
         const deco = switch (style.underline_color) {
             .default => fg,
             else => self.rgba(style.underline_color, true),
         };
-        return .{ .fg = fg, .bg = bg, .has_bg = has_bg, .eff_bg = eff_bg, .deco = deco };
+        return .{ .fg = fg, .bg = bg, .has_bg = has_bg and under == null, .eff_bg = eff_bg, .deco = deco };
     }
 };
 

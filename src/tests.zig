@@ -174,6 +174,9 @@ comptime {
     _ = @import("grid/style_pool.zig");
     _ = @import("grid/borders.zig");
     _ = @import("grid/borders_screen_test.zig");
+    _ = @import("grid/slot_table.zig");
+    _ = @import("grid/overlay.zig");
+    _ = @import("grid/overstrike_screen_test.zig");
     _ = @import("grid/screen.zig");
     _ = @import("grid/selection.zig");
     _ = @import("grid/selection_conformance_test.zig");

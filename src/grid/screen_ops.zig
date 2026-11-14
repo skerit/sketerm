@@ -348,6 +348,9 @@ pub fn decrqm(self: *Screen, mode: u32) void {
         2048 => self.in_band_resize,
         // 1007 (alt-screen scroll): we don't, treat as off.
         1007 => false,
+        // DEC VK100 overstrike, mintty's private mode 20 (public 20
+        // is LNM, answered by the public DECRQM).
+        20 => self.overstrike,
         47, 1047, 1049 => self.use_alt,
         2004 => self.bracketed_paste,
         else => null,
@@ -578,6 +581,7 @@ pub fn decstr(self: *Screen) void {
     self.row = 0;
     self.col = 0;
     self.cur_style = 0;
+    self.overstrike = false;
     self.scroll_top = 0;
     self.scroll_bot = if (self.rows > 0) self.rows - 1 else 0;
     self.autowrap = true;
@@ -613,9 +617,11 @@ pub fn fullReset(self: *Screen) void {
     self.row = 0;
     self.col = 0;
     self.cur_style = 0;
+    self.overstrike = false;
     // RIS clears the pen and every border, scrollback and the other
     // buffer included; a pen parked in DECSC must not come back either.
     self.saved_style = 0;
+    self.saved_overstrike = false;
     dropAllBorders(self);
     self.scroll_top = 0;
     self.scroll_bot = if (self.rows > 0) self.rows - 1 else 0;
@@ -726,6 +732,7 @@ pub fn saveCursor(self: *Screen) void {
     self.saved_charset_g1 = self.charset_g1;
     self.saved_active_charset = self.active_charset;
     self.saved_link_id = self.current_link_id;
+    self.saved_overstrike = self.overstrike;
 }
 
 pub fn restoreCursor(self: *Screen) void {
@@ -738,6 +745,7 @@ pub fn restoreCursor(self: *Screen) void {
     self.charset_g1 = self.saved_charset_g1;
     self.active_charset = self.saved_active_charset;
     self.current_link_id = self.saved_link_id;
+    self.overstrike = self.saved_overstrike;
     self.pending_wrap = false;
 }
 
@@ -1114,6 +1122,8 @@ pub fn modeSet(self: *Screen, params: Event.Csi, set: bool) void {
                 self.pending_wrap = false;
             },
             7 => self.autowrap = set,
+            // DEC VK100 overstrike (mintty): the same flag as `CSI 8:7 m`.
+            20 => self.overstrike = set,
             40 => self.allow_decolm = set,
             25 => self.cursor_visible = set,
             1000 => self.mouse_mode = if (set) 1000 else 0,
@@ -1300,11 +1310,15 @@ pub fn sgrReadExtColor(params: *const Event.Csi, i: usize) ?struct { color: @imp
 
 pub fn sgr(self: *Screen, params: Event.Csi) void {
     var entry = self.pool.get(self.cur_style);
+    var overstrike = self.overstrike;
     var i: usize = 0;
     while (i < params.n_params or (params.n_params == 0 and i == 0)) : (i += 1) {
         const p = if (params.n_params == 0) 0 else params.params[i];
         switch (p) {
-            0 => entry = .{},
+            0 => {
+                entry = .{};
+                overstrike = false;
+            },
             1 => entry.attrs.bold = true,
             2 => entry.attrs.dim = true,
             3 => entry.attrs.italic = true,
@@ -1325,7 +1339,19 @@ pub fn sgr(self: *Screen, params: Event.Csi) void {
             5 => entry.attrs.blink = true,
             6 => entry.attrs.fast_blink = true,
             7 => entry.attrs.reverse = true,
-            8 => entry.attrs.invisible = true,
+            8 => {
+                // `8:7` is mintty's overstrike and nothing else: the
+                // colon group is consumed whole, so its 7 is not SGR 7.
+                // Any other `8:N` is ignored, as mintty ignores it;
+                // `8;7` stays conceal + reverse.
+                if (i + 1 < params.n_params and params.isSub(i + 1)) {
+                    if (params.params[i + 1] == 7) overstrike = true;
+                    i += 1;
+                    while (i + 1 < params.n_params and params.isSub(i + 1)) i += 1;
+                } else {
+                    entry.attrs.invisible = true;
+                }
+            },
             9 => entry.attrs.strikethrough = true,
             21 => entry.attrs.setUnderlineStyle(.double),
             22 => {
@@ -1339,7 +1365,10 @@ pub fn sgr(self: *Screen, params: Event.Csi) void {
                 entry.attrs.fast_blink = false;
             },
             27 => entry.attrs.reverse = false,
-            28 => entry.attrs.invisible = false,
+            28 => {
+                entry.attrs.invisible = false;
+                overstrike = false;
+            },
             29 => entry.attrs.strikethrough = false,
             30...37 => entry.fg = .{ .palette = @intCast(p - 30) },
             38 => {
@@ -1374,6 +1403,7 @@ pub fn sgr(self: *Screen, params: Event.Csi) void {
         }
         if (params.n_params == 0) break; // CSI m alone = reset
     }
+    self.overstrike = overstrike;
     self.cur_style = self.pool.intern(entry) catch blk: {
         // Pool exhausted (65535 distinct styles). Without this,
         // intern silently returns the OLD cur_style, so a fresh
@@ -1405,11 +1435,11 @@ pub fn sgrUnderlineParam(attrs: Attrs) []const u8 {
     };
 }
 
-/// Longest `sgrParams` output: every attribute plus truecolor fg, bg
-/// and underline colour. `sgr_conformance_test.zig` pins it, so a new
-/// attribute that lengthens the worst case fails there, not in a
-/// silently truncated DECRQSS reply.
-pub const sgr_params_max_len: usize = 75;
+/// Longest `sgrParams` output: every attribute (overstrike included)
+/// plus truecolor fg, bg and underline colour. `sgr_conformance_test.zig`
+/// pins it, so a new attribute that lengthens the worst case fails
+/// there, not in a silently truncated DECRQSS reply.
+pub const sgr_params_max_len: usize = 79;
 
 /// A colour as SGR items: `base`+n for palette 0-7, `base`+60+n for
 /// 8-15, else `ext;5;n` / `ext;2;r;g;b`. Without a `base` (SGR 58 has
@@ -1428,9 +1458,10 @@ fn sgrColorParams(buf: []u8, color: Color, base: ?u8, ext: u8) ![]const u8 {
     };
 }
 
-/// Writes the parameters that recreate `e` from a reset style, e.g.
-/// `0;1;4:3;38;2;255;0;0`, and returns the written slice.
-pub fn sgrParams(e: Entry, buf: []u8) ![]const u8 {
+/// Writes the parameters that recreate `e` (with the cursor's
+/// overstrike flag, which lives outside the entry) from a reset style,
+/// e.g. `0;1;4:3;38;2;255;0;0`, and returns the written slice.
+pub fn sgrParams(e: Entry, overstrike: bool, buf: []u8) ![]const u8 {
     var len: usize = 0;
     const put = struct {
         fn item(out: []u8, at: *usize, s: []const u8) !void {
@@ -1449,6 +1480,7 @@ pub fn sgrParams(e: Entry, buf: []u8) ![]const u8 {
     if (a.fast_blink) try put(buf, &len, ";6");
     if (a.reverse) try put(buf, &len, ";7");
     if (a.invisible) try put(buf, &len, ";8");
+    if (overstrike) try put(buf, &len, ";8:7");
     if (a.strikethrough) try put(buf, &len, ";9");
     if (a.overline) try put(buf, &len, ";53");
     len += (try sgrColorParams(buf[len..], e.fg, 30, 38)).len;
@@ -1457,10 +1489,11 @@ pub fn sgrParams(e: Entry, buf: []u8) ![]const u8 {
     return buf[0..len];
 }
 
-/// Reclaim after an intern hit a full pool: collect styles and border
-/// sets nothing references. Returns whether anything was freed. One
-/// that frees nothing arms `Pool.reclaim_cooldown`, so a pool full of
-/// live styles is not rescanned (every cell of every line) per cell.
+/// Reclaim after an intern hit a full pool: collect styles and the
+/// border sets and layer lists nothing references. Returns whether
+/// anything was freed. One that frees nothing arms
+/// `Pool.reclaim_cooldown`, so a pool full of live styles is not
+/// rescanned (every cell of every line) per cell.
 pub fn reclaimStyles(self: *Screen) bool {
     const pool = self.pool;
     if (pool.reclaim_cooldown > 0) {
@@ -1468,9 +1501,9 @@ pub fn reclaimStyles(self: *Screen) bool {
         return false;
     }
     const styles_before = pool.entries.items.len;
-    const free_sets_before = pool.border_free.items.len;
+    const free_before = pool.freeSlots();
     compactStylePool(self);
-    const freed = pool.entries.items.len < styles_before or pool.border_free.items.len > free_sets_before;
+    const freed = pool.entries.items.len < styles_before or pool.freeSlots() > free_before;
     if (!freed) pool.reclaim_cooldown = Pool.reclaim_backoff;
     return freed;
 }
@@ -1479,15 +1512,15 @@ pub fn reclaimStyles(self: *Screen) bool {
 /// (active + alt + scrollback) plus `cur_style` / `saved_style`,
 /// keeps only the referenced entries (entry 0 / default always
 /// survives at slot 0), rewrites every `style_ref` to the
-/// compacted indices, then frees the border sets no surviving entry
-/// uses. No-op if it can't allocate scratch or if every entry is
-/// still live (genuinely 64K distinct styles on screen —
+/// compacted indices, then frees the border sets and layer lists no
+/// surviving entry uses. No-op if it can't allocate scratch or if every
+/// entry is still live (genuinely 64K distinct styles on screen —
 /// pathological, nothing to reclaim).
 pub fn compactStylePool(self: *Screen) void {
     const pool = self.pool;
-    // Whatever happens to the entries, no unrooted border ID is in hand
-    // here, so the sets the remaining entries do not use can go.
-    defer pool.collectBorders();
+    // Whatever happens to the entries, no unrooted side-table ID is in
+    // hand here, so the values the remaining entries do not use can go.
+    defer pool.collectTables();
     const old_len = pool.entries.items.len;
     if (old_len == 0) return;
 

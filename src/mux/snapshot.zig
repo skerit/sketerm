@@ -45,11 +45,15 @@ const style_pool = @import("../grid/style_pool.zig");
 const wire = @import("wire.zig");
 const Pool = style_pool.Pool;
 const borders = @import("../grid/borders.zig");
+const overlay = @import("../grid/overlay.zig");
 const palette_default_256 = @import("../grid/palette.zig").default_256;
 
 /// v13: style entries carry a border-set ID, followed by the border-set
 /// table (cell-border protocol). Older bodies restore with no borders.
-pub const SNAPSHOT_VERSION = 13;
+/// v14: style entries also carry an overstrike layer-list ID, followed
+/// (after the border table) by the layer-list table and the overstrike
+/// and saved-overstrike flags. Older bodies restore with no layers.
+pub const SNAPSHOT_VERSION = 14;
 pub const LEGACY_SNAPSHOT_VERSION = 3;
 
 /// What a `Screen` field means to a snapshot.
@@ -112,7 +116,9 @@ const field_policy = [_]struct { name: []const u8, class: FieldClass }{
     .{ .name = "saved_charset_g1", .class = .carried },
     .{ .name = "saved_active_charset", .class = .carried },
     .{ .name = "saved_link_id", .class = .carried },
+    .{ .name = "saved_overstrike", .class = .carried },
     .{ .name = "cur_style", .class = .carried },
+    .{ .name = "overstrike", .class = .carried },
     .{ .name = "scroll_top", .class = .carried },
     .{ .name = "scroll_bot", .class = .carried },
 
@@ -421,10 +427,17 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
         try s.color(e.underline_color);
         try s.int(u16, @bitCast(e.attrs));
         if (version >= 13) try s.int(u16, e.border);
+        if (version >= 14) try s.int(u16, e.overlay);
     }
     // Written before the scrollback, so the scrollback budget below
-    // already counts it: up to `max_border_sets` x 100 bytes.
+    // already counts them: up to `BorderTable.max_slots` x 100 bytes of
+    // border sets and as many x 66 bytes of layer lists.
     if (version >= 13) try writeBorderSets(pool, s);
+    if (version >= 14) {
+        try writeOverlayLists(pool, s);
+        try s.boolean(screen.overstrike);
+        try s.boolean(screen.saved_overstrike);
+    }
 
     // Grid: active, alt (optional), scrollback in logical order.
     for (screen.active) |*ln| try s.line(ln);
@@ -735,11 +748,12 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
 /// survive the trip, since entries name them), then each live slot as
 /// its ID, its present-segment mask and one stroke per set mask bit.
 fn writeBorderSets(pool: *const Pool, s: Sink) !void {
-    try s.int(u16, @intCast(pool.border_sets.items.len));
+    const slots = pool.border_table.slots.items;
+    try s.int(u16, @intCast(slots.len));
     var live: u16 = 0;
-    for (pool.border_sets.items) |set| live += @intFromBool(!borders.isEmpty(set));
+    for (slots) |set| live += @intFromBool(!borders.isEmpty(set));
     try s.int(u16, live);
-    for (pool.border_sets.items, 1..) |set, id| {
+    for (slots, 1..) |set, id| {
         const mask = borders.presentMask(set);
         if (mask == 0) continue;
         try s.int(u16, @intCast(id));
@@ -747,6 +761,24 @@ fn writeBorderSets(pool: *const Pool, s: Sink) !void {
         for (borders.segments) |seg| {
             if (mask & seg.mask() != 0) try s.int(u64, set[@intFromEnum(seg)].bits());
         }
+    }
+}
+
+/// v14: the overstrike layer-list table, shaped like the border table:
+/// slot count, live count, then each live slot as its ID, its layer
+/// count and one 128-bit layer per present layer.
+fn writeOverlayLists(pool: *const Pool, s: Sink) !void {
+    const slots = pool.overlay_table.slots.items;
+    try s.int(u16, @intCast(slots.len));
+    var live: u16 = 0;
+    for (slots) |list| live += @intFromBool(overlay.count(list) != 0);
+    try s.int(u16, live);
+    for (slots, 1..) |list, id| {
+        const n = overlay.count(list);
+        if (n == 0) continue;
+        try s.int(u16, @intCast(id));
+        try s.byte(@intCast(n));
+        for (list[0..n]) |layer| try s.int(u128, layer.bits());
     }
 }
 
@@ -955,7 +987,7 @@ const Src = struct {
 fn readBorderSets(src: *Src, allocator: std.mem.Allocator) Src.Error!std.ArrayList(borders.Set) {
     const n_slots = try src.int(u16);
     const n_live = try src.int(u16);
-    if (n_slots > Pool.max_border_sets or n_live > n_slots) return error.BadSnapshot;
+    if (n_slots > style_pool.BorderTable.max_slots or n_live > n_slots) return error.BadSnapshot;
     var sets: std.ArrayList(borders.Set) = .empty;
     errdefer sets.deinit(allocator);
     try sets.appendNTimes(allocator, borders.empty, n_slots);
@@ -973,6 +1005,27 @@ fn readBorderSets(src: *Src, allocator: std.mem.Allocator) Src.Error!std.ArrayLi
         }
     }
     return sets;
+}
+
+/// Reads `writeOverlayLists`' table into slot order, rejecting anything
+/// the interning paths could not have written.
+fn readOverlayLists(src: *Src, allocator: std.mem.Allocator) Src.Error!std.ArrayList(overlay.List) {
+    const n_slots = try src.int(u16);
+    const n_live = try src.int(u16);
+    if (n_slots > style_pool.OverlayTable.max_slots or n_live > n_slots) return error.BadSnapshot;
+    var lists: std.ArrayList(overlay.List) = .empty;
+    errdefer lists.deinit(allocator);
+    try lists.appendNTimes(allocator, overlay.empty, n_slots);
+    for (0..n_live) |_| {
+        const id = try src.int(u16);
+        const n = try src.byte();
+        if (id == 0 or id > n_slots or n == 0 or n > overlay.max_layers) return error.BadSnapshot;
+        const list = &lists.items[id - 1];
+        if (overlay.count(list.*) != 0) return error.BadSnapshot;
+        for (list[0..n]) |*layer| layer.* = @bitCast(try src.int(u128));
+        if (!overlay.validList(list.*)) return error.BadSnapshot;
+    }
+    return lists;
 }
 
 fn validateLinkState(screen: *const Screen) !void {
@@ -1078,6 +1131,7 @@ pub fn restoreStaged(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u
             .underline_color = ul,
             .attrs = @bitCast(attrs_raw),
             .border = if (version >= 13) try src.int(u16) else 0,
+            .overlay = if (version >= 14) try src.int(u16) else 0,
         });
     }
     var border_sets: std.ArrayList(borders.Set) = if (version >= 13)
@@ -1085,19 +1139,29 @@ pub fn restoreStaged(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u
     else
         .empty;
     errdefer border_sets.deinit(pool.allocator);
+    var overlay_lists: std.ArrayList(overlay.List) = if (version >= 14)
+        try readOverlayLists(&src, pool.allocator)
+    else
+        .empty;
+    errdefer overlay_lists.deinit(pool.allocator);
+    const overstrike = if (version >= 14) try src.strictBoolean() else false;
+    const saved_overstrike = if (version >= 14) try src.strictBoolean() else false;
 
     const replacement_pool = try pool.allocator.create(Pool);
     errdefer pool.allocator.destroy(replacement_pool);
-    replacement_pool.* = Pool.initReplacement(pool.allocator, new_entries, border_sets) catch |err| switch (err) {
+    replacement_pool.* = Pool.initReplacement(pool.allocator, new_entries, border_sets, overlay_lists) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidBorderTable => return error.BadSnapshot,
+        error.InvalidTable => return error.BadSnapshot,
     };
     new_entries = .empty;
     border_sets = .empty;
+    overlay_lists = .empty;
     errdefer replacement_pool.deinit();
 
     const screen = try Screen.init(allocator, replacement_pool, cols, rows);
     errdefer screen.deinit();
+    screen.overstrike = overstrike;
+    screen.saved_overstrike = saved_overstrike;
 
     // Active rows: swap each freshly-built line for the snapshot one.
     for (screen.active) |*ln| {
@@ -1571,7 +1635,9 @@ fn expectScreensEqual(expected: *const Screen, actual: *const Screen) !void {
     try testing.expectEqual(expected.saved_charset_g1, actual.saved_charset_g1);
     try testing.expectEqual(expected.saved_active_charset, actual.saved_active_charset);
     try testing.expectEqual(expected.saved_link_id, actual.saved_link_id);
+    try testing.expectEqual(expected.saved_overstrike, actual.saved_overstrike);
     try testing.expectEqual(expected.cur_style, actual.cur_style);
+    try testing.expectEqual(expected.overstrike, actual.overstrike);
     try testing.expectEqual(expected.scroll_top, actual.scroll_top);
     try testing.expectEqual(expected.scroll_bot, actual.scroll_bot);
     try testing.expectEqual(expected.pending_wrap, actual.pending_wrap);
@@ -1811,10 +1877,16 @@ fn skipHeadAndStyles(src: *Src) !SkippedHead {
         _ = try src.color();
         _ = try src.int(u16);
         if (version >= 13) _ = try src.int(u16);
+        if (version >= 14) _ = try src.int(u16);
     }
     if (version >= 13) {
         var sets = try readBorderSets(src, testing.allocator);
         sets.deinit(testing.allocator);
+    }
+    if (version >= 14) {
+        var lists = try readOverlayLists(src, testing.allocator);
+        lists.deinit(testing.allocator);
+        _ = try src.int(u16);
     }
     return .{ .rows = rows, .n_styles = n_styles };
 }
@@ -3337,7 +3409,7 @@ test "snapshot: cell borders reach a mirror through the wire and survive a v13 r
     // The index was rebuilt: re-interning a live set finds its slot.
     const set = restored_pool.bordersOf(restored.cur_style);
     try testing.expectEqual(restored_pool.get(restored.cur_style).border, try restored_pool.internBorder(set));
-    try testing.expectEqual(daemon_pool.border_sets.items.len, restored_pool.border_sets.items.len);
+    try testing.expectEqual(daemon_pool.border_table.slots.items.len, restored_pool.border_table.slots.items.len);
 }
 
 test "snapshot: a pre-border body restores with no borders" {
@@ -3379,6 +3451,7 @@ test "snapshot: a border table the interning paths could not write is BadSnapsho
         _ = try src.int(u16);
         last_border = src.pos;
         _ = try src.int(u16);
+        _ = try src.int(u16);
     }
     const table = src.pos;
     // Slot count, live count, then the first live slot's ID, mask, stroke.
@@ -3395,6 +3468,143 @@ test "snapshot: a border table the interning paths could not write is BadSnapsho
         .{ .at = first_stroke, .bytes = &.{65} },
         // More live slots than slots.
         .{ .at = table + 2, .bytes = &.{ 0xff, 0x7f } },
+    };
+    for (corruptions) |c| {
+        const bad = try a.dupe(u8, body.items);
+        defer a.free(bad);
+        @memcpy(bad[c.at..][0..c.bytes.len], c.bytes);
+        var pool = try Pool.init(a);
+        defer pool.deinit();
+        try testing.expectError(error.BadSnapshot, restore(a, &pool, bad));
+    }
+}
+
+fn expectSameOverlays(expected: *const Screen, actual: *const Screen) !void {
+    for (expected.active, actual.active) |e_ln, a_ln| {
+        for (e_ln.cells, a_ln.cells) |e_cell, a_cell| {
+            try testing.expectEqual(e_cell.rune, a_cell.rune);
+            try testing.expectEqual(
+                expected.pool.overlaysOf(e_cell.style_ref),
+                actual.pool.overlaysOf(a_cell.style_ref),
+            );
+        }
+    }
+    try testing.expectEqual(expected.overstrike, actual.overstrike);
+    try testing.expectEqual(expected.saved_overstrike, actual.saved_overstrike);
+}
+
+/// Red `AB`, overstruck with green `//` via SGR 8:7, a blue `x` via
+/// DECSET 20 on a blank cell, then DECSC with overstrike on and SGR 28.
+const overstruck_bytes = "\x1b[31mAB\x1b[1;1H\x1b[32m\x1b[8:7m//\x1b[28m\x1b[1;4H\x1b[34m\x1b[?20hx\x1b7\x1b[28m";
+
+test "snapshot: overstrike layers and flags reach a mirror through the wire and survive a v14 restore" {
+    const a = testing.allocator;
+    var daemon_pool = try Pool.init(a);
+    defer daemon_pool.deinit();
+    var mirror_pool = try Pool.init(a);
+    defer mirror_pool.deinit();
+    const daemon = try Screen.init(a, &daemon_pool, 8, 3);
+    defer daemon.deinit();
+    const mirror = try Screen.init(a, &mirror_pool, 8, 3);
+    defer mirror.deinit();
+    var feeder = WireFeeder{ .parser = Parser.init(a), .allocator = a, .daemon = daemon, .mirror = mirror };
+    defer feeder.parser.deinit();
+    feeder.feed(overstruck_bytes);
+    try testing.expectEqual(@as(usize, 0), feeder.wire_failures);
+    try testing.expect(daemon_pool.hasOverlays());
+    try testing.expectEqual(@as(u21, '/'), daemon_pool.overlaysOf(daemon.active[0].cells[1].style_ref)[0].cp);
+    try testing.expectEqual(@as(u21, 'x'), daemon_pool.overlaysOf(daemon.active[0].cells[3].style_ref)[0].cp);
+    try testing.expect(!daemon.overstrike and daemon.saved_overstrike);
+    try expectSameOverlays(daemon, mirror);
+    // The flag itself crosses too (sub-parameter and private mode).
+    feeder.feed("\x1b[8:7m");
+    try testing.expect(mirror.overstrike);
+    try expectSameOverlays(daemon, mirror);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try serialize(daemon, &body, a);
+    var restored_pool = try Pool.init(a);
+    defer restored_pool.deinit();
+    const restored = try restore(a, &restored_pool, body.items);
+    defer restored.deinit();
+    try expectSameOverlays(daemon, restored);
+    // The index was rebuilt: re-interning a live list finds its slot.
+    const ref = restored.active[0].cells[0].style_ref;
+    try testing.expectEqual(restored_pool.get(ref).overlay, try restored_pool.overlay_table.intern(a, restored_pool.overlaysOf(ref)));
+    try testing.expectEqual(daemon_pool.overlay_table.slots.items.len, restored_pool.overlay_table.slots.items.len);
+}
+
+test "snapshot: a pre-overstrike body restores with no layers" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 8, 3);
+    defer h.deinit();
+    h.feed(overstruck_bytes ++ "\x1b[8:7m");
+    for ([_]u32{ 12, 13 }) |version| {
+        var old_body: std.ArrayList(u8) = .empty;
+        defer old_body.deinit(a);
+        try serializeVersion(h.screen, &old_body, a, version);
+        var pool = try Pool.init(a);
+        defer pool.deinit();
+        const old = try restore(a, &pool, old_body.items);
+        defer old.deinit();
+        try testing.expect(!pool.hasOverlays());
+        try testing.expect(!old.overstrike and !old.saved_overstrike);
+        try testing.expectEqual(@as(u32, 'A'), old.active[0].cells[0].rune);
+    }
+}
+
+test "snapshot: a layer table the interning paths could not write is BadSnapshot" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 8, 3);
+    defer h.deinit();
+    h.feed(overstruck_bytes);
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try serialize(h.screen, &body, a);
+
+    // Walk to the layer table: the last entry's overlay ID, past the
+    // border table, then the layer table and the two flags.
+    var src = Src{ .bytes = body.items };
+    _ = try src.int(u32);
+    _ = try src.int(u16);
+    _ = try src.int(u16);
+    const n_styles = try src.int(u16);
+    var last_overlay: usize = 0;
+    for (0..n_styles) |_| {
+        _ = try src.color();
+        _ = try src.color();
+        _ = try src.color();
+        _ = try src.int(u16);
+        _ = try src.int(u16);
+        last_overlay = src.pos;
+        _ = try src.int(u16);
+    }
+    var sets = try readBorderSets(&src, a);
+    sets.deinit(a);
+    const table = src.pos;
+    var lists = try readOverlayLists(&src, a);
+    lists.deinit(a);
+    const flags = src.pos;
+    // Slot count, live count, then the first live slot's ID, count, layer.
+    const first_count = table + 6;
+    const first_layer = table + 7;
+
+    const Corruption = struct { at: usize, bytes: []const u8 };
+    const corruptions = [_]Corruption{
+        // An entry naming a slot past the table.
+        .{ .at = last_overlay, .bytes = &.{ 0xff, 0x00 } },
+        // A slot ID of zero.
+        .{ .at = table + 4, .bytes = &.{ 0, 0 } },
+        // An empty list, and one past the layer bound.
+        .{ .at = first_count, .bytes = &.{0} },
+        .{ .at = first_count, .bytes = &.{overlay.max_layers + 1} },
+        // A layer with no codepoint.
+        .{ .at = first_layer, .bytes = &.{ 0, 0 } },
+        // More live slots than slots.
+        .{ .at = table + 2, .bytes = &.{ 0xff, 0x7f } },
+        // A flag that is not a boolean.
+        .{ .at = flags, .bytes = &.{2} },
     };
     for (corruptions) |c| {
         const bad = try a.dupe(u8, body.items);

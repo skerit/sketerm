@@ -86,11 +86,11 @@ test "DECRQSS m: the reply is the longest in the worst case and fits its buffer"
     defer h.deinit();
     // Every attribute, then every colour as truecolor (three SGRs so
     // no single one exceeds the parser's 16 parameters).
-    h.feed("\x1b[1;2;3;4:3;5;6;7;8;9;53m\x1b[38;2;255;255;255;48;2;255;255;255m\x1b[58;2;255;255;255m");
+    h.feed("\x1b[1;2;3;4:3;5;6;7;8;8:7;9;53m\x1b[38;2;255;255;255;48;2;255;255;255m\x1b[58;2;255;255;255m");
     var buf: [screen_ops.sgr_params_max_len]u8 = undefined;
-    const params = try screen_ops.sgrParams(currentEntry(&h), &buf);
+    const params = try screen_ops.sgrParams(currentEntry(&h), h.screen.overstrike, &buf);
     try std.testing.expectEqualStrings(
-        "0;1;2;3;4:3;5;6;7;8;9;53;38;2;255;255;255;48;2;255;255;255;58;2;255;255;255",
+        "0;1;2;3;4:3;5;6;7;8;8:7;9;53;38;2;255;255;255;48;2;255;255;255;58;2;255;255;255",
         params,
     );
     try std.testing.expectEqual(screen_ops.sgr_params_max_len, params.len);
@@ -99,8 +99,54 @@ test "DECRQSS m: the reply is the longest in the worst case and fits its buffer"
     h.wtc.clearRetainingCapacity();
     h.feed(DECRQSS_SGR);
     try std.testing.expectEqualStrings("\x1bP1$r" ++
-        "0;1;2;3;4:3;5;6;7;8;9;53;38;2;255;255;255;48;2;255;255;255;58;2;255;255;255" ++
+        "0;1;2;3;4:3;5;6;7;8;8:7;9;53;38;2;255;255;255;48;2;255;255;255;58;2;255;255;255" ++
         "m\x1b\\", h.wtc.items);
+}
+
+test "SGR 8:7 is overstrike alone; 8;7 stays conceal + reverse" {
+    var h = try Harness.init(std.testing.allocator, 10, 2);
+    defer h.deinit();
+    h.feed("\x1b[8:7m");
+    try std.testing.expect(h.screen.overstrike);
+    try std.testing.expectEqual(@as(u16, 0), @as(u16, @bitCast(currentEntry(&h).attrs)));
+    h.feed("\x1b[0;8;7m");
+    try std.testing.expect(!h.screen.overstrike);
+    try std.testing.expect(currentEntry(&h).attrs.invisible and currentEntry(&h).attrs.reverse);
+    // Another `8:N` is ignored whole, its sub-parameters included.
+    h.feed("\x1b[0;8:3:7;1m");
+    try std.testing.expect(!h.screen.overstrike);
+    try std.testing.expectEqual(@as(u16, 1), @as(u16, @bitCast(currentEntry(&h).attrs)));
+}
+
+test "SGR 28 clears conceal and overstrike, SGR 0 and a bare CSI m overstrike" {
+    inline for (.{ "\x1b[28m", "\x1b[0m", "\x1b[m" }) |clear| {
+        var h = try Harness.init(std.testing.allocator, 10, 2);
+        defer h.deinit();
+        h.feed("\x1b[8;8:7;1m");
+        try std.testing.expect(h.screen.overstrike and currentEntry(&h).attrs.invisible);
+        h.feed(clear);
+        try std.testing.expect(!h.screen.overstrike and !currentEntry(&h).attrs.invisible);
+    }
+    // Other SGRs leave it alone.
+    var h = try Harness.init(std.testing.allocator, 10, 2);
+    defer h.deinit();
+    h.feed("\x1b[8:7m\x1b[31;1;22;27m");
+    try std.testing.expect(h.screen.overstrike);
+}
+
+test "DECRQSS m reports overstrike as 8:7 and round-trips it" {
+    try expectReport("\x1b[8:7m", "0;8:7");
+    try expectReport("\x1b[?20h", "0;8:7");
+    try expectReport("\x1b[8;8:7;31m", "0;8;8:7;31");
+    try expectRoundTrip("\x1b[8:7;1;31m");
+    var h = try Harness.init(std.testing.allocator, 10, 2);
+    defer h.deinit();
+    const reply = queryAfter(&h, "\x1b[8:7m");
+    var b = try Harness.init(std.testing.allocator, 10, 2);
+    defer b.deinit();
+    b.feed("\x1b[" ++ "0;8:7" ++ "m");
+    try std.testing.expect(b.screen.overstrike);
+    try std.testing.expectEqualStrings("\x1bP1$r0;8:7m\x1b\\", reply);
 }
 
 /// Feed `seq` to one screen, replay its DECRQSS answer as a CSI m

@@ -57,9 +57,10 @@ fn isValidWidePair(cells: []const Cell, left: usize) bool {
         isWideCont(cells[left + 1]) and cells[left + 1].rune == 0;
 }
 
-/// A blank cell with borders is content: reflow never drops it.
-fn carriesBorder(cell: Cell, pool: *const Pool) bool {
-    return pool.get(cell.style_ref).border != 0;
+/// A blank cell that draws something (borders, overstrike layers) is
+/// content: reflow never drops it.
+fn drawsOnBlank(cell: Cell, pool: *const Pool) bool {
+    return pool.get(cell.style_ref).drawsOnBlank();
 }
 
 /// Exclude the structural blank left when a wide pair wrapped early.
@@ -69,7 +70,7 @@ pub fn logicalRowLen(rows: []const Line, row: usize, pool: *const Pool) usize {
     const next = rows[row + 1];
     if (!next.continues_above or !isValidWidePair(next.cells, 0)) return cells.len;
     const last = cells[cells.len - 1];
-    if (last.rune == 0 and last.flags == 0 and !carriesBorder(last, pool)) return cells.len - 1;
+    if (last.rune == 0 and last.flags == 0 and !drawsOnBlank(last, pool)) return cells.len - 1;
     return cells.len;
 }
 
@@ -143,7 +144,7 @@ pub fn trim(logicals: *std.ArrayList(Logical), allocator: std.mem.Allocator, poo
     for (logicals.items) |*ll| {
         repairMalformedWideCells(ll.cells.items);
         var hi = ll.cells.items.len;
-        while (hi > 0 and ll.cells.items[hi - 1].rune == 0 and !carriesBorder(ll.cells.items[hi - 1], pool)) {
+        while (hi > 0 and ll.cells.items[hi - 1].rune == 0 and !drawsOnBlank(ll.cells.items[hi - 1], pool)) {
             if (hi >= 2 and isValidWidePair(ll.cells.items, hi - 2)) break;
             hi -= 1;
         }

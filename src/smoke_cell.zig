@@ -1360,6 +1360,12 @@ pub fn main() !u8 {
         if (rc != 0) return rc;
     }
 
+    // Overstrike layers: both colours, no background repaint, parity.
+    {
+        const rc = try overstrikeStage(allocator);
+        if (rc != 0) return rc;
+    }
+
     std.debug.print("smoke-cell: PASS\n", .{});
     return 0;
 }
@@ -2453,5 +2459,154 @@ fn borderStage(allocator: std.mem.Allocator) !u8 {
         return 122;
     }
     std.debug.print("smoke-cell: cell borders OK (cell {d}x{d}, stroke {d}px)\n", .{ cw, ch, t64 });
+    return 0;
+}
+
+/// Overstrike (`CSI 8:7 m`) through `scene.drawGrid`: a red `A` on a
+/// blue cell overstruck with a green `/` must show both colours, keep
+/// the blue background around them (a layer never paints one), and
+/// light the same pixels on a CellPass row (row 0) as on a row a Thai
+/// letter routes to GridPass (row 2).
+fn overstrikeStage(allocator: std.mem.Allocator) !u8 {
+    const OW: c_int = 240;
+    const OH: c_int = 120;
+
+    var fbo: c_uint = 0;
+    var rbo: c_uint = 0;
+    c.glGenFramebuffers(1, &fbo);
+    c.glGenRenderbuffers(1, &rbo);
+    c.glBindRenderbuffer(c.GL_RENDERBUFFER, rbo);
+    c.glRenderbufferStorage(c.GL_RENDERBUFFER, c.GL_RGBA8, OW, OH);
+    c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+    c.glFramebufferRenderbuffer(c.GL_FRAMEBUFFER, c.GL_COLOR_ATTACHMENT0, c.GL_RENDERBUFFER, rbo);
+    defer {
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, 0);
+        c.glDeleteFramebuffers(1, &fbo);
+        c.glDeleteRenderbuffers(1, &rbo);
+    }
+    if (c.glCheckFramebufferStatus(c.GL_FRAMEBUFFER) != c.GL_FRAMEBUFFER_COMPLETE) {
+        std.debug.print("smoke-cell: overstrike FAIL - framebuffer incomplete\n", .{});
+        return 130;
+    }
+
+    const atlas: ?*Atlas = fonts.openAtlas(allocator, FONT_SIZE);
+    if (atlas == null) {
+        std.debug.print("smoke-cell: overstrike FAIL - no font\n", .{});
+        return 131;
+    }
+    defer atlas.?.deinit();
+    atlas.?.realize();
+
+    var pool = try StylePool.init(allocator);
+    defer pool.deinit();
+    const screen = try Screen.init(allocator, &pool, 12, 4);
+    defer screen.deinit();
+
+    var parser = @import("parser/vt.zig").Parser.init(allocator);
+    defer parser.deinit();
+    const Ctx = struct { screen: *Screen, allocator: std.mem.Allocator };
+    const Emit = struct {
+        fn cb(user: ?*anyopaque, ev: @import("parser/event.zig").Event) void {
+            const ec: *Ctx = @ptrCast(@alignCast(user.?));
+            var mut = ev;
+            ec.screen.apply(ev);
+            mut.deinit(ec.allocator);
+        }
+    };
+    var ec = Ctx{ .screen = screen, .allocator = allocator };
+    // The layer's own rendition has a black background: if anything
+    // painted it, the blue would be gone.
+    const struck = "\x1b[38;2;255;0;0;48;2;0;0;255mA\x08\x1b[38;2;0;255;0;48;2;0;0;0m\x1b[8:7m/\x1b[0m";
+    parser.advance("\x1b[1;2H" ++ struck ++ "\x1b[3;2H" ++ struck ++ "\x1b[3;12H\u{0E01}\x1b[4;12H", Emit.cb, @ptrCast(&ec));
+    if (!pool.hasOverlays()) {
+        std.debug.print("smoke-cell: overstrike FAIL - no layer was recorded\n", .{});
+        return 132;
+    }
+
+    var cell_pass = CellPass.init(allocator);
+    defer cell_pass.deinit();
+    try cell_pass.realize();
+    var grid_pass = GridPass.init(allocator);
+    defer grid_pass.deinit();
+    try grid_pass.realize();
+    grid_pass.canvas_w = @floatFromInt(OW);
+    grid_pass.canvas_h = @floatFromInt(OH);
+    var border_pass = border_pass_mod.BorderPass.init(allocator);
+    defer border_pass.deinit();
+    try border_pass.realize();
+
+    c.glViewport(0, 0, OW, OH);
+    c.glClearColor(0, 0, 0, 1);
+    c.glClear(c.GL_COLOR_BUFFER_BIT);
+    try cell_pass.rebuildAndUpload(screen, &pool, atlas.?);
+    try grid_pass.buildVertices(screen, &pool, atlas.?, false, true, &.{});
+    try border_pass.build(screen, &pool, .{
+        .cell_w = atlas.?.cell_w,
+        .cell_h = atlas.?.cell_h,
+        .pad = grid_pass.pad,
+    }, true);
+    @import("render/scene.zig").drawGrid(&cell_pass, &grid_pass, &border_pass, atlas.?, OW, OH);
+    c.glFinish();
+
+    const fb = try allocator.alloc(u8, @as(usize, @intCast(OW * OH)) * 4);
+    defer allocator.free(fb);
+    c.glReadPixels(0, 0, OW, OH, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+
+    const w: usize = @intCast(OW);
+    const h: usize = @intCast(OH);
+    const at = struct {
+        fn rgb(buf: []const u8, bw: usize, bh: usize, x: usize, y_top: usize) [3]u8 {
+            const o = ((bh - 1 - y_top) * bw + x) * 4;
+            return .{ buf[o], buf[o + 1], buf[o + 2] };
+        }
+        fn near(got: [3]u8, want: [3]u8) bool {
+            for (got, want) |g, v| if (@abs(@as(i32, g) - @as(i32, v)) > 8) return false;
+            return true;
+        }
+    };
+    const cw: usize = atlas.?.cell_w;
+    const ch: usize = atlas.?.cell_h;
+    const pad: usize = @intFromFloat(grid_pass.pad);
+
+    var failures: u32 = 0;
+    for ([_]usize{ 0, 2 }) |row| {
+        var red: usize = 0;
+        var green: usize = 0;
+        var blue: usize = 0;
+        var black: usize = 0;
+        for (0..ch) |dy| for (0..cw) |dx| {
+            const p = at.rgb(fb, w, h, pad + cw + dx, pad + row * ch + dy);
+            // Glyph pixels by their dominant channel: antialiased edges
+            // over blue still lean red or green.
+            if (p[0] > 128 and p[1] < 96) red += 1;
+            if (p[1] > 128 and p[0] < 96) green += 1;
+            if (at.near(p, .{ 0, 0, 255 })) blue += 1;
+            if (at.near(p, .{ 0, 0, 0 })) black += 1;
+        };
+        std.debug.print("smoke-cell: overstrike row {d}: red {d} green {d} blue {d} black {d} of {d}\n", .{ row, red, green, blue, black, cw * ch });
+        if (red == 0 or green == 0) {
+            std.debug.print("smoke-cell: overstrike FAIL - row {d} does not show both glyph colours\n", .{row});
+            failures += 1;
+        }
+        if (blue * 2 < cw * ch or black != 0) {
+            std.debug.print("smoke-cell: overstrike FAIL - row {d} background was repainted\n", .{row});
+            failures += 1;
+        }
+    }
+
+    var mismatched: usize = 0;
+    for (0..ch) |dy| {
+        for (pad..pad + 10 * cw) |x| {
+            const a = at.rgb(fb, w, h, x, pad + dy);
+            const b = at.rgb(fb, w, h, x, pad + 2 * ch + dy);
+            if (!std.mem.eql(u8, &a, &b)) mismatched += 1;
+        }
+    }
+    if (mismatched != 0) {
+        std.debug.print("smoke-cell: overstrike FAIL - CellPass and GridPass rows differ in {d} pixels\n", .{mismatched});
+        failures += 1;
+    }
+    if (failures != 0) return 133;
+    std.debug.print("smoke-cell: overstrike OK (cell {d}x{d})\n", .{ cw, ch });
     return 0;
 }

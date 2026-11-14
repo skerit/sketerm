@@ -252,16 +252,16 @@ test "style GC collects border sets nothing uses, and keeps the live ones" {
     var h = try Harness.init(testing.allocator, 4, 1);
     defer h.deinit();
     h.feed("\x1bP1+bcell-border;pen;1;8;ff0000;0;0\x1b\\a\x1bP1+bcell-border;pen;1;8;00ff00;0;0\x1b\\b");
-    try testing.expectEqual(@as(usize, 2), h.pool.border_sets.items.len);
+    try testing.expectEqual(@as(usize, 2), h.pool.border_table.slots.items.len);
     // Overwrite the red cell with no pen; the green one stays live.
     h.feed(pen_clear ++ "\x1b[1;1Hx");
     h.screen.compactStylePool();
-    try testing.expectEqual(@as(usize, 1), h.pool.border_free.items.len);
+    try testing.expectEqual(@as(usize, 1), h.pool.border_table.free.items.len);
     try testing.expectEqual(@as(u24, 0x00ff00), strokeAt(&h, 0, 1, .top_left).color.value);
     // The freed slot is reused, and the live set kept its ID.
     const live_id = h.pool.get(h.screen.line(0).cells[1].style_ref).border;
     h.feed("\x1bP1+bcell-border;pen;1;8;0000ff;0;0\x1b\\\x1b[1;4Hc");
-    try testing.expectEqual(@as(usize, 2), h.pool.border_sets.items.len);
+    try testing.expectEqual(@as(usize, 2), h.pool.border_table.slots.items.len);
     try testing.expectEqual(live_id, h.pool.get(h.screen.line(0).cells[1].style_ref).border);
     h.feed(pen_clear ++ "\x1b[1;1H\x1b[2K");
     h.screen.compactStylePool();

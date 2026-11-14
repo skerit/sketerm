@@ -23,6 +23,7 @@ const StylePool = @import("../grid/style_pool.zig").Pool;
 const StyleEntry = @import("../grid/style_pool.zig").Entry;
 const Cell = @import("../grid/cell.zig").Cell;
 const style_util = @import("style.zig");
+const overlay = @import("../grid/overlay.zig");
 const blend = @import("blend.zig");
 pub const scrollbar = @import("scrollbar.zig");
 
@@ -1212,8 +1213,6 @@ pub const GridPass = struct {
     ) !void {
         const pad = self.pad;
         const x_scale: f32 = if (scaling == .single) 1.0 else 2.0;
-        const y_scale: f32 = if (scaling == .dhl_top or scaling == .dhl_bot) 2.0 else 1.0;
-        const y_origin_shift: f32 = if (scaling == .dhl_bot) -ch else 0.0;
         const y: f32 = pad + @as(f32, @floatFromInt(row)) * ch;
 
         // Visual order of a bidi row, shared by the bg and glyph sweeps
@@ -1241,12 +1240,8 @@ pub const GridPass = struct {
             return;
         }
 
-        // Glyphs — bidi-reorder runs to visual order before shaping.
-        if (order) |o| {
-            try self.emitBidiGlyphs(atlas, pool, glossary, cells, o, row, cw, ch, ascent, scaling);
-        } else {
-            try self.emitLogicalGlyphs(atlas, pool, glossary, cells, row, cw, ch, ascent, scaling, x_scale, y_scale, y_origin_shift);
-        }
+        // Glyphs — bidi rows in visual order (shaping is per cell).
+        try self.emitRowGlyphs(atlas, pool, glossary, cells, order, row, cw, ch, ascent, scaling);
     }
 
     /// Visual-to-logical column order of a bidi row: `order[v]` is the
@@ -1285,10 +1280,26 @@ pub const GridPass = struct {
         if ((cell.flags & cell_mod.FLAG_WIDE_CONT) != 0) return; // wide continuation
         const style = pool.get(cell.style_ref);
         const a = style.attrs;
+        if (style_util.underlineKind(a) == .none and !a.strikethrough and !a.overline) return;
+        const resolved = self.styleResolver().resolve(style);
+        try self.emitDeco(a, resolved, cell, visual_col, y, cw, ch, x_scale);
+    }
+
+    /// The decoration quads of `attrs` in `resolved`'s colours over the
+    /// cell at `visual_col`: a cell's own, or an overstrike layer's.
+    fn emitDeco(
+        self: *GridPass,
+        a: @import("../grid/style_pool.zig").Attrs,
+        resolved: style_util.Resolver.Resolved,
+        cell: Cell,
+        visual_col: usize,
+        y: f32,
+        cw: f32,
+        ch: f32,
+        x_scale: f32,
+    ) !void {
         const ul = style_util.underlineKind(a);
         if (ul == .none and !a.strikethrough and !a.overline) return;
-
-        const resolved = self.styleResolver().resolve(style);
         const color = resolved.deco;
 
         const is_wide = (cell.flags & cell_mod.FLAG_WIDE_LEFT) != 0;
@@ -1327,9 +1338,10 @@ pub const GridPass = struct {
     }
 
     /// The decoration sweep of an overlay row: every cell at its
-    /// visual column (`order`, or logical order when null). Separate
-    /// from the glyph sweep because decorations draw on spaces and
-    /// empty cells too (underlined whitespace is meaningful).
+    /// visual column (`order`, or logical order when null), then every
+    /// overstrike layer's, the order CellPass's decoration draw has.
+    /// Separate from the glyph sweep because decorations draw on spaces
+    /// and empty cells too (underlined whitespace is meaningful).
     fn emitRowDecos(
         self: *GridPass,
         pool: *const StylePool,
@@ -1340,82 +1352,71 @@ pub const GridPass = struct {
         ch: f32,
         x_scale: f32,
     ) !void {
-        if (order) |ord| {
-            for (ord, 0..) |logical, visual| {
-                try self.emitCellDeco(pool, cells[logical], visual, y, cw, ch, x_scale);
-            }
-        } else {
-            for (cells, 0..) |cell, col| {
-                try self.emitCellDeco(pool, cell, col, y, cw, ch, x_scale);
+        for (0..cells.len) |visual| {
+            const logical = if (order) |o| o[visual] else visual;
+            try self.emitCellDeco(pool, cells[logical], visual, y, cw, ch, x_scale);
+        }
+        if (!pool.hasOverlays()) return;
+        const resolver = self.styleResolver();
+        for (0..cells.len) |visual| {
+            const cell = cells[if (order) |o| o[visual] else visual];
+            const base = pool.get(cell.style_ref);
+            if (base.overlay == 0) continue;
+            const under = resolver.resolve(base).eff_bg;
+            const layers = pool.overlayList(base.overlay);
+            for (layers[0..overlay.count(layers)]) |layer| {
+                const r = layer.rendition();
+                try self.emitDeco(r.attrs, resolver.resolveOver(r, under), cell, visual, y, cw, ch, x_scale);
             }
         }
     }
 
-    fn emitLogicalGlyphs(
+    /// One glyph of `cp` in `attrs` and colour `fg` at the cell origin
+    /// `x`, `y`: a cell's own glyph or an overstrike layer's. Italic
+    /// shear and bold apply only on single-scale rows (the shear pivot
+    /// misbehaves with y_scale != 1), and the shear only without a real
+    /// italic face (the glyph carries the slant otherwise).
+    fn pushCellGlyph(
         self: *GridPass,
         atlas: *Atlas,
-        pool: *const StylePool,
         glossary: *const @import("../grid/glyph_glossary.zig").Glossary,
-        cells: []const Cell,
-        row: u16,
-        cw: f32,
+        cp: u32,
+        attrs: @import("../grid/style_pool.zig").Attrs,
+        fg: [4]f32,
+        eff_bg: [4]f32,
+        x: f32,
+        y: f32,
         ch: f32,
         ascent: f32,
-        _: @import("../grid/line.zig").Scaling,
         x_scale: f32,
         y_scale: f32,
         y_origin_shift: f32,
     ) !void {
-        const pad = self.pad;
-        const y: f32 = pad + @as(f32, @floatFromInt(row)) * ch;
-        const resolver = self.styleResolver();
-
-        var col: u16 = 0;
-        const cols: u16 = @intCast(cells.len);
-        while (col < cols) {
-            const cell = cells[col];
-            if ((cell.flags & cell_mod.FLAG_WIDE_CONT) != 0 or cell.rune == 0 or cell.rune == ' ') {
-                col += 1;
-                continue;
-            }
-            const style = pool.get(cell.style_ref);
-            const resolved = resolver.resolve(style);
-            const fg = resolved.fg;
-            const bold = style.attrs.bold and self.allow_bold;
-            const x: f32 = pad + @as(f32, @floatFromInt(col)) * cw * x_scale;
-            const g = atlas.lookupGlyph(glossary, cell.rune, bold, style.attrs.italic, fg) catch {
-                col += 1;
-                continue;
-            };
-            if (g.w > 0 and g.h > 0) {
-                const gx: f32 = x + @as(f32, @floatFromInt(g.bearing_x)) * x_scale;
-                const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y)) * y_scale + y_origin_shift;
-                const gw: f32 = @as(f32, @floatFromInt(g.w)) * x_scale;
-                const gh: f32 = @as(f32, @floatFromInt(g.h)) * y_scale;
-                // Italic/bold only on single-scale rows. DH/DW rows
-                // skip — shear pivot math gets weird with y_scale != 1.
-                // Shear only without a real italic face (the glyph
-                // carries the slant otherwise).
-                const is_single = (x_scale == 1.0 and y_scale == 1.0);
-                const italic_f: f32 = if (is_single and style.attrs.italic and !g.colored and !atlas.hasItalic()) 1.0 else 0.0;
-                const bold_f: f32 = if (is_single and style.attrs.bold and self.allow_bold) 1.0 else 0.0;
-                const baseline_y: f32 = y + ch;
-                const colored_f: f32 = if (g.colored) 1.0 else 0.0;
-                try self.pushGlyphQuadStyled(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0, italic_f, bold_f, baseline_y, colored_f, resolved.eff_bg);
-            }
-            col += 1;
-        }
-
-        try self.emitRowDecos(pool, cells, null, y + y_origin_shift, cw, ch, x_scale);
+        const bold = attrs.bold and self.allow_bold;
+        const g = atlas.lookupGlyph(glossary, cp, bold, attrs.italic, fg) catch return;
+        if (g.w == 0 or g.h == 0) return;
+        const gx: f32 = x + @as(f32, @floatFromInt(g.bearing_x)) * x_scale;
+        const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y)) * y_scale + y_origin_shift;
+        const gw: f32 = @as(f32, @floatFromInt(g.w)) * x_scale;
+        const gh: f32 = @as(f32, @floatFromInt(g.h)) * y_scale;
+        const is_single = (x_scale == 1.0 and y_scale == 1.0);
+        const italic_f: f32 = if (is_single and attrs.italic and !g.colored and !atlas.hasItalic()) 1.0 else 0.0;
+        const bold_f: f32 = if (is_single and bold) 1.0 else 0.0;
+        const colored_f: f32 = if (g.colored) 1.0 else 0.0;
+        try self.pushGlyphQuadStyled(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0, italic_f, bold_f, y + ch, colored_f, eff_bg);
     }
 
-    fn emitBidiGlyphs(
+    /// Every glyph of an overlay row at its visual column (`order`, or
+    /// logical order when null), then every overstrike layer on top,
+    /// then the decorations: CellPass's draw order, so a row that
+    /// switches passes stacks the same way.
+    fn emitRowGlyphs(
         self: *GridPass,
         atlas: *Atlas,
         pool: *const StylePool,
         glossary: *const @import("../grid/glyph_glossary.zig").Glossary,
         cells: []const Cell,
-        indices: []const usize,
+        order: ?[]const usize,
         row: u16,
         cw: f32,
         ch: f32,
@@ -1429,30 +1430,32 @@ pub const GridPass = struct {
         const y: f32 = pad + @as(f32, @floatFromInt(row)) * ch;
         const resolver = self.styleResolver();
 
-        for (indices, 0..) |logical, visual| {
-            const cell = cells[logical];
+        for (0..cells.len) |visual| {
+            const cell = cells[if (order) |o| o[visual] else visual];
             if ((cell.flags & cell_mod.FLAG_WIDE_CONT) != 0 or cell.rune == 0 or cell.rune == ' ') continue;
             const style = pool.get(cell.style_ref);
             const resolved = resolver.resolve(style);
-            const fg = resolved.fg;
-            const bold = style.attrs.bold and self.allow_bold;
             const x: f32 = pad + @as(f32, @floatFromInt(visual)) * cw * x_scale;
-            const g = atlas.lookupGlyph(glossary, cell.rune, bold, style.attrs.italic, fg) catch continue;
-            if (g.w == 0 or g.h == 0) continue;
-            const gx: f32 = x + @as(f32, @floatFromInt(g.bearing_x)) * x_scale;
-            const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y)) * y_scale + y_origin_shift;
-            const gw: f32 = @as(f32, @floatFromInt(g.w)) * x_scale;
-            const gh: f32 = @as(f32, @floatFromInt(g.h)) * y_scale;
-            const is_single = (x_scale == 1.0 and y_scale == 1.0);
-            const italic_f: f32 = if (is_single and style.attrs.italic and !g.colored and !atlas.hasItalic()) 1.0 else 0.0;
-            const bold_f: f32 = if (is_single and style.attrs.bold and self.allow_bold) 1.0 else 0.0;
-            const baseline_y: f32 = y + ch;
-            const colored_f: f32 = if (g.colored) 1.0 else 0.0;
-            try self.pushGlyphQuadStyled(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0, italic_f, bold_f, baseline_y, colored_f, resolved.eff_bg);
+            try self.pushCellGlyph(atlas, glossary, cell.rune, style.attrs, resolved.fg, resolved.eff_bg, x, y, ch, ascent, x_scale, y_scale, y_origin_shift);
         }
 
-        // Decorations at visual columns.
-        try self.emitRowDecos(pool, cells, indices, y + y_origin_shift, cw, ch, x_scale);
+        if (pool.hasOverlays()) {
+            for (0..cells.len) |visual| {
+                const cell = cells[if (order) |o| o[visual] else visual];
+                const base = pool.get(cell.style_ref);
+                if (base.overlay == 0) continue;
+                const under = resolver.resolve(base).eff_bg;
+                const x: f32 = pad + @as(f32, @floatFromInt(visual)) * cw * x_scale;
+                const layers = pool.overlayList(base.overlay);
+                for (layers[0..overlay.count(layers)]) |layer| {
+                    const r = layer.rendition();
+                    const resolved = resolver.resolveOver(r, under);
+                    try self.pushCellGlyph(atlas, glossary, layer.cp, r.attrs, resolved.fg, resolved.eff_bg, x, y, ch, ascent, x_scale, y_scale, y_origin_shift);
+                }
+            }
+        }
+
+        try self.emitRowDecos(pool, cells, order, y + y_origin_shift, cw, ch, x_scale);
     }
 
     fn pushQuad(

@@ -11,6 +11,8 @@
 const std = @import("std");
 
 pub const borders = @import("borders.zig");
+pub const overlay = @import("overlay.zig");
+const SlotTable = @import("slot_table.zig").SlotTable;
 pub const Color = union(enum) {
     /// Use the terminal's default fg/bg.
     default: void,
@@ -29,6 +31,28 @@ pub const Color = union(enum) {
             .default => true,
             .palette => |p| p == b.palette,
             .rgb => |c| c.r == b.rgb.r and c.g == b.rgb.g and c.b == b.rgb.b,
+        };
+    }
+
+    /// Canonical 26-bit form: the kind (0 default, 1 palette, 2 rgb) in
+    /// bits 24-25 and the payload below it. Equal colours pack equal,
+    /// which unions cannot promise (inactive payload bytes are undefined).
+    pub fn pack(col: Color) u26 {
+        return switch (col) {
+            .default => 0,
+            .palette => |p| (1 << 24) | @as(u26, p),
+            .rgb => |c| (2 << 24) | (@as(u26, c.r) << 16) | (@as(u26, c.g) << 8) | c.b,
+        };
+    }
+
+    /// The inverse of `pack`; null for bits `pack` cannot produce.
+    pub fn unpack(bits: u26) ?Color {
+        const payload: u24 = @truncate(bits);
+        return switch (bits >> 24) {
+            0 => if (payload == 0) .default else null,
+            1 => if (payload <= 0xFF) .{ .palette = @intCast(payload) } else null,
+            2 => .{ .rgb = .{ .r = @truncate(payload >> 16), .g = @truncate(payload >> 8), .b = @truncate(payload) } },
+            else => null,
         };
     }
 };
@@ -93,35 +117,42 @@ pub const Entry = struct {
     /// the cell's fg, the pre-SGR-58 behaviour.
     underline_color: Color = .default,
     attrs: Attrs = .{},
-    /// The cell's border set: an ID into `Pool.border_sets`, 0 = none.
+    /// The cell's border set: an ID into `Pool.border_table`, 0 = none.
     /// Living in the style is what makes it the pen: every path that
     /// stamps `cur_style` on a cell (print, BCE erase, DECSC) carries it.
     border: u16 = 0,
+    /// The cell's overstrike layers: an ID into `Pool.overlay_table`,
+    /// 0 = none. Only an overstrike print sets it, on the struck cell's
+    /// own entry; `cur_style` never carries one, so every ordinary write
+    /// or erase of the cell drops its layers.
+    overlay: u16 = 0,
 
     pub fn equal(a: Entry, b: Entry) bool {
         if (!Color.equal(a.fg, b.fg)) return false;
         if (!Color.equal(a.bg, b.bg)) return false;
         if (!Color.equal(a.underline_color, b.underline_color)) return false;
-        return a.border == b.border and @as(u16, @bitCast(a.attrs)) == @as(u16, @bitCast(b.attrs));
+        return a.border == b.border and a.overlay == b.overlay and
+            @as(u16, @bitCast(a.attrs)) == @as(u16, @bitCast(b.attrs));
+    }
+
+    /// Whether a cell with this style draws something even with no
+    /// rune (borders, overstrike layers): such a blank is content.
+    pub fn drawsOnBlank(self: Entry) bool {
+        return self.border != 0 or self.overlay != 0;
     }
 };
 
-/// Canonical packed form of a Color — unions can't be hashed raw
-/// (inactive payload bytes are undefined).
-fn colorKey(col: Color) u32 {
-    return switch (col) {
-        .default => 0,
-        .palette => |p| 0x0100_0000 | @as(u32, p),
-        .rgb => |c| 0x0200_0000 | (@as(u32, c.r) << 16) | (@as(u32, c.g) << 8) | c.b,
-    };
+/// 26 bits per colour (`Color.pack`), three of them, then the three u16
+/// fields: 126 bits.
+fn entryKey(e: Entry) u128 {
+    return (@as(u128, e.fg.pack()) << 100) |
+        (@as(u128, e.bg.pack()) << 74) |
+        (@as(u128, e.underline_color.pack()) << 48) |
+        (@as(u128, e.border) << 32) | (@as(u128, e.overlay) << 16) | @as(u16, @bitCast(e.attrs));
 }
 
-fn entryKey(e: Entry) u128 {
-    return (@as(u128, colorKey(e.fg)) << 96) |
-        (@as(u128, colorKey(e.bg)) << 64) |
-        (@as(u128, colorKey(e.underline_color)) << 32) |
-        (@as(u128, e.border) << 16) | @as(u16, @bitCast(e.attrs));
-}
+pub const BorderTable = SlotTable(borders.Set, borders.empty);
+pub const OverlayTable = SlotTable(overlay.List, overlay.empty);
 
 pub const Pool = struct {
     entries: std.ArrayList(Entry) = .empty,
@@ -133,24 +164,19 @@ pub const Pool = struct {
     /// touching the rest of the array.
     last_idx: u16 = 0,
     allocator: std.mem.Allocator,
-    /// Interned border sets: ID `n` is slot `n - 1`, ID 0 the empty set.
-    /// Slots are stable, so collecting never renumbers a surviving set;
-    /// unused slots hold `borders.empty` and sit on `border_free`.
-    border_sets: std.ArrayList(borders.Set) = .empty,
-    border_index: std.HashMapUnmanaged(borders.Set, u16, borders.SetContext, std.hash_map.default_max_load_percentage) = .empty,
-    border_free: std.ArrayList(u16) = .empty,
+    /// Interned border sets, named by `Entry.border`.
+    border_table: BorderTable = .{},
+    /// Interned overstrike layer lists, named by `Entry.overlay`.
+    overlay_table: OverlayTable = .{},
     /// Failed reclaims left to skip. A reclaim that frees nothing arms
     /// this, so a pool saturated with live styles is rescanned once per
     /// `reclaim_backoff` failed interns instead of once per cell.
     reclaim_cooldown: u16 = 0,
 
     pub const reclaim_backoff: u16 = 4096;
-    /// IDs are u16 with 0 reserved for the empty set.
-    pub const max_border_sets: usize = 0xFFFF - 1;
 
     pub fn borderSet(self: *const Pool, id: u16) borders.Set {
-        if (id == 0 or id > self.border_sets.items.len) return borders.empty;
-        return self.border_sets.items[id - 1];
+        return self.border_table.get(id);
     }
 
     /// The border set a cell with this style draws.
@@ -160,75 +186,67 @@ pub const Pool = struct {
 
     /// Whether any live border set exists; renderers bail on false.
     pub fn hasBorders(self: *const Pool) bool {
-        return self.border_sets.items.len > self.border_free.items.len;
+        return self.border_table.hasLive();
     }
 
-    /// The ID of `set`, interning it if new. The ID is unrooted until a
-    /// style entry holds it: `collectBorders` frees it before then.
     pub fn internBorder(self: *Pool, set: borders.Set) !u16 {
-        if (borders.isEmpty(set)) return 0;
-        if (self.border_index.get(set)) |id| return id;
-        const reuse = self.border_free.items.len > 0;
-        if (!reuse) {
-            if (self.border_sets.items.len >= max_border_sets) return error.PoolFull;
-            try self.border_sets.ensureUnusedCapacity(self.allocator, 1);
-        }
-        const id: u16 = if (reuse)
-            self.border_free.items[self.border_free.items.len - 1]
-        else
-            @intCast(self.border_sets.items.len + 1);
-        try self.border_index.put(self.allocator, set, id);
-        if (reuse) {
-            _ = self.border_free.pop();
-            self.border_sets.items[id - 1] = set;
-        } else {
-            self.border_sets.appendAssumeCapacity(set);
-        }
-        return id;
+        return self.border_table.intern(self.allocator, set);
     }
 
-    /// `entry` with its border set replaced by `set`, interned. A set
-    /// interned only for an entry that then fails is released again, so
-    /// a failed intern leaves no orphan for a reclaim to mistake for
-    /// progress.
-    pub fn internWithBorders(self: *Pool, entry: Entry, set: borders.Set) !u16 {
-        const known = borders.isEmpty(set) or self.border_index.contains(set);
+    pub fn overlayList(self: *const Pool, id: u16) overlay.List {
+        return self.overlay_table.get(id);
+    }
+
+    /// The overstrike layers a cell with this style draws.
+    pub fn overlaysOf(self: *const Pool, style_ref: u16) overlay.List {
+        return self.overlayList(self.get(style_ref).overlay);
+    }
+
+    /// Whether any live layer list exists; renderers bail on false.
+    pub fn hasOverlays(self: *const Pool) bool {
+        return self.overlay_table.hasLive();
+    }
+
+    /// Free slots across the side tables; a reclaim that grows it freed
+    /// something.
+    pub fn freeSlots(self: *const Pool) usize {
+        return self.border_table.free.items.len + self.overlay_table.free.items.len;
+    }
+
+    /// `entry` with its border set and layer list replaced by `set` and
+    /// `list`, interned. Takes the side values, never their IDs, so a
+    /// reclaim between reading and interning cannot leave a dangling ID.
+    /// A value interned only for an entry that then fails is released
+    /// again, so a failed intern leaves no orphan for a reclaim to
+    /// mistake for progress.
+    pub fn internStyle(self: *Pool, entry: Entry, set: borders.Set, list: overlay.List) !u16 {
+        const set_known = BorderTable.isEmpty(set) or self.border_table.contains(set);
+        const list_known = OverlayTable.isEmpty(list) or self.overlay_table.contains(list);
         var e = entry;
-        e.border = try self.internBorder(set);
-        return self.intern(e) catch |err| {
-            if (!known) self.releaseBorder(e.border);
-            return err;
-        };
+        e.border = try self.border_table.intern(self.allocator, set);
+        errdefer if (!set_known) self.border_table.release(self.allocator, e.border);
+        e.overlay = try self.overlay_table.intern(self.allocator, list);
+        errdefer if (!list_known) self.overlay_table.release(self.allocator, e.overlay);
+        return self.intern(e);
     }
 
-    /// Return an unrooted ID's slot to the free list.
-    fn releaseBorder(self: *Pool, id: u16) void {
-        const slot = &self.border_sets.items[id - 1];
-        // Without room on the free list the set stays interned as an
-        // orphan, which the next `collectBorders` frees.
-        self.border_free.append(self.allocator, id) catch return;
-        _ = self.border_index.remove(slot.*);
-        slot.* = borders.empty;
-    }
-
-    /// Free every border set no style entry references. Callers run it
-    /// only when no unrooted ID from `internBorder` is still in hand.
-    pub fn collectBorders(self: *Pool) void {
-        if (self.border_sets.items.len == 0) return;
-        const used = self.allocator.alloc(bool, self.border_sets.items.len + 1) catch return;
+    /// Free every border set and layer list no style entry references.
+    /// Callers run it only when no unrooted ID is still in hand.
+    pub fn collectTables(self: *Pool) void {
+        const nb = self.border_table.slots.items.len;
+        const no = self.overlay_table.slots.items.len;
+        if (nb == 0 and no == 0) return;
+        const used = self.allocator.alloc(bool, nb + 1 + no + 1) catch return;
         defer self.allocator.free(used);
         @memset(used, false);
+        const used_b = used[0 .. nb + 1];
+        const used_o = used[nb + 1 ..];
         for (self.entries.items) |e| {
-            if (e.border <= self.border_sets.items.len) used[e.border] = true;
+            if (e.border <= nb) used_b[e.border] = true;
+            if (e.overlay <= no) used_o[e.overlay] = true;
         }
-        self.border_free.ensureTotalCapacity(self.allocator, self.border_sets.items.len) catch return;
-        self.border_free.clearRetainingCapacity();
-        for (self.border_sets.items, 1..) |*set, id| {
-            if (used[id]) continue;
-            if (!borders.isEmpty(set.*)) _ = self.border_index.remove(set.*);
-            set.* = borders.empty;
-            self.border_free.appendAssumeCapacity(@intCast(id));
-        }
+        if (nb > 0) self.border_table.collect(self.allocator, used_b);
+        if (no > 0) self.overlay_table.collect(self.allocator, used_o);
     }
 
     pub const default_index: u16 = 0;
@@ -244,44 +262,39 @@ pub const Pool = struct {
     pub fn deinit(self: *Pool) void {
         self.entries.deinit(self.allocator);
         self.index.deinit(self.allocator);
-        self.border_sets.deinit(self.allocator);
-        self.border_index.deinit(self.allocator);
-        self.border_free.deinit(self.allocator);
+        self.border_table.deinit(self.allocator);
+        self.overlay_table.deinit(self.allocator);
     }
 
-    /// Builds a complete pool while leaving `entries` and `border_sets`
-    /// caller-owned on error. Rejects a border table the interning paths
-    /// could not have produced (a duplicate set, or an entry naming a
+    /// Builds a complete pool while leaving `entries` and both slot lists
+    /// caller-owned on error. Rejects side tables the interning paths
+    /// could not have produced (a duplicate value, or an entry naming a
     /// missing or empty slot), which only untrusted input can hold.
     pub fn initReplacement(
         allocator: std.mem.Allocator,
         entries: std.ArrayList(Entry),
-        border_sets: std.ArrayList(borders.Set),
+        border_slots: std.ArrayList(borders.Set),
+        overlay_slots: std.ArrayList(overlay.List),
     ) !Pool {
         var replacement = Pool{ .allocator = allocator };
         errdefer {
             replacement.index.deinit(allocator);
-            replacement.border_index.deinit(allocator);
-            replacement.border_free.deinit(allocator);
+            replacement.border_table.index.deinit(allocator);
+            replacement.border_table.free.deinit(allocator);
+            replacement.overlay_table.index.deinit(allocator);
+            replacement.overlay_table.free.deinit(allocator);
         }
-        if (border_sets.items.len > max_border_sets) return error.InvalidBorderTable;
-        for (border_sets.items, 1..) |set, id| {
-            if (borders.isEmpty(set)) {
-                try replacement.border_free.append(allocator, @intCast(id));
-                continue;
-            }
-            const slot = try replacement.border_index.getOrPut(allocator, set);
-            if (slot.found_existing) return error.InvalidBorderTable;
-            slot.value_ptr.* = @intCast(id);
-        }
+        try replacement.border_table.indexSlots(allocator, border_slots.items);
+        try replacement.overlay_table.indexSlots(allocator, overlay_slots.items);
         for (entries.items, 0..) |entry, i| {
-            if (entry.border != 0 and (entry.border > border_sets.items.len or
-                borders.isEmpty(border_sets.items[entry.border - 1])))
-                return error.InvalidBorderTable;
+            if (!BorderTable.validRef(border_slots.items, entry.border) or
+                !OverlayTable.validRef(overlay_slots.items, entry.overlay))
+                return error.InvalidTable;
             try replacement.index.put(allocator, entryKey(entry), @intCast(i));
         }
         replacement.entries = entries;
-        replacement.border_sets = border_sets;
+        replacement.border_table.slots = border_slots;
+        replacement.overlay_table.slots = overlay_slots;
         return replacement;
     }
 

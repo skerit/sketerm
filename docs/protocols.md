@@ -65,6 +65,8 @@ DECSET / DECRST (`?`-prefixed), per `modeSet` in `screen_ops.zig`:
 - 6  — DECOM — origin mode
 - 7  — DECAWM — autowrap
 - 25 — DECTCEM — cursor visible
+- 20 — DEC VK100 overstrike (mintty), the same flag as SGR `8:7`; see
+  *Character attributes*. The public mode 20 stays LNM ✓
 - 40 - allow DECCOLM
 - 1000 — X10 mouse
 - 1002 — cell-motion mouse
@@ -103,6 +105,14 @@ in `grid/style_pool.zig` `Attrs.UnderlineStyle`; the render geometry
 of each (and the dotted / dashed on-off pattern) is `render/style.zig`.
 Dotted and dashed also carry the curly bit, so a client older than
 their own bits draws the undercurl it always drew for them.
+
+Overstrike (mintty): `8:7` turns it on, `28` and `0` turn it off, and
+DECSET 20 is the same flag. While it is on, a printed character is
+drawn ON TOP of the cell under the cursor in the current rendition,
+keeping that cell's own glyph and rendition, and the cursor advances
+one column. `8;7` (semicolon) stays conceal + reverse; any other
+`8:N` is ignored. DECRQSS `m` reports it as `8:7`. Layers are bounded,
+copy returns the base character only; see `docs/overstrike.md`.
 
 ### Device status / version
 - DA1 (`CSI c`), and DECID (`CSI Z`) with the same payload

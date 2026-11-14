@@ -42,10 +42,11 @@ borders to an outer terminal.
 ## Storage
 
 A cell's border set is part of its style, not a separate cell field:
-`style_pool.Entry.border` is a `u16` ID into `Pool.border_sets`, interned
-like the style entries themselves (ID 0 is the empty set; slots are
-stable, unused ones are recycled through a free list). `Cell` stays 8
-bytes.
+`style_pool.Entry.border` is a `u16` ID into `Pool.border_table`, a
+`grid/slot_table.zig` table interned like the style entries themselves
+(ID 0 is the empty set; slots are stable, unused ones are recycled
+through a free list). Overstrike layers (`docs/overstrike.md`) use the
+same table type. `Cell` stays 8 bytes.
 
 That makes the pen simply `cur_style`'s border set. Every path that
 already copies a style reference carries borders for free: printing,

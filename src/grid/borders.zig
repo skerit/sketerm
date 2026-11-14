@@ -220,17 +220,6 @@ pub fn withStroke(set: Set, mask: Mask, stroke: Stroke) Set {
     return out;
 }
 
-/// Hash-map context: a Set is canonical, so its bytes are its identity.
-pub const SetContext = struct {
-    pub fn hash(_: SetContext, set: Set) u64 {
-        return std.hash.Wyhash.hash(0, std.mem.asBytes(&set));
-    }
-
-    pub fn eql(_: SetContext, a: Set, b: Set) bool {
-        return std.mem.eql(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
-    }
-};
-
 /// Whether `own` is drawn on a shared edge whose other half is
 /// `neighbour`: only two centred strokes merge, the wider wins, and a
 /// tie goes to the right or lower cell.
