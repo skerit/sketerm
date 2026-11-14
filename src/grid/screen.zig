@@ -5005,7 +5005,7 @@ pub const Screen = struct {
 
     pub fn lineFeed(self: *Screen) void {
         if (self.row == self.scroll_bot) {
-            self.scrollUp(1, .save_at_top);
+            self.scrollUp(1);
         } else if (self.row + 1 < self.rows) {
             self.row += 1;
         }
@@ -5772,7 +5772,7 @@ fn runScrollFailureScenario(scenario: ScrollFailureScenario, fail_index: ?usize)
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, config);
     const old_allocator = screen.allocator;
     screen.allocator = failing.allocator();
-    screen.scrollUp(scrollScenarioMove(scenario), .save_at_top);
+    screen.scrollUp(scrollScenarioMove(scenario));
     screen.allocator = old_allocator;
 
     if (fail_index != null) {
@@ -5963,7 +5963,7 @@ test "column resize in alt screen normalizes main scrollback width" {
     try s.resize(9, 3);
     for (s.scrollback.items) |ln| try std.testing.expectEqual(@as(usize, 9), ln.cells.len);
     s.toggleAltScreen(false);
-    s.scrollUp(1, .save_at_top);
+    s.scrollUp(1);
     for (s.active) |ln| try std.testing.expectEqual(@as(usize, 9), ln.cells.len);
 }
 
@@ -6025,7 +6025,7 @@ test "scroll up moves content" {
     s.execute('\r');
     s.execute('\n');
     s.printCp('c');
-    s.scrollUp(1, .save_at_top);
+    s.scrollUp(1);
     try std.testing.expectEqual(@as(u32, 'b'), s.cellAt(0, 0).rune);
     try std.testing.expectEqual(@as(u32, 'c'), s.cellAt(1, 0).rune);
     try std.testing.expectEqual(@as(u32, 0), s.cellAt(2, 0).rune);
@@ -6040,7 +6040,7 @@ test "zero-capacity first scroll keeps no history and reuses the row" {
 
     s.active[0].cells[0].rune = 'x';
     const top_cells = s.active[0].cells.ptr;
-    s.scrollUp(1, .save_at_top);
+    s.scrollUp(1);
 
     try std.testing.expectEqual(@as(u32, 0), s.scrollbackCount());
     try std.testing.expectEqual(@as(usize, 0), s.scrollback_head);
@@ -7427,7 +7427,7 @@ test "OSC 133 ; A records prompt mark with line ID" {
 
     // Mark survives scrolling: scroll once, the row at id2 is now at
     // row 1 (or in scrollback), but rowForLineId resolves both.
-    s.scrollUp(1, .save_at_top);
+    s.scrollUp(1);
     const r1 = s.rowForLineId(id1);
     const r2 = s.rowForLineId(id2);
     try std.testing.expect(r1 != null);
@@ -7815,7 +7815,7 @@ test "OSC 133 C/D bounds the last-command-output zone" {
 
     // Zone survives scrolling into scrollback.
     var k: u32 = 0;
-    while (k < 6) : (k += 1) s.scrollUp(1, .save_at_top);
+    while (k < 6) : (k += 1) s.scrollUp(1);
     const out2 = (try s.extractLastCommandOutput(std.testing.allocator)).?;
     defer std.testing.allocator.free(out2);
     try std.testing.expectEqualStrings("file1\nfile2\n", out2);
@@ -7949,7 +7949,7 @@ test "command-zone ring: membership, selection, fast row lookup" {
     // Fast lookup agrees with the linear walk after scrolling the
     // zones into scrollback.
     var k: u32 = 0;
-    while (k < 6) : (k += 1) s.scrollUp(1, .save_at_top);
+    while (k < 6) : (k += 1) s.scrollUp(1);
     const fail_z = s.cmdZone(1).?;
     try std.testing.expectEqual(
         s.rowForLineId(fail_z.start_id),
@@ -7966,7 +7966,7 @@ test "jumpPrevPrompt scrolls into scrollback" {
     s.row = 0;
     s.onOsc("133;A");
     var k: u32 = 0;
-    while (k < 10) : (k += 1) s.scrollUp(1, .save_at_top);
+    while (k < 10) : (k += 1) s.scrollUp(1);
     try std.testing.expectEqual(@as(u32, 0), s.view_offset);
     const off = s.jumpPrevPrompt();
     try std.testing.expect(off != null);
@@ -9176,7 +9176,7 @@ test "scroll within region preserves DECDWL scaling of shifted lines" {
     var s = try Screen.init(std.testing.allocator, &pool, 10, 4);
     defer s.deinit();
     s.active[2].scaling = .dwl;
-    s.scrollUp(1, .save_at_top);
+    s.scrollUp(1);
     try std.testing.expectEqual(@import("line.zig").Scaling.dwl, s.active[1].scaling);
     // The recycled bottom row must come back as single-width.
     try std.testing.expectEqual(@import("line.zig").Scaling.single, s.active[3].scaling);
@@ -9419,7 +9419,7 @@ test "imageRowForAnchor tracks multiple anchors through a wrapped ring" {
 
     // Five scrolls rotate the full ring while both anchors survive in
     // logical slots 0 and 1, which are physical slots 1 and 2.
-    for (0..5) |_| s.scrollUp(1, .save_at_top);
+    for (0..5) |_| s.scrollUp(1);
     try std.testing.expect(s.scrollback_head != 0);
     try std.testing.expectEqual(older, s.scrollbackLine(0).id);
     try std.testing.expectEqual(newer, s.scrollbackLine(1).id);
@@ -9433,12 +9433,12 @@ test "imageRowForAnchor tracks multiple anchors through a wrapped ring" {
 
     // One more push evicts only the older anchor. The newer anchor is
     // offscreen, not evicted, until the following push removes it too.
-    s.scrollUp(1, .save_at_top);
+    s.scrollUp(1);
     try std.testing.expectEqual(Screen.ImageRow.evicted, s.imageRowForAnchor(older));
     try std.testing.expectEqual(Screen.ImageRow.offscreen, s.imageRowForAnchor(newer));
     s.view_offset = s.scrollbackCount();
     try expectImageAnchorVisible(s, newer, 0);
-    s.scrollUp(1, .save_at_top);
+    s.scrollUp(1);
     try std.testing.expectEqual(Screen.ImageRow.evicted, s.imageRowForAnchor(newer));
 }
 
@@ -9449,7 +9449,7 @@ test "imageRowForAnchor preserves surviving anchors across capacity shrink" {
     defer s.deinit();
     try s.setScrollbackCapacity(5);
 
-    for (0..7) |_| s.scrollUp(1, .save_at_top);
+    for (0..7) |_| s.scrollUp(1);
     try std.testing.expect(s.scrollback_head != 0);
     const dropped = s.scrollbackLine(0).id;
     const surviving = s.scrollbackLine(2).id;
@@ -9576,7 +9576,7 @@ test "retained positional deletion follows anchors rather than stale rows or vie
     s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 2, .col = 0, .image_id = 1 });
     s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 0, .col = 1, .image_id = 2, .cells_high = 2 });
     s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 2, .col = 2, .image_id = 3, .anchor_id = std.math.maxInt(u64) });
-    s.scrollUp(1, .save_at_top);
+    s.scrollUp(1);
     s.view_offset = 1;
     s.pruneRetainedImages(.{ .what = 'p', .x = 0, .y = 2 });
     try std.testing.expectEqual(@as(usize, 3), s.retained_images.items.len);
@@ -9605,7 +9605,7 @@ test "retained positional deletion succeeds with all allocations denied" {
         s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 1, .col = 1, .z_index = 2 });
         s.retained_images.items[2].ev.anchor_id = 0; // Legacy pinned placement.
         s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 1, .col = 1, .z_index = 2, .anchor_id = std.math.maxInt(u64) });
-        s.scrollUp(1, .save_at_top);
+        s.scrollUp(1);
         s.view_offset = 1;
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
         s.allocator = failing.allocator();
@@ -9626,10 +9626,10 @@ test "batch line lookup resolves unordered large history duplicates and missing 
     defer s.deinit();
     try s.setScrollbackCapacity(70000);
     const missing = s.nextLineId();
-    for (0..70000) |_| s.scrollUp(1, .save_at_top);
+    for (0..70000) |_| s.scrollUp(1);
     const evicted = s.scrollbackLine(0).id;
     s.scrollDown(1);
-    s.scrollUp(2, .save_at_top);
+    s.scrollUp(2);
     try std.testing.expect(s.scrollback_head != 0);
     // A real reverse-scroll produces nonmonotonic history, not just a fixture edit.
     try std.testing.expect(s.scrollbackLine(69998).id > s.scrollbackLine(69999).id);
@@ -9772,7 +9772,7 @@ test "retained reanchor batches large history and long logical lines with dead a
                 for (ln.cells) |*cell| cell.rune = 'x';
                 ln.continues_above = wrapped;
             }
-            s.scrollUp(1, .save_at_top);
+            s.scrollUp(1);
         }
         for (s.active) |*ln| {
             for (ln.cells) |*cell| cell.rune = 'x';
@@ -9946,7 +9946,7 @@ test "next_line_id advances on scroll, not on in-place print" {
     // Scrolling births new lines — the activity drain can short-circuit
     // (definite visible change) without hashing.
     const before_scroll = s.next_line_id;
-    s.scrollUp(1, .save_at_top);
+    s.scrollUp(1);
     try std.testing.expect(s.next_line_id > before_scroll);
 }
 

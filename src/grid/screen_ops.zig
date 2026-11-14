@@ -235,7 +235,7 @@ pub fn csiPublic(self: *Screen, params: Event.Csi) void {
         // Scroll.
         // xterm's CASE_SU is `xtermScroll`, the very routine LF/IND at the
         // bottom margin use (charproc.c), so SU saves under the same rule.
-        'S' => scrollUp(self, params.paramOrDefault(0, 1), .save_at_top),
+        'S' => scrollUp(self, params.paramOrDefault(0, 1)),
         'T' => scrollDown(self, params.paramOrDefault(0, 1)),
         'L' => insertLines(self, params.paramOrDefault(0, 1)),
         'M' => deleteLines(self, params.paramOrDefault(0, 1)),
@@ -834,19 +834,10 @@ pub fn eraseLine(self: *Screen, mode: u32) void {
 
 // ── Scroll ───────────────────────────────────────────────────
 
-/// What a scroll-up does with the rows leaving the top of the region;
-/// every caller states it, because only a real scroll-off may feed
-/// scrollback.
-pub const ScrollOff = enum {
-    /// Saved to scrollback when the region starts at screen row 0 on the
-    /// main buffer (xterm `xtermScroll`'s `top_marg == 0`): LF/IND/NEL
-    /// at the bottom margin and SU.
-    save_at_top,
-    /// Discarded wherever the region starts: DL.
-    discard,
-};
-
-pub fn scrollUp(self: *Screen, n: u32, off: ScrollOff) void {
+/// Rows leaving a region that starts at screen row 0 on the main buffer
+/// go to scrollback, for LF/IND/NEL, SU and DL alike (xterm
+/// `xtermScroll`'s `top_marg == 0`).
+pub fn scrollUp(self: *Screen, n: u32) void {
     // A region of exactly one row is a region: a one-row terminal must
     // still recycle its row on LF (and push it to scrollback), and
     // `deleteLines` on the bottom margin narrows the region to one row
@@ -859,7 +850,7 @@ pub fn scrollUp(self: *Screen, n: u32, off: ScrollOff) void {
     // captured: a pool-full reclaim here renumbers styles.
     const blank = self.blankStyle();
 
-    const push_to_sb = off == .save_at_top and !self.use_alt and self.scroll_top == 0;
+    const push_to_sb = !self.use_alt and self.scroll_top == 0;
 
     const Plan = struct {
         cells: []Cell,
@@ -1066,17 +1057,16 @@ pub fn insertLines(self: *Screen, n: u32) void {
     scrollDown(self, n);
 }
 
-/// DL never feeds scrollback, even on the top row of a full-height
-/// region. This departs from xterm, whose `DeleteLine(.., canSave=True)`
-/// (util.c) saves there like a scroll, and matches kitty's
-/// `screen_delete_lines`: a deleted line is content the app removed,
-/// not output that scrolled off.
+/// DL on the top row of a full-height region feeds scrollback, as in
+/// xterm (`DeleteLine(.., canSave=True)`, util.c) and alacritty; kitty
+/// discards there. Programs that scroll by deleting the top line would
+/// otherwise lose their output.
 pub fn deleteLines(self: *Screen, n: u32) void {
     if (self.row < self.scroll_top or self.row > self.scroll_bot) return;
     const old_top = self.scroll_top;
     self.scroll_top = self.row;
     defer self.scroll_top = old_top;
-    scrollUp(self, n, .discard);
+    scrollUp(self, n);
 }
 
 pub fn setScrollRegion(self: *Screen, params: Event.Csi) void {

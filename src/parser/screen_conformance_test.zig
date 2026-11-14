@@ -640,20 +640,22 @@ test "xterm: DECAWM reset while a wrap is pending drops the wrap; the print over
     try std.testing.expect(h.screen.line(1).continues_above);
 }
 
-test "xterm: DL at the top row discards; LF and SU at a full-height region feed scrollback" {
+test "xterm: DL at the top row, LF and SU at a full-height region all feed scrollback" {
     var h = try Harness.init(std.testing.allocator, 4, 3);
     defer h.deinit();
+    // Deliberate: xterm and alacritty save a line deleted at row 0; do not "fix" it.
     h.feed("a\r\nb\r\nc\x1b[1;1H\x1b[M");
-    try std.testing.expectEqual(@as(usize, 0), h.screen.scrollbackCount());
+    try std.testing.expectEqual(@as(usize, 1), h.screen.scrollbackCount());
     try h.expectLine(0, "b");
-    h.feed("\x1b[2M");
-    try std.testing.expectEqual(@as(usize, 0), h.screen.scrollbackCount());
+    // DL below the top row saves nothing.
+    h.feed("\x1b[2;1H\x1b[M");
+    try std.testing.expectEqual(@as(usize, 1), h.screen.scrollbackCount());
     h.feed("\x1b[3;1Hx\r\ny\r\nz\x1b[S");
-    try std.testing.expectEqual(@as(usize, 3), h.screen.scrollbackCount());
+    try std.testing.expectEqual(@as(usize, 4), h.screen.scrollbackCount());
     try h.expectLine(0, "y");
     // Inside a region that does not start at row 0 nothing is saved.
     h.feed("\x1b[2;3r\x1b[3;1H\n\x1b[S");
-    try std.testing.expectEqual(@as(usize, 3), h.screen.scrollbackCount());
+    try std.testing.expectEqual(@as(usize, 4), h.screen.scrollbackCount());
 }
 
 test "xterm: concealed text is still copied" {
