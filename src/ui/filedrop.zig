@@ -80,9 +80,12 @@ pub const Owner = struct {
         return self;
     }
 
-    /// The face's teardown; idempotent. Pending jobs deliver nothing.
-    pub fn sever(self: *Owner) void {
-        if (self.ctx == null) return;
+    /// Release the face's reference and cancel pending drops. Clear its
+    /// slot first: without jobs, unref frees this allocation immediately,
+    /// so a later destroy/finalize callback must not inspect it again.
+    pub fn sever(slot: *?*Owner) void {
+        const self = slot.* orelse return;
+        slot.* = null;
         self.ctx = null;
         c.g_cancellable_cancel(self.cancellable);
         self.unref();
@@ -324,16 +327,25 @@ fn settle() !void {
     }
 }
 
+test "Owner.sever: repeated teardown without pending drops" {
+    var sink: TestSink = .{};
+    defer sink.deinit();
+    var owner: ?*Owner = try Owner.create(std.testing.allocator, @ptrCast(&sink), TestSink.onFile, .first);
+    Owner.sever(&owner);
+    try std.testing.expect(owner == null);
+    Owner.sever(&owner);
+}
+
 test "start: opens files in drop order off the main loop, folders skipped" {
     var dbuf: [64:0]u8 = undefined;
     const dir = try makeTree(&dbuf);
     defer removeTree(dir);
     var sink: TestSink = .{};
     defer sink.deinit();
-    const owner = try Owner.create(std.testing.allocator, @ptrCast(&sink), TestSink.onFile, .all);
-    defer owner.sever();
+    var owner: ?*Owner = try Owner.create(std.testing.allocator, @ptrCast(&sink), TestSink.onFile, .all);
+    defer Owner.sever(&owner);
     var list = try listOf(dir, &.{ "b.txt", "folder", "a.txt", "missing.txt" });
-    try std.testing.expect(startPaths(owner, &list));
+    try std.testing.expect(startPaths(owner.?, &list));
     // The drop handler returned without one type known: no stat ran on
     // the calling (main) thread.
     try std.testing.expectEqual(@as(usize, 0), sink.got.items.len);
@@ -352,12 +364,15 @@ test "start: a severed face gets nothing and every job frees itself" {
     defer removeTree(dir);
     var sink: TestSink = .{};
     defer sink.deinit();
-    const owner = try Owner.create(std.testing.allocator, @ptrCast(&sink), TestSink.onFile, .all);
+    var owner: ?*Owner = try Owner.create(std.testing.allocator, @ptrCast(&sink), TestSink.onFile, .all);
     var list = try listOf(dir, &.{ "b.txt", "a.txt" });
-    try std.testing.expect(startPaths(owner, &list));
-    owner.sever();
-    owner.sever();
+    try std.testing.expect(startPaths(owner.?, &list));
+    Owner.sever(&owner);
+    try std.testing.expect(owner == null);
+    Owner.sever(&owner);
     try settle();
+    // GTK finalization can run after the last cancelled job freed the owner.
+    Owner.sever(&owner);
     try std.testing.expectEqual(@as(usize, 0), sink.got.items.len);
 }
 
@@ -367,12 +382,12 @@ test "start: first mode opens one file and a newer drop supersedes" {
     defer removeTree(dir);
     var sink: TestSink = .{};
     defer sink.deinit();
-    const owner = try Owner.create(std.testing.allocator, @ptrCast(&sink), TestSink.onFile, .first);
-    defer owner.sever();
+    var owner: ?*Owner = try Owner.create(std.testing.allocator, @ptrCast(&sink), TestSink.onFile, .first);
+    defer Owner.sever(&owner);
     var older = try listOf(dir, &.{ "b.txt", "a.txt" });
-    try std.testing.expect(startPaths(owner, &older));
+    try std.testing.expect(startPaths(owner.?, &older));
     var newer = try listOf(dir, &.{ "folder", "a.txt", "b.txt" });
-    try std.testing.expect(startPaths(owner, &newer));
+    try std.testing.expect(startPaths(owner.?, &newer));
     try settle();
     try std.testing.expectEqual(@as(usize, 1), sink.got.items.len);
     try std.testing.expectEqualStrings("a.txt", sink.got.items[0]);
@@ -384,16 +399,16 @@ test "cancelPending: a batch replaced meanwhile wins over a pending drop" {
     defer removeTree(dir);
     var sink: TestSink = .{};
     defer sink.deinit();
-    const owner = try Owner.create(std.testing.allocator, @ptrCast(&sink), TestSink.onFile, .first);
-    defer owner.sever();
+    var owner: ?*Owner = try Owner.create(std.testing.allocator, @ptrCast(&sink), TestSink.onFile, .first);
+    defer Owner.sever(&owner);
     var list = try listOf(dir, &.{"a.txt"});
-    try std.testing.expect(startPaths(owner, &list));
-    try std.testing.expect(owner.cancelPending());
+    try std.testing.expect(startPaths(owner.?, &list));
+    try std.testing.expect(owner.?.cancelPending());
     try settle();
     try std.testing.expectEqual(@as(usize, 0), sink.got.items.len);
     // The owner still serves the next drop.
     var next = try listOf(dir, &.{"b.txt"});
-    try std.testing.expect(startPaths(owner, &next));
+    try std.testing.expect(startPaths(owner.?, &next));
     try settle();
     try std.testing.expectEqual(@as(usize, 1), sink.got.items.len);
 }

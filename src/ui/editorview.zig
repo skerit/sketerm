@@ -1904,7 +1904,7 @@ pub const EditorView = struct {
             c.abort();
         }
         self.fence.close();
-        if (self.drops) |d| d.sever();
+        filedrop.Owner.sever(&self.drops);
         // Last resort — every ordinary path severed already (either
         // `prepareDestroyCb` or the area's ::destroy). Only safe while
         // the widget is alive; once it is finalized its own destroy
