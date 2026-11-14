@@ -1070,7 +1070,7 @@ pub fn runAction(ctx: *Ctx, action: Action) c.gboolean {
         },
         .scrollback_page_up => {
             const screen = ctx.terminal.screen;
-            const sb: u32 = @intCast(screen.scrollbackCount());
+            const sb: u32 = screen.viewableScrollback();
             const want = screen.view_offset + screen.rows;
             screen.view_offset = if (want > sb) sb else want;
             screen.dirty = true;
@@ -1089,7 +1089,7 @@ pub fn runAction(ctx: *Ctx, action: Action) c.gboolean {
         },
         .scrollback_top => {
             const screen = ctx.terminal.screen;
-            screen.view_offset = @intCast(screen.scrollbackCount());
+            screen.view_offset = screen.viewableScrollback();
             screen.dirty = true;
             c.gtk_gl_area_queue_render(@ptrCast(ctx.widget));
             return 1;

@@ -202,7 +202,7 @@ pub fn activateHintAs(self: *Window, m: @import("hints.zig").Match, action: @imp
         .paste => pane.terminal.writeUserInput(m.text),
         .select => {
             const screen = pane.terminal.screen;
-            const view_off: i32 = @intCast(@min(screen.view_offset, screen.scrollbackCount()));
+            const view_off: i32 = @intCast(screen.clampedViewOffset());
             const row: i32 = @as(i32, m.row) - view_off;
             screen.selection.start(row, m.col_start, .normal);
             screen.selection.extend(row, m.col_end);
@@ -648,7 +648,7 @@ pub fn handleCopyModeKey(self: *Window, keyval: c_uint, state: c.GdkModifierType
 
 /// Display row of the topmost line currently on screen.
 pub fn viewTopOf(screen: *const Screen) i32 {
-    return -@as(i32, @intCast(@min(screen.view_offset, screen.scrollbackCount())));
+    return -@as(i32, @intCast(screen.clampedViewOffset()));
 }
 
 /// The display rows and columns copy mode can visit.
@@ -830,7 +830,7 @@ pub fn clampMove(screen: *const Screen, row: i32, col: i32) Move {
     const r = std.math.clamp(row, ext.top, ext.bottom);
     const cc: u16 = @intCast(std.math.clamp(col, 0, ext.last_col));
     // The cursor's visible row is row + view_offset.
-    const view_off: i32 = @intCast(@min(screen.view_offset, screen.scrollbackCount()));
+    const view_off: i32 = @intCast(screen.clampedViewOffset());
     const vo: ?u32 = if (r + view_off < 0)
         @intCast(-r)
     else if (r + view_off > ext.bottom)

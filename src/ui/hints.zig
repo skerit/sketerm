@@ -99,7 +99,7 @@ pub fn collectVisibleWith(
     var compiled = try CompiledRules.init(allocator, rules);
     defer compiled.deinit(allocator);
 
-    const view_off: i32 = @intCast(@min(screen.view_offset, screen.scrollbackCount()));
+    const view_off: i32 = @intCast(screen.clampedViewOffset());
     var d: u16 = 0;
     while (d < screen.rows) : (d += 1) {
         const buf_row: i32 = @as(i32, d) - view_off;

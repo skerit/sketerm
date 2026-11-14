@@ -996,7 +996,7 @@ pub const Screen = struct {
         if (anchor_id == 0) return .offscreen;
         const b = self.buf();
         const sb_count = self.scrollbackCount();
-        const view_off: u32 = @min(self.view_offset, sb_count);
+        const view_off: u32 = self.clampedViewOffset();
 
         // Current buffer: display row = buffer index + view_off.
         for (b, 0..) |ln, i| {
@@ -2346,7 +2346,7 @@ pub const Screen = struct {
         defer out.deinit(allocator);
         var run: TextRun = .{ .screen = self, .allocator = allocator, .out = &out };
 
-        const view_off: i32 = @intCast(@min(self.view_offset, self.scrollbackCount()));
+        const view_off: i32 = @intCast(self.clampedViewOffset());
 
         var r: i32 = 0;
         while (r < @as(i32, @intCast(self.rows))) : (r += 1) {

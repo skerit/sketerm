@@ -682,3 +682,14 @@ test "visibleLine: scrollback rows first while scrolled back, clamped, never on 
     try std.testing.expectEqual(@as(u32, 'z'), s.visibleCells(0)[0].rune);
     try std.testing.expectEqual(@as(usize, 4), s.visibleCells(1).len);
 }
+
+test "a scroll offset left over on the alt screen does not shift the dump or image anchors' view" {
+    var h = try Harness.init(std.testing.allocator, 4, 2);
+    defer h.deinit();
+    h.feed("a\r\nb\r\nc\r\nd\x1b[?1049hz");
+    h.screen.view_offset = 2;
+    const text = try h.screen.extractScreen(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "z"));
+    try std.testing.expect(std.mem.indexOfScalar(u8, text, 'a') == null);
+}

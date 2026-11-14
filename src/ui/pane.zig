@@ -3066,7 +3066,7 @@ fn onScroll(g: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) 
     const delta_lines: i32 = @intFromFloat(whole);
     if (delta_lines == 0) return 1;
 
-    const sb = screen.scrollbackCount();
+    const sb = screen.viewableScrollback();
     if (delta_lines > 0) {
         const want: u64 = @as(u64, @intCast(screen.view_offset)) + @as(u64, @intCast(delta_lines));
         screen.view_offset = if (want > sb) sb else @intCast(want);
