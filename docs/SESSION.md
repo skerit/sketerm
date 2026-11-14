@@ -1,6 +1,6 @@
 # Autonomous build session — 2026-04-25
 
-## 2026-11-14: conceal renders; DL keeps scrollback clean; one wrap rule; one visible-row home
+## 2026-11-14: conceal renders; DL scrollback pinned to xterm; one wrap rule; one visible-row home
 
 SGR 8 (conceal) was parsed and stored but never drawn: concealed text
 showed. `style.Resolver` now reports `text` (false under conceal), and
@@ -9,9 +9,9 @@ glyph and every SGR line decoration for it, keeping the background as
 xterm does. Borders, copy and the a11y text still see the cell.
 smoke-cell's conceal stage asserts background-only, kept borders and
 pass parity; its three GL stages now share one `shoot` helper.
-`scrollUp` takes an explicit `ScrollOff`: LF/IND and SU save rows leaving
-a region at row 0 (xterm `xtermScroll`), DL discards them (kitty; xterm
-saves there). A wrap pending when DECAWM is reset is dropped and the next
+DL at the top row of a full-height region keeps feeding scrollback like
+LF/IND and SU: xterm (`DeleteLine` canSave) and alacritty do, kitty does
+not; a conformance test pins it. A wrap pending when DECAWM is reset is dropped and the next
 print overwrites the last column (xterm `dotext`); the normal and
 overstrike print paths share `takePendingWrap`. The renderers map a
 viewport row to its line through `Screen.visibleLine`/`visibleCells`/
