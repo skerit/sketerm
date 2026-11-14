@@ -640,6 +640,23 @@ test "xterm: DECAWM reset while a wrap is pending drops the wrap; the print over
     try std.testing.expect(h.screen.line(1).continues_above);
 }
 
+test "xterm: with DECAWM reset a wide char that does not fit at the last column is dropped" {
+    var h = try Harness.init(std.testing.allocator, 4, 2);
+    defer h.deinit();
+    h.feed("\x1b[?7labc\xe4\xb8\xad");
+    try h.expectLine(0, "abc");
+    try h.expectLine(1, "");
+    try h.expectCursor(0, 3);
+    try std.testing.expect(!h.screen.pending_wrap);
+    // The column it would have overwritten stays, and the next narrow print lands there.
+    h.feed("d");
+    try h.expectLine(0, "abcd");
+    // DECAWM on: the same wide char wraps to the next line instead.
+    h.feed("\x1b[?7h\x1b[1;4H\xe4\xb8\xad");
+    try h.expectLine(0, "abcd");
+    try h.expectCursor(1, 2);
+}
+
 test "xterm: DL at the top row, LF and SU at a full-height region all feed scrollback" {
     var h = try Harness.init(std.testing.allocator, 4, 3);
     defer h.deinit();

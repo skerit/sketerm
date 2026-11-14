@@ -4444,8 +4444,12 @@ pub const Screen = struct {
         const width: u8 = if (isWideCp(cp)) 2 else 1;
 
         self.takePendingWrap();
-        // Wide char near right edge wraps before placing.
-        if (width == 2 and self.col + 1 >= self.cols) self.wrapLine();
+        if (width == 2 and self.col + 1 >= self.cols) {
+            // Without autowrap a wide char that does not fit is dropped and the cursor stays
+            // (xterm charproc.c dotext: nothing is chomped and do_wrap stays False).
+            if (!self.autowrap) return;
+            self.wrapLine();
+        }
         if (self.col >= self.cols) return;
 
         var ln = self.line(self.row);
