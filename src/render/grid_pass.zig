@@ -777,23 +777,8 @@ pub const GridPass = struct {
                     }
                     self.row_url_match_count.items[vrow] = n_match;
                 }
-                const n_match = self.row_url_match_count.items[vrow];
-                if (n_match == 0) continue;
-                const y: f32 = pad + @as(f32, @floatFromInt(vrow)) * ch;
-                // 1px-equivalent underline near the bottom of the cell.
-                const thin: f32 = @max(1.0, ch / 14.0);
-                const uy: f32 = y + ch - thin - 1.0;
-                const accent: [4]f32 = .{
-                    self.default_fg[0],
-                    self.default_fg[1],
-                    self.default_fg[2],
-                    0.85,
-                };
-                for (self.row_url_matches.items[vrow].items) |m| {
-                    const x: f32 = pad + @as(f32, @floatFromInt(m.col_start)) * cw;
-                    const w: f32 = @as(f32, @floatFromInt(m.col_end - m.col_start)) * cw;
-                    try self.pushQuadDim(.{ x, uy }, .{ w, thin }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0, 1.0);
-                }
+                if (self.row_url_match_count.items[vrow] == 0) continue;
+                try self.emitUrlUnderlines(pool, screen.visibleCells(vrow), self.row_url_matches.items[vrow].items, vrow, cw, ch);
             }
         }
 
@@ -1269,6 +1254,40 @@ pub const GridPass = struct {
         const a = style.attrs;
         if (style_util.underlineKind(a) == .none and !a.strikethrough and !a.overline) return;
         try self.emitDeco(a, self.styleResolver().resolve(style), cell, visual_col, y, cw, ch, x_scale);
+    }
+
+    /// The auto-detected URL underline under `matches` on `row`, one quad
+    /// per run of cells whose text is drawn: concealed cells get none.
+    fn emitUrlUnderlines(
+        self: *GridPass,
+        pool: *const StylePool,
+        cells: []const Cell,
+        matches: []const @import("../grid/url_scan.zig").Match,
+        row: u16,
+        cw: f32,
+        ch: f32,
+    ) !void {
+        const y: f32 = self.pad + @as(f32, @floatFromInt(row)) * ch;
+        // 1px-equivalent underline near the bottom of the cell.
+        const thin: f32 = @max(1.0, ch / 14.0);
+        const uy: f32 = y + ch - thin - 1.0;
+        const accent: [4]f32 = .{ self.default_fg[0], self.default_fg[1], self.default_fg[2], 0.85 };
+        const resolver = self.styleResolver();
+        for (matches) |m| {
+            const end = @min(m.col_end, cells.len);
+            var col: usize = m.col_start;
+            while (col < end) {
+                if (!resolver.resolve(pool.get(cells[col].style_ref)).text) {
+                    col += 1;
+                    continue;
+                }
+                const start = col;
+                while (col < end and resolver.resolve(pool.get(cells[col].style_ref)).text) col += 1;
+                const x: f32 = self.pad + @as(f32, @floatFromInt(start)) * cw;
+                const w: f32 = @as(f32, @floatFromInt(col - start)) * cw;
+                try self.pushQuadDim(.{ x, uy }, .{ w, thin }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0, 1.0);
+            }
+        }
     }
 
     /// The decoration quads of `attrs` in `resolved`'s colours over the
@@ -1754,6 +1773,30 @@ test "emitCellDeco: a concealed cell draws no decoration" {
     defer gp.deinit();
     const cell = Cell{ .rune = 'x', .style_ref = try pool.intern(.{ .attrs = .{ .underline = true, .strikethrough = true, .overline = true, .invisible = true } }) };
     try gp.emitCellDeco(&pool, cell, 0, 0, 9, 20, 1.0);
+    try testing.expectEqual(@as(usize, 0), gp.vbuf.items.len);
+}
+
+test "emitUrlUnderlines: concealed cells of a detected url get no underline" {
+    var pool = try StylePool.init(testing.allocator);
+    defer pool.deinit();
+    var gp = GridPass.init(testing.allocator);
+    defer gp.deinit();
+    const plain = try pool.intern(.{});
+    const hidden = try pool.intern(.{ .attrs = .{ .invisible = true } });
+    var cells: [6]Cell = undefined;
+    for (&cells, 0..) |*cell, i| cell.* = .{ .rune = 'a', .style_ref = if (i == 2 or i == 3) hidden else plain };
+    // One match over columns 1..5: the concealed middle splits it into 1..2 and 4..5.
+    try gp.emitUrlUnderlines(&pool, &cells, &.{.{ .col_start = 1, .col_end = 5 }}, 0, 9, 20);
+    try testing.expectEqual(@as(usize, 12), gp.vbuf.items.len);
+    const a = quadBounds(gp.vbuf.items, 0);
+    try testing.expectEqual(gp.pad + 9, a.x0);
+    try testing.expectEqual(gp.pad + 18, a.x1);
+    const b = quadBounds(gp.vbuf.items, 1);
+    try testing.expectEqual(gp.pad + 36, b.x0);
+    try testing.expectEqual(gp.pad + 45, b.x1);
+    // All concealed: nothing at all.
+    gp.vbuf.clearRetainingCapacity();
+    try gp.emitUrlUnderlines(&pool, &cells, &.{.{ .col_start = 2, .col_end = 4 }}, 0, 9, 20);
     try testing.expectEqual(@as(usize, 0), gp.vbuf.items.len);
 }
 
