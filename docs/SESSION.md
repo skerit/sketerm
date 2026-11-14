@@ -1,5 +1,22 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-14: web_perf, web_cpu_profile and cpu_throttle
+
+Page performance through the engine's DevTools protocol, nothing injected:
+`web_perf` is a fixed-shape `Performance.getMetrics` delta (window or since
+the last call), `web_cpu_profile` a V8 sampling profile summarized here
+(buckets, top self/total, source maps resolved through the page's own
+fetch or `source_map_files`, the raw `.cpuprofile` staged by the helper and
+moved like a staged print), `cpu_throttle` on web_open and both tools, kept
+across navigations. Helper capability `web-perf` (0xA6/0xA7), facts
+`web_perf`/`web_cpu_profile`/`web_cpu_throttle`; headless only, local helper
+for profiles. One DevTools session per view now serves media emulation too.
+Profiling first crashed every renderer: the helper's 256 KiB static TLS (Zig
+std's alternate signal stack) left V8's 64 KiB sampler thread no stack; the
+helper drops that signal stack. smoke-mcp stage wp
+(`SKETERM_SMOKE_MCP_WEBPERF_ONLY`) proves it all on the real engine;
+`docs/web-perf.md` has the details and limits.
+
 ## 2026-11-14: conceal renders; DL scrollback pinned to xterm; one wrap rule; one visible-row home
 
 SGR 8 (conceal) was parsed and stored but never drawn: concealed text
