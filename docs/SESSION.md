@@ -1,5 +1,22 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-14: web_trace
+
+`web_trace` records the engine's own trace of a headless tab (start/stop or
+`duration_ms` up to 30 s) and answers with a short summary of the tab's
+renderer main thread: self times, long tasks with their dominant cause (the
+heaviest JS entry), forced style/layout grouped by the JS frame that forced
+it, `selector_stats:true` per-selector costs, frames drawn and
+`performance.mark`/`measure`; frames are source-mapped like
+`web_cpu_profile`, the raw `{"traceEvents":[...]}` file is kept for
+DevTools/Perfetto. The helper streams `Tracing.dataCollected` into a staged
+file (256 MiB cap, `truncated`) and finishes on `tracingComplete`; the
+summarizer (`src/ipc/perf/trace.zig`) streams it twice. Capability
+`web-trace` (its own token: a `web-perf`-only helper is never sent a trace
+op), fact `web_trace`. A CPU profile may run alongside. smoke-mcp stage wt
+(`SKETERM_SMOKE_MCP_WEBTRACE_ONLY`) proves it on the real engine;
+`docs/web-perf.md` has the details.
+
 ## 2026-11-14: web_perf, web_cpu_profile and cpu_throttle
 
 Page performance through the engine's DevTools protocol, nothing injected:
