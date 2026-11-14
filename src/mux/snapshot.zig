@@ -44,9 +44,12 @@ const Cell = @import("../grid/cell.zig").Cell;
 const style_pool = @import("../grid/style_pool.zig");
 const wire = @import("wire.zig");
 const Pool = style_pool.Pool;
+const borders = @import("../grid/borders.zig");
 const palette_default_256 = @import("../grid/palette.zig").default_256;
 
-pub const SNAPSHOT_VERSION = 12;
+/// v13: style entries carry a border-set ID, followed by the border-set
+/// table (cell-border protocol). Older bodies restore with no borders.
+pub const SNAPSHOT_VERSION = 13;
 pub const LEGACY_SNAPSHOT_VERSION = 3;
 
 /// What a `Screen` field means to a snapshot.
@@ -417,7 +420,11 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
         try s.color(e.bg);
         try s.color(e.underline_color);
         try s.int(u16, @bitCast(e.attrs));
+        if (version >= 13) try s.int(u16, e.border);
     }
+    // Written before the scrollback, so the scrollback budget below
+    // already counts it: up to `max_border_sets` x 100 bytes.
+    if (version >= 13) try writeBorderSets(pool, s);
 
     // Grid: active, alt (optional), scrollback in logical order.
     for (screen.active) |*ln| try s.line(ln);
@@ -724,6 +731,25 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
     if (version >= 12) try writePlaceholderTail(screen, s, first_sb, retained_sent);
 }
 
+/// v13: the border-set table. Slot count (IDs are slot + 1 and must
+/// survive the trip, since entries name them), then each live slot as
+/// its ID, its present-segment mask and one stroke per set mask bit.
+fn writeBorderSets(pool: *const Pool, s: Sink) !void {
+    try s.int(u16, @intCast(pool.border_sets.items.len));
+    var live: u16 = 0;
+    for (pool.border_sets.items) |set| live += @intFromBool(!borders.isEmpty(set));
+    try s.int(u16, live);
+    for (pool.border_sets.items, 1..) |set, id| {
+        const mask = borders.presentMask(set);
+        if (mask == 0) continue;
+        try s.int(u16, @intCast(id));
+        try s.int(u16, mask);
+        for (borders.segments) |seg| {
+            if (mask & seg.mask() != 0) try s.int(u64, set[@intFromEnum(seg)].bits());
+        }
+    }
+}
+
 /// Serialized size of one placeholder tile record.
 const PLACEHOLDER_TILE_BYTES: usize = 8 + 2 + 4 + 2 + 2;
 
@@ -924,6 +950,31 @@ const Src = struct {
     }
 };
 
+/// Reads `writeBorderSets`' table into slot order, rejecting anything
+/// the interning paths could not have written.
+fn readBorderSets(src: *Src, allocator: std.mem.Allocator) Src.Error!std.ArrayList(borders.Set) {
+    const n_slots = try src.int(u16);
+    const n_live = try src.int(u16);
+    if (n_slots > Pool.max_border_sets or n_live > n_slots) return error.BadSnapshot;
+    var sets: std.ArrayList(borders.Set) = .empty;
+    errdefer sets.deinit(allocator);
+    try sets.appendNTimes(allocator, borders.empty, n_slots);
+    for (0..n_live) |_| {
+        const id = try src.int(u16);
+        const mask = try src.int(u16);
+        if (id == 0 or id > n_slots or mask == 0 or mask > borders.group.all) return error.BadSnapshot;
+        const set = &sets.items[id - 1];
+        if (!borders.isEmpty(set.*)) return error.BadSnapshot;
+        for (borders.segments) |seg| {
+            if (mask & seg.mask() == 0) continue;
+            const stroke: borders.Stroke = @bitCast(try src.int(u64));
+            if (!stroke.present() or !stroke.valid()) return error.BadSnapshot;
+            set[@intFromEnum(seg)] = stroke;
+        }
+    }
+    return sets;
+}
+
 fn validateLinkState(screen: *const Screen) !void {
     if (screen.current_link_id != 0 and !screen.links.contains(screen.current_link_id))
         return error.BadSnapshot;
@@ -1026,13 +1077,23 @@ pub fn restoreStaged(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u
             .bg = bg,
             .underline_color = ul,
             .attrs = @bitCast(attrs_raw),
+            .border = if (version >= 13) try src.int(u16) else 0,
         });
     }
+    var border_sets: std.ArrayList(borders.Set) = if (version >= 13)
+        try readBorderSets(&src, pool.allocator)
+    else
+        .empty;
+    errdefer border_sets.deinit(pool.allocator);
 
     const replacement_pool = try pool.allocator.create(Pool);
     errdefer pool.allocator.destroy(replacement_pool);
-    replacement_pool.* = try Pool.initReplacement(pool.allocator, new_entries);
+    replacement_pool.* = Pool.initReplacement(pool.allocator, new_entries, border_sets) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidBorderTable => return error.BadSnapshot,
+    };
     new_entries = .empty;
+    border_sets = .empty;
     errdefer replacement_pool.deinit();
 
     const screen = try Screen.init(allocator, replacement_pool, cols, rows);
@@ -1735,9 +1796,12 @@ fn skipSerializedLine(src: *Src) !void {
     _ = try src.take(@as(usize, n_cells) * @sizeOf(Cell));
 }
 
-fn alternateStateOffsets(bytes: []const u8) !AlternateStateOffsets {
-    var src = Src{ .bytes = bytes };
-    _ = try src.int(u32);
+const SkippedHead = struct { rows: u16, n_styles: u16 };
+
+/// Walk a body's header and style section (border table included) the
+/// way `restoreStaged` reads it, leaving `src` at the first active line.
+fn skipHeadAndStyles(src: *Src) !SkippedHead {
+    const version = try src.int(u32);
     _ = try src.int(u16);
     const rows = try src.int(u16);
     const n_styles = try src.int(u16);
@@ -1746,7 +1810,18 @@ fn alternateStateOffsets(bytes: []const u8) !AlternateStateOffsets {
         _ = try src.color();
         _ = try src.color();
         _ = try src.int(u16);
+        if (version >= 13) _ = try src.int(u16);
     }
+    if (version >= 13) {
+        var sets = try readBorderSets(src, testing.allocator);
+        sets.deinit(testing.allocator);
+    }
+    return .{ .rows = rows, .n_styles = n_styles };
+}
+
+fn alternateStateOffsets(bytes: []const u8) !AlternateStateOffsets {
+    var src = Src{ .bytes = bytes };
+    const rows = (try skipHeadAndStyles(&src)).rows;
     for (0..rows) |_| try skipSerializedLine(&src);
     const has_alt = src.pos;
     if (try src.boolean()) {
@@ -1759,16 +1834,7 @@ fn alternateStateOffsets(bytes: []const u8) !AlternateStateOffsets {
 
 fn firstLineOffsets(bytes: []const u8) !FirstLineOffsets {
     var src = Src{ .bytes = bytes };
-    _ = try src.int(u32);
-    _ = try src.int(u16);
-    _ = try src.int(u16);
-    const n_styles = try src.int(u16);
-    for (0..n_styles) |_| {
-        _ = try src.color();
-        _ = try src.color();
-        _ = try src.color();
-        _ = try src.int(u16);
-    }
+    const n_styles = (try skipHeadAndStyles(&src)).n_styles;
     _ = try src.int(u64);
     _ = try src.boolean();
     const scaling = src.pos;
@@ -2678,7 +2744,10 @@ test "snapshot: numbered deletes survive source eviction and negotiated replay" 
         defer v11.deinit(a);
         try serializeVersion(h.screen, &v11, a, 11);
         // No placeholder tiles: v12 adds only its two empty counts.
-        try testing.expectEqual(v11.items.len + 2 * 4, current.items.len);
+        var v12: std.ArrayList(u8) = .empty;
+        defer v12.deinit(a);
+        try serializeVersion(h.screen, &v12, a, 12);
+        try testing.expectEqual(v11.items.len + 2 * 4, v12.items.len);
         // Every historical layout remains readable and omits the new field.
         for (1..11) |version| {
             var legacy: std.ArrayList(u8) = .empty;
@@ -2774,16 +2843,7 @@ test "snapshot: corrupt input errors cleanly" {
     // Locate the first serialized cell and give it a style reference beyond
     // the advertised pool. Restore must reject it before render-side Pool.get.
     var src = Src{ .bytes = buf.items };
-    _ = try src.int(u32); // version
-    _ = try src.int(u16); // cols
-    _ = try src.int(u16); // rows
-    const n_styles = try src.int(u16);
-    for (0..n_styles) |_| {
-        _ = try src.color();
-        _ = try src.color();
-        _ = try src.color();
-        _ = try src.int(u16);
-    }
+    const n_styles = (try skipHeadAndStyles(&src)).n_styles;
     _ = try src.int(u64);
     _ = try src.boolean();
     _ = try src.byte();
@@ -2806,7 +2866,7 @@ test "snapshot: v8 validates saved indexes and tab-stop dimensions" {
     try serializeVersion(h.screen, &v7, a, 7);
     var v8: std.ArrayList(u8) = .empty;
     defer v8.deinit(a);
-    try serialize(h.screen, &v8, a);
+    try serializeVersion(h.screen, &v8, a, 8);
     const tail = v7.items.len;
     try testing.expect(v8.items.len > tail + 18 + h.screen.cols);
 
@@ -3172,7 +3232,7 @@ test "snapshot: a v9 body is refused by a v8 reader and truncation is Truncated"
 
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(a);
-    try serialize(h.screen, &body, a);
+    try serializeVersion(h.screen, &body, a, 9);
 
     // A truncated tail is a short read, never garbage.
     var pool_short = try Pool.init(a);
@@ -3197,4 +3257,151 @@ test "snapshot: a v9 body is refused by a v8 reader and truncation is Truncated"
     const old = try restore(a, &pool_old, v8_body.items);
     defer old.deinit();
     try testing.expectEqual(@as(u16, 0), old.cmd_zones_len);
+}
+
+/// A session's two screens: the daemon applies each parsed event, and
+/// the mirror applies it after a trip through the wire encoding.
+const WireFeeder = struct {
+    parser: Parser,
+    allocator: std.mem.Allocator,
+    daemon: *Screen,
+    mirror: *Screen,
+    wire_failures: usize = 0,
+
+    fn emit(user: ?*anyopaque, ev: Event) void {
+        const self: *WireFeeder = @ptrCast(@alignCast(user.?));
+        var owned = ev;
+        defer owned.deinit(self.allocator);
+        self.daemon.apply(ev);
+        var w = wire.Writer.init(self.allocator);
+        defer w.deinit();
+        w.putEvent(ev) catch {
+            self.wire_failures += 1;
+            return;
+        };
+        var r = wire.Reader.init(w.buf.items);
+        var decoded = r.getEvent(self.allocator) catch {
+            self.wire_failures += 1;
+            return;
+        };
+        defer decoded.deinit(self.allocator);
+        self.mirror.apply(decoded);
+    }
+
+    fn feed(self: *WireFeeder, bytes: []const u8) void {
+        self.parser.advance(bytes, emit, @ptrCast(self));
+    }
+};
+
+fn expectSameBorders(expected: *const Screen, actual: *const Screen) !void {
+    for (expected.active, actual.active) |e_ln, a_ln| {
+        for (e_ln.cells, a_ln.cells) |e_cell, a_cell| {
+            try testing.expectEqual(
+                expected.pool.bordersOf(e_cell.style_ref),
+                actual.pool.bordersOf(a_cell.style_ref),
+            );
+        }
+    }
+    try testing.expectEqual(expected.pool.bordersOf(expected.cur_style), actual.pool.bordersOf(actual.cur_style));
+}
+
+const bordered_bytes = "\x1bP1+bcell-border;pen;4095;24;p3;1;0;style=double\x1b\\ab" ++
+    "\x1bP1+bcell-border;pen-clear;192\x1b\\c\r\n" ++
+    "\x1bP1+bcell-border;set;12;64;12aBef;0;1;2;3\x1b\\";
+
+test "snapshot: cell borders reach a mirror through the wire and survive a v13 restore" {
+    const a = testing.allocator;
+    var daemon_pool = try Pool.init(a);
+    defer daemon_pool.deinit();
+    var mirror_pool = try Pool.init(a);
+    defer mirror_pool.deinit();
+    const daemon = try Screen.init(a, &daemon_pool, 8, 3);
+    defer daemon.deinit();
+    const mirror = try Screen.init(a, &mirror_pool, 8, 3);
+    defer mirror.deinit();
+    var feeder = WireFeeder{ .parser = Parser.init(a), .allocator = a, .daemon = daemon, .mirror = mirror };
+    defer feeder.parser.deinit();
+    feeder.feed(bordered_bytes);
+    try testing.expectEqual(@as(usize, 0), feeder.wire_failures);
+    try testing.expect(daemon_pool.hasBorders());
+    try expectSameBorders(daemon, mirror);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try serialize(daemon, &body, a);
+    var restored_pool = try Pool.init(a);
+    defer restored_pool.deinit();
+    const restored = try restore(a, &restored_pool, body.items);
+    defer restored.deinit();
+    try expectSameBorders(daemon, restored);
+    // The index was rebuilt: re-interning a live set finds its slot.
+    const set = restored_pool.bordersOf(restored.cur_style);
+    try testing.expectEqual(restored_pool.get(restored.cur_style).border, try restored_pool.internBorder(set));
+    try testing.expectEqual(daemon_pool.border_sets.items.len, restored_pool.border_sets.items.len);
+}
+
+test "snapshot: a pre-border body restores with no borders" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 8, 3);
+    defer h.deinit();
+    h.feed(bordered_bytes);
+    var v12: std.ArrayList(u8) = .empty;
+    defer v12.deinit(a);
+    try serializeVersion(h.screen, &v12, a, 12);
+    var pool = try Pool.init(a);
+    defer pool.deinit();
+    const old = try restore(a, &pool, v12.items);
+    defer old.deinit();
+    try testing.expect(!pool.hasBorders());
+    try testing.expectEqual(@as(u32, 'a'), old.active[0].cells[0].rune);
+}
+
+test "snapshot: a border table the interning paths could not write is BadSnapshot" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 8, 3);
+    defer h.deinit();
+    h.feed(bordered_bytes);
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try serialize(h.screen, &body, a);
+
+    // Walk to the table: the last entry's border ID, then the table.
+    var src = Src{ .bytes = body.items };
+    _ = try src.int(u32);
+    _ = try src.int(u16);
+    _ = try src.int(u16);
+    const n_styles = try src.int(u16);
+    var last_border: usize = 0;
+    for (0..n_styles) |_| {
+        _ = try src.color();
+        _ = try src.color();
+        _ = try src.color();
+        _ = try src.int(u16);
+        last_border = src.pos;
+        _ = try src.int(u16);
+    }
+    const table = src.pos;
+    // Slot count, live count, then the first live slot's ID, mask, stroke.
+    const first_id = table + 4;
+    const first_stroke = table + 8;
+
+    const Corruption = struct { at: usize, bytes: []const u8 };
+    const corruptions = [_]Corruption{
+        // An entry naming a slot past the table.
+        .{ .at = last_border, .bytes = &.{ 0xff, 0x00 } },
+        // A slot ID of zero.
+        .{ .at = first_id, .bytes = &.{ 0, 0 } },
+        // A stroke wider than the protocol allows.
+        .{ .at = first_stroke, .bytes = &.{65} },
+        // More live slots than slots.
+        .{ .at = table + 2, .bytes = &.{ 0xff, 0x7f } },
+    };
+    for (corruptions) |c| {
+        const bad = try a.dupe(u8, body.items);
+        defer a.free(bad);
+        @memcpy(bad[c.at..][0..c.bytes.len], c.bytes);
+        var pool = try Pool.init(a);
+        defer pool.deinit();
+        try testing.expectError(error.BadSnapshot, restore(a, &pool, bad));
+    }
 }

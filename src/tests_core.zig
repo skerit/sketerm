@@ -113,6 +113,8 @@ comptime {
     _ = @import("grid/selection.zig");
     _ = @import("grid/selection_conformance_test.zig");
     _ = @import("grid/style_pool.zig");
+    _ = @import("grid/borders.zig");
+    _ = @import("grid/borders_screen_test.zig");
     _ = @import("grid/url_scan.zig");
     _ = @import("grid/word_motion.zig");
     _ = @import("grid/bracket.zig");

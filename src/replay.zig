@@ -169,7 +169,26 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         }
         std.debug.print("{d:3}|{s}|\n", .{ r, line_buf[0..len] });
     }
+    try dumpBorders(screen, &pool);
     return 0;
+}
+
+/// Cell borders leave no runes either: one `borders` line per row that
+/// has any, each bordered cell as `col:mask` (protocol segment bits).
+fn dumpBorders(screen: *Screen, pool: *const StylePool) !void {
+    if (!pool.hasBorders()) return;
+    const borders = @import("grid/borders.zig");
+    var r: u16 = 0;
+    while (r < screen.rows) : (r += 1) {
+        var buf: [8192]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var col: u16 = 0;
+        while (col < screen.cols) : (col += 1) {
+            const mask = borders.presentMask(pool.bordersOf(screen.cellAt(r, col).style_ref));
+            if (mask != 0) w.print(" {d}:{d}", .{ col, mask }) catch break;
+        }
+        if (w.end != 0) std.debug.print("borders {d:3}:{s}\n", .{ r, w.buffered() });
+    }
 }
 
 /// One settled frame as `--cast` prints it.

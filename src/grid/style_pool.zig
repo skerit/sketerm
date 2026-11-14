@@ -10,6 +10,7 @@
 
 const std = @import("std");
 
+pub const borders = @import("borders.zig");
 pub const Color = union(enum) {
     /// Use the terminal's default fg/bg.
     default: void,
@@ -92,12 +93,16 @@ pub const Entry = struct {
     /// the cell's fg, the pre-SGR-58 behaviour.
     underline_color: Color = .default,
     attrs: Attrs = .{},
+    /// The cell's border set: an ID into `Pool.border_sets`, 0 = none.
+    /// Living in the style is what makes it the pen: every path that
+    /// stamps `cur_style` on a cell (print, BCE erase, DECSC) carries it.
+    border: u16 = 0,
 
     pub fn equal(a: Entry, b: Entry) bool {
         if (!Color.equal(a.fg, b.fg)) return false;
         if (!Color.equal(a.bg, b.bg)) return false;
         if (!Color.equal(a.underline_color, b.underline_color)) return false;
-        return @as(u16, @bitCast(a.attrs)) == @as(u16, @bitCast(b.attrs));
+        return a.border == b.border and @as(u16, @bitCast(a.attrs)) == @as(u16, @bitCast(b.attrs));
     }
 };
 
@@ -115,7 +120,7 @@ fn entryKey(e: Entry) u128 {
     return (@as(u128, colorKey(e.fg)) << 96) |
         (@as(u128, colorKey(e.bg)) << 64) |
         (@as(u128, colorKey(e.underline_color)) << 32) |
-        @as(u16, @bitCast(e.attrs));
+        (@as(u128, e.border) << 16) | @as(u16, @bitCast(e.attrs));
 }
 
 pub const Pool = struct {
@@ -128,6 +133,103 @@ pub const Pool = struct {
     /// touching the rest of the array.
     last_idx: u16 = 0,
     allocator: std.mem.Allocator,
+    /// Interned border sets: ID `n` is slot `n - 1`, ID 0 the empty set.
+    /// Slots are stable, so collecting never renumbers a surviving set;
+    /// unused slots hold `borders.empty` and sit on `border_free`.
+    border_sets: std.ArrayList(borders.Set) = .empty,
+    border_index: std.HashMapUnmanaged(borders.Set, u16, borders.SetContext, std.hash_map.default_max_load_percentage) = .empty,
+    border_free: std.ArrayList(u16) = .empty,
+    /// Failed reclaims left to skip. A reclaim that frees nothing arms
+    /// this, so a pool saturated with live styles is rescanned once per
+    /// `reclaim_backoff` failed interns instead of once per cell.
+    reclaim_cooldown: u16 = 0,
+
+    pub const reclaim_backoff: u16 = 4096;
+    /// IDs are u16 with 0 reserved for the empty set.
+    pub const max_border_sets: usize = 0xFFFF - 1;
+
+    pub fn borderSet(self: *const Pool, id: u16) borders.Set {
+        if (id == 0 or id > self.border_sets.items.len) return borders.empty;
+        return self.border_sets.items[id - 1];
+    }
+
+    /// The border set a cell with this style draws.
+    pub fn bordersOf(self: *const Pool, style_ref: u16) borders.Set {
+        return self.borderSet(self.get(style_ref).border);
+    }
+
+    /// Whether any live border set exists; renderers bail on false.
+    pub fn hasBorders(self: *const Pool) bool {
+        return self.border_sets.items.len > self.border_free.items.len;
+    }
+
+    /// The ID of `set`, interning it if new. The ID is unrooted until a
+    /// style entry holds it: `collectBorders` frees it before then.
+    pub fn internBorder(self: *Pool, set: borders.Set) !u16 {
+        if (borders.isEmpty(set)) return 0;
+        if (self.border_index.get(set)) |id| return id;
+        const reuse = self.border_free.items.len > 0;
+        if (!reuse) {
+            if (self.border_sets.items.len >= max_border_sets) return error.PoolFull;
+            try self.border_sets.ensureUnusedCapacity(self.allocator, 1);
+        }
+        const id: u16 = if (reuse)
+            self.border_free.items[self.border_free.items.len - 1]
+        else
+            @intCast(self.border_sets.items.len + 1);
+        try self.border_index.put(self.allocator, set, id);
+        if (reuse) {
+            _ = self.border_free.pop();
+            self.border_sets.items[id - 1] = set;
+        } else {
+            self.border_sets.appendAssumeCapacity(set);
+        }
+        return id;
+    }
+
+    /// `entry` with its border set replaced by `set`, interned. A set
+    /// interned only for an entry that then fails is released again, so
+    /// a failed intern leaves no orphan for a reclaim to mistake for
+    /// progress.
+    pub fn internWithBorders(self: *Pool, entry: Entry, set: borders.Set) !u16 {
+        const known = borders.isEmpty(set) or self.border_index.contains(set);
+        var e = entry;
+        e.border = try self.internBorder(set);
+        return self.intern(e) catch |err| {
+            if (!known) self.releaseBorder(e.border);
+            return err;
+        };
+    }
+
+    /// Return an unrooted ID's slot to the free list.
+    fn releaseBorder(self: *Pool, id: u16) void {
+        const slot = &self.border_sets.items[id - 1];
+        // Without room on the free list the set stays interned as an
+        // orphan, which the next `collectBorders` frees.
+        self.border_free.append(self.allocator, id) catch return;
+        _ = self.border_index.remove(slot.*);
+        slot.* = borders.empty;
+    }
+
+    /// Free every border set no style entry references. Callers run it
+    /// only when no unrooted ID from `internBorder` is still in hand.
+    pub fn collectBorders(self: *Pool) void {
+        if (self.border_sets.items.len == 0) return;
+        const used = self.allocator.alloc(bool, self.border_sets.items.len + 1) catch return;
+        defer self.allocator.free(used);
+        @memset(used, false);
+        for (self.entries.items) |e| {
+            if (e.border <= self.border_sets.items.len) used[e.border] = true;
+        }
+        self.border_free.ensureTotalCapacity(self.allocator, self.border_sets.items.len) catch return;
+        self.border_free.clearRetainingCapacity();
+        for (self.border_sets.items, 1..) |*set, id| {
+            if (used[id]) continue;
+            if (!borders.isEmpty(set.*)) _ = self.border_index.remove(set.*);
+            set.* = borders.empty;
+            self.border_free.appendAssumeCapacity(@intCast(id));
+        }
+    }
 
     pub const default_index: u16 = 0;
 
@@ -142,16 +244,44 @@ pub const Pool = struct {
     pub fn deinit(self: *Pool) void {
         self.entries.deinit(self.allocator);
         self.index.deinit(self.allocator);
+        self.border_sets.deinit(self.allocator);
+        self.border_index.deinit(self.allocator);
+        self.border_free.deinit(self.allocator);
     }
 
-    /// Builds a complete pool while leaving `entries` caller-owned on error.
-    pub fn initReplacement(allocator: std.mem.Allocator, entries: std.ArrayList(Entry)) !Pool {
+    /// Builds a complete pool while leaving `entries` and `border_sets`
+    /// caller-owned on error. Rejects a border table the interning paths
+    /// could not have produced (a duplicate set, or an entry naming a
+    /// missing or empty slot), which only untrusted input can hold.
+    pub fn initReplacement(
+        allocator: std.mem.Allocator,
+        entries: std.ArrayList(Entry),
+        border_sets: std.ArrayList(borders.Set),
+    ) !Pool {
         var replacement = Pool{ .allocator = allocator };
-        errdefer replacement.index.deinit(allocator);
+        errdefer {
+            replacement.index.deinit(allocator);
+            replacement.border_index.deinit(allocator);
+            replacement.border_free.deinit(allocator);
+        }
+        if (border_sets.items.len > max_border_sets) return error.InvalidBorderTable;
+        for (border_sets.items, 1..) |set, id| {
+            if (borders.isEmpty(set)) {
+                try replacement.border_free.append(allocator, @intCast(id));
+                continue;
+            }
+            const slot = try replacement.border_index.getOrPut(allocator, set);
+            if (slot.found_existing) return error.InvalidBorderTable;
+            slot.value_ptr.* = @intCast(id);
+        }
         for (entries.items, 0..) |entry, i| {
+            if (entry.border != 0 and (entry.border > border_sets.items.len or
+                borders.isEmpty(border_sets.items[entry.border - 1])))
+                return error.InvalidBorderTable;
             try replacement.index.put(allocator, entryKey(entry), @intCast(i));
         }
         replacement.entries = entries;
+        replacement.border_sets = border_sets;
         return replacement;
     }
 

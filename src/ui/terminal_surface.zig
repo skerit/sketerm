@@ -22,6 +22,7 @@ const widgetshot = @import("widgetshot.zig");
 const Atlas = @import("../render/atlas.zig").Atlas;
 const GridPass = @import("../render/grid_pass.zig").GridPass;
 const CellPass = @import("../render/cell_pass.zig").CellPass;
+const BorderPass = @import("../render/border_pass.zig").BorderPass;
 const ImagePass = @import("../render/image_pass.zig").ImagePass;
 const BgPass = @import("../render/bg_pass.zig").BgPass;
 const blend_mod = @import("../render/blend.zig");
@@ -89,6 +90,8 @@ pub const TerminalSurface = struct {
     atlas: ?*Atlas = null,
     grid_pass: GridPass,
     cell_pass: CellPass,
+    /// Cell-border protocol strokes, both layers (`render/border_pass.zig`).
+    border_pass: BorderPass,
     image_pass: ImagePass = ImagePass.init(),
     bg_pass: BgPass = .{},
     shader_pass: ShaderPass = .{},
@@ -273,6 +276,7 @@ pub const TerminalSurface = struct {
             .terminal = terminal,
             .grid_pass = GridPass.init(allocator),
             .cell_pass = CellPass.init(allocator),
+            .border_pass = BorderPass.init(allocator),
             .image_store = ImageStore.init(allocator),
             .allocator = allocator,
         };
@@ -330,6 +334,7 @@ pub const TerminalSurface = struct {
         self.stopVisualSources();
         self.grid_pass.deinit();
         self.cell_pass.deinit();
+        self.border_pass.deinit();
         self.image_pass.deinit();
         self.image_store.deinit();
         self.placeholders.deinit(self.allocator);
@@ -452,6 +457,7 @@ pub const TerminalSurface = struct {
         self.grid_pass.vbuf_valid = false;
         self.grid_pass.vbo_uploaded = false;
         for (self.grid_pass.row_caches_valid.items) |*r| r.* = false;
+        self.border_pass.built = false;
     }
 
     /// Invalidate every cached cell row (config pushes that change
@@ -1263,6 +1269,7 @@ fn onUnrealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
 fn forgetAllGL(self: *TerminalSurface) void {
     self.grid_pass.forgetGL();
     self.cell_pass.forgetGL();
+    self.border_pass.forgetGL();
     self.image_pass.forgetGL();
     self.bg_pass.forgetGL();
     self.shader_pass.forgetGL();
@@ -1283,6 +1290,7 @@ fn releaseAreaGL(self: *TerminalSurface, area: *c.GtkGLArea) void {
     }
     self.grid_pass.releaseGL();
     self.cell_pass.releaseGL();
+    self.border_pass.releaseGL();
     self.image_pass.releaseGL();
     self.bg_pass.releaseGL();
     self.shader_pass.releaseGL();
@@ -1336,6 +1344,10 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     };
     self.cell_pass.realize() catch {
         std.debug.print("pane realize: cell_pass realize failed\n", .{});
+        return;
+    };
+    self.border_pass.realize() catch {
+        std.debug.print("pane realize: border_pass realize failed\n", .{});
         return;
     };
     self.image_pass.realize() catch {
@@ -1457,6 +1469,7 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     const eff_mode: blend_mod.Mode = if (linear_on) blend_mode else .native;
     self.cell_pass.blend_mode = eff_mode;
     self.grid_pass.blend_mode = eff_mode;
+    self.border_pass.blend_mode = eff_mode;
     self.image_pass.blend_mode = eff_mode;
     self.bg_pass.blend_mode = eff_mode;
 
@@ -1503,22 +1516,23 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
         if (profile.enabled) img_ns += @intCast(profile.nanoTimestamp() - t_img);
     }
 
-    const t_cell_draw = if (profile.enabled) profile.nanoTimestamp() else 0;
-    self.cell_pass.draw(atlas, rw, rh);
-    if (profile.enabled) profile.record(.cell_draw, @intCast(profile.nanoTimestamp() - t_cell_draw));
-    // Cursor trail: retarget + integrate before the overlay pass
-    // builds its vertices, since the quad it publishes is one of
-    // that pass's inputs (and part of its snapshot hash).
+    // Paint order (cell-border protocol): backgrounds, below-text
+    // borders, text, the block cursor, above-text borders, every other
+    // cursor shape and the pane chrome. GridPass builds first so its
+    // overlay-row backgrounds can go down with CellPass's.
     self.updateCursorTrail();
-    // Overlay pipeline (per-vertex VBO) — cursor, selection, focus
-    // border, scrollback indicator, preedit, bell, and any rows that
-    // need bidi reorder or DH/DW per-line scaling.
     const t_grid_build = if (profile.enabled) profile.nanoTimestamp() else 0;
     self.grid_pass.buildVertices(self.terminal.screen, &self.terminal.pool, atlas, focused, cells_changed, rebuilt_rows) catch return @intFromBool(false);
     if (profile.enabled) profile.record(.grid_build, @intCast(profile.nanoTimestamp() - t_grid_build));
-    const t_grid_draw = if (profile.enabled) profile.nanoTimestamp() else 0;
-    self.grid_pass.draw(atlas, rw, rh);
-    if (profile.enabled) profile.record(.grid_draw, @intCast(profile.nanoTimestamp() - t_grid_draw));
+    self.border_pass.build(self.terminal.screen, &self.terminal.pool, .{
+        .cell_w = atlas.cell_w,
+        .cell_h = atlas.cell_h,
+        .pad = self.grid_pass.pad,
+    }, cells_changed) catch return @intFromBool(false);
+
+    const t_draw = if (profile.enabled) profile.nanoTimestamp() else 0;
+    @import("../render/scene.zig").drawGrid(&self.cell_pass, &self.grid_pass, &self.border_pass, atlas, rw, rh);
+    if (profile.enabled) profile.record(.grid_draw, @intCast(profile.nanoTimestamp() - t_draw));
 
     // Foreground images (z >= 0), placeholder tiles first: they are the
     // content of their cells, not something placed above the grid.

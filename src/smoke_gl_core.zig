@@ -14,6 +14,7 @@ const bg_pass = @import("render/bg_pass.zig");
 const image_pass = @import("render/image_pass.zig");
 const cell_pass = @import("render/cell_pass.zig");
 const grid_pass = @import("render/grid_pass.zig");
+const border_pass = @import("render/border_pass.zig");
 const shader_pass = @import("render/shader_pass.zig");
 const editor_pass = @import("render/editor_pass.zig");
 const blend = @import("render/blend.zig");
@@ -56,6 +57,7 @@ pub fn main() !u8 {
     failures += try check("image_pass", image_pass.VERT_SRC, image_pass.FRAG_SRC);
     failures += try check("cell_pass", cell_pass.VERT_SRC, cell_pass.FRAG_SRC);
     failures += try check("grid_pass", grid_pass.VERT_SRC, grid_pass.FRAG_SRC);
+    failures += try check("border_pass", border_pass.VERT_SRC, border_pass.FRAG_SRC);
     failures += try check("editor_pass", editor_pass.VERT_SRC, editor_pass.FRAG_SRC);
     // The linear-blending resolve pass — its sources are private to
     // blend.zig, so it exposes them for exactly this check.

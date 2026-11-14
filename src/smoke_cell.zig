@@ -1354,6 +1354,12 @@ pub fn main() !u8 {
         if (rc != 0) return rc;
     }
 
+    // Cell-border protocol: placement, merging, layers, pass parity.
+    {
+        const rc = try borderStage(allocator);
+        if (rc != 0) return rc;
+    }
+
     std.debug.print("smoke-cell: PASS\n", .{});
     return 0;
 }
@@ -2253,5 +2259,199 @@ fn decoColorParityStage(allocator: std.mem.Allocator) !u8 {
 
     if (failures != 0) return 91;
     std.debug.print("smoke-cell: deco colour parity OK\n", .{});
+    return 0;
+}
+
+const borders = @import("grid/borders.zig");
+const border_pass_mod = @import("render/border_pass.zig");
+
+/// One `set` rectangle command for the single cell at 1-based `row`,`col`.
+fn borderSet(comptime row: u16, comptime col: u16, comptime mask: borders.Mask, comptime width: u7, comptime color: []const u8, comptime placement: borders.Placement, comptime layer: borders.Layer) []const u8 {
+    return std.fmt.comptimePrint("\x1b[{d};{d}H\x1bP1+bcell-border;set;{d};{d};{s};{d};{d};1;1\x1b\\", .{
+        row, col, mask, width, color, @intFromEnum(placement), @intFromEnum(layer),
+    });
+}
+
+/// The same strokes on a 1-based screen row: an inside stroke over a
+/// cell background, a centred one, a shared edge the wider stroke
+/// wins, and a tie the right-hand cell wins.
+fn borderProbeRow(comptime row: u16) []const u8 {
+    return comptime std.fmt.comptimePrint("\x1b[{d};3H\x1b[44m \x1b[0m", .{row}) ++
+        borderSet(row, 3, borders.group.left, 64, "ff0000", .inside, .below_text) ++
+        borderSet(row, 7, borders.group.right, 64, "00ff00", .centred, .below_text) ++
+        borderSet(row, 11, borders.group.right, 32, "0000ff", .centred, .below_text) ++
+        borderSet(row, 12, borders.group.left, 64, "ffff00", .centred, .below_text) ++
+        borderSet(row, 15, borders.group.right, 32, "0000ff", .centred, .below_text) ++
+        borderSet(row, 16, borders.group.left, 32, "ff00ff", .centred, .below_text);
+}
+
+/// Cell borders through `scene.drawGrid`, the paint order the pane uses.
+/// Row 0 is a CellPass row; row 2 carries the same strokes but a Thai
+/// letter routes it to GridPass, so the two bands must match pixel for
+/// pixel. Row 0 also proves the layers: a full block glyph covers a
+/// below-text centre line and is covered by an above-text one.
+fn borderStage(allocator: std.mem.Allocator) !u8 {
+    const BW: c_int = 400;
+    const BH: c_int = 160;
+
+    var fbo: c_uint = 0;
+    var rbo: c_uint = 0;
+    c.glGenFramebuffers(1, &fbo);
+    c.glGenRenderbuffers(1, &rbo);
+    c.glBindRenderbuffer(c.GL_RENDERBUFFER, rbo);
+    c.glRenderbufferStorage(c.GL_RENDERBUFFER, c.GL_RGBA8, BW, BH);
+    c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+    c.glFramebufferRenderbuffer(c.GL_FRAMEBUFFER, c.GL_COLOR_ATTACHMENT0, c.GL_RENDERBUFFER, rbo);
+    defer {
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, 0);
+        c.glDeleteFramebuffers(1, &fbo);
+        c.glDeleteRenderbuffers(1, &rbo);
+    }
+    if (c.glCheckFramebufferStatus(c.GL_FRAMEBUFFER) != c.GL_FRAMEBUFFER_COMPLETE) {
+        std.debug.print("smoke-cell: borders FAIL - framebuffer incomplete\n", .{});
+        return 120;
+    }
+
+    const atlas: ?*Atlas = fonts.openAtlas(allocator, FONT_SIZE);
+    if (atlas == null) {
+        std.debug.print("smoke-cell: borders FAIL - no font\n", .{});
+        return 121;
+    }
+    defer atlas.?.deinit();
+    atlas.?.realize();
+
+    var pool = try StylePool.init(allocator);
+    defer pool.deinit();
+    const screen = try Screen.init(allocator, &pool, 26, 6);
+    defer screen.deinit();
+
+    var parser = @import("parser/vt.zig").Parser.init(allocator);
+    defer parser.deinit();
+    const Ctx = struct { screen: *Screen, allocator: std.mem.Allocator };
+    const Emit = struct {
+        fn cb(user: ?*anyopaque, ev: @import("parser/event.zig").Event) void {
+            const ec: *Ctx = @ptrCast(@alignCast(user.?));
+            var mut = ev;
+            ec.screen.apply(ev);
+            mut.deinit(ec.allocator);
+        }
+    };
+    var ec = Ctx{ .screen = screen, .allocator = allocator };
+    const white_block = "\x1b[38;2;255;255;255m\u{2588}\x1b[0m";
+    parser.advance(comptime borderProbeRow(1) ++
+        "\x1b[1;19H" ++ white_block ++ borderSet(1, 19, borders.group.horizontal, 64, "ff0000", .inside, .below_text) ++
+        "\x1b[1;21H" ++ white_block ++ borderSet(1, 21, borders.group.horizontal, 64, "ff0000", .inside, .above_text) ++
+        borderProbeRow(3) ++ "\x1b[3;25H\u{0E01}" ++
+        "\x1b[6;26H", Emit.cb, @ptrCast(&ec));
+
+    var cell_pass = CellPass.init(allocator);
+    defer cell_pass.deinit();
+    try cell_pass.realize();
+    var grid_pass = GridPass.init(allocator);
+    defer grid_pass.deinit();
+    try grid_pass.realize();
+    grid_pass.canvas_w = @floatFromInt(BW);
+    grid_pass.canvas_h = @floatFromInt(BH);
+    var border_pass = border_pass_mod.BorderPass.init(allocator);
+    defer border_pass.deinit();
+    try border_pass.realize();
+
+    c.glViewport(0, 0, BW, BH);
+    c.glClearColor(0, 0, 0, 1);
+    c.glClear(c.GL_COLOR_BUFFER_BIT);
+    try cell_pass.rebuildAndUpload(screen, &pool, atlas.?);
+    try grid_pass.buildVertices(screen, &pool, atlas.?, false, true, &.{});
+    try border_pass.build(screen, &pool, .{
+        .cell_w = atlas.?.cell_w,
+        .cell_h = atlas.?.cell_h,
+        .pad = grid_pass.pad,
+    }, true);
+    @import("render/scene.zig").drawGrid(&cell_pass, &grid_pass, &border_pass, atlas.?, BW, BH);
+    c.glFinish();
+
+    const fb = try allocator.alloc(u8, @as(usize, @intCast(BW * BH)) * 4);
+    defer allocator.free(fb);
+    c.glReadPixels(0, 0, BW, BH, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+
+    const Px = struct {
+        buf: []const u8,
+        w: usize,
+        h: usize,
+        /// RGB at a top-down pixel (glReadPixels is bottom-up).
+        fn at(self: @This(), x: i32, y_top: i32) [3]u8 {
+            const o = ((self.h - 1 - @as(usize, @intCast(y_top))) * self.w + @as(usize, @intCast(x))) * 4;
+            return .{ self.buf[o], self.buf[o + 1], self.buf[o + 2] };
+        }
+        fn is(self: @This(), x: i32, y_top: i32, want: [3]u8) bool {
+            const got = self.at(x, y_top);
+            for (got, want) |g, w| if (@abs(@as(i32, g) - @as(i32, w)) > 8) return false;
+            return true;
+        }
+    };
+    const px = Px{ .buf = fb, .w = @intCast(BW), .h = @intCast(BH) };
+    const cw: i32 = atlas.?.cell_w;
+    const ch: i32 = atlas.?.cell_h;
+    const pad: i32 = @intFromFloat(grid_pass.pad);
+    const t64 = border_pass_mod.thickness(64, cw);
+    const red = [3]u8{ 255, 0, 0 };
+    const green = [3]u8{ 0, 255, 0 };
+    const blue = [3]u8{ 0, 0, 255 };
+    const yellow = [3]u8{ 255, 255, 0 };
+    const magenta = [3]u8{ 255, 0, 255 };
+    const white = [3]u8{ 255, 255, 255 };
+
+    var failures: u32 = 0;
+    const Check = struct {
+        fn expect(ok: bool, what: []const u8, n: *u32) void {
+            if (ok) return;
+            std.debug.print("smoke-cell: borders FAIL - {s}\n", .{what});
+            n.* += 1;
+        }
+    };
+    for ([_]i32{ 0, 2 }) |row| {
+        const y = pad + row * ch + @divFloor(ch, 2);
+        // Inside: flush with the cell's left edge, over its background,
+        // nothing in the neighbour.
+        const left = pad + 2 * cw;
+        Check.expect(px.is(left, y, red) and px.is(left + t64 - 1, y, red), "inside stroke not at the cell edge", &failures);
+        Check.expect(!px.is(left - 1, y, red) and !px.is(left + t64, y, red), "inside stroke leaks", &failures);
+        // Centred: straddles the edge, so it bleeds into the next cell.
+        const edge = pad + 7 * cw;
+        const lo = edge - @divFloor(t64, 2);
+        Check.expect(px.is(lo, y, green) and px.is(lo + t64 - 1, y, green) and px.is(edge, y, green), "centred stroke does not straddle the edge", &failures);
+        Check.expect(!px.is(lo - 1, y, green) and !px.is(lo + t64, y, green), "centred stroke too wide", &failures);
+        // Shared edges: the wider stroke wins, a tie goes right; the
+        // loser draws nothing at all.
+        for ([_]struct { col: i32, winner: [3]u8 }{ .{ .col = 11, .winner = yellow }, .{ .col = 15, .winner = magenta } }) |pair| {
+            const e = pad + pair.col * cw;
+            Check.expect(px.is(e, y, pair.winner), "shared edge winner missing", &failures);
+            var x = e - 3;
+            while (x <= e + 3) : (x += 1) Check.expect(!px.is(x, y, blue), "shared edge loser drawn", &failures);
+        }
+    }
+
+    // Layers: the centre line sits on the middle scanline of row 0.
+    const mid = pad + @divFloor(ch, 2);
+    Check.expect(px.is(pad + 18 * cw + 1, mid, white), "below-text stroke drawn over text", &failures);
+    Check.expect(px.is(pad + 20 * cw + 1, mid, red), "above-text stroke hidden by text", &failures);
+
+    // Pass parity: row 0 (CellPass) and row 2 (GridPass overlay row)
+    // light the same pixels in the probed columns.
+    var mismatched: u32 = 0;
+    var dy: i32 = 0;
+    while (dy < ch) : (dy += 1) {
+        var x = pad;
+        while (x < pad + 17 * cw) : (x += 1) {
+            const a = px.at(x, pad + dy);
+            const b = px.at(x, pad + 2 * ch + dy);
+            if (!std.mem.eql(u8, &a, &b)) mismatched += 1;
+        }
+    }
+    Check.expect(mismatched == 0, "CellPass and GridPass rows differ", &failures);
+    if (failures != 0) {
+        std.debug.print("smoke-cell: borders: {d} failed checks, {d} parity mismatches (cell {d}x{d}, stroke {d}px)\n", .{ failures, mismatched, cw, ch, t64 });
+        return 122;
+    }
+    std.debug.print("smoke-cell: cell borders OK (cell {d}x{d}, stroke {d}px)\n", .{ cw, ch, t64 });
     return 0;
 }

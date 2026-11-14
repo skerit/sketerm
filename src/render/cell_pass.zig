@@ -812,8 +812,36 @@ pub const CellPass = struct {
         for (self.row_needs_upload.items) |*r| r.* = true;
     }
 
+    /// Backgrounds then text: the whole pass, for callers with no
+    /// layer to slot in between (`TerminalSurface` draws the cell-border
+    /// below-text layer there).
     pub fn draw(self: *CellPass, atlas: *Atlas, viewport_w: i32, viewport_h: i32) void {
-        if (self.program == 0 or self.instances.items.len == 0) return;
+        self.drawBackgrounds(atlas, viewport_w, viewport_h);
+        self.drawText(atlas, viewport_w, viewport_h);
+    }
+
+    pub fn drawBackgrounds(self: *CellPass, atlas: *Atlas, viewport_w: i32, viewport_h: i32) void {
+        if (!self.beginDraw(atlas, viewport_w, viewport_h)) return;
+        c.glUniform1i(self.u_kind, 0);
+        c.glDrawArraysInstanced(c.GL_TRIANGLES, 0, 6, @intCast(self.instances.items.len));
+        endDraw();
+    }
+
+    /// Glyphs, then line decorations (underline / double / curly /
+    /// strike / overline). The vertex shader collapses cells with
+    /// deco=0 to a degenerate triangle, so cells without decorations
+    /// cost only the vertex throughput.
+    pub fn drawText(self: *CellPass, atlas: *Atlas, viewport_w: i32, viewport_h: i32) void {
+        if (!self.beginDraw(atlas, viewport_w, viewport_h)) return;
+        c.glUniform1i(self.u_kind, 1);
+        c.glDrawArraysInstanced(c.GL_TRIANGLES, 0, 6, @intCast(self.instances.items.len));
+        c.glUniform1i(self.u_kind, 2);
+        c.glDrawArraysInstanced(c.GL_TRIANGLES, 0, 6, @intCast(self.instances.items.len));
+        endDraw();
+    }
+
+    fn beginDraw(self: *CellPass, atlas: *Atlas, viewport_w: i32, viewport_h: i32) bool {
+        if (self.program == 0 or self.instances.items.len == 0) return false;
         c.glUseProgram(self.program);
         c.glUniform2f(self.u_screen_px, @floatFromInt(viewport_w), @floatFromInt(viewport_h));
         c.glUniform1f(self.u_dim_fg, self.dim_fg);
@@ -823,27 +851,14 @@ pub const CellPass = struct {
         c.glActiveTexture(c.GL_TEXTURE0);
         c.glBindTexture(c.GL_TEXTURE_2D_ARRAY, atlas.gl_tex);
         c.glUniform1i(self.u_atlas, 0);
-
         // Bind the VAO that matches the slot the upload just wrote.
         c.glBindVertexArray(self.tri.vao());
         c.glEnable(c.GL_BLEND);
         c.glBlendFunc(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
+        return true;
+    }
 
-        // Pass 1: backgrounds.
-        c.glUniform1i(self.u_kind, 0);
-        c.glDrawArraysInstanced(c.GL_TRIANGLES, 0, 6, @intCast(self.instances.items.len));
-
-        // Pass 2: glyphs.
-        c.glUniform1i(self.u_kind, 1);
-        c.glDrawArraysInstanced(c.GL_TRIANGLES, 0, 6, @intCast(self.instances.items.len));
-
-        // Pass 3: line decorations (underline / double / curly /
-        // strike / overline). The vertex shader collapses cells with
-        // deco=0 to a degenerate triangle, so cells without
-        // decorations cost only the vertex throughput.
-        c.glUniform1i(self.u_kind, 2);
-        c.glDrawArraysInstanced(c.GL_TRIANGLES, 0, 6, @intCast(self.instances.items.len));
-
+    fn endDraw() void {
         c.glDisable(c.GL_BLEND);
         c.glBindVertexArray(0);
     }

@@ -17,6 +17,7 @@ const Pool = style_pool.Pool;
 const Entry = style_pool.Entry;
 const Attrs = style_pool.Attrs;
 const Color = style_pool.Color;
+const borders = @import("borders.zig");
 const Event = @import("../parser/event.zig").Event;
 const utf8 = @import("../util/utf8.zig");
 const palette_default_256 = @import("palette.zig").default_256;
@@ -1199,8 +1200,9 @@ pub const Screen = struct {
             (if (col > 0 and (ln.cells[col - 1].flags & cell_mod.FLAG_WIDE_LEFT) != 0) col - 1 else null)
         else
             return;
-        ln.cells[col] = .{};
-        if (other) |o| ln.cells[o] = .{};
+        const blank = self.blankStyle();
+        ln.cells[col] = .{ .style_ref = blank };
+        if (other) |o| ln.cells[o] = .{ .style_ref = blank };
         if (self.clusters.count() == 0) return;
         self.clearClusterAt(self.row, col);
         if (other) |o| self.clearClusterAt(self.row, o);
@@ -1638,14 +1640,15 @@ pub const Screen = struct {
             combined.items,
             @as(usize, sb_count) + self.row,
             self.col,
+            self.pool,
         );
 
-        var logicals = try reflow.build(self.allocator, combined.items, false);
+        var logicals = try reflow.build(self.allocator, combined.items, false, self.pool);
         defer {
             for (logicals.items) |*ll| ll.cells.deinit(self.allocator);
             logicals.deinit(self.allocator);
         }
-        reflow.trim(&logicals, self.allocator);
+        reflow.trim(&logicals, self.allocator, self.pool);
 
         var all_rows = try reflow.rechunk(self.allocator, logicals.items, new_cols);
         defer {
@@ -1736,6 +1739,7 @@ pub const Screen = struct {
                     combined.items,
                     @as(usize, sb_count) + old_row,
                     old_col,
+                    self.pool,
                 );
                 const destination = reflow.positionAfterRechunk(
                     logicals.items,
@@ -1814,6 +1818,7 @@ pub const Screen = struct {
     /// so callers can stage on its result before committing the reflow.
     fn mapReflowProbes(
         allocator: std.mem.Allocator,
+        pool: *const Pool,
         combined: []const Line,
         logicals: []const @import("reflow.zig").Logical,
         all_rows: []const Line,
@@ -1834,7 +1839,7 @@ pub const Screen = struct {
                 source.idx += 1;
                 source.col = 0;
             }
-            source.len = reflow.logicalRowLen(combined, row);
+            source.len = reflow.logicalRowLen(combined, row, pool);
             if (anchors.getPtr(ln.id)) |value| value.* = source;
             source.col += @intCast(source.len);
         }
@@ -1910,7 +1915,7 @@ pub const Screen = struct {
             probes[i] = .{ .line_id = entry.key_ptr.line_id, .col = entry.key_ptr.col };
             tiles[i] = entry.value_ptr.*;
         }
-        try mapReflowProbes(self.allocator, combined, logicals, all_rows, new_cols, probes);
+        try mapReflowProbes(self.allocator, self.pool, combined, logicals, all_rows, new_cols, probes);
         try staged.ensureTotalCapacity(n);
         const first_kept = sb_rows - @min(sb_rows, self.scrollback_capacity);
         for (probes, tiles) |p, tile| {
@@ -1937,7 +1942,7 @@ pub const Screen = struct {
         const probes = try self.allocator.alloc(ReflowProbe, self.retained_images.items.len);
         defer self.allocator.free(probes);
         for (self.retained_images.items, probes) |ri, *p| p.* = .{ .line_id = ri.ev.anchor_id, .col = ri.ev.col };
-        try mapReflowProbes(self.allocator, combined, logicals, all_rows, new_cols, probes);
+        try mapReflowProbes(self.allocator, self.pool, combined, logicals, all_rows, new_cols, probes);
 
         const first_kept = sb_rows - @min(sb_rows, self.scrollback_capacity);
         for (self.retained_images.items, probes) |*ri, p| {
@@ -3742,7 +3747,84 @@ pub const Screen = struct {
         };
     }
 
+    // ── Cell borders (`borders.zig`) ─────────────────────────────
+    //
+    // A cell's border set is part of its style (`Entry.border`), so the
+    // pen is simply `cur_style`'s border set, and every path that stamps
+    // `cur_style` (print, BCE erase, DECSC/DECRC, SGR 0 resetting the
+    // entry) carries or clears it without knowing borders exist.
+
+    /// `entry` with border set `set`, interned; on a full pool one
+    /// reclaim and a retry, then null. Takes values, never an index,
+    /// because a reclaim renumbers every style.
+    fn internStyle(self: *Screen, entry: Entry, set: borders.Set) ?u16 {
+        return self.pool.internWithBorders(entry, set) catch |err| switch (err) {
+            error.PoolFull => if (self.reclaimStyles())
+                self.pool.internWithBorders(entry, set) catch null
+            else
+                null,
+            else => null,
+        };
+    }
+
+    /// `source` with its border set changed by `cmd`, or null when the
+    /// pool has no room even after a reclaim.
+    pub fn withBorders(self: *Screen, source: u16, cmd: borders.Command) ?u16 {
+        const entry = self.pool.get(source);
+        const set = cmd.apply(self.pool.borderSet(entry.border));
+        if (entry.border == 0 and borders.isEmpty(set)) return source;
+        return self.internStyle(entry, set);
+    }
+
+    /// `source` without the `mask` segments (the source itself when the
+    /// pool is full: a wide glyph keeps an inner line, nothing worse).
+    fn withoutSegments(self: *Screen, source: u16, mask: borders.Mask) u16 {
+        return self.withBorders(source, .{ .op = .@"pen-clear", .mask = mask }) orelse source;
+    }
+
+    /// The style of a cell the terminal blanks without BCE (scroll and
+    /// ICH/DCH fill, a split wide pair, DECALN): default rendition plus
+    /// the pen's borders, which is the default style while the pen is
+    /// empty.
+    pub fn blankStyle(self: *Screen) u16 {
+        const border = self.pool.get(self.cur_style).border;
+        if (border == 0) return Pool.default_index;
+        return self.internStyle(.{}, self.pool.borderSet(border)) orelse Pool.default_index;
+    }
+
+    fn cellBorder(self: *Screen, body: []const u8) void {
+        const cmd = borders.parse(body) orelse return;
+        switch (cmd.op) {
+            .q => self.respond(borders.query_reply),
+            .pen, .@"pen-clear" => self.cur_style = self.withBorders(self.cur_style, cmd) orelse self.cur_style,
+            .set, .clear => self.applyBorderRect(cmd),
+        }
+    }
+
+    /// `set` / `clear` on the rectangle at the cursor, clipped to the
+    /// screen (not the margins). Running out of styles stops partway,
+    /// which the protocol allows.
+    fn applyBorderRect(self: *Screen, cmd: borders.Command) void {
+        const end_row: u16 = @intCast(@min(@as(u32, self.row) + cmd.rows, self.rows));
+        const end_col: u16 = @intCast(@min(@as(u32, self.col) + cmd.cols, self.cols));
+        defer self.dirty = true;
+        var r = self.row;
+        while (r < end_row) : (r += 1) {
+            const ln = self.line(r);
+            ln.dirty = true;
+            for (ln.cells[self.col..end_col]) |*cell| {
+                cell.style_ref = self.withBorders(cell.style_ref, cmd) orelse return;
+            }
+        }
+    }
+
     fn onDcs(self: *Screen, d: Event.DcsFull) void {
+        if (d.proto.final == 'b' and d.proto.n_intermediates == 1 and d.proto.intermediates[0] == '+' and
+            d.proto.n_params == 1 and d.proto.params[0] == borders.protocol_version)
+        {
+            self.cellBorder(d.body);
+            return;
+        }
         // DECRQSS: `DCS $ q <selector> ST` — request status string.
         if (d.proto.final == 'q' and d.proto.n_intermediates == 1 and d.proto.intermediates[0] == '$') {
             self.handleDecrqss(d.body);
@@ -4340,7 +4422,7 @@ pub const Screen = struct {
         if (has_cont) flags |= cell_mod.FLAG_WIDE_LEFT; // is_wide_left
         ln.cells[self.col] = .{
             .rune = cp,
-            .style_ref = self.cur_style,
+            .style_ref = if (has_cont) self.withoutSegments(self.cur_style, borders.group.right) else self.cur_style,
             .flags = flags,
             .reserved = self.current_link_id,
         };
@@ -4348,7 +4430,7 @@ pub const Screen = struct {
             // Continuation cell: empty rune, is_wide_cont flag.
             ln.cells[self.col + 1] = .{
                 .rune = 0,
-                .style_ref = self.cur_style,
+                .style_ref = self.withoutSegments(self.cur_style, borders.group.left),
                 .flags = cell_mod.FLAG_WIDE_CONT,
                 .reserved = self.current_link_id,
             };
@@ -4901,7 +4983,8 @@ pub const Screen = struct {
     const sgrReadRgb = screen_ops.sgrReadRgb;
     const sgrReadExtColor = screen_ops.sgrReadExtColor;
     const sgr = screen_ops.sgr;
-    const compactStylePool = screen_ops.compactStylePool;
+    pub const compactStylePool = screen_ops.compactStylePool;
+    const reclaimStyles = screen_ops.reclaimStyles;
 
     // ── Debug ────────────────────────────────────────────────────
 

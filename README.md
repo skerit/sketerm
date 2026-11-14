@@ -63,7 +63,8 @@ binary. See [standalone deployment](docs/mcp.md#headless-hosts-sketerm-mcp).
 **Terminal.** Truecolor SGR with all line decorations, Sixel + Kitty +
 iTerm2 images rendered through the GL pipeline, OSC 8 hyperlinks, OSC 52
 clipboard, Kitty keyboard protocol, bracketed paste, focus reporting,
-OSC 133 prompt marks (jump between prompts), scrollback search with
+OSC 133 prompt marks (jump between prompts), cell borders (the draft
+`DCS 1 + b cell-border` protocol), scrollback search with
 regex and smart-case, hint mode, copy mode, cell and background shaders
 with presets, bidi/complex-script shaping, IME through GtkIMMulticontext,
 dead keys, and a `sketerm-256color` terminfo.
@@ -196,6 +197,7 @@ Xvfb. See `docs/testing.md`.
 - [mux design](docs/mux-design.md) -- durable panes and remote domains
 - [GPU / GL](docs/gpu.md) -- `GtkGLArea` lifecycle, share groups, scaling
 - [Images](docs/images.md) -- unified placement model for Sixel, Kitty, iTerm2
+- [Cell borders](docs/cell-borders.md) -- the cell-border protocol: scope and storage
 - [Layout persistence](docs/layout.md) -- save/restore, trust model
 - [Lifecycle](docs/lifecycle.md) -- spawn, signals, teardown
 - [Editor commands](docs/editor-commands.md), [Project layer](docs/project.md), [LSP](docs/lsp.md)

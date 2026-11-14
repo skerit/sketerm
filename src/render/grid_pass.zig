@@ -269,6 +269,22 @@ const Snapshot = struct {
     scrollbar_thumb_active_color: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
+/// The two sweeps over overlay rows: every background, then every glyph.
+const OverlayPhase = enum { backgrounds, text };
+
+/// Spans of the vertex buffer, so `TerminalSurface` can draw the
+/// cell-border layers between them.
+pub const Layer = enum {
+    /// Overlay-row cell backgrounds.
+    backgrounds,
+    /// Overlay-row glyphs and decorations, then every overlay up to and
+    /// including a focused block cursor.
+    text,
+    /// Any other cursor shape, the copy-mode cursor, the pane border
+    /// and the scrollbar.
+    chrome,
+};
+
 pub const GridPass = struct {
     program: c_uint = 0,
     vao: c_uint = 0,
@@ -348,6 +364,10 @@ pub const GridPass = struct {
     /// after `draw` uploads. Cleared by every `buildVertices` rebuild
     /// and by `forgetGL`. When set, `draw` skips the `glBufferData`.
     vbo_uploaded: bool = false,
+    /// Where the `text` and `chrome` layers start in `vbuf`; set by
+    /// every rebuild, so a reused vbuf keeps its own.
+    text_start: usize = 0,
+    chrome_start: usize = 0,
     last_snapshot: Snapshot = .{},
     last_atlas_generations: [atlas_mod.PAGE_COUNT]u32 =
         @as([atlas_mod.PAGE_COUNT]u32, @splat(0)),
@@ -557,22 +577,25 @@ pub const GridPass = struct {
         // `rowNeedsBidi` cell scan entirely. Mostly-static htop-style
         // content stops paying for the per-cell non-ASCII check on
         // every redraw.
-        var row: u16 = 0;
-        while (row < screen.rows) : (row += 1) {
-            const ln_ptr: *const @TypeOf(buf[0]) = if (row < view_off) blk: {
-                const sb_idx = sb_count - view_off + row;
-                break :blk screen.scrollbackLine(sb_idx);
-            } else &buf[row - view_off];
-            const ln = ln_ptr.*;
-            const cells = ln.cells[0..@min(ln.cells.len, @as(usize, screen.cols))];
+        for ([_]OverlayPhase{ .backgrounds, .text }) |phase| {
+            if (phase == .text) self.text_start = self.vbuf.items.len;
+            var row: u16 = 0;
+            while (row < screen.rows) : (row += 1) {
+                const ln_ptr: *const @TypeOf(buf[0]) = if (row < view_off) blk: {
+                    const sb_idx = sb_count - view_off + row;
+                    break :blk screen.scrollbackLine(sb_idx);
+                } else &buf[row - view_off];
+                const ln = ln_ptr.*;
+                const cells = ln.cells[0..@min(ln.cells.len, @as(usize, screen.cols))];
 
-            if (!self.row_caches_valid.items[row]) {
-                self.row_overlay_needed.items[row] =
-                    ln.scaling != .single or rowNeedsBidi(cells);
+                if (phase == .backgrounds and !self.row_caches_valid.items[row]) {
+                    self.row_overlay_needed.items[row] =
+                        ln.scaling != .single or rowNeedsBidi(cells);
+                }
+                if (!self.row_overlay_needed.items[row]) continue;
+
+                try self.emitOverlayRow(phase, atlas, pool, &screen.glyphs, cells, row, cw, ch, ascent, ln.scaling);
             }
-            if (!self.row_overlay_needed.items[row]) continue;
-
-            try self.emitOverlayRow(atlas, pool, &screen.glyphs, cells, row, cw, ch, ascent, ln.scaling);
         }
 
         // Search-result overlay — every match in `screen.search_highlights`
@@ -922,7 +945,10 @@ pub const GridPass = struct {
             }
         }
 
-        // Cursor.
+        // Cursor. A focused block cursor ends the `text` layer, so the
+        // cell-border above-text layer covers it; every other shape
+        // starts `chrome` and stays above all borders.
+        self.chrome_start = self.vbuf.items.len;
         const blinking = switch (screen.cursor_shape) {
             .block_blink, .underline_blink, .bar_blink => true,
             else => false,
@@ -953,6 +979,7 @@ pub const GridPass = struct {
                 switch (screen.cursor_shape) {
                     .block_blink, .block_steady => {
                         try self.pushQuad(.{ cx, cy }, .{ cur_cw, ch }, .{ 0, 0 }, .{ 0, 0 }, .{ fg[0], fg[1], fg[2], block_alpha }, 0.0);
+                        self.chrome_start = self.vbuf.items.len;
                     },
                     .underline_blink, .underline_steady => {
                         const h: f32 = @max(2.0, ch / 8.0);
@@ -1165,11 +1192,14 @@ pub const GridPass = struct {
         return @import("cell_pass.zig").rowNeedsBidiOrComplexShape(cells);
     }
 
-    /// Emit glyphs (and per-cell bg) for a row that needs special
-    /// handling: bidi, DW/DH scaling. The cell pipeline doesn't run on
-    /// these rows, so we have to draw bg + fg here.
+    /// Emit one phase of a row that needs special handling: bidi, DW/DH
+    /// scaling. The cell pipeline doesn't run on these rows, so we have
+    /// to draw bg + fg here; the two phases are separate so every
+    /// overlay row's background lands below the cell-border below-text
+    /// layer and every glyph above it.
     fn emitOverlayRow(
         self: *GridPass,
+        phase: OverlayPhase,
         atlas: *Atlas,
         pool: *const StylePool,
         glossary: *const @import("../grid/glyph_glossary.zig").Glossary,
@@ -1198,14 +1228,17 @@ pub const GridPass = struct {
         // colour or reverse video); the default bg falls through to
         // the clear colour. The resolver applies the same bold-bright
         // lift under reverse that CellPass does.
-        const resolver = self.styleResolver();
-        for (0..cells.len) |visual| {
-            const logical = if (order) |o| o[visual] else visual;
-            const resolved = resolver.resolve(pool.get(cells[logical].style_ref));
-            if (!resolved.has_bg) continue;
-            const x: f32 = pad + @as(f32, @floatFromInt(visual)) * cw * x_scale;
-            // Cell content bg — apply bg-dim when unfocused.
-            try self.pushQuadDim(.{ x, y }, .{ cw * x_scale, ch }, .{ 0, 0 }, .{ 0, 0 }, resolved.bg, 0.0, 2.0);
+        if (phase == .backgrounds) {
+            const resolver = self.styleResolver();
+            for (0..cells.len) |visual| {
+                const logical = if (order) |o| o[visual] else visual;
+                const resolved = resolver.resolve(pool.get(cells[logical].style_ref));
+                if (!resolved.has_bg) continue;
+                const x: f32 = pad + @as(f32, @floatFromInt(visual)) * cw * x_scale;
+                // Cell content bg — apply bg-dim when unfocused.
+                try self.pushQuadDim(.{ x, y }, .{ cw * x_scale, ch }, .{ 0, 0 }, .{ 0, 0 }, resolved.bg, 0.0, 2.0);
+            }
+            return;
         }
 
         // Glyphs — bidi-reorder runs to visual order before shaping.
@@ -1583,8 +1616,23 @@ pub const GridPass = struct {
         };
     }
 
+    /// The whole vertex buffer, for callers with no layer to slot in.
     pub fn draw(self: *GridPass, atlas: *Atlas, viewport_w: i32, viewport_h: i32) void {
-        if (self.vbuf.items.len == 0) return;
+        self.drawSpan(atlas, viewport_w, viewport_h, 0, self.vbuf.items.len);
+    }
+
+    /// One `Layer` of the vertex buffer.
+    pub fn drawLayer(self: *GridPass, atlas: *Atlas, viewport_w: i32, viewport_h: i32, layer: Layer) void {
+        const span: [2]usize = switch (layer) {
+            .backgrounds => .{ 0, self.text_start },
+            .text => .{ self.text_start, self.chrome_start },
+            .chrome => .{ self.chrome_start, self.vbuf.items.len },
+        };
+        self.drawSpan(atlas, viewport_w, viewport_h, span[0], span[1]);
+    }
+
+    fn drawSpan(self: *GridPass, atlas: *Atlas, viewport_w: i32, viewport_h: i32, first: usize, end: usize) void {
+        if (end <= first) return;
         c.glUseProgram(self.program);
         c.glUniform2f(self.u_screen_px, @floatFromInt(viewport_w), @floatFromInt(viewport_h));
         c.glUniform1f(self.u_dim_fg, self.dim_fg);
@@ -1604,7 +1652,7 @@ pub const GridPass = struct {
 
         c.glEnable(c.GL_BLEND);
         c.glBlendFunc(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
-        c.glDrawArrays(c.GL_TRIANGLES, 0, @intCast(self.vbuf.items.len));
+        c.glDrawArrays(c.GL_TRIANGLES, @intCast(first), @intCast(end - first));
         c.glDisable(c.GL_BLEND);
         c.glBindVertexArray(0);
     }

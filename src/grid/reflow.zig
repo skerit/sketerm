@@ -28,6 +28,7 @@ const std = @import("std");
 const cell_mod = @import("cell.zig");
 const Cell = @import("cell.zig").Cell;
 const Line = @import("line.zig").Line;
+const Pool = @import("style_pool.zig").Pool;
 
 pub const Logical = struct {
     /// Concatenated cells from all rows in this logical line.
@@ -56,14 +57,19 @@ fn isValidWidePair(cells: []const Cell, left: usize) bool {
         isWideCont(cells[left + 1]) and cells[left + 1].rune == 0;
 }
 
+/// A blank cell with borders is content: reflow never drops it.
+fn carriesBorder(cell: Cell, pool: *const Pool) bool {
+    return pool.get(cell.style_ref).border != 0;
+}
+
 /// Exclude the structural blank left when a wide pair wrapped early.
-pub fn logicalRowLen(rows: []const Line, row: usize) usize {
+pub fn logicalRowLen(rows: []const Line, row: usize, pool: *const Pool) usize {
     const cells = rows[row].cells;
     if (cells.len == 0 or row + 1 >= rows.len) return cells.len;
     const next = rows[row + 1];
     if (!next.continues_above or !isValidWidePair(next.cells, 0)) return cells.len;
     const last = cells[cells.len - 1];
-    if (last.rune == 0 and last.flags == 0) return cells.len - 1;
+    if (last.rune == 0 and last.flags == 0 and !carriesBorder(last, pool)) return cells.len - 1;
     return cells.len;
 }
 
@@ -88,6 +94,7 @@ pub fn build(
     allocator: std.mem.Allocator,
     rows: []const Line,
     initial_continues: bool,
+    pool: *const Pool,
 ) !std.ArrayList(Logical) {
     var out: std.ArrayList(Logical) = .empty;
     errdefer {
@@ -110,7 +117,7 @@ pub fn build(
             try out.append(allocator, .{});
         }
         const ll = &out.items[out.items.len - 1];
-        try ll.cells.appendSlice(allocator, row.cells[0..logicalRowLen(rows, row_idx)]);
+        try ll.cells.appendSlice(allocator, row.cells[0..logicalRowLen(rows, row_idx, pool)]);
     }
 
     // Set `fully_filled` per logical line: a line is filled if the
@@ -132,11 +139,11 @@ pub fn build(
 /// of-active blank padding, not content. Without this, narrowing
 /// pushes real content into scrollback as the empty logicals consume
 /// active rows.
-pub fn trim(logicals: *std.ArrayList(Logical), allocator: std.mem.Allocator) void {
+pub fn trim(logicals: *std.ArrayList(Logical), allocator: std.mem.Allocator, pool: *const Pool) void {
     for (logicals.items) |*ll| {
         repairMalformedWideCells(ll.cells.items);
         var hi = ll.cells.items.len;
-        while (hi > 0 and ll.cells.items[hi - 1].rune == 0) {
+        while (hi > 0 and ll.cells.items[hi - 1].rune == 0 and !carriesBorder(ll.cells.items[hi - 1], pool)) {
             if (hi >= 2 and isValidWidePair(ll.cells.items, hi - 2)) break;
             hi -= 1;
         }
@@ -228,7 +235,7 @@ pub fn rechunk(
 /// `row` indexes scrollback + active together, so it is `usize`: a large
 /// `scrollback` setting puts it past 65535 and a `u16` counter would wrap
 /// into an infinite loop.
-pub fn positionInLogicals(rows: []const Line, row: usize, col: u16) struct { idx: usize, col: u32 } {
+pub fn positionInLogicals(rows: []const Line, row: usize, col: u16, pool: *const Pool) struct { idx: usize, col: u32 } {
     var idx: usize = 0;
     var col_in: u32 = 0;
     var r: usize = 0;
@@ -238,10 +245,10 @@ pub fn positionInLogicals(rows: []const Line, row: usize, col: u16) struct { idx
             col_in = 0;
         }
         if (r == row) {
-            col_in += @intCast(@min(@as(usize, col), logicalRowLen(rows, r)));
+            col_in += @intCast(@min(@as(usize, col), logicalRowLen(rows, r, pool)));
             break;
         } else {
-            col_in += @intCast(logicalRowLen(rows, r));
+            col_in += @intCast(logicalRowLen(rows, r, pool));
         }
     }
     return .{ .idx = idx, .col = col_in };
@@ -360,13 +367,15 @@ fn putWide(cells: []Cell, col: usize, rune: u32) void {
 
 test "build groups continuations into logical lines" {
     const a = testing.allocator;
+    var pool = try Pool.init(a);
+    defer pool.deinit();
     var rows = [_]Line{
         try makeRow(a, "hello", 5, false),
         try makeRow(a, "world", 5, true), // soft-wrap continuation
         try makeRow(a, "next", 5, false),
     };
     defer for (&rows) |*r| r.deinit(a);
-    var logicals = try build(a, &rows, false);
+    var logicals = try build(a, &rows, false, &pool);
     defer {
         for (logicals.items) |*ll| ll.cells.deinit(a);
         logicals.deinit(a);
@@ -380,18 +389,20 @@ test "build groups continuations into logical lines" {
 
 test "trim drops trailing blank cells from each logical line" {
     const a = testing.allocator;
+    var pool = try Pool.init(a);
+    defer pool.deinit();
     var rows = [_]Line{
         try makeRow(a, "hi", 5, false),
         try makeRow(a, "x", 5, false),
     };
     defer for (&rows) |*r| r.deinit(a);
-    var logicals = try build(a, &rows, false);
+    var logicals = try build(a, &rows, false, &pool);
     defer {
         for (logicals.items) |*ll| ll.cells.deinit(a);
         logicals.deinit(a);
     }
     try testing.expectEqual(@as(usize, 5), logicals.items[0].cells.items.len);
-    trim(&logicals, a);
+    trim(&logicals, a, &pool);
     try testing.expectEqual(@as(usize, 2), logicals.items.len);
     try testing.expectEqual(@as(usize, 2), logicals.items[0].cells.items.len);
     try testing.expectEqual(@as(usize, 1), logicals.items[1].cells.items.len);
@@ -399,16 +410,18 @@ test "trim drops trailing blank cells from each logical line" {
 
 test "trim preserves a wide pair in the final old columns" {
     const a = testing.allocator;
+    var pool = try Pool.init(a);
+    defer pool.deinit();
     var row = try makeRow(a, "ab", 4, false);
     defer row.deinit(a);
     putWide(row.cells, 2, 0x754C);
 
-    var logicals = try build(a, &.{row}, false);
+    var logicals = try build(a, &.{row}, false, &pool);
     defer {
         for (logicals.items) |*ll| ll.cells.deinit(a);
         logicals.deinit(a);
     }
-    trim(&logicals, a);
+    trim(&logicals, a, &pool);
 
     try testing.expectEqual(@as(usize, 4), logicals.items[0].cells.items.len);
     try testing.expect(isValidWidePair(logicals.items[0].cells.items, 2));
@@ -416,6 +429,8 @@ test "trim preserves a wide pair in the final old columns" {
 
 test "build removes only the blank inserted before a wrapped wide pair" {
     const a = testing.allocator;
+    var pool = try Pool.init(a);
+    defer pool.deinit();
     var rows = [_]Line{
         try makeRow(a, "ab", 3, false),
         try makeRow(a, "", 3, true),
@@ -424,12 +439,12 @@ test "build removes only the blank inserted before a wrapped wide pair" {
     putWide(rows[1].cells, 0, 0x754C);
     rows[1].cells[2].rune = 'c';
 
-    var logicals = try build(a, &rows, false);
+    var logicals = try build(a, &rows, false, &pool);
     defer {
         for (logicals.items) |*ll| ll.cells.deinit(a);
         logicals.deinit(a);
     }
-    trim(&logicals, a);
+    trim(&logicals, a, &pool);
 
     const cells = logicals.items[0].cells.items;
     try testing.expectEqual(@as(usize, 5), cells.len);
@@ -441,17 +456,19 @@ test "build removes only the blank inserted before a wrapped wide pair" {
 
 test "rechunk places a wide pair at exact and off-by-one boundaries" {
     const a = testing.allocator;
+    var pool = try Pool.init(a);
+    defer pool.deinit();
     var row = try makeRow(a, "ab", 5, false);
     defer row.deinit(a);
     putWide(row.cells, 2, 0x754C);
     row.cells[4].rune = 'c';
 
-    var logicals = try build(a, &.{row}, false);
+    var logicals = try build(a, &.{row}, false, &pool);
     defer {
         for (logicals.items) |*ll| ll.cells.deinit(a);
         logicals.deinit(a);
     }
-    trim(&logicals, a);
+    trim(&logicals, a, &pool);
 
     const exact = try rechunk(a, logicals.items, 4);
     defer {
@@ -480,13 +497,15 @@ test "rechunk places a wide pair at exact and off-by-one boundaries" {
 
 test "rechunk repairs malformed wide halves and rejects an impossible width" {
     const a = testing.allocator;
+    var pool = try Pool.init(a);
+    defer pool.deinit();
     var row = try makeRow(a, "", 3, false);
     defer row.deinit(a);
     row.cells[0] = .{ .flags = wide_cont };
     row.cells[1] = .{ .rune = 'x' };
     row.cells[2] = .{ .rune = 0x754C, .flags = wide_left };
 
-    var logicals = try build(a, &.{row}, false);
+    var logicals = try build(a, &.{row}, false, &pool);
     defer {
         for (logicals.items) |*ll| ll.cells.deinit(a);
         logicals.deinit(a);
@@ -503,7 +522,7 @@ test "rechunk repairs malformed wide halves and rejects an impossible width" {
     var valid_row = try makeRow(a, "", 2, false);
     defer valid_row.deinit(a);
     putWide(valid_row.cells, 0, 0x754C);
-    var valid = try build(a, &.{valid_row}, false);
+    var valid = try build(a, &.{valid_row}, false, &pool);
     defer {
         for (valid.items) |*ll| ll.cells.deinit(a);
         valid.deinit(a);
@@ -524,17 +543,19 @@ test "rechunk repairs malformed wide halves and rejects an impossible width" {
 
 test "positionAfterRechunk stays in range on a one-column grid" {
     const a = testing.allocator;
+    var pool = try Pool.init(a);
+    defer pool.deinit();
     var row = try makeRow(a, "", 4, false);
     defer row.deinit(a);
     putWide(row.cells, 0, 0x754C);
     putWide(row.cells, 2, 0x754D);
 
-    var logicals = try build(a, &.{row}, false);
+    var logicals = try build(a, &.{row}, false, &pool);
     defer {
         for (logicals.items) |*ll| ll.cells.deinit(a);
         logicals.deinit(a);
     }
-    trim(&logicals, a);
+    trim(&logicals, a, &pool);
     const rows = try rechunk(a, logicals.items, 1);
     defer {
         for (rows) |*line| line.deinit(a);
@@ -553,11 +574,13 @@ test "positionAfterRechunk stays in range on a one-column grid" {
 
 test "PositionCursor incremental seeks match independent mapping across wide pairs and padding" {
     const a = testing.allocator;
+    var pool = try Pool.init(a);
+    defer pool.deinit();
     var row = try makeRow(a, "abcdefghi", 9, false);
     defer row.deinit(a);
     putWide(row.cells, 2, 0x754C);
     putWide(row.cells, 6, 0x754D);
-    var logicals = try build(a, &.{row}, false);
+    var logicals = try build(a, &.{row}, false, &pool);
     defer {
         for (logicals.items) |*ll| ll.cells.deinit(a);
         logicals.deinit(a);
@@ -582,17 +605,19 @@ test "PositionCursor incremental seeks match independent mapping across wide pai
 
 test "rechunk widens — 'hellowor' in 5-col rows becomes 1 row at 10 cols" {
     const a = testing.allocator;
+    var pool = try Pool.init(a);
+    defer pool.deinit();
     var rows = [_]Line{
         try makeRow(a, "hello", 5, false),
         try makeRow(a, "wor", 5, true),
     };
     defer for (&rows) |*r| r.deinit(a);
-    var logicals = try build(a, &rows, false);
+    var logicals = try build(a, &rows, false, &pool);
     defer {
         for (logicals.items) |*ll| ll.cells.deinit(a);
         logicals.deinit(a);
     }
-    trim(&logicals, a);
+    trim(&logicals, a, &pool);
     const out = try rechunk(a, logicals.items, 10);
     defer {
         for (out) |*r| r.deinit(a);
@@ -606,16 +631,18 @@ test "rechunk widens — 'hellowor' in 5-col rows becomes 1 row at 10 cols" {
 
 test "rechunk narrows — 'hellowor' in 8-col row becomes 2 rows at 4 cols" {
     const a = testing.allocator;
+    var pool = try Pool.init(a);
+    defer pool.deinit();
     var rows = [_]Line{
         try makeRow(a, "hellowor", 8, false),
     };
     defer for (&rows) |*r| r.deinit(a);
-    var logicals = try build(a, &rows, false);
+    var logicals = try build(a, &rows, false, &pool);
     defer {
         for (logicals.items) |*ll| ll.cells.deinit(a);
         logicals.deinit(a);
     }
-    trim(&logicals, a);
+    trim(&logicals, a, &pool);
     const out = try rechunk(a, logicals.items, 4);
     defer {
         for (out) |*r| r.deinit(a);
@@ -632,28 +659,32 @@ test "rechunk narrows — 'hellowor' in 8-col row becomes 2 rows at 4 cols" {
 
 test "positionInLogicals: row 1 col 2 in a 2-row logical line → idx 0 col 7" {
     const a = testing.allocator;
+    var pool = try Pool.init(a);
+    defer pool.deinit();
     var rows = [_]Line{
         try makeRow(a, "hello", 5, false),
         try makeRow(a, "world", 5, true),
     };
     defer for (&rows) |*r| r.deinit(a);
-    const p = positionInLogicals(&rows, 1, 2);
+    const p = positionInLogicals(&rows, 1, 2, &pool);
     try testing.expectEqual(@as(usize, 0), p.idx);
     try testing.expectEqual(@as(u32, 7), p.col);
 }
 
 test "positionAfterRechunk: idx 0 col 7 → row 0 col 7 at new_cols=10" {
     const a = testing.allocator;
+    var pool = try Pool.init(a);
+    defer pool.deinit();
     var rows = [_]Line{
         try makeRow(a, "helloworld", 10, false),
     };
     defer for (&rows) |*r| r.deinit(a);
-    var logicals = try build(a, &rows, false);
+    var logicals = try build(a, &rows, false, &pool);
     defer {
         for (logicals.items) |*ll| ll.cells.deinit(a);
         logicals.deinit(a);
     }
-    trim(&logicals, a);
+    trim(&logicals, a, &pool);
     const p = positionAfterRechunk(logicals.items, &rows, 0, 7, 10);
     try testing.expectEqual(@as(usize, 0), p.row);
     try testing.expectEqual(@as(u16, 7), p.col);

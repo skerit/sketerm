@@ -15,8 +15,9 @@ pub const Stage = enum(u8) {
     cell_rebuild,
     cell_rebuild_loop,
     cell_upload,
-    cell_draw,
     grid_build,
+    /// The whole grid paint (`render/scene.zig`): both cell passes and
+    /// both border layers.
     grid_draw,
     image_pass,
 };

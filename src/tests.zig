@@ -172,6 +172,8 @@ comptime {
     _ = @import("parser/wezterm_conformance_test.zig");
     _ = @import("grid/cell.zig");
     _ = @import("grid/style_pool.zig");
+    _ = @import("grid/borders.zig");
+    _ = @import("grid/borders_screen_test.zig");
     _ = @import("grid/screen.zig");
     _ = @import("grid/selection.zig");
     _ = @import("grid/selection_conformance_test.zig");
@@ -472,6 +474,7 @@ comptime {
     _ = @import("render/atlas.zig");
     _ = @import("render/cell_pass.zig");
     _ = @import("render/grid_pass.zig");
+    _ = @import("render/border_pass.zig");
     _ = @import("render/style.zig");
     _ = @import("ui/input_conformance_test.zig");
     _ = @import("parser/multicell_conformance_test.zig");

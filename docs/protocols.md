@@ -203,6 +203,7 @@ Default behavior per app:
 | `q`    | Sixel image                               | ✓ |
 | `$q`   | DECRQSS — report setting (m / r / SP q)   | ✓ |
 | `+q`   | XTGETTCAP — terminfo query                | ✓ (TN, Co, RGB, Tc, bce, U8, civis/cnorm, csr, Su) |
+| `1+b`  | Cell borders (draft protocol v1 baseline) | ✓ (`docs/cell-borders.md`) |
 | `P`    | DECUDK — user-defined keys                | never |
 
 DECRQSS answers `DCS 1 $ r <setting> ST` for three selectors and

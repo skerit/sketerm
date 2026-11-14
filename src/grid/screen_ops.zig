@@ -516,8 +516,9 @@ pub fn escFinal(self: *Screen, ef: Event.EscFinal) void {
     // DECALN — `ESC # 8` fills the screen with 'E' for an
     // alignment pattern. Used by `vttest`.
     if (ef.n_intermediates == 1 and ef.intermediates[0] == '#' and ef.final == '8') {
+        const blank = self.blankStyle();
         for (self.buf()) |*ln| {
-            for (ln.cells) |*cell| cell.* = .{ .rune = 'E', .style_ref = 0, .flags = 0, .reserved = 0 };
+            for (ln.cells) |*cell| cell.* = .{ .rune = 'E', .style_ref = blank, .flags = 0, .reserved = 0 };
             ln.dirty = true;
         }
         self.row = 0;
@@ -612,6 +613,10 @@ pub fn fullReset(self: *Screen) void {
     self.row = 0;
     self.col = 0;
     self.cur_style = 0;
+    // RIS clears the pen and every border, scrollback and the other
+    // buffer included; a pen parked in DECSC must not come back either.
+    self.saved_style = 0;
+    dropAllBorders(self);
     self.scroll_top = 0;
     self.scroll_bot = if (self.rows > 0) self.rows - 1 else 0;
     self.autowrap = true;
@@ -828,6 +833,9 @@ pub fn scrollUp(self: *Screen, n: u32) void {
     const region: u16 = self.scroll_bot - self.scroll_top + 1;
     const move: u16 = @intCast(@min(n, @as(u32, region)));
     const lines = self.buf();
+    // New blank lines take the pen. Resolved before anything is
+    // captured: a pool-full reclaim here renumbers styles.
+    const blank = self.blankStyle();
 
     const push_to_sb = !self.use_alt and self.scroll_top == 0;
 
@@ -901,7 +909,7 @@ pub fn scrollUp(self: *Screen, n: u32) void {
         while (i < move) : (i += 1) {
             const dst = self.scroll_bot - move + 1 + i;
             lines[dst].cells = plan[i].cells;
-            @memset(lines[dst].cells, .{});
+            @memset(lines[dst].cells, .{ .style_ref = blank });
             lines[dst].continues_above = false;
             lines[dst].id = self.nextLineId();
             lines[dst].scaling = .single;
@@ -910,7 +918,7 @@ pub fn scrollUp(self: *Screen, n: u32) void {
         var i: u16 = self.scroll_top;
         while (i <= self.scroll_bot) : (i += 1) {
             lines[i].cells = plan[i - self.scroll_top].cells;
-            @memset(lines[i].cells, .{});
+            @memset(lines[i].cells, .{ .style_ref = blank });
             lines[i].continues_above = false;
             lines[i].id = self.nextLineId();
             lines[i].scaling = .single;
@@ -928,6 +936,7 @@ pub fn scrollDown(self: *Screen, n: u32) void {
     const region: u16 = self.scroll_bot - self.scroll_top + 1;
     const move: u16 = @intCast(@min(n, @as(u32, region)));
     const lines = self.buf();
+    const blank = self.blankStyle();
 
     if (move < region) {
         // move=1 is the steady-state RI path; stack scratch up to
@@ -957,7 +966,7 @@ pub fn scrollDown(self: *Screen, n: u32) void {
         i = 0;
         while (i < move) : (i += 1) {
             lines[self.scroll_top + i].cells = stash[i];
-            @memset(lines[self.scroll_top + i].cells, .{});
+            @memset(lines[self.scroll_top + i].cells, .{ .style_ref = blank });
             lines[self.scroll_top + i].continues_above = false;
             lines[self.scroll_top + i].id = self.nextLineId();
             lines[self.scroll_top + i].scaling = .single;
@@ -965,7 +974,7 @@ pub fn scrollDown(self: *Screen, n: u32) void {
     } else {
         var i: u16 = self.scroll_top;
         while (i <= self.scroll_bot) : (i += 1) {
-            @memset(lines[i].cells, .{});
+            @memset(lines[i].cells, .{ .style_ref = blank });
             lines[i].continues_above = false;
             lines[i].id = self.nextLineId();
             lines[i].scaling = .single;
@@ -995,8 +1004,9 @@ pub fn insertChars(self: *Screen, n: u32) void {
         cells[i - 1] = cells[i - 1 - move];
     }
     // Clear the inserted cells.
+    const blank = self.blankStyle();
     var k: u16 = 0;
-    while (k < move) : (k += 1) cells[col + k] = .{};
+    while (k < move) : (k += 1) cells[col + k] = .{ .style_ref = blank };
     ln.dirty = true;
 }
 
@@ -1021,7 +1031,8 @@ pub fn deleteChars(self: *Screen, n: u32) void {
     while (i + move < cells.len) : (i += 1) {
         cells[i] = cells[i + move];
     }
-    while (i < cells.len) : (i += 1) cells[i] = .{};
+    const blank = self.blankStyle();
+    while (i < cells.len) : (i += 1) cells[i] = .{ .style_ref = blank };
     ln.dirty = true;
 }
 
@@ -1124,6 +1135,7 @@ pub fn modeSet(self: *Screen, params: Event.Csi, set: bool) void {
             1015 => self.mouse_enc = if (set) .urxvt else .legacy,
             1016 => self.mouse_enc = if (set) .sgr_pixel else .legacy,
             47, 1047 => toggleAltScreen(self, set),
+            1048 => if (set) saveCursor(self) else restoreCursor(self),
             1049 => {
                 // 1049 = save cursor + switch alt + clear alt on
                 // set; restore cursor + switch main on reset.
@@ -1370,7 +1382,7 @@ pub fn sgr(self: *Screen, params: Event.Csi) void {
         // persists — the "ghost text too bright / remains" bug in
         // long truecolor TUI sessions. Garbage-collect the styles
         // no live cell references, then retry once.
-        compactStylePool(self, );
+        if (!reclaimStyles(self)) break :blk self.cur_style;
         break :blk self.pool.intern(entry) catch self.cur_style;
     };
 }
@@ -1445,15 +1457,37 @@ pub fn sgrParams(e: Entry, buf: []u8) ![]const u8 {
     return buf[0..len];
 }
 
+/// Reclaim after an intern hit a full pool: collect styles and border
+/// sets nothing references. Returns whether anything was freed. One
+/// that frees nothing arms `Pool.reclaim_cooldown`, so a pool full of
+/// live styles is not rescanned (every cell of every line) per cell.
+pub fn reclaimStyles(self: *Screen) bool {
+    const pool = self.pool;
+    if (pool.reclaim_cooldown > 0) {
+        pool.reclaim_cooldown -= 1;
+        return false;
+    }
+    const styles_before = pool.entries.items.len;
+    const free_sets_before = pool.border_free.items.len;
+    compactStylePool(self);
+    const freed = pool.entries.items.len < styles_before or pool.border_free.items.len > free_sets_before;
+    if (!freed) pool.reclaim_cooldown = Pool.reclaim_backoff;
+    return freed;
+}
+
 /// Garbage-collect the interned style pool. Walks every live cell
 /// (active + alt + scrollback) plus `cur_style` / `saved_style`,
 /// keeps only the referenced entries (entry 0 / default always
-/// survives at slot 0), and rewrites every `style_ref` to the
-/// compacted indices. No-op if it can't allocate scratch or if
-/// every entry is still live (genuinely 64K distinct styles on
-/// screen — pathological, nothing to reclaim).
+/// survives at slot 0), rewrites every `style_ref` to the
+/// compacted indices, then frees the border sets no surviving entry
+/// uses. No-op if it can't allocate scratch or if every entry is
+/// still live (genuinely 64K distinct styles on screen —
+/// pathological, nothing to reclaim).
 pub fn compactStylePool(self: *Screen) void {
     const pool = self.pool;
+    // Whatever happens to the entries, no unrooted border ID is in hand
+    // here, so the sets the remaining entries do not use can go.
+    defer pool.collectBorders();
     const old_len = pool.entries.items.len;
     if (old_len == 0) return;
 
@@ -1506,6 +1540,14 @@ pub fn compactStylePool(self: *Screen) void {
         return;
     }
 
+    remapStyleRefs(self, remap);
+    pool.replaceEntries(new_entries);
+}
+
+/// Rewrite every style reference through `remap` (old index -> new);
+/// an index past it or mapped to `Pool.unused_index` becomes the
+/// default style. Marks the whole screen for redraw.
+fn remapStyleRefs(self: *Screen, remap: []const u16) void {
     const remapRef = struct {
         fn f(r: []const u16, ref: u16) u16 {
             if (ref >= r.len) return 0;
@@ -1528,12 +1570,31 @@ pub fn compactStylePool(self: *Screen) void {
         for (ln.cells) |*cell| cell.style_ref = remapRef(remap, cell.style_ref);
     }
 
-    pool.replaceEntries(new_entries);
-
-    // Cell contents shifted style indices — force a full redraw.
     for (self.active) |*l| l.dirty = true;
     if (self.alt) |alt| for (alt) |*l| {
         l.dirty = true;
     };
     self.dirty = true;
+}
+
+/// RIS: strip the borders from every style any cell, buffer or
+/// scrollback line uses, then collect the bordered entries and sets.
+fn dropAllBorders(self: *Screen) void {
+    const pool = self.pool;
+    if (!pool.hasBorders()) return;
+    const old_len = pool.entries.items.len;
+    const remap = self.allocator.alloc(u16, old_len) catch return;
+    defer self.allocator.free(remap);
+    for (remap, 0..) |*r, i| {
+        var entry = pool.entries.items[i];
+        if (entry.border == 0) {
+            r.* = @intCast(i);
+            continue;
+        }
+        entry.border = 0;
+        // A full pool loses the rendition along with the borders.
+        r.* = pool.intern(entry) catch Pool.default_index;
+    }
+    remapStyleRefs(self, remap);
+    compactStylePool(self);
 }
