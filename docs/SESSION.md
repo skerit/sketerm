@@ -1,5 +1,13 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-14: a leftover scroll offset no longer skews the alt screen
+
+Shift+PageUp, scrollback_top and the wheel could set `view_offset` while
+an app was on the alt screen, where the renderers ignore it. Hints,
+copy-mode positions, image anchors and `extractScreen` still applied it.
+They now read `Screen.clampedViewOffset()` and the setters cap at
+`viewableScrollback()`, which is 0 on the alt screen.
+
 ## 2026-11-14: web_trace
 
 `web_trace` records the engine's own trace of a headless tab (start/stop or
