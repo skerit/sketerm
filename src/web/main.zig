@@ -51,6 +51,18 @@ const USAGE =
     \\
 ;
 
+/// `SKETERM_WEB_STDERR=/abs/path` appends this helper's stderr, and so its engine subprocesses' and CEF's, to that
+/// file instead of the launcher's pipe; the owner's `web_diagnostic` excerpt is then empty. Ignored when untrusted.
+fn redirectStderr() void {
+    const where = std.mem.span(c.getenv("SKETERM_WEB_STDERR") orelse return);
+    if (where.len == 0 or where[0] != '/') return;
+    const fd = c.open(where.ptr, c.O_WRONLY | c.O_APPEND | c.O_CREAT | c.O_CLOEXEC, @as(c_uint, 0o600));
+    if (fd < 0) return;
+    // dup2 clears close-on-exec on the duplicate, so every re-exec and subprocess inherits it.
+    _ = c.dup2(fd, 2);
+    _ = c.close(fd);
+}
+
 /// Marks a process that already re-exec'd; CEF's own subprocesses
 /// inherit it through the environment and so never re-exec themselves.
 const PRELOAD_GUARD = "SKETERM_WEB_PRELOADED";
@@ -86,6 +98,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             }
         }
     }
+    if (!restricted and !subprocess and c.getenv(PRELOAD_GUARD) == null) redirectStderr();
 
     // (1) DT_NEEDED order workaround, LINUX ONLY. Zig always emits libc
     // BEFORE libcef, and libcef's zygote resolves dlsym(RTLD_NEXT,

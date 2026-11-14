@@ -100,7 +100,7 @@ pub const Session = struct {
         if (self.requests.items.len >= MAX_REQUESTS) return error.TooManyRequests;
         try self.requests.ensureUnusedCapacity(self.gpa, 1);
         const id = execute(browser, method, params_json);
-        if (trace()) traceLine("devtools view={d} send {s} id={d}", .{ self.view, method, id });
+        if (trace()) host_mod.logLine("devtools view={d} send {s} id={d}", .{ self.view, method, id });
         if (id <= 0) return error.DevToolsRefused;
         _ = self.track(id, timeout_ms, sink, member);
         if (self.findMut(id)) |r| r.method = method;
@@ -214,7 +214,7 @@ pub const Session = struct {
         const r = self.findMut(id) orelse return;
         if (r.state != .pending) return;
         r.answered_ms = clock.nowMs();
-        if (trace()) traceLine("devtools view={d} result id={d} success={d} bytes={d}", .{ self.view, id, @intFromBool(success), payload.len });
+        if (trace()) host_mod.logLine("devtools view={d} result id={d} success={d} bytes={d}", .{ self.view, id, @intFromBool(success), payload.len });
         if (!success) {
             const msg = errorMessage(payload);
             r.state = .failed;
@@ -258,7 +258,7 @@ pub const Session = struct {
         self.event_count +|= 1;
         var name = host_mod.Utf8.init(method);
         defer name.free();
-        if (trace()) traceLine("devtools view={d} event {s} bytes={d}", .{ self.view, name.slice(), size });
+        if (trace()) host_mod.logLine("devtools view={d} event {s} bytes={d}", .{ self.view, name.slice(), size });
         // The agent outlives a renderer crash; what was pending there is never answered.
         if (std.mem.eql(u8, name.slice(), "Inspector.targetCrashed")) {
             for (self.requests.items) |*r| if (r.state == .pending) self.fail(r, "the page's renderer crashed");
@@ -272,7 +272,7 @@ pub const Session = struct {
         defer host_mod.releaseArg(browser);
         const self = Ref.owner(@ptrCast(arg));
         if (!self.matches(browser)) return;
-        if (trace()) traceLine("devtools view={d} agent detached", .{self.view});
+        if (trace()) host_mod.logLine("devtools view={d} agent detached", .{self.view});
         self.detached = true;
         for (self.requests.items) |*r| if (r.state == .pending) self.fail(r, "the DevTools agent detached before the method was answered");
     }
@@ -280,20 +280,9 @@ pub const Session = struct {
 
 const Ref = host_mod.HeapRef(Session, "observer");
 
-/// `SKETERM_WEB_DEVTOOLS_TRACE` logs every method, result and event of every session to stderr, or appends to the absolute file it names.
+/// `SKETERM_WEB_DEVTOOLS_TRACE` logs every method, result and event of every session to stderr.
 fn trace() bool {
     return c.getenv("SKETERM_WEB_DEVTOOLS_TRACE") != null;
-}
-
-fn traceLine(comptime fmt: []const u8, args: anytype) void {
-    const where = std.mem.span(c.getenv("SKETERM_WEB_DEVTOOLS_TRACE") orelse return);
-    if (where.len == 0 or where[0] != '/') return host_mod.logLine(fmt, args);
-    var buf: [512]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, "sketerm-web: " ++ fmt ++ "\n", args) catch return;
-    const fd = c.open(where.ptr, c.O_WRONLY | c.O_APPEND | c.O_CREAT | c.O_CLOEXEC, @as(c_uint, 0o600));
-    if (fd < 0) return;
-    defer _ = c.close(fd);
-    _ = c.write(fd, line.ptr, line.len);
 }
 
 /// Submit one method; a positive id means queued only.

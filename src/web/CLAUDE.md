@@ -1010,6 +1010,15 @@ offset destroys 1px detail into uniform gray on its own.
 - `SKETERM_WEB_LAT=1` runs the hover latency probe.
 - `zig build measure-web` is the latency/sharpness rig; it reproduces a
   fractional 1.5x desktop through sketerm's own compositor.
+- **The helper's stderr is a bounded datagram pipe to its owner**
+  (`web/diagnostic.zig`, surfaced only as `web_diagnostic`'s 8 KiB excerpt).
+  To read it live, start the helper with `SKETERM_WEB_STDERR=/abs/path`:
+  `main.zig` appends fd 2 there before anything else runs, so `logLine`,
+  `SKETERM_WEB_DEVTOOLS_TRACE`, the engine subprocesses and CEF's own log
+  (`SKETERM_WEB_LOG=verbose` raises it) all land in that file and the
+  diagnostic excerpt goes empty. Ignored for untrusted helpers. The variable
+  must be in the LAUNCHER's environment: the MCP server or GUI for a direct
+  helper, the daemon for a broker-owned engine.
 
 ## "DevTools open" verdicts are load, not the engine (measured 2026-10-12)
 
@@ -1059,8 +1068,8 @@ Rules:
   nothing may run a perf op by default: the dt stage is the check.
 - No remote debugging port, ever.
 - `SKETERM_WEB_DEVTOOLS_TRACE=1` logs every method, result and event to
-  stderr; an absolute path appends there instead (the MCP lane captures the
-  helper's stderr for `web_diagnostic`, so a file is how to read it live).
+  stderr (`SKETERM_WEB_STDERR`, under "Measuring anything here", puts it in
+  a file you can read live).
 - Measured: `Tracing.start` through this per-view session succeeds and
   `Tracing.dataCollected` + `Tracing.tracingComplete` arrive; the method
   RESULT of `Tracing.end` did not arrive within 10s, so a tracing client must
