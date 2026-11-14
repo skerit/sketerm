@@ -11415,20 +11415,25 @@ test "web_open and web_tabs carry the identity a view lives in" {
 }
 
 test "every tool this module serves declares an output schema" {
-    // The dispatcher routes every web_* name here, so a tool added
-    // without a schema fails here rather than silently shipping a
-    // text-only result.
+    // The dispatcher routes the browser group here by name, so a tool
+    // added without a schema fails here rather than silently shipping a
+    // text-only result, and the web_ prefix and the group must agree.
     const mcp_tools = @import("mcp_tools.zig");
     var seen: usize = 0;
     for (mcp_tools.TOOLS) |tool| {
-        if (!std.mem.startsWith(u8, tool.name, "web_")) continue;
+        const web = std.mem.startsWith(u8, tool.name, "web_");
+        if (web != (tool.group == .browser)) {
+            std.debug.print("{s}: the web_ prefix and the browser group disagree\n", .{tool.name});
+            return error.GroupPrefixMismatch;
+        }
+        if (!web) continue;
         seen += 1;
         if (tool.output_schema == null) {
             std.debug.print("{s} has no output schema\n", .{tool.name});
             return error.MissingOutputSchema;
         }
     }
-    try std.testing.expectEqual(@as(usize, 37), seen);
+    try std.testing.expectEqual(std.enums.values(mcp_tools.GroupTool(.browser)).len, seen);
 }
 
 test "web_trace's output schema names every field its summary emits" {
