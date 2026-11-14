@@ -13,6 +13,17 @@
 
 pub const main = @import("web/main.zig").main;
 
+/// No per-thread alternate signal stack: std's 256 KiB default is a STATIC
+/// TLS block, and glibc carves static TLS out of every thread's stack, so any
+/// engine thread asking for a small stack failed to start. V8's sampling
+/// profiler thread (64 KiB) did, and its CHECK killed the renderer at
+/// `Profiler.start` (measured: TLS segment 0x40018 bytes, renderer SIGTRAP).
+pub const std_options: @import("std").Options = blk: {
+    var o: @import("std").Options = .{};
+    if (@hasField(@import("std").Options, "signal_stack_size")) o.signal_stack_size = null;
+    break :blk o;
+};
+
 test {
     _ = @import("web/cefhost.zig");
     _ = @import("web/cefhost/semlayer.zig");
