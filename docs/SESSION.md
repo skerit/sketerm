@@ -1,5 +1,22 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-14: conceal renders; DL keeps scrollback clean; one wrap rule; one visible-row home
+
+SGR 8 (conceal) was parsed and stored but never drawn: concealed text
+showed. `style.Resolver` now reports `text` (false under conceal), and
+CellPass, GridPass, ligature runs and overstrike layers all skip the
+glyph and every SGR line decoration for it, keeping the background as
+xterm does. Borders, copy and the a11y text still see the cell.
+smoke-cell's conceal stage asserts background-only, kept borders and
+pass parity; its three GL stages now share one `shoot` helper.
+`scrollUp` takes an explicit `ScrollOff`: LF/IND and SU save rows leaving
+a region at row 0 (xterm `xtermScroll`), DL discards them (kitty; xterm
+saves there). A wrap pending when DECAWM is reset is dropped and the next
+print overwrites the last column (xterm `dotext`); the normal and
+overstrike print paths share `takePendingWrap`. The renderers map a
+viewport row to its line through `Screen.visibleLine`/`visibleCells`/
+`clampedViewOffset`; `lineCellsAtPub` is now `lineCellsAt`.
+
 ## 2026-11-14: overstrike (mintty `CSI 8:7 m` / DECSET 20)
 
 While overstrike is on, a print draws on top of the cell under the
