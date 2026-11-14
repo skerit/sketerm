@@ -342,7 +342,7 @@ pub const Renderer = struct {
         var r: u16 = 0;
         while (r < self.rows) : (r += 1) {
             const logical: i32 = @as(i32, r) - view_off;
-            const cells: ?[]Cell = screen.lineCellsAtPub(logical);
+            const cells: ?[]Cell = screen.lineCellsAt(logical);
             const on_active = logical >= 0 and logical < @as(i32, screen.rows);
             const overlay: ?[]const u8 = if (r == 0 and ind.len > 0) ind else null;
             var col: u16 = 0;

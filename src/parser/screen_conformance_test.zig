@@ -620,3 +620,63 @@ test "parser.py: CSI 11 t reports window state (not iconified)" {
     h.feed("\x1b[11t");
     try std.testing.expectEqualStrings("\x1b[1t", h.wtc.items);
 }
+
+// ── xterm reference behaviour (charproc.c / util.c) ──────────────
+
+test "xterm: DECAWM reset while a wrap is pending drops the wrap; the print overwrites the last column" {
+    var h = try Harness.init(std.testing.allocator, 4, 3);
+    defer h.deinit();
+    h.feed("abcd");
+    try std.testing.expect(h.screen.pending_wrap);
+    h.feed("\x1b[?7lX");
+    try h.expectLine(0, "abcX");
+    try h.expectLine(1, "");
+    try h.expectCursor(0, 3);
+    try std.testing.expect(!h.screen.pending_wrap);
+    // DECAWM back on: a pending wrap set from here on wraps again.
+    h.feed("\x1b[?7hYZ");
+    try h.expectLine(0, "abcY");
+    try h.expectLine(1, "Z");
+    try std.testing.expect(h.screen.line(1).continues_above);
+}
+
+test "xterm: DL at the top row discards; LF and SU at a full-height region feed scrollback" {
+    var h = try Harness.init(std.testing.allocator, 4, 3);
+    defer h.deinit();
+    h.feed("a\r\nb\r\nc\x1b[1;1H\x1b[M");
+    try std.testing.expectEqual(@as(usize, 0), h.screen.scrollbackCount());
+    try h.expectLine(0, "b");
+    h.feed("\x1b[2M");
+    try std.testing.expectEqual(@as(usize, 0), h.screen.scrollbackCount());
+    h.feed("\x1b[3;1Hx\r\ny\r\nz\x1b[S");
+    try std.testing.expectEqual(@as(usize, 3), h.screen.scrollbackCount());
+    try h.expectLine(0, "y");
+    // Inside a region that does not start at row 0 nothing is saved.
+    h.feed("\x1b[2;3r\x1b[3;1H\n\x1b[S");
+    try std.testing.expectEqual(@as(usize, 3), h.screen.scrollbackCount());
+}
+
+test "xterm: concealed text is still copied" {
+    var h = try Harness.init(std.testing.allocator, 8, 1);
+    defer h.deinit();
+    h.feed("a\x1b[8mbc\x1b[28md");
+    h.select(0, 0, 0, 4);
+    try h.expectSelection("abcd");
+}
+
+test "visibleLine: scrollback rows first while scrolled back, clamped, never on the alt screen" {
+    var h = try Harness.init(std.testing.allocator, 4, 2);
+    defer h.deinit();
+    h.feed("a\r\nb\r\nc\r\nd");
+    const s = h.screen;
+    s.view_offset = 1;
+    try std.testing.expectEqual(@as(u32, 'b'), s.visibleCells(0)[0].rune);
+    try std.testing.expectEqual(@as(u32, 'c'), s.visibleCells(1)[0].rune);
+    s.view_offset = 99;
+    try std.testing.expectEqual(@as(u32, 2), s.clampedViewOffset());
+    try std.testing.expectEqual(@as(u32, 'a'), s.visibleLine(0).cells[0].rune);
+    h.feed("\x1b[?1049hz");
+    try std.testing.expectEqual(@as(u32, 0), s.clampedViewOffset());
+    try std.testing.expectEqual(@as(u32, 'z'), s.visibleCells(0)[0].rune);
+    try std.testing.expectEqual(@as(usize, 4), s.visibleCells(1).len);
+}

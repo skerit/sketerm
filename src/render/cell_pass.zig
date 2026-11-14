@@ -546,9 +546,8 @@ pub const CellPass = struct {
         const ascent: f32 = @floatFromInt(atlas.ascent);
         const pad = self.pad;
 
-        const buf = if (screen.use_alt) screen.alt.? else screen.active;
-        const sb_count: u32 = if (screen.use_alt) 0 else screen.scrollbackCount();
-        const view_off: u32 = @min(screen.view_offset, sb_count);
+        const sb_count: u32 = screen.viewableScrollback();
+        const view_off: u32 = screen.clampedViewOffset();
 
         // Scroll-position change: every row sources from a different
         // line. Mark all dirty exactly once on the change instead of
@@ -567,10 +566,9 @@ pub const CellPass = struct {
         var any_built = false;
         var row: u16 = 0;
         while (row < screen.rows) : (row += 1) {
-            const ln_ptr: *Line = if (row < view_off) blk: {
-                const sb_idx = sb_count - view_off + row;
-                break :blk @constCast(screen.scrollbackLine(sb_idx));
-            } else &buf[row - view_off];
+            // The passes clear `dirty` on the line they drew, scrollback
+            // lines included; the Screen hands every line out const.
+            const ln_ptr: *Line = @constCast(screen.visibleLine(row));
 
             const need_rebuild = ln_ptr.*.dirty or self.row_needs_upload.items[row] or atlas_evicted;
             if (!need_rebuild) continue;
@@ -642,6 +640,7 @@ pub const CellPass = struct {
         var cached_bg: [4]f32 = .{ 0, 0, 0, 0 };
         var cached_has_bg: bool = false;
         var cached_deco: f32 = 0;
+        var cached_text: bool = true;
         var cached_deco_color: [4]f32 = .{ 0, 0, 0, 0 };
         var cached_italic: f32 = 0;
         var cached_attr_italic: bool = false;
@@ -662,7 +661,9 @@ pub const CellPass = struct {
                 cached_fg = resolved.fg;
                 cached_bg = if (resolved.has_bg) resolved.bg else .{ 0, 0, 0, 0 };
                 cached_has_bg = resolved.has_bg;
-                cached_deco = @floatFromInt(@intFromEnum(style_util.decoKind(style.attrs)));
+                cached_text = resolved.text;
+                // Concealed text keeps its background only.
+                cached_deco = if (resolved.text) @floatFromInt(@intFromEnum(style_util.decoKind(style.attrs))) else 0;
                 cached_deco_color = resolved.deco;
                 cached_attr_italic = style.attrs.italic;
                 // Shader shear is the fallback for families without a
@@ -682,7 +683,7 @@ pub const CellPass = struct {
             // Per-codepoint glyph (will be overridden by ligature shaping
             // below if applicable). Bold pulls a real bold glyph from the
             // atlas (bold face or outline-embolden) — no shader fakery.
-            if (cell.rune != 0 and cell.rune != ' ' and (cell.flags & cell_mod.FLAG_WIDE_CONT) == 0) {
+            if (cached_text and cell.rune != 0 and cell.rune != ' ' and (cell.flags & cell_mod.FLAG_WIDE_CONT) == 0) {
                 const g = atlas.lookupGlyph(glossary, cell.rune, cached_bold > 0.5, cached_attr_italic, cached_fg) catch continue;
                 if (g.w > 0 and g.h > 0) {
                     const gx: f32 = cx + @as(f32, @floatFromInt(g.bearing_x)) * x_scale;
@@ -735,6 +736,7 @@ pub const CellPass = struct {
             for (list[0..overlay.count(list)]) |layer| {
                 const r = layer.rendition();
                 const resolved = resolver.resolveOver(r, under);
+                if (!resolved.text) continue;
                 const bold = r.attrs.bold and self.allow_bold;
                 var inst = Instance{
                     .cell_xy = base.cell_xy,
@@ -850,11 +852,21 @@ pub const CellPass = struct {
             if (!lig_ascii_only) continue;
             if (blen == 0) continue;
 
+            // Must match rebuildRow's resolution exactly (bold-bright
+            // lift, reverse swap, dim attenuation, conceal) — otherwise
+            // ligature glyphs render with a different fg than the
+            // surrounding cells. The most visible failure mode: dim
+            // placeholder text containing `...`, `->`, `=>` etc. shows a
+            // bright glyph at the ligature anchor while the rest stays dim.
+            const style = pool.get(run_style);
+            const resolved = self.styleResolver().resolve(style);
+            if (!resolved.text) continue;
+            const fg = resolved.fg;
+
             // Styled runs shape + rasterize against the matching face
             // (or synthesize) so the ligature matches its cells.
-            const run_attrs = pool.get(run_style).attrs;
-            const run_bold = run_attrs.bold and self.allow_bold;
-            const run_italic = run_attrs.italic;
+            const run_bold = style.attrs.bold and self.allow_bold;
+            const run_italic = style.attrs.italic;
 
             // Atlas owns the cached shape slice — do NOT free.
             const shaped = atlas.shapeRun(self.allocator, bytes[0..blen], run_bold, run_italic) catch continue;
@@ -863,15 +875,6 @@ pub const CellPass = struct {
             // Clear all run cells' glyphs first; we'll repopulate.
             var cc: u16 = run_start;
             while (cc < run_start + run_len) : (cc += 1) instances[cc].has_glyph = 1.0;
-
-            const style = pool.get(run_style);
-            // Must match rebuildRow's resolution exactly (bold-bright
-            // lift, reverse swap, dim attenuation) — otherwise ligature
-            // glyphs render with a different fg than the surrounding
-            // cells. The most visible failure mode: dim placeholder
-            // text containing `...`, `->`, `=>` etc. shows a bright
-            // glyph at the ligature anchor while the rest stays dim.
-            const fg = self.styleResolver().resolve(style).fg;
 
             for (shaped) |sg| {
                 const cluster_col = run_start + @as(u16, @intCast(@min(@as(usize, sg.cluster), @as(usize, run_len) - 1)));

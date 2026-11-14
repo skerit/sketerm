@@ -24,6 +24,8 @@ them.
   IL/DL/scrolling, SGR 0, DECSC/DECRC, modes 1048/1049, DECSTR, RIS,
   DECCOLM, DECALN), rectangles, reflow, scrollback and the alternate
   screen.
+- Borders ignore the cell's text rendition: a concealed (SGR 8) cell
+  hides its glyph and decorations but still draws its borders.
 - The capability reply is `ok;1;pen,rect,half,center,palette`.
 
 ## Not supported

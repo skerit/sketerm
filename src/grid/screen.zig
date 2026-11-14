@@ -2460,14 +2460,33 @@ pub const Screen = struct {
 
     /// Returns the cells slice for a display row, including scrollback
     /// (negative rows). Returns null on out-of-range.
-    fn lineCellsAt(self: *const Screen, row: i32) ?[]Cell {
+    pub fn lineCellsAt(self: *const Screen, row: i32) ?[]Cell {
         return if (self.lineAt(row)) |l| l.cells else null;
     }
 
-    /// Public alias of lineCellsAt for UI lookups (e.g. mouse-cell
-    /// resolution that needs to peek at scrollback).
-    pub fn lineCellsAtPub(self: *const Screen, row: i32) ?[]Cell {
-        return self.lineCellsAt(row);
+    /// Scrollback rows the viewport can show: none on the alt screen.
+    pub fn viewableScrollback(self: *const Screen) u32 {
+        return if (self.use_alt) 0 else self.scrollbackCount();
+    }
+
+    /// `view_offset` clamped to `viewableScrollback`: how many scrollback
+    /// rows sit above the live rows in the viewport. `view_offset` itself
+    /// can exceed it, e.g. a Shift+PageUp on the alt screen.
+    pub fn clampedViewOffset(self: *const Screen) u32 {
+        return @min(self.view_offset, self.viewableScrollback());
+    }
+
+    /// The line the viewport shows at `row` (< rows), scrollback rows
+    /// first while scrolled back: the one row-to-line mapping every
+    /// pass draws through.
+    pub fn visibleLine(self: *const Screen, row: u16) *const Line {
+        return self.lineAt(@as(i32, row) - @as(i32, @intCast(self.clampedViewOffset()))).?;
+    }
+
+    /// `visibleLine(row)`'s cells, clamped to `cols`.
+    pub fn visibleCells(self: *const Screen, row: u16) []Cell {
+        const ln = self.visibleLine(row);
+        return ln.cells[0..@min(ln.cells.len, @as(usize, self.cols))];
     }
 
     /// The monotonic id of the line at a display row (negative rows index
@@ -3167,7 +3186,7 @@ pub const Screen = struct {
         if (vcol < 0 or vcol >= @as(i32, @intCast(self.cols))) return null;
 
         const url_scan = @import("url_scan.zig");
-        const cells = self.lineCellsAtPub(vrow) orelse return null;
+        const cells = self.lineCellsAt(vrow) orelse return null;
         var matches: [16]url_scan.Match = undefined;
         const n = url_scan.scanRow(cells, &matches);
         if (n == 0) return null;
@@ -4274,9 +4293,7 @@ pub const Screen = struct {
                     self.col = self.cols - 1;
                     continue;
                 }
-                self.lineFeed();
-                self.col = 0;
-                self.line(self.row).continues_above = true;
+                self.wrapLine();
                 continue;
             }
             const can_write: u16 = @min(total - i, remaining);
@@ -4332,14 +4349,10 @@ pub const Screen = struct {
     /// as a narrow print does, wide codepoints included. A pool with no
     /// room even after a reclaim drops the layer; the cursor still moves.
     fn overstrikeCp(self: *Screen, cp: u32) void {
-        if (self.pending_wrap) {
-            if (self.autowrap and !isExtendingCp(cp)) {
-                self.lineFeed();
-                self.col = 0;
-                self.line(self.row).continues_above = true;
-            }
-            self.pending_wrap = false;
-        }
+        // mintty never wraps for a zero-width codepoint; it still drops
+        // the pending flag, which `takePendingWrap` then sees cleared.
+        if (isExtendingCp(cp)) self.pending_wrap = false;
+        self.takePendingWrap();
         if (self.cols == 0 or self.rows == 0) return;
         if (self.col >= self.cols) self.col = self.cols - 1;
         const ln = self.line(self.row);
@@ -4430,15 +4443,9 @@ pub const Screen = struct {
 
         const width: u8 = if (isWideCp(cp)) 2 else 1;
 
+        self.takePendingWrap();
         // Wide char near right edge wraps before placing.
-        if (self.pending_wrap or (width == 2 and self.col + 1 >= self.cols)) {
-            self.lineFeed();
-            self.col = 0;
-            self.pending_wrap = false;
-            // Mark the new line as a soft-wrap continuation; future
-            // reflow can join wrapped paragraphs.
-            self.line(self.row).continues_above = true;
-        }
+        if (width == 2 and self.col + 1 >= self.cols) self.wrapLine();
         if (self.col >= self.cols) return;
 
         var ln = self.line(self.row);
@@ -4655,15 +4662,9 @@ pub const Screen = struct {
     /// none: kitty does not lay placeholders out on them.
     pub fn collectPlaceholderRuns(self: *const Screen, allocator: std.mem.Allocator, out: *std.ArrayList(PlaceholderRun)) !void {
         if (self.ph_tiles.count() == 0) return;
-        const lines = if (self.use_alt) self.alt.? else self.active;
-        const sb_count: u32 = if (self.use_alt) 0 else self.scrollbackCount();
-        const view_off: u32 = @min(self.view_offset, sb_count);
         var row: u16 = 0;
         while (row < self.rows) : (row += 1) {
-            const ln: *const Line = if (row < view_off)
-                self.scrollbackLine(sb_count - view_off + row)
-            else
-                &lines[row - view_off];
+            const ln = self.visibleLine(row);
             if (ln.scaling != .single) continue;
             var open: ?PlaceholderRun = null;
             var col: u16 = 0;
@@ -4981,9 +4982,30 @@ pub const Screen = struct {
         return 0;
     }
 
+    /// Resolves a pending autowrap before a print, the one rule both
+    /// print paths follow: the flag is consumed either way, and wraps
+    /// only if DECAWM is set NOW. xterm's `dotext` (charproc.c) checks
+    /// `WRAPAROUND` when it consumes `do_wrap`, and resetting DECAWM
+    /// (`srm_DECAWM`) leaves `do_wrap` alone, so `?7l` between the wrap
+    /// becoming pending and the next print makes that print overwrite
+    /// the last column.
+    fn takePendingWrap(self: *Screen) void {
+        if (!self.pending_wrap) return;
+        self.pending_wrap = false;
+        if (self.autowrap) self.wrapLine();
+    }
+
+    /// An autowrap: the cursor moves to column 0 of the next line, which
+    /// is marked as a soft-wrap continuation so reflow can rejoin it.
+    fn wrapLine(self: *Screen) void {
+        self.lineFeed();
+        self.col = 0;
+        self.line(self.row).continues_above = true;
+    }
+
     pub fn lineFeed(self: *Screen) void {
         if (self.row == self.scroll_bot) {
-            self.scrollUp(1);
+            self.scrollUp(1, .save_at_top);
         } else if (self.row + 1 < self.rows) {
             self.row += 1;
         }
@@ -5750,7 +5772,7 @@ fn runScrollFailureScenario(scenario: ScrollFailureScenario, fail_index: ?usize)
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, config);
     const old_allocator = screen.allocator;
     screen.allocator = failing.allocator();
-    screen.scrollUp(scrollScenarioMove(scenario));
+    screen.scrollUp(scrollScenarioMove(scenario), .save_at_top);
     screen.allocator = old_allocator;
 
     if (fail_index != null) {
@@ -5941,7 +5963,7 @@ test "column resize in alt screen normalizes main scrollback width" {
     try s.resize(9, 3);
     for (s.scrollback.items) |ln| try std.testing.expectEqual(@as(usize, 9), ln.cells.len);
     s.toggleAltScreen(false);
-    s.scrollUp(1);
+    s.scrollUp(1, .save_at_top);
     for (s.active) |ln| try std.testing.expectEqual(@as(usize, 9), ln.cells.len);
 }
 
@@ -6003,7 +6025,7 @@ test "scroll up moves content" {
     s.execute('\r');
     s.execute('\n');
     s.printCp('c');
-    s.scrollUp(1);
+    s.scrollUp(1, .save_at_top);
     try std.testing.expectEqual(@as(u32, 'b'), s.cellAt(0, 0).rune);
     try std.testing.expectEqual(@as(u32, 'c'), s.cellAt(1, 0).rune);
     try std.testing.expectEqual(@as(u32, 0), s.cellAt(2, 0).rune);
@@ -6018,7 +6040,7 @@ test "zero-capacity first scroll keeps no history and reuses the row" {
 
     s.active[0].cells[0].rune = 'x';
     const top_cells = s.active[0].cells.ptr;
-    s.scrollUp(1);
+    s.scrollUp(1, .save_at_top);
 
     try std.testing.expectEqual(@as(u32, 0), s.scrollbackCount());
     try std.testing.expectEqual(@as(usize, 0), s.scrollback_head);
@@ -7405,7 +7427,7 @@ test "OSC 133 ; A records prompt mark with line ID" {
 
     // Mark survives scrolling: scroll once, the row at id2 is now at
     // row 1 (or in scrollback), but rowForLineId resolves both.
-    s.scrollUp(1);
+    s.scrollUp(1, .save_at_top);
     const r1 = s.rowForLineId(id1);
     const r2 = s.rowForLineId(id2);
     try std.testing.expect(r1 != null);
@@ -7793,7 +7815,7 @@ test "OSC 133 C/D bounds the last-command-output zone" {
 
     // Zone survives scrolling into scrollback.
     var k: u32 = 0;
-    while (k < 6) : (k += 1) s.scrollUp(1);
+    while (k < 6) : (k += 1) s.scrollUp(1, .save_at_top);
     const out2 = (try s.extractLastCommandOutput(std.testing.allocator)).?;
     defer std.testing.allocator.free(out2);
     try std.testing.expectEqualStrings("file1\nfile2\n", out2);
@@ -7927,7 +7949,7 @@ test "command-zone ring: membership, selection, fast row lookup" {
     // Fast lookup agrees with the linear walk after scrolling the
     // zones into scrollback.
     var k: u32 = 0;
-    while (k < 6) : (k += 1) s.scrollUp(1);
+    while (k < 6) : (k += 1) s.scrollUp(1, .save_at_top);
     const fail_z = s.cmdZone(1).?;
     try std.testing.expectEqual(
         s.rowForLineId(fail_z.start_id),
@@ -7944,7 +7966,7 @@ test "jumpPrevPrompt scrolls into scrollback" {
     s.row = 0;
     s.onOsc("133;A");
     var k: u32 = 0;
-    while (k < 10) : (k += 1) s.scrollUp(1);
+    while (k < 10) : (k += 1) s.scrollUp(1, .save_at_top);
     try std.testing.expectEqual(@as(u32, 0), s.view_offset);
     const off = s.jumpPrevPrompt();
     try std.testing.expect(off != null);
@@ -9154,7 +9176,7 @@ test "scroll within region preserves DECDWL scaling of shifted lines" {
     var s = try Screen.init(std.testing.allocator, &pool, 10, 4);
     defer s.deinit();
     s.active[2].scaling = .dwl;
-    s.scrollUp(1);
+    s.scrollUp(1, .save_at_top);
     try std.testing.expectEqual(@import("line.zig").Scaling.dwl, s.active[1].scaling);
     // The recycled bottom row must come back as single-width.
     try std.testing.expectEqual(@import("line.zig").Scaling.single, s.active[3].scaling);
@@ -9397,7 +9419,7 @@ test "imageRowForAnchor tracks multiple anchors through a wrapped ring" {
 
     // Five scrolls rotate the full ring while both anchors survive in
     // logical slots 0 and 1, which are physical slots 1 and 2.
-    for (0..5) |_| s.scrollUp(1);
+    for (0..5) |_| s.scrollUp(1, .save_at_top);
     try std.testing.expect(s.scrollback_head != 0);
     try std.testing.expectEqual(older, s.scrollbackLine(0).id);
     try std.testing.expectEqual(newer, s.scrollbackLine(1).id);
@@ -9411,12 +9433,12 @@ test "imageRowForAnchor tracks multiple anchors through a wrapped ring" {
 
     // One more push evicts only the older anchor. The newer anchor is
     // offscreen, not evicted, until the following push removes it too.
-    s.scrollUp(1);
+    s.scrollUp(1, .save_at_top);
     try std.testing.expectEqual(Screen.ImageRow.evicted, s.imageRowForAnchor(older));
     try std.testing.expectEqual(Screen.ImageRow.offscreen, s.imageRowForAnchor(newer));
     s.view_offset = s.scrollbackCount();
     try expectImageAnchorVisible(s, newer, 0);
-    s.scrollUp(1);
+    s.scrollUp(1, .save_at_top);
     try std.testing.expectEqual(Screen.ImageRow.evicted, s.imageRowForAnchor(newer));
 }
 
@@ -9427,7 +9449,7 @@ test "imageRowForAnchor preserves surviving anchors across capacity shrink" {
     defer s.deinit();
     try s.setScrollbackCapacity(5);
 
-    for (0..7) |_| s.scrollUp(1);
+    for (0..7) |_| s.scrollUp(1, .save_at_top);
     try std.testing.expect(s.scrollback_head != 0);
     const dropped = s.scrollbackLine(0).id;
     const surviving = s.scrollbackLine(2).id;
@@ -9554,7 +9576,7 @@ test "retained positional deletion follows anchors rather than stale rows or vie
     s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 2, .col = 0, .image_id = 1 });
     s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 0, .col = 1, .image_id = 2, .cells_high = 2 });
     s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 2, .col = 2, .image_id = 3, .anchor_id = std.math.maxInt(u64) });
-    s.scrollUp(1);
+    s.scrollUp(1, .save_at_top);
     s.view_offset = 1;
     s.pruneRetainedImages(.{ .what = 'p', .x = 0, .y = 2 });
     try std.testing.expectEqual(@as(usize, 3), s.retained_images.items.len);
@@ -9583,7 +9605,7 @@ test "retained positional deletion succeeds with all allocations denied" {
         s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 1, .col = 1, .z_index = 2 });
         s.retained_images.items[2].ev.anchor_id = 0; // Legacy pinned placement.
         s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 1, .col = 1, .z_index = 2, .anchor_id = std.math.maxInt(u64) });
-        s.scrollUp(1);
+        s.scrollUp(1, .save_at_top);
         s.view_offset = 1;
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
         s.allocator = failing.allocator();
@@ -9604,10 +9626,10 @@ test "batch line lookup resolves unordered large history duplicates and missing 
     defer s.deinit();
     try s.setScrollbackCapacity(70000);
     const missing = s.nextLineId();
-    for (0..70000) |_| s.scrollUp(1);
+    for (0..70000) |_| s.scrollUp(1, .save_at_top);
     const evicted = s.scrollbackLine(0).id;
     s.scrollDown(1);
-    s.scrollUp(2);
+    s.scrollUp(2, .save_at_top);
     try std.testing.expect(s.scrollback_head != 0);
     // A real reverse-scroll produces nonmonotonic history, not just a fixture edit.
     try std.testing.expect(s.scrollbackLine(69998).id > s.scrollbackLine(69999).id);
@@ -9750,7 +9772,7 @@ test "retained reanchor batches large history and long logical lines with dead a
                 for (ln.cells) |*cell| cell.rune = 'x';
                 ln.continues_above = wrapped;
             }
-            s.scrollUp(1);
+            s.scrollUp(1, .save_at_top);
         }
         for (s.active) |*ln| {
             for (ln.cells) |*cell| cell.rune = 'x';
@@ -9924,7 +9946,7 @@ test "next_line_id advances on scroll, not on in-place print" {
     // Scrolling births new lines — the activity drain can short-circuit
     // (definite visible change) without hashing.
     const before_scroll = s.next_line_id;
-    s.scrollUp(1);
+    s.scrollUp(1, .save_at_top);
     try std.testing.expect(s.next_line_id > before_scroll);
 }
 

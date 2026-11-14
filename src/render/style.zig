@@ -133,6 +133,12 @@ pub const Resolver = struct {
         eff_bg: [4]f32,
         /// Underline / strikethrough / overline colour.
         deco: [4]f32,
+        /// The glyph and its SGR line decorations are drawn. False
+        /// under SGR 8 (conceal), which keeps only the background:
+        /// xterm's `updatedXtermGC` (util.c) paints INVISIBLE text and
+        /// its underline in the bg colour. Cell borders and the copied
+        /// text ignore it.
+        text: bool,
     };
 
     fn rgba(self: Resolver, color: Color, is_fg: bool) [4]f32 {
@@ -171,7 +177,7 @@ pub const Resolver = struct {
             .default => fg,
             else => self.rgba(style.underline_color, true),
         };
-        return .{ .fg = fg, .bg = bg, .has_bg = has_bg and under == null, .eff_bg = eff_bg, .deco = deco };
+        return .{ .fg = fg, .bg = bg, .has_bg = has_bg and under == null, .eff_bg = eff_bg, .deco = deco, .text = !style.attrs.invisible };
     }
 };
 
@@ -649,6 +655,16 @@ test "Resolver: reverse swaps after the lift, so a bold cell's bg is bright" {
     try std.testing.expectEqual(r.default_bg, flipped.fg);
     try std.testing.expectEqual(r.default_fg, flipped.bg);
     try std.testing.expect(flipped.has_bg);
+}
+
+test "Resolver: conceal keeps the background and drops text, for a layer too" {
+    var pal: [256][3]u8 = std.mem.zeroes([256][3]u8);
+    const r = testResolver(&pal, true, 1.0);
+    const hidden = r.resolve(.{ .bg = .{ .palette = 4 }, .attrs = .{ .invisible = true, .underline = true } });
+    try std.testing.expect(!hidden.text);
+    try std.testing.expect(hidden.has_bg);
+    try std.testing.expect(r.resolve(.{ .bg = .{ .palette = 4 } }).text);
+    try std.testing.expect(!r.resolveOver(.{ .attrs = .{ .invisible = true } }, r.default_bg).text);
 }
 
 test "Resolver: dim attenuates the drawn text colour, even the reversed one" {

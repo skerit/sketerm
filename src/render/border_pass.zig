@@ -262,12 +262,11 @@ pub const BorderPass = struct {
             self.built = false;
             return;
         }
-        const sb_count: u32 = if (screen.use_alt) 0 else screen.scrollbackCount();
         const key = Key{
             .geometry = geometry,
             .rows = screen.rows,
             .cols = screen.cols,
-            .view_off = @min(screen.view_offset, sb_count),
+            .view_off = screen.clampedViewOffset(),
             .use_alt = screen.use_alt,
             .default_fg = if (screen.reverse_screen) screen.default_bg else screen.default_fg,
             .palette = screen.palette,
@@ -278,7 +277,7 @@ pub const BorderPass = struct {
         try self.ids.resize(self.allocator, n);
         for (0..key.rows) |row| {
             const out = self.ids.items[row * key.cols ..][0..key.cols];
-            const cells = screen.lineCellsAtPub(@as(i32, @intCast(row)) - @as(i32, @intCast(key.view_off))) orelse &.{};
+            const cells = screen.visibleCells(@intCast(row));
             for (out, 0..) |*id, col| {
                 id.* = if (col < cells.len) pool.get(cells[col].style_ref).border else 0;
             }

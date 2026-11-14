@@ -18,7 +18,7 @@ pub const Pos = struct { row: i32, col: u16 };
 /// a stray bracket in a long scrollback from turning one keystroke
 /// into a full-buffer scan on the main loop.
 pub fn matchAt(screen: *const Screen, row: i32, col: u16, max_rows: i32) ?Pos {
-    const cells = screen.lineCellsAtPub(row) orelse return null;
+    const cells = screen.lineCellsAt(row) orelse return null;
     if (col >= cells.len) return null;
     const here = cells[col].rune;
 
@@ -53,7 +53,7 @@ pub fn matchAt(screen: *const Screen, row: i32, col: u16, max_rows: i32) ?Pos {
         rows_left -= 1;
         r += dir;
         if (r < -sb or r > last_row) return null;
-        line = screen.lineCellsAtPub(r) orelse return null;
+        line = screen.lineCellsAt(r) orelse return null;
         c = if (dir > 0) 0 else @as(i32, @intCast(line.len)) - 1;
     }
 }

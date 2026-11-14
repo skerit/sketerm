@@ -690,7 +690,7 @@ pub fn copyModeFind(self: *Window, kind: u8, ch: u32) void {
 /// Column an f/F/t/T motion for `ch` lands on, or null when `ch` is
 /// not on that side of `col` in `row`.
 pub fn findTarget(screen: *const Screen, row: i32, col: u16, kind: u8, ch: u32) ?u16 {
-    const cells = screen.lineCellsAtPub(row) orelse return null;
+    const cells = screen.lineCellsAt(row) orelse return null;
     const hit = switch (kind) {
         'f' => wm.findForward(cells, col, ch, false),
         't' => wm.findForward(cells, col, ch, true),
@@ -723,7 +723,7 @@ pub fn paragraphTarget(screen: *const Screen, from: i32, dir: i32) i32 {
 }
 
 fn copyModeRowBlank(screen: *const Screen, row: i32) bool {
-    const cells = screen.lineCellsAtPub(row) orelse return true;
+    const cells = screen.lineCellsAt(row) orelse return true;
     for (cells) |cell| {
         if (cell.rune != 0 and cell.rune != ' ') return false;
     }
@@ -856,7 +856,7 @@ pub fn copyModeWord(self: *Window, dir: WordDir, kind: wm.Kind) void {
 /// buffer edge, where the cursor stays put.
 pub fn wordTarget(screen: *const Screen, row: i32, col: u16, dir: WordDir, kind: wm.Kind) ?Screen.CopyCursor {
     const chars = screen.word_chars;
-    if (screen.lineCellsAtPub(row)) |cells| {
+    if (screen.lineCellsAt(row)) |cells| {
         const hit = switch (dir) {
             .next => wm.nextStart(cells, chars, col, kind),
             .prev => wm.prevStart(cells, chars, col, kind),
@@ -871,7 +871,7 @@ pub fn wordTarget(screen: *const Screen, row: i32, col: u16, dir: WordDir, kind:
     while (true) {
         r = if (forward) r + 1 else r - 1;
         if (r < ext.top or r > ext.bottom) return null;
-        const cells = screen.lineCellsAtPub(r) orelse continue;
+        const cells = screen.lineCellsAt(r) orelse continue;
         const hit = switch (dir) {
             .next => wm.firstStart(cells, chars, kind),
             .prev => wm.lastStart(cells, chars, kind),
@@ -958,7 +958,7 @@ pub fn onCopyModeKey(ctx: ?*anyopaque, keyval: c_uint, state: c.GdkModifierType)
 /// Column of the last non-blank cell on a display row ($ motion).
 /// Blank line → column 0.
 pub fn copyModeLineEnd(screen: *const Screen, row: i32) i32 {
-    const cells = screen.lineCellsAtPub(row) orelse return 0;
+    const cells = screen.lineCellsAt(row) orelse return 0;
     var i: usize = cells.len;
     while (i > 0 and cells[i - 1].rune == 0) i -= 1;
     if (i == 0) return 0;
@@ -967,7 +967,7 @@ pub fn copyModeLineEnd(screen: *const Screen, row: i32) i32 {
 
 /// Column of the first non-blank cell on a display row (^ motion).
 pub fn copyModeLineStart(screen: *const Screen, row: i32) i32 {
-    const cells = screen.lineCellsAtPub(row) orelse return 0;
+    const cells = screen.lineCellsAt(row) orelse return 0;
     for (cells, 0..) |cell, i| {
         if (cell.rune != 0 and cell.rune != ' ') return @intCast(i);
     }

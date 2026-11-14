@@ -1164,7 +1164,7 @@ fn readLine(allocator: std.mem.Allocator, screen: *const Screen, row: i32) !Line
         break :blk d;
     };
     var full = false;
-    if (screen.lineCellsAtPub(row)) |cells| {
+    if (screen.lineCellsAt(row)) |cells| {
         if (cells.len > 0) {
             const last = cells[cells.len - 1];
             full = last.rune != 0 or last.flags & cell_mod.FLAG_WIDE_CONT != 0;

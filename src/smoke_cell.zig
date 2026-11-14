@@ -1366,6 +1366,12 @@ pub fn main() !u8 {
         if (rc != 0) return rc;
     }
 
+    // SGR 8 conceal: background only, borders kept, parity.
+    {
+        const rc = try concealStage(allocator);
+        if (rc != 0) return rc;
+    }
+
     std.debug.print("smoke-cell: PASS\n", .{});
     return 0;
 }
@@ -2271,6 +2277,130 @@ fn decoColorParityStage(allocator: std.mem.Allocator) !u8 {
 const borders = @import("grid/borders.zig");
 const border_pass_mod = @import("render/border_pass.zig");
 
+/// One frame of a fresh `cols` x `rows` screen fed `bytes`, drawn by
+/// `scene.drawGrid` (the pane's paint order) into a `w` x `h` offscreen
+/// target over black and read back.
+const Shot = struct {
+    fb: []u8,
+    w: usize,
+    h: usize,
+    cw: usize,
+    ch: usize,
+    pad: usize,
+    /// The pool held overstrike layers after the feed.
+    had_overlays: bool,
+
+    fn deinit(self: Shot, allocator: std.mem.Allocator) void {
+        allocator.free(self.fb);
+    }
+
+    /// RGB at a top-down pixel (glReadPixels is bottom-up).
+    fn at(self: Shot, x: usize, y_top: usize) [3]u8 {
+        const o = ((self.h - 1 - y_top) * self.w + x) * 4;
+        return .{ self.fb[o], self.fb[o + 1], self.fb[o + 2] };
+    }
+
+    /// Within 8 per channel of `want`.
+    fn is(self: Shot, x: usize, y_top: usize, want: [3]u8) bool {
+        for (self.at(x, y_top), want) |g, v| if (@abs(@as(i32, g) - @as(i32, v)) > 8) return false;
+        return true;
+    }
+
+    /// Pixels differing between screen rows `a` and `b` over the first
+    /// `cols` columns: the CellPass-vs-GridPass parity count.
+    fn rowMismatches(self: Shot, a: usize, b: usize, cols: usize) usize {
+        var n: usize = 0;
+        for (0..self.ch) |dy| {
+            for (self.pad..self.pad + cols * self.cw) |x| {
+                const pa = self.at(x, self.pad + a * self.ch + dy);
+                const pb = self.at(x, self.pad + b * self.ch + dy);
+                if (!std.mem.eql(u8, &pa, &pb)) n += 1;
+            }
+        }
+        return n;
+    }
+};
+
+fn shoot(allocator: std.mem.Allocator, w: c_int, h: c_int, cols: u16, rows: u16, bytes: []const u8) !Shot {
+    const target = try eglboot.offscreenRgba8(w, h);
+    defer {
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, 0);
+        c.glDeleteFramebuffers(1, &target.fbo);
+        c.glDeleteRenderbuffers(1, &target.rbo);
+    }
+    const atlas: *Atlas = fonts.openAtlas(allocator, FONT_SIZE) orelse return error.NoFont;
+    defer atlas.deinit();
+    atlas.realize();
+
+    var pool = try StylePool.init(allocator);
+    defer pool.deinit();
+    const screen = try Screen.init(allocator, &pool, cols, rows);
+    defer screen.deinit();
+
+    var parser = @import("parser/vt.zig").Parser.init(allocator);
+    defer parser.deinit();
+    const Ctx = struct { screen: *Screen, allocator: std.mem.Allocator };
+    const Emit = struct {
+        fn cb(user: ?*anyopaque, ev: @import("parser/event.zig").Event) void {
+            const ec: *Ctx = @ptrCast(@alignCast(user.?));
+            var mut = ev;
+            ec.screen.apply(ev);
+            mut.deinit(ec.allocator);
+        }
+    };
+    var ec = Ctx{ .screen = screen, .allocator = allocator };
+    parser.advance(bytes, Emit.cb, @ptrCast(&ec));
+
+    var cell_pass = CellPass.init(allocator);
+    defer cell_pass.deinit();
+    try cell_pass.realize();
+    var grid_pass = GridPass.init(allocator);
+    defer grid_pass.deinit();
+    try grid_pass.realize();
+    grid_pass.canvas_w = @floatFromInt(w);
+    grid_pass.canvas_h = @floatFromInt(h);
+    var border_pass = border_pass_mod.BorderPass.init(allocator);
+    defer border_pass.deinit();
+    try border_pass.realize();
+
+    c.glClearColor(0, 0, 0, 1);
+    c.glClear(c.GL_COLOR_BUFFER_BIT);
+    try cell_pass.rebuildAndUpload(screen, &pool, atlas);
+    try grid_pass.buildVertices(screen, &pool, atlas, false, true, &.{});
+    try border_pass.build(screen, &pool, .{
+        .cell_w = atlas.cell_w,
+        .cell_h = atlas.cell_h,
+        .pad = grid_pass.pad,
+    }, true);
+    @import("render/scene.zig").drawGrid(&cell_pass, &grid_pass, &border_pass, atlas, w, h);
+    c.glFinish();
+
+    const fb = try allocator.alloc(u8, @as(usize, @intCast(w * h)) * 4);
+    c.glReadPixels(0, 0, w, h, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+    return .{
+        .fb = fb,
+        .w = @intCast(w),
+        .h = @intCast(h),
+        .cw = atlas.cell_w,
+        .ch = atlas.cell_h,
+        .pad = @intFromFloat(grid_pass.pad),
+        .had_overlays = pool.hasOverlays(),
+    };
+}
+
+/// A `shoot` setup failure as `stage`'s exit code: `base` for an
+/// incomplete framebuffer, `base + 1` for no font; anything else
+/// propagates.
+fn shotFailed(stage: []const u8, err: anyerror, base: u8) !u8 {
+    const code: u8 = switch (err) {
+        error.Incomplete => base,
+        error.NoFont => base + 1,
+        else => return err,
+    };
+    std.debug.print("smoke-cell: {s} FAIL - {s}\n", .{ stage, if (code == base) "framebuffer incomplete" else "no font" });
+    return code;
+}
+
 /// One `set` rectangle command for the single cell at 1-based `row`,`col`.
 fn borderSet(comptime row: u16, comptime col: u16, comptime mask: borders.Mask, comptime width: u7, comptime color: []const u8, comptime placement: borders.Placement, comptime layer: borders.Layer) []const u8 {
     return std.fmt.comptimePrint("\x1b[{d};{d}H\x1bP1+bcell-border;set;{d};{d};{s};{d};{d};1;1\x1b\\", .{
@@ -2299,105 +2429,27 @@ fn borderProbeRow(comptime row: u16) []const u8 {
 fn borderStage(allocator: std.mem.Allocator) !u8 {
     const BW: c_int = 400;
     const BH: c_int = 160;
-
-    var fbo: c_uint = 0;
-    var rbo: c_uint = 0;
-    c.glGenFramebuffers(1, &fbo);
-    c.glGenRenderbuffers(1, &rbo);
-    c.glBindRenderbuffer(c.GL_RENDERBUFFER, rbo);
-    c.glRenderbufferStorage(c.GL_RENDERBUFFER, c.GL_RGBA8, BW, BH);
-    c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
-    c.glFramebufferRenderbuffer(c.GL_FRAMEBUFFER, c.GL_COLOR_ATTACHMENT0, c.GL_RENDERBUFFER, rbo);
-    defer {
-        c.glBindFramebuffer(c.GL_FRAMEBUFFER, 0);
-        c.glDeleteFramebuffers(1, &fbo);
-        c.glDeleteRenderbuffers(1, &rbo);
-    }
-    if (c.glCheckFramebufferStatus(c.GL_FRAMEBUFFER) != c.GL_FRAMEBUFFER_COMPLETE) {
-        std.debug.print("smoke-cell: borders FAIL - framebuffer incomplete\n", .{});
-        return 120;
-    }
-
-    const atlas: ?*Atlas = fonts.openAtlas(allocator, FONT_SIZE);
-    if (atlas == null) {
-        std.debug.print("smoke-cell: borders FAIL - no font\n", .{});
-        return 121;
-    }
-    defer atlas.?.deinit();
-    atlas.?.realize();
-
-    var pool = try StylePool.init(allocator);
-    defer pool.deinit();
-    const screen = try Screen.init(allocator, &pool, 26, 6);
-    defer screen.deinit();
-
-    var parser = @import("parser/vt.zig").Parser.init(allocator);
-    defer parser.deinit();
-    const Ctx = struct { screen: *Screen, allocator: std.mem.Allocator };
-    const Emit = struct {
-        fn cb(user: ?*anyopaque, ev: @import("parser/event.zig").Event) void {
-            const ec: *Ctx = @ptrCast(@alignCast(user.?));
-            var mut = ev;
-            ec.screen.apply(ev);
-            mut.deinit(ec.allocator);
-        }
-    };
-    var ec = Ctx{ .screen = screen, .allocator = allocator };
     const white_block = "\x1b[38;2;255;255;255m\u{2588}\x1b[0m";
-    parser.advance(comptime borderProbeRow(1) ++
+    const shot = shoot(allocator, BW, BH, 26, 6, comptime borderProbeRow(1) ++
         "\x1b[1;19H" ++ white_block ++ borderSet(1, 19, borders.group.horizontal, 64, "ff0000", .inside, .below_text) ++
         "\x1b[1;21H" ++ white_block ++ borderSet(1, 21, borders.group.horizontal, 64, "ff0000", .inside, .above_text) ++
         borderProbeRow(3) ++ "\x1b[3;25H\u{0E01}" ++
-        "\x1b[6;26H", Emit.cb, @ptrCast(&ec));
-
-    var cell_pass = CellPass.init(allocator);
-    defer cell_pass.deinit();
-    try cell_pass.realize();
-    var grid_pass = GridPass.init(allocator);
-    defer grid_pass.deinit();
-    try grid_pass.realize();
-    grid_pass.canvas_w = @floatFromInt(BW);
-    grid_pass.canvas_h = @floatFromInt(BH);
-    var border_pass = border_pass_mod.BorderPass.init(allocator);
-    defer border_pass.deinit();
-    try border_pass.realize();
-
-    c.glViewport(0, 0, BW, BH);
-    c.glClearColor(0, 0, 0, 1);
-    c.glClear(c.GL_COLOR_BUFFER_BIT);
-    try cell_pass.rebuildAndUpload(screen, &pool, atlas.?);
-    try grid_pass.buildVertices(screen, &pool, atlas.?, false, true, &.{});
-    try border_pass.build(screen, &pool, .{
-        .cell_w = atlas.?.cell_w,
-        .cell_h = atlas.?.cell_h,
-        .pad = grid_pass.pad,
-    }, true);
-    @import("render/scene.zig").drawGrid(&cell_pass, &grid_pass, &border_pass, atlas.?, BW, BH);
-    c.glFinish();
-
-    const fb = try allocator.alloc(u8, @as(usize, @intCast(BW * BH)) * 4);
-    defer allocator.free(fb);
-    c.glReadPixels(0, 0, BW, BH, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+        "\x1b[6;26H") catch |err| return shotFailed("borders", err, 120);
+    defer shot.deinit(allocator);
 
     const Px = struct {
-        buf: []const u8,
-        w: usize,
-        h: usize,
-        /// RGB at a top-down pixel (glReadPixels is bottom-up).
+        shot: Shot,
         fn at(self: @This(), x: i32, y_top: i32) [3]u8 {
-            const o = ((self.h - 1 - @as(usize, @intCast(y_top))) * self.w + @as(usize, @intCast(x))) * 4;
-            return .{ self.buf[o], self.buf[o + 1], self.buf[o + 2] };
+            return self.shot.at(@intCast(x), @intCast(y_top));
         }
         fn is(self: @This(), x: i32, y_top: i32, want: [3]u8) bool {
-            const got = self.at(x, y_top);
-            for (got, want) |g, w| if (@abs(@as(i32, g) - @as(i32, w)) > 8) return false;
-            return true;
+            return self.shot.is(@intCast(x), @intCast(y_top), want);
         }
     };
-    const px = Px{ .buf = fb, .w = @intCast(BW), .h = @intCast(BH) };
-    const cw: i32 = atlas.?.cell_w;
-    const ch: i32 = atlas.?.cell_h;
-    const pad: i32 = @intFromFloat(grid_pass.pad);
+    const px = Px{ .shot = shot };
+    const cw: i32 = @intCast(shot.cw);
+    const ch: i32 = @intCast(shot.ch);
+    const pad: i32 = @intCast(shot.pad);
     const t64 = border_pass_mod.thickness(64, cw);
     const red = [3]u8{ 255, 0, 0 };
     const green = [3]u8{ 0, 255, 0 };
@@ -2470,104 +2522,19 @@ fn borderStage(allocator: std.mem.Allocator) !u8 {
 fn overstrikeStage(allocator: std.mem.Allocator) !u8 {
     const OW: c_int = 240;
     const OH: c_int = 120;
-
-    var fbo: c_uint = 0;
-    var rbo: c_uint = 0;
-    c.glGenFramebuffers(1, &fbo);
-    c.glGenRenderbuffers(1, &rbo);
-    c.glBindRenderbuffer(c.GL_RENDERBUFFER, rbo);
-    c.glRenderbufferStorage(c.GL_RENDERBUFFER, c.GL_RGBA8, OW, OH);
-    c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
-    c.glFramebufferRenderbuffer(c.GL_FRAMEBUFFER, c.GL_COLOR_ATTACHMENT0, c.GL_RENDERBUFFER, rbo);
-    defer {
-        c.glBindFramebuffer(c.GL_FRAMEBUFFER, 0);
-        c.glDeleteFramebuffers(1, &fbo);
-        c.glDeleteRenderbuffers(1, &rbo);
-    }
-    if (c.glCheckFramebufferStatus(c.GL_FRAMEBUFFER) != c.GL_FRAMEBUFFER_COMPLETE) {
-        std.debug.print("smoke-cell: overstrike FAIL - framebuffer incomplete\n", .{});
-        return 130;
-    }
-
-    const atlas: ?*Atlas = fonts.openAtlas(allocator, FONT_SIZE);
-    if (atlas == null) {
-        std.debug.print("smoke-cell: overstrike FAIL - no font\n", .{});
-        return 131;
-    }
-    defer atlas.?.deinit();
-    atlas.?.realize();
-
-    var pool = try StylePool.init(allocator);
-    defer pool.deinit();
-    const screen = try Screen.init(allocator, &pool, 12, 4);
-    defer screen.deinit();
-
-    var parser = @import("parser/vt.zig").Parser.init(allocator);
-    defer parser.deinit();
-    const Ctx = struct { screen: *Screen, allocator: std.mem.Allocator };
-    const Emit = struct {
-        fn cb(user: ?*anyopaque, ev: @import("parser/event.zig").Event) void {
-            const ec: *Ctx = @ptrCast(@alignCast(user.?));
-            var mut = ev;
-            ec.screen.apply(ev);
-            mut.deinit(ec.allocator);
-        }
-    };
-    var ec = Ctx{ .screen = screen, .allocator = allocator };
     // The layer's own rendition has a black background: if anything
     // painted it, the blue would be gone.
     const struck = "\x1b[38;2;255;0;0;48;2;0;0;255mA\x08\x1b[38;2;0;255;0;48;2;0;0;0m\x1b[8:7m/\x1b[0m";
-    parser.advance("\x1b[1;2H" ++ struck ++ "\x1b[3;2H" ++ struck ++ "\x1b[3;12H\u{0E01}\x1b[4;12H", Emit.cb, @ptrCast(&ec));
-    if (!pool.hasOverlays()) {
+    const shot = shoot(allocator, OW, OH, 12, 4, "\x1b[1;2H" ++ struck ++ "\x1b[3;2H" ++ struck ++ "\x1b[3;12H\u{0E01}\x1b[4;12H") catch |err|
+        return shotFailed("overstrike", err, 130);
+    defer shot.deinit(allocator);
+    if (!shot.had_overlays) {
         std.debug.print("smoke-cell: overstrike FAIL - no layer was recorded\n", .{});
         return 132;
     }
-
-    var cell_pass = CellPass.init(allocator);
-    defer cell_pass.deinit();
-    try cell_pass.realize();
-    var grid_pass = GridPass.init(allocator);
-    defer grid_pass.deinit();
-    try grid_pass.realize();
-    grid_pass.canvas_w = @floatFromInt(OW);
-    grid_pass.canvas_h = @floatFromInt(OH);
-    var border_pass = border_pass_mod.BorderPass.init(allocator);
-    defer border_pass.deinit();
-    try border_pass.realize();
-
-    c.glViewport(0, 0, OW, OH);
-    c.glClearColor(0, 0, 0, 1);
-    c.glClear(c.GL_COLOR_BUFFER_BIT);
-    try cell_pass.rebuildAndUpload(screen, &pool, atlas.?);
-    try grid_pass.buildVertices(screen, &pool, atlas.?, false, true, &.{});
-    try border_pass.build(screen, &pool, .{
-        .cell_w = atlas.?.cell_w,
-        .cell_h = atlas.?.cell_h,
-        .pad = grid_pass.pad,
-    }, true);
-    @import("render/scene.zig").drawGrid(&cell_pass, &grid_pass, &border_pass, atlas.?, OW, OH);
-    c.glFinish();
-
-    const fb = try allocator.alloc(u8, @as(usize, @intCast(OW * OH)) * 4);
-    defer allocator.free(fb);
-    c.glReadPixels(0, 0, OW, OH, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
-
-    const w: usize = @intCast(OW);
-    const h: usize = @intCast(OH);
-    const at = struct {
-        fn rgb(buf: []const u8, bw: usize, bh: usize, x: usize, y_top: usize) [3]u8 {
-            const o = ((bh - 1 - y_top) * bw + x) * 4;
-            return .{ buf[o], buf[o + 1], buf[o + 2] };
-        }
-        fn near(got: [3]u8, want: [3]u8) bool {
-            for (got, want) |g, v| if (@abs(@as(i32, g) - @as(i32, v)) > 8) return false;
-            return true;
-        }
-    };
-    const cw: usize = atlas.?.cell_w;
-    const ch: usize = atlas.?.cell_h;
-    const pad: usize = @intFromFloat(grid_pass.pad);
-
+    const cw = shot.cw;
+    const ch = shot.ch;
+    const pad = shot.pad;
     var failures: u32 = 0;
     for ([_]usize{ 0, 2 }) |row| {
         var red: usize = 0;
@@ -2575,13 +2542,13 @@ fn overstrikeStage(allocator: std.mem.Allocator) !u8 {
         var blue: usize = 0;
         var black: usize = 0;
         for (0..ch) |dy| for (0..cw) |dx| {
-            const p = at.rgb(fb, w, h, pad + cw + dx, pad + row * ch + dy);
+            const p = shot.at(pad + cw + dx, pad + row * ch + dy);
             // Glyph pixels by their dominant channel: antialiased edges
             // over blue still lean red or green.
             if (p[0] > 128 and p[1] < 96) red += 1;
             if (p[1] > 128 and p[0] < 96) green += 1;
-            if (at.near(p, .{ 0, 0, 255 })) blue += 1;
-            if (at.near(p, .{ 0, 0, 0 })) black += 1;
+            if (shot.is(pad + cw + dx, pad + row * ch + dy, .{ 0, 0, 255 })) blue += 1;
+            if (shot.is(pad + cw + dx, pad + row * ch + dy, .{ 0, 0, 0 })) black += 1;
         };
         std.debug.print("smoke-cell: overstrike row {d}: red {d} green {d} blue {d} black {d} of {d}\n", .{ row, red, green, blue, black, cw * ch });
         if (red == 0 or green == 0) {
@@ -2594,19 +2561,80 @@ fn overstrikeStage(allocator: std.mem.Allocator) !u8 {
         }
     }
 
-    var mismatched: usize = 0;
-    for (0..ch) |dy| {
-        for (pad..pad + 10 * cw) |x| {
-            const a = at.rgb(fb, w, h, x, pad + dy);
-            const b = at.rgb(fb, w, h, x, pad + 2 * ch + dy);
-            if (!std.mem.eql(u8, &a, &b)) mismatched += 1;
-        }
-    }
+    const mismatched = shot.rowMismatches(0, 2, 10);
     if (mismatched != 0) {
         std.debug.print("smoke-cell: overstrike FAIL - CellPass and GridPass rows differ in {d} pixels\n", .{mismatched});
         failures += 1;
     }
     if (failures != 0) return 133;
     std.debug.print("smoke-cell: overstrike OK (cell {d}x{d})\n", .{ cw, ch });
+    return 0;
+}
+
+/// SGR 8 (conceal) through `scene.drawGrid`: a concealed red `A` with
+/// underline, strike and overline on a blue cell paints only its blue
+/// background; a concealed red overstrike layer on a visible green `B`
+/// draws nothing; a concealed cell's yellow border still draws (borders
+/// ignore conceal, docs/cell-borders.md). Row 0 is a CellPass row and
+/// row 2 the same cells routed to GridPass by a Thai letter, and the two
+/// must light the same pixels.
+fn concealStage(allocator: std.mem.Allocator) !u8 {
+    const hidden = "\x1b[38;2;255;0;0;48;2;0;0;255;4;9;53;8mA\x1b[0m";
+    const layer = "\x1b[38;2;0;255;0;48;2;0;0;255mB\x08\x1b[38;2;255;0;0;4;8m\x1b[8:7m/\x1b[0m";
+    const bordered = "\x1b[38;2;255;0;0;8mX\x1b[0m";
+    const scene = comptime "\x1b[1;2H" ++ hidden ++ "\x1b[1;4H" ++ layer ++ "\x1b[1;6H" ++ bordered ++
+        borderSet(1, 6, borders.group.left, 64, "ffff00", .inside, .above_text) ++
+        "\x1b[3;2H" ++ hidden ++ "\x1b[3;4H" ++ layer ++ "\x1b[3;6H" ++ bordered ++
+        borderSet(3, 6, borders.group.left, 64, "ffff00", .inside, .above_text) ++
+        "\x1b[3;12H\u{0E01}\x1b[4;12H";
+    const shot = shoot(allocator, 240, 120, 12, 4, scene) catch |err| return shotFailed("conceal", err, 140);
+    defer shot.deinit(allocator);
+    const cw = shot.cw;
+    const ch = shot.ch;
+
+    const Count = struct { red: usize = 0, green: usize = 0, yellow: usize = 0, not_blue: usize = 0 };
+    const count = struct {
+        fn cell(s: Shot, row: usize, col: usize) Count {
+            var n = Count{};
+            for (0..s.ch) |dy| for (0..s.cw) |dx| {
+                const x = s.pad + col * s.cw + dx;
+                const y = s.pad + row * s.ch + dy;
+                const p = s.at(x, y);
+                // By dominant channel, so antialiased edges count too.
+                if (p[0] > 128 and p[1] < 96) n.red += 1;
+                if (p[1] > 128 and p[0] < 96) n.green += 1;
+                if (p[0] > 128 and p[1] > 128 and p[2] < 96) n.yellow += 1;
+                if (!s.is(x, y, .{ 0, 0, 255 })) n.not_blue += 1;
+            };
+            return n;
+        }
+    }.cell;
+
+    var failures: u32 = 0;
+    for ([_]usize{ 0, 2 }) |row| {
+        const a = count(shot, row, 1);
+        const b = count(shot, row, 3);
+        const x = count(shot, row, 5);
+        std.debug.print("smoke-cell: conceal row {d}: A not-blue {d}; B green {d} red {d}; X red {d} yellow {d}\n", .{ row, a.not_blue, b.green, b.red, x.red, x.yellow });
+        if (a.not_blue != 0) {
+            std.debug.print("smoke-cell: conceal FAIL - row {d}: a concealed glyph or decoration was drawn\n", .{row});
+            failures += 1;
+        }
+        if (b.green == 0 or b.red != 0) {
+            std.debug.print("smoke-cell: conceal FAIL - row {d}: a concealed overstrike layer was drawn, or hid its base\n", .{row});
+            failures += 1;
+        }
+        if (x.red != 0 or x.yellow == 0) {
+            std.debug.print("smoke-cell: conceal FAIL - row {d}: concealed text drawn or its border hidden\n", .{row});
+            failures += 1;
+        }
+    }
+    const mismatched = shot.rowMismatches(0, 2, 10);
+    if (mismatched != 0) {
+        std.debug.print("smoke-cell: conceal FAIL - CellPass and GridPass rows differ in {d} pixels\n", .{mismatched});
+        failures += 1;
+    }
+    if (failures != 0) return 142;
+    std.debug.print("smoke-cell: conceal OK (cell {d}x{d})\n", .{ cw, ch });
     return 0;
 }

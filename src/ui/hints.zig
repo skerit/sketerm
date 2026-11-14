@@ -103,7 +103,7 @@ pub fn collectVisibleWith(
     var d: u16 = 0;
     while (d < screen.rows) : (d += 1) {
         const buf_row: i32 = @as(i32, d) - view_off;
-        const cells = screen.lineCellsAtPub(buf_row) orelse continue;
+        const cells = screen.lineCellsAt(buf_row) orelse continue;
         // Both scanners dedupe against everything already found on
         // THIS row, rules included — a rule that claimed a path must
         // stop the built-in path scanner finding it again.

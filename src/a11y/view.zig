@@ -237,7 +237,7 @@ pub fn attrRun(snap: *const Snapshot, screen: *const Screen, off: u32) ?AttrRun 
 
 fn attrsOfChar(snap: *const Snapshot, screen: *const Screen, ch: u32) TextAttrs {
     const pos = snap.char_to_cell[ch];
-    const cells = screen.lineCellsAtPub(pos.row) orelse return defaultAttrs(screen);
+    const cells = screen.lineCellsAt(pos.row) orelse return defaultAttrs(screen);
     if (pos.col >= cells.len) return defaultAttrs(screen);
     return cellAttrs(screen, cells[pos.col]);
 }
@@ -316,7 +316,7 @@ pub fn build(screen: *const Screen, allocator: std.mem.Allocator) !Snapshot {
     while (r < nrows) : (r += 1) {
         line_starts[r] = n_chars;
         const is_cursor_row = r == screen.row;
-        const cells = screen.lineCellsAtPub(@intCast(r)) orelse &[_]Cell{};
+        const cells = screen.lineCellsAt(@intCast(r)) orelse &[_]Cell{};
 
         // Last non-blank column, so trailing blanks are trimmed (a screen
         // reader shouldn't recite a row of spaces).

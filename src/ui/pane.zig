@@ -2373,7 +2373,7 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
         // cellAt's row can be negative when the click landed in
         // scrollback. Resolve via lineCellsAt (negative rows index
         // scrollback from the bottom).
-        const cells_at = screen.lineCellsAtPub(cell.row);
+        const cells_at = screen.lineCellsAt(cell.row);
         if (cells_at) |cells| {
             // Bidi remap: cellAt returns the *visual* column. For
             // mixed/RTL rows, the logical cell at that visual col

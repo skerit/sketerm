@@ -567,9 +567,8 @@ pub const GridPass = struct {
         const ascent: f32 = @floatFromInt(atlas.ascent);
         const pad: f32 = self.pad;
 
-        const buf = if (screen.use_alt) screen.alt.? else screen.active;
-        const sb_count: u32 = if (screen.use_alt) 0 else screen.scrollbackCount();
-        const view_off: u32 = @min(screen.view_offset, sb_count);
+        const sb_count: u32 = screen.viewableScrollback();
+        const view_off: u32 = screen.clampedViewOffset();
 
         // Bidi rows + DH/DW rows: emit their glyphs here as overlays
         // (the cell pipeline only handles single-scale ASCII rows).
@@ -582,12 +581,8 @@ pub const GridPass = struct {
             if (phase == .text) self.text_start = self.vbuf.items.len;
             var row: u16 = 0;
             while (row < screen.rows) : (row += 1) {
-                const ln_ptr: *const @TypeOf(buf[0]) = if (row < view_off) blk: {
-                    const sb_idx = sb_count - view_off + row;
-                    break :blk screen.scrollbackLine(sb_idx);
-                } else &buf[row - view_off];
-                const ln = ln_ptr.*;
-                const cells = ln.cells[0..@min(ln.cells.len, @as(usize, screen.cols))];
+                const ln = screen.visibleLine(row).*;
+                const cells = screen.visibleCells(row);
 
                 if (phase == .backgrounds and !self.row_caches_valid.items[row]) {
                     self.row_overlay_needed.items[row] =
@@ -693,11 +688,7 @@ pub const GridPass = struct {
             const bar_w: f32 = @min(3.0, pad - 1.0);
             var vr: u16 = 0;
             while (vr < screen.rows) : (vr += 1) {
-                const ln_ptr: *const @TypeOf(buf[0]) = if (vr < view_off) blk: {
-                    const sb_idx = sb_count - view_off + vr;
-                    break :blk screen.scrollbackLine(sb_idx);
-                } else &buf[vr - view_off];
-                const lid = ln_ptr.id;
+                const lid = screen.visibleLine(vr).id;
                 if (lid == 0) continue;
                 var zi: u16 = 0;
                 while (zi < screen.cmd_zones_len) : (zi += 1) {
@@ -777,11 +768,7 @@ pub const GridPass = struct {
             var vrow: u16 = 0;
             while (vrow < screen.rows) : (vrow += 1) {
                 if (!self.row_caches_valid.items[vrow]) {
-                    const ln_ptr2: *const @TypeOf(buf[0]) = if (vrow < view_off) blk: {
-                        const sb_idx = sb_count - view_off + vrow;
-                        break :blk screen.scrollbackLine(sb_idx);
-                    } else &buf[vrow - view_off];
-                    const cells2 = ln_ptr2.cells[0..screen.cols];
+                    const cells2 = screen.visibleCells(vrow);
                     const n_match = url_scan.scanRow(cells2, &scratch);
                     var slot = &self.row_url_matches.items[vrow];
                     slot.clearRetainingCapacity();
@@ -839,7 +826,7 @@ pub const GridPass = struct {
                     // Quick bidi check on this row.
                     var row_has_bidi = false;
                     if (self.enable_bidi) {
-                        const cells = screen.lineCellsAtPub(sr) orelse &.{};
+                        const cells = screen.lineCellsAt(sr) orelse &.{};
                         for (cells) |cl| if (cl.rune > 0x7F) {
                             row_has_bidi = true;
                             break;
@@ -1063,7 +1050,7 @@ pub const GridPass = struct {
         w_full: f32,
         h_full: f32,
     ) ?scrollbar.View {
-        const sb_count: u32 = if (screen.use_alt) 0 else screen.scrollbackCount();
+        const sb_count: u32 = screen.viewableScrollback();
         if (!scrollbar.visible(self.scrollbar_mode, self.scrollbar_width, sb_count)) return null;
         return .{
             .canvas_w = w_full,
@@ -1071,7 +1058,7 @@ pub const GridPass = struct {
             .width = self.scrollbar_width,
             .sb_count = sb_count,
             .rows = screen.rows,
-            .view_off = @min(screen.view_offset, sb_count),
+            .view_off = screen.clampedViewOffset(),
         };
     }
 
@@ -1096,7 +1083,7 @@ pub const GridPass = struct {
     }
 
     fn computeSnapshot(self: *const GridPass, screen: *const Screen, atlas: *const Atlas, focused: bool) Snapshot {
-        const sb_count: u32 = if (screen.use_alt) 0 else screen.scrollbackCount();
+        const sb_count: u32 = screen.viewableScrollback();
         var s: Snapshot = .{
             .canvas_w = self.canvas_w,
             .canvas_h = self.canvas_h,
@@ -1104,7 +1091,7 @@ pub const GridPass = struct {
             .focused = focused,
 
             .use_alt = screen.use_alt,
-            .view_off = @min(screen.view_offset, sb_count),
+            .view_off = screen.clampedViewOffset(),
             .sb_count = sb_count,
 
             .rows = screen.rows,
@@ -1281,12 +1268,12 @@ pub const GridPass = struct {
         const style = pool.get(cell.style_ref);
         const a = style.attrs;
         if (style_util.underlineKind(a) == .none and !a.strikethrough and !a.overline) return;
-        const resolved = self.styleResolver().resolve(style);
-        try self.emitDeco(a, resolved, cell, visual_col, y, cw, ch, x_scale);
+        try self.emitDeco(a, self.styleResolver().resolve(style), cell, visual_col, y, cw, ch, x_scale);
     }
 
     /// The decoration quads of `attrs` in `resolved`'s colours over the
     /// cell at `visual_col`: a cell's own, or an overstrike layer's.
+    /// Nothing for concealed text (`resolved.text`).
     fn emitDeco(
         self: *GridPass,
         a: @import("../grid/style_pool.zig").Attrs,
@@ -1298,6 +1285,7 @@ pub const GridPass = struct {
         ch: f32,
         x_scale: f32,
     ) !void {
+        if (!resolved.text) return;
         const ul = style_util.underlineKind(a);
         if (ul == .none and !a.strikethrough and !a.overline) return;
         const color = resolved.deco;
@@ -1371,19 +1359,19 @@ pub const GridPass = struct {
         }
     }
 
-    /// One glyph of `cp` in `attrs` and colour `fg` at the cell origin
-    /// `x`, `y`: a cell's own glyph or an overstrike layer's. Italic
-    /// shear and bold apply only on single-scale rows (the shear pivot
-    /// misbehaves with y_scale != 1), and the shear only without a real
-    /// italic face (the glyph carries the slant otherwise).
+    /// One glyph of `cp` in `attrs` and `resolved`'s colours at the cell
+    /// origin `x`, `y`: a cell's own glyph or an overstrike layer's, or
+    /// nothing when concealed. Italic shear and bold apply only on
+    /// single-scale rows (the shear pivot misbehaves with y_scale != 1),
+    /// and the shear only without a real italic face (the glyph carries
+    /// the slant otherwise).
     fn pushCellGlyph(
         self: *GridPass,
         atlas: *Atlas,
         glossary: *const @import("../grid/glyph_glossary.zig").Glossary,
         cp: u32,
         attrs: @import("../grid/style_pool.zig").Attrs,
-        fg: [4]f32,
-        eff_bg: [4]f32,
+        resolved: style_util.Resolver.Resolved,
         x: f32,
         y: f32,
         ch: f32,
@@ -1392,6 +1380,8 @@ pub const GridPass = struct {
         y_scale: f32,
         y_origin_shift: f32,
     ) !void {
+        if (!resolved.text) return;
+        const fg = resolved.fg;
         const bold = attrs.bold and self.allow_bold;
         const g = atlas.lookupGlyph(glossary, cp, bold, attrs.italic, fg) catch return;
         if (g.w == 0 or g.h == 0) return;
@@ -1403,7 +1393,7 @@ pub const GridPass = struct {
         const italic_f: f32 = if (is_single and attrs.italic and !g.colored and !atlas.hasItalic()) 1.0 else 0.0;
         const bold_f: f32 = if (is_single and bold) 1.0 else 0.0;
         const colored_f: f32 = if (g.colored) 1.0 else 0.0;
-        try self.pushGlyphQuadStyled(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0, italic_f, bold_f, y + ch, colored_f, eff_bg);
+        try self.pushGlyphQuadStyled(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0, italic_f, bold_f, y + ch, colored_f, resolved.eff_bg);
     }
 
     /// Every glyph of an overlay row at its visual column (`order`, or
@@ -1434,9 +1424,8 @@ pub const GridPass = struct {
             const cell = cells[if (order) |o| o[visual] else visual];
             if ((cell.flags & cell_mod.FLAG_WIDE_CONT) != 0 or cell.rune == 0 or cell.rune == ' ') continue;
             const style = pool.get(cell.style_ref);
-            const resolved = resolver.resolve(style);
             const x: f32 = pad + @as(f32, @floatFromInt(visual)) * cw * x_scale;
-            try self.pushCellGlyph(atlas, glossary, cell.rune, style.attrs, resolved.fg, resolved.eff_bg, x, y, ch, ascent, x_scale, y_scale, y_origin_shift);
+            try self.pushCellGlyph(atlas, glossary, cell.rune, style.attrs, resolver.resolve(style), x, y, ch, ascent, x_scale, y_scale, y_origin_shift);
         }
 
         if (pool.hasOverlays()) {
@@ -1449,8 +1438,7 @@ pub const GridPass = struct {
                 const layers = pool.overlayList(base.overlay);
                 for (layers[0..overlay.count(layers)]) |layer| {
                     const r = layer.rendition();
-                    const resolved = resolver.resolveOver(r, under);
-                    try self.pushCellGlyph(atlas, glossary, layer.cp, r.attrs, resolved.fg, resolved.eff_bg, x, y, ch, ascent, x_scale, y_scale, y_origin_shift);
+                    try self.pushCellGlyph(atlas, glossary, layer.cp, r.attrs, resolver.resolveOver(r, under), x, y, ch, ascent, x_scale, y_scale, y_origin_shift);
                 }
             }
         }
@@ -1757,6 +1745,16 @@ test "emitCellDeco: underline plus strike plus overline emit three independent q
     try expectQuadRect(gp.vbuf.items, 0, gp.pad, 9, 0, style_util.decoStrip(.underline, ch));
     try expectQuadRect(gp.vbuf.items, 1, gp.pad, 9, 0, style_util.decoStrip(.strikethrough, ch));
     try expectQuadRect(gp.vbuf.items, 2, gp.pad, 9, 0, style_util.decoStrip(.overline, ch));
+}
+
+test "emitCellDeco: a concealed cell draws no decoration" {
+    var pool = try StylePool.init(testing.allocator);
+    defer pool.deinit();
+    var gp = GridPass.init(testing.allocator);
+    defer gp.deinit();
+    const cell = Cell{ .rune = 'x', .style_ref = try pool.intern(.{ .attrs = .{ .underline = true, .strikethrough = true, .overline = true, .invisible = true } }) };
+    try gp.emitCellDeco(&pool, cell, 0, 0, 9, 20, 1.0);
+    try testing.expectEqual(@as(usize, 0), gp.vbuf.items.len);
 }
 
 test "emitCellDeco: decoration colour is the resolver's, not a private copy" {
