@@ -106,8 +106,7 @@ fn flush() void {
             const avg_us: f64 = @as(f64, @floatFromInt(s.total_ns)) / @as(f64, @floatFromInt(s.count)) / 1000.0;
             const max_us: f64 = @as(f64, @floatFromInt(s.max_ns)) / 1000.0;
             const total_us: f64 = @as(f64, @floatFromInt(s.total_ns)) / 1000.0;
-            w.print(" {s} x{d} avg={d:.1}us max={d:.1}us total={d:.1}us |",
-                .{ f.name, s.count, avg_us, max_us, total_us }) catch {};
+            w.print(" {s} x{d} avg={d:.1}us max={d:.1}us total={d:.1}us |", .{ f.name, s.count, avg_us, max_us, total_us }) catch {};
             s.* = .{};
         }
     }

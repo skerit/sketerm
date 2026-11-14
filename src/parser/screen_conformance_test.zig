@@ -445,14 +445,14 @@ test "screen.py: DECSTBM bottom-margin scroll" {
     h.feed("\x1b[1;5r");
     var i: u8 = 0;
     while (i < 6) : (i += 1) {
-        var b: [1]u8 = .{ '0' + i };
+        var b: [1]u8 = .{'0' + i};
         h.feed(&b);
         h.feed("\r\n");
     }
     // Inside-region rows scroll while writing more.
     var j: u8 = 6;
     while (j < 8) : (j += 1) {
-        var b: [1]u8 = .{ '0' + j };
+        var b: [1]u8 = .{'0' + j};
         h.feed(&b);
         h.feed("\r\n");
     }

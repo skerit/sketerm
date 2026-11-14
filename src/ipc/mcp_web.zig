@@ -197,7 +197,6 @@ pub fn idleCloseSecs() u32 {
     return @intCast(@divTrunc(g_idle_close_ms, 1000));
 }
 
-
 /// What `capabilities` reports as `web_tab_rules`.
 pub fn tabRules() struct {
     target_required: bool = true,
@@ -3060,7 +3059,6 @@ fn navFacts(res: *mcp.Res, arena: std.mem.Allocator, post: NavPost) !void {
     }
 }
 
-
 fn openResult(
     arena: std.mem.Allocator,
     mode: Mode,
@@ -3810,7 +3808,7 @@ fn readResult(arena: std.mem.Allocator, mode: Mode, v: View, r: ReadOut) ![]cons
             var lines: std.Io.Writer.Allocating = .init(arena);
             for (scripts) |sc| {
                 if (sc.src) |src|
-                    try lines.writer.print("script {s}{s}{s}{s}\n", .{ src, if (sc.@"async") " async" else "", if (sc.@"defer") " defer" else "", if (sc.type.len > 0) try std.fmt.allocPrint(arena, " type={s}", .{sc.type}) else "" })
+                    try lines.writer.print("script {s}{s}{s}{s}\n", .{ src, if (sc.async) " async" else "", if (sc.@"defer") " defer" else "", if (sc.type.len > 0) try std.fmt.allocPrint(arena, " type={s}", .{sc.type}) else "" })
                 else
                     try lines.writer.print("script inline, {d} chars{s}\n", .{ sc.size orelse 0, if (sc.type.len > 0) try std.fmt.allocPrint(arena, " type={s}", .{sc.type}) else "" });
             }
@@ -4871,27 +4869,29 @@ fn webBody(
 
         // Settle, the `wait` and the first snapshot run in `OpenRun`, a
         // step at a time.
-        return deferTo(pend, drv, new_handle, .{ .open = .{
-            .args = args,
-            .new_handle = new_handle,
-            .url = url,
-            .profile = profile,
-            .where = where,
-            .tab_label = tab_label,
-            .drift_on = drift_on,
-            .nav_wait = nav_wait,
-            .nav_started = nav_started,
-            .policy = policy,
-            .policy_source = policy_source,
-            .cap = cap,
-            .deadline = drv.now() + timeoutOf(args, 20_000),
-            .wanted_blank = if (url) |u| isBlankDoc(u) else true,
-            .v = .{ .pane = new_handle },
-            .settled = url == null,
-            // How many views exist now that this one does: the polled
-            // list when it answered, else the pre-open count plus this.
-            .open_views = (if (views) |vs| vs.views.len else 0) + 1,
-        } });
+        return deferTo(pend, drv, new_handle, .{
+            .open = .{
+                .args = args,
+                .new_handle = new_handle,
+                .url = url,
+                .profile = profile,
+                .where = where,
+                .tab_label = tab_label,
+                .drift_on = drift_on,
+                .nav_wait = nav_wait,
+                .nav_started = nav_started,
+                .policy = policy,
+                .policy_source = policy_source,
+                .cap = cap,
+                .deadline = drv.now() + timeoutOf(args, 20_000),
+                .wanted_blank = if (url) |u| isBlankDoc(u) else true,
+                .v = .{ .pane = new_handle },
+                .settled = url == null,
+                // How many views exist now that this one does: the polled
+                // list when it answered, else the pre-open count plus this.
+                .open_views = (if (views) |vs| vs.views.len else 0) + 1,
+            },
+        });
     }
 
     // web_close resolves its own handle (it must answer for a view it
@@ -4942,22 +4942,24 @@ fn webBody(
         if (try navigateView(drv, arena, view.pane, url, action)) |e|
             return failRes(arena, e);
         // Settle, the `wait` and the snapshot run in `NavigateRun`.
-        return deferTo(pend, drv, view.pane, .{ .navigate = .{
-            .args = args,
-            .view = view,
-            .url = url,
-            .navigates = navigates,
-            .cursor = cursor,
-            .nav_started = nav_started,
-            .nav_wait = nav_wait,
-            .deadline = drv.now() + timeoutOf(args, 15_000),
-            .base_seq = view.load_seq,
-            .wanted_blank = if (url) |u| isBlankDoc(u) else true,
-            .settled = view,
-            // The first look comes after the navigation had a moment to
-            // start; a stop/back is usually instant, a url is not.
-            .due = drv.now() + 100,
-        } });
+        return deferTo(pend, drv, view.pane, .{
+            .navigate = .{
+                .args = args,
+                .view = view,
+                .url = url,
+                .navigates = navigates,
+                .cursor = cursor,
+                .nav_started = nav_started,
+                .nav_wait = nav_wait,
+                .deadline = drv.now() + timeoutOf(args, 15_000),
+                .base_seq = view.load_seq,
+                .wanted_blank = if (url) |u| isBlankDoc(u) else true,
+                .settled = view,
+                // The first look comes after the navigation had a moment to
+                // start; a stop/back is usually instant, a url is not.
+                .due = drv.now() + 100,
+            },
+        });
     }
 
     if (eql(u8, name, "web_snapshot")) {
@@ -8846,29 +8848,29 @@ pub const WaitProbe = struct {
                 const answer = (try self.flight.?.poll(arena)) orelse return null;
                 self.flight = null;
                 switch (answer) {
-                .err => |e| return .{ .err = e },
-                .done => |r| if (!r.timed_out) {
-                    // An eval that could not run says nothing about the
-                    // selector: the page is between documents (a script's
-                    // redirect, a bot check passing itself), so the wait
-                    // goes on in the next document. Only the selector
-                    // engine's own SyntaxError makes a selector invalid,
-                    // and that answer is the same in any document.
-                    if (!r.ok) {
-                        self.eval_failed = firstLine(r.payload, 300);
-                        return null;
-                    }
-                    switch (selectorVerdict(arena, r.payload)) {
-                        .match => {
-                            if (try listViews(drv, arena)) |vs| if (viewFor(vs, view.pane)) |v| {
-                                self.last = v;
-                            };
-                            return .{ .met = .{ .view = self.last, .detail = "an element matches the selector" } };
-                        },
-                        .invalid => |why| return .{ .not_met = .{ .view = self.last, .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "\"{s}\" is not a valid CSS selector: {s}", .{ arg, firstLine(why, 300) }) } },
-                        .none => self.eval_failed = "",
-                    }
-                },
+                    .err => |e| return .{ .err = e },
+                    .done => |r| if (!r.timed_out) {
+                        // An eval that could not run says nothing about the
+                        // selector: the page is between documents (a script's
+                        // redirect, a bot check passing itself), so the wait
+                        // goes on in the next document. Only the selector
+                        // engine's own SyntaxError makes a selector invalid,
+                        // and that answer is the same in any document.
+                        if (!r.ok) {
+                            self.eval_failed = firstLine(r.payload, 300);
+                            return null;
+                        }
+                        switch (selectorVerdict(arena, r.payload)) {
+                            .match => {
+                                if (try listViews(drv, arena)) |vs| if (viewFor(vs, view.pane)) |v| {
+                                    self.last = v;
+                                };
+                                return .{ .met = .{ .view = self.last, .detail = "an element matches the selector" } };
+                            },
+                            .invalid => |why| return .{ .not_met = .{ .view = self.last, .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "\"{s}\" is not a valid CSS selector: {s}", .{ arg, firstLine(why, 300) }) } },
+                            .none => self.eval_failed = "",
+                        }
+                    },
                 }
             },
             .network_idle => switch (try netLog(drv, arena, view.pane, 0, 128, @min(self.deadline - self.started, 5000))) {
@@ -10650,8 +10652,11 @@ test "web_stream returns common view facts and refuses GUI and malformed audio w
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const out = try streamResult(arena, .{ .pane = 7, .view = 7, .url = "https://example.com/", .route = "via:box" }, .{
-        .view = 7, .req = 1, .path = "/tmp/web-stream.sock",
-        .token = "0123456789abcdef0123456789abcdef", .err = "",
+        .view = 7,
+        .req = 1,
+        .path = "/tmp/web-stream.sock",
+        .token = "0123456789abcdef0123456789abcdef",
+        .err = "",
     }, false, false);
     const sc = (try mcp.expectToolResultShape(arena, "web_stream", out)).object.get("structuredContent").?.object;
     try std.testing.expectEqualStrings("headless", sc.get("backend").?.string);
@@ -10664,8 +10669,13 @@ test "web_stream returns common view facts and refuses GUI and malformed audio w
     // An encoded stream names its codec (null = lossless regions only).
     for ([_]u8{ 0, @intFromEnum(vcodec.Codec.h264) }) |codec| {
         const enc_out = try streamResult(arena, .{ .pane = 7, .view = 7, .url = "https://example.com/", .route = "direct" }, .{
-            .view = 7, .req = 2, .path = "/tmp/web-stream.sock",
-            .token = "0123456789abcdef0123456789abcdef", .err = "", .encoding = .encoded, .codec = codec,
+            .view = 7,
+            .req = 2,
+            .path = "/tmp/web-stream.sock",
+            .token = "0123456789abcdef0123456789abcdef",
+            .err = "",
+            .encoding = .encoded,
+            .codec = codec,
         }, true, false);
         const esc = (try mcp.expectToolResultShape(arena, "web_stream", enc_out)).object.get("structuredContent").?.object;
         try std.testing.expectEqualStrings("encoded", esc.get("encoding").?.string);
@@ -10673,8 +10683,11 @@ test "web_stream returns common view facts and refuses GUI and malformed audio w
     }
     // Asked for encoded, answered raw (an older helper): the facts say raw and the prose says why.
     const fell_back = try streamResult(arena, .{ .pane = 7, .view = 7, .url = "https://example.com/", .route = "direct" }, .{
-        .view = 7, .req = 3, .path = "/tmp/web-stream.sock",
-        .token = "0123456789abcdef0123456789abcdef", .err = "",
+        .view = 7,
+        .req = 3,
+        .path = "/tmp/web-stream.sock",
+        .token = "0123456789abcdef0123456789abcdef",
+        .err = "",
     }, true, false);
     const fsc = (try mcp.expectToolResultShape(arena, "web_stream", fell_back)).object.get("structuredContent").?.object;
     try std.testing.expectEqualStrings("raw", fsc.get("encoding").?.string);

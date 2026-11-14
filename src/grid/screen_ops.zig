@@ -160,7 +160,9 @@ pub fn csiPublic(self: *Screen, params: Event.Csi) void {
     }
     if (params.n_intermediates == 1 and params.intermediates[0] == '!') {
         switch (params.final) {
-            'p' => decstr(self, ),
+            'p' => decstr(
+                self,
+            ),
             else => {},
         }
         return;
@@ -214,8 +216,12 @@ pub fn csiPublic(self: *Screen, params: Event.Csi) void {
             self.row = if (r == 0) 0 else @min(@as(u16, @intCast(@min(r, 0xFFFF))) - 1, self.rows - 1);
             self.pending_wrap = false;
         },
-        's' => saveCursor(self, ),
-        'u' => restoreCursor(self, ),
+        's' => saveCursor(
+            self,
+        ),
+        'u' => restoreCursor(
+            self,
+        ),
 
         // Erase.
         'J' => eraseDisplay(self, params.paramOrDefault(0, 0)),
@@ -282,7 +288,9 @@ pub fn csiPublic(self: *Screen, params: Event.Csi) void {
         // Device status report.
         'n' => dsr(self, params),
         // Primary device attributes.
-        'c' => respondDa(self, ),
+        'c' => respondDa(
+            self,
+        ),
         // Window manipulation reports.
         't' => windowOps(self, params),
 
@@ -458,9 +466,13 @@ pub fn windowOps(self: *Screen, params: Event.Csi) void {
         },
         // 22 — save title onto stack. Param 0/2 = window title;
         // we treat both identically (no separate icon name).
-        22 => titleStackPush(self, ),
+        22 => titleStackPush(
+            self,
+        ),
         // 23 — restore title from stack.
-        23 => titleStackPop(self, ),
+        23 => titleStackPop(
+            self,
+        ),
         else => {},
     }
 }
@@ -549,8 +561,12 @@ pub fn escFinal(self: *Screen, ef: Event.EscFinal) void {
         return;
     }
     switch (ef.final) {
-        '7' => saveCursor(self, ),
-        '8' => restoreCursor(self, ),
+        '7' => saveCursor(
+            self,
+        ),
+        '8' => restoreCursor(
+            self,
+        ),
         'D' => self.lineFeed(),
         'E' => {
             self.lineFeed();
@@ -560,7 +576,9 @@ pub fn escFinal(self: *Screen, ef: Event.EscFinal) void {
             // HTS — set tab stop at cursor column.
             if (self.col < self.tab_stops.items.len) self.tab_stops.items[self.col] = true;
         },
-        'M' => reverseLineFeed(self, ),
+        'M' => reverseLineFeed(
+            self,
+        ),
         // SS2 (ESC N) / SS3 (ESC O) — single-shift designate G2/G3
         // for the next printed character. We don't model G2/G3
         // charsets, so the next codepoint passes through as ASCII.
@@ -569,8 +587,12 @@ pub fn escFinal(self: *Screen, ef: Event.EscFinal) void {
         // is consumed (no-op'd) by the next printCp.
         'N' => self.pending_single_shift = .ss2,
         'O' => self.pending_single_shift = .ss3,
-        'Z' => respondDa(self, ), // DECID — identify, same payload as DA1
-        'c' => fullReset(self, ),
+        'Z' => respondDa(
+            self,
+        ), // DECID — identify, same payload as DA1
+        'c' => fullReset(
+            self,
+        ),
         '=' => self.app_keypad = true, // DECPAM — application keypad on
         '>' => self.app_keypad = false, // DECPNM — application keypad off
         else => {},
@@ -1158,14 +1180,18 @@ pub fn modeSet(self: *Screen, params: Event.Csi, set: bool) void {
             1049 => {
                 // 1049 = save cursor + switch alt + clear alt on
                 // set; restore cursor + switch main on reset.
-                if (set and !self.use_alt) saveCursor(self, );
+                if (set and !self.use_alt) saveCursor(
+                    self,
+                );
                 toggleAltScreen(self, set);
                 if (set) {
                     self.row = 0;
                     self.col = 0;
                     self.pending_wrap = false;
                 } else {
-                    restoreCursor(self, );
+                    restoreCursor(
+                        self,
+                    );
                 }
             },
             2004 => self.bracketed_paste = set,
@@ -1179,7 +1205,9 @@ pub fn modeSet(self: *Screen, params: Event.Csi, set: bool) void {
                 // report on enabling so the app learns the
                 // current geometry without a race.
                 self.in_band_resize = set;
-                if (set) sendResizeReport(self, );
+                if (set) sendResizeReport(
+                    self,
+                );
             },
             else => {},
         }

@@ -974,7 +974,6 @@ pub fn copyModeLineStart(screen: *const Screen, row: i32) i32 {
     return 0;
 }
 
-
 pub fn onSearchChanged(entry: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Window, user);
     const text_ptr = c.gtk_editable_get_text(@ptrCast(entry));

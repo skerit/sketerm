@@ -820,8 +820,23 @@ pub const CellPass = struct {
                 while (k < run_len) : (k += 1) {
                     const cp = cells[run_start + k].rune;
                     switch (cp) {
-                        '=', '<', '>', '!', '-', ':', '&', '|',
-                        '+', '*', '/', '?', '#', '~', '$', '.', '@',
+                        '=',
+                        '<',
+                        '>',
+                        '!',
+                        '-',
+                        ':',
+                        '&',
+                        '|',
+                        '+',
+                        '*',
+                        '/',
+                        '?',
+                        '#',
+                        '~',
+                        '$',
+                        '.',
+                        '@',
                         => {
                             lig_eligible = true;
                             break;
