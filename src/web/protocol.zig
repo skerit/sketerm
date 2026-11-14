@@ -1224,6 +1224,7 @@ pub const HelloAck = struct {
 /// `ceil(logical * scale)`. Input coordinates stay logical.
 pub const ViewCreate = struct {
     pub const tag: Tag = .view_create;
+    pub const optional_from = "max_fps";
     view: u32,
     w: u16,
     h: u16,
@@ -1239,11 +1240,6 @@ pub const ViewCreate = struct {
         try putU16(gpa, out, self.scale_x1000);
         try putU32(gpa, out, self.context);
         if (self.max_fps != 0) try putU16(gpa, out, self.max_fps);
-    }
-
-    pub fn decodeFrom(payload: []const u8) !ViewCreate {
-        var cur = Cur{ .buf = payload };
-        return .{ .view = try cur.readU32(), .w = try cur.readU16(), .h = try cur.readU16(), .scale_x1000 = try cur.readU16(), .context = try cur.readU32(), .max_fps = if (cur.pos == payload.len) 0 else try cur.readU16() };
     }
 };
 
@@ -1263,6 +1259,7 @@ pub const ViewCreate = struct {
 /// blank one and hand back a snapshot of an empty page.
 pub const ViewCreateUrl = struct {
     pub const tag: Tag = .view_create_url;
+    pub const optional_from = "max_fps";
     view: u32,
     w: u16,
     h: u16,
@@ -1286,14 +1283,6 @@ pub const ViewCreateUrl = struct {
         try putStr(gpa, out, self.url);
         if (self.max_fps != 0 or self.flags != 0) try putU16(gpa, out, self.max_fps);
         if (self.flags != 0) try putU8(gpa, out, self.flags);
-    }
-
-    pub fn decodeFrom(payload: []const u8) !ViewCreateUrl {
-        var cur = Cur{ .buf = payload };
-        var out: ViewCreateUrl = .{ .view = try cur.readU32(), .w = try cur.readU16(), .h = try cur.readU16(), .scale_x1000 = try cur.readU16(), .context = try cur.readU32(), .url = try cur.readStr() };
-        if (cur.pos != payload.len) out.max_fps = try cur.readU16();
-        if (cur.pos != payload.len) out.flags = try cur.readU8();
-        return out;
     }
 };
 
@@ -1989,38 +1978,21 @@ pub const EvNavState = struct {
 /// and reports, so the client decides between a tab, a window and a
 /// refusal.
 ///
-/// `user_gesture` is an OPTIONAL TRAILING field — the one shape in
-/// which this wire tolerates growing a frame, and only because the
-/// decoder below treats a payload that ends early as "field absent"
+/// `user_gesture` is an OPTIONAL TRAILING field (a defaulted field, see
+/// `decode`): a payload that ends before it reads as "field absent"
 /// instead of `error.Truncated`. It defaults to 1 (a gesture) when
 /// absent, so a client with a popup policy keeps a pre-gesture helper's
 /// popups working exactly as before rather than blocking all of them.
-/// Nothing may be appended after it unless the same rule is kept, and
+/// Nothing may be appended after it unless it has a default too, and
 /// no EXISTING field may ever be widened or reordered.
 pub const EvPopupRequest = struct {
     pub const tag: Tag = .ev_popup_request;
+    pub const optional_from = "user_gesture";
     view: u32,
     url: []const u8,
     disposition: u8,
     /// 1 when the page asked from inside a real user interaction.
     user_gesture: u8 = 1,
-
-    pub fn encodeTo(self: EvPopupRequest, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
-        try putU32(gpa, out, self.view);
-        try putStr(gpa, out, self.url);
-        try putU8(gpa, out, self.disposition);
-        try putU8(gpa, out, self.user_gesture);
-    }
-
-    pub fn decodeFrom(payload: []const u8) !EvPopupRequest {
-        var cur = Cur{ .buf = payload };
-        return .{
-            .view = try cur.readU32(),
-            .url = try cur.readStr(),
-            .disposition = try cur.readU8(),
-            .user_gesture = cur.readU8() catch 1,
-        };
-    }
 };
 
 /// Popup blocking, pushed AHEAD of the decision.
@@ -2196,6 +2168,7 @@ pub const ctx_flag_selection: u8 = 8;
 /// the rule.
 pub const EvContextMenu = struct {
     pub const tag: Tag = .ev_context_menu;
+    pub const optional_from = "src_url";
     view: u32,
     x: i32,
     y: i32,
@@ -2206,29 +2179,6 @@ pub const EvContextMenu = struct {
     /// Selected text at menu time (`ctx_flag_selection`), truncated
     /// by the helper to a sane length for a menu row.
     selection_text: []const u8 = "",
-
-    pub fn encodeTo(self: EvContextMenu, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
-        try putU32(gpa, out, self.view);
-        try putI32(gpa, out, self.x);
-        try putI32(gpa, out, self.y);
-        try putU8(gpa, out, self.flags);
-        try putStr(gpa, out, self.link_url);
-        try putStr(gpa, out, self.src_url);
-        try putStr(gpa, out, self.selection_text);
-    }
-
-    pub fn decodeFrom(payload: []const u8) !EvContextMenu {
-        var cur = Cur{ .buf = payload };
-        return .{
-            .view = try cur.readU32(),
-            .x = try cur.readI32(),
-            .y = try cur.readI32(),
-            .flags = try cur.readU8(),
-            .link_url = try cur.readStr(),
-            .src_url = cur.readStr() catch "",
-            .selection_text = cur.readStr() catch "",
-        };
-    }
 };
 
 // -- TLS interstitials (capability "tls") -----------------------------
@@ -2335,6 +2285,7 @@ pub const PermissionDecision = struct {
 /// "the page started it" — the only behaviour that helper had.
 pub const EvDownloadOffer = struct {
     pub const tag: Tag = .ev_download_offer;
+    pub const optional_from = "req";
     view: u32,
     id: u32,
     total: u64,
@@ -2343,20 +2294,6 @@ pub const EvDownloadOffer = struct {
     name: []const u8,
     mime: []const u8,
     req: u32 = 0,
-
-    pub fn decodeFrom(payload: []const u8) !EvDownloadOffer {
-        var cur = Cur{ .buf = payload };
-        var out: EvDownloadOffer = .{
-            .view = try cur.readU32(),
-            .id = try cur.readU32(),
-            .total = try cur.readU64(),
-            .url = try cur.readStr(),
-            .name = try cur.readStr(),
-            .mime = try cur.readStr(),
-        };
-        out.req = cur.readU32() catch 0;
-        return out;
-    }
 };
 
 /// Ask the view's browser to download `url` itself, so the fetch
@@ -2380,18 +2317,12 @@ pub const DownloadStart = struct {
 /// always answer late.
 pub const DownloadDecide = struct {
     pub const tag: Tag = .download_decide;
+    pub const optional_from = "stage";
     view: u32,
     id: u32,
     path: []const u8,
     /// Allocate a private helper-side staging file; progress reports its path.
     stage: u8 = 0,
-
-    pub fn decodeFrom(payload: []const u8) !DownloadDecide {
-        var cur = Cur{ .buf = payload };
-        var out: DownloadDecide = .{ .view = try cur.readU32(), .id = try cur.readU32(), .path = try cur.readStr() };
-        out.stage = cur.readU8() catch 0;
-        return out;
-    }
 };
 
 /// Coalesced progress for a decided download: at most one frame per
@@ -2408,6 +2339,7 @@ pub const DownloadDecide = struct {
 /// can never come.
 pub const EvDownloadProgress = struct {
     pub const tag: Tag = .ev_download_progress;
+    pub const optional_from = "req";
     view: u32,
     id: u32,
     received: u64,
@@ -2419,22 +2351,6 @@ pub const EvDownloadProgress = struct {
     req: u32 = 0,
     path: []const u8 = "",
     interrupt_reason: i32 = 0,
-
-    pub fn decodeFrom(payload: []const u8) !EvDownloadProgress {
-        var cur = Cur{ .buf = payload };
-        var out: EvDownloadProgress = .{
-            .view = try cur.readU32(),
-            .id = try cur.readU32(),
-            .received = try cur.readU64(),
-            .total = try cur.readU64(),
-            .done = try cur.readU8(),
-            .failed = try cur.readU8(),
-        };
-        out.req = cur.readU32() catch 0;
-        out.path = cur.readStr() catch "";
-        out.interrupt_reason = cur.readI32() catch 0;
-        return out;
-    }
 };
 
 /// Abort a running download. Unknown ids are ignored (the download may
@@ -2769,6 +2685,7 @@ pub const SemSnapshot = struct {
 
 pub const SemAction = struct {
     pub const tag: Tag = .sem_act;
+    pub const optional_from = "motion";
     view: u32,
     id: u32,
     action: u8,
@@ -2784,17 +2701,6 @@ pub const SemAction = struct {
         try putU8(gpa, out, self.action);
         try putStr(gpa, out, self.arg);
         if (self.motion != 0) try putU8(gpa, out, self.motion);
-    }
-
-    pub fn decodeFrom(payload: []const u8) !SemAction {
-        var cur = Cur{ .buf = payload };
-        return .{
-            .view = try cur.readU32(),
-            .id = try cur.readU32(),
-            .action = try cur.readU8(),
-            .arg = try cur.readStr(),
-            .motion = if (cur.pos == payload.len) 0 else try cur.readU8(),
-        };
     }
 };
 
@@ -2812,6 +2718,7 @@ pub const MotionResult = enum(u8) { absent = 0, direct = 1, replayed = 2, _ };
 
 pub const SemActResult = struct {
     pub const tag: Tag = .sem_act_result;
+    pub const optional_from = "motion";
     view: u32,
     id: u32,
     ok: u8,
@@ -2830,20 +2737,6 @@ pub const SemActResult = struct {
             try putU8(gpa, out, self.motion);
             try putU32(gpa, out, self.duration_ms);
         }
-    }
-
-    pub fn decodeFrom(payload: []const u8) !SemActResult {
-        var cur = Cur{ .buf = payload };
-        var out: SemActResult = .{
-            .view = try cur.readU32(),
-            .id = try cur.readU32(),
-            .ok = try cur.readU8(),
-            .msg = try cur.readStr(),
-        };
-        if (cur.pos == payload.len) return out;
-        out.motion = try cur.readU8();
-        out.duration_ms = try cur.readU32();
-        return out;
     }
 };
 
@@ -2960,23 +2853,12 @@ pub const SemExpand = struct {
 /// message rather than the node's text (discarded, navigating, unknown id).
 pub const SemExpandResult = struct {
     pub const tag: Tag = .sem_expand_result;
+    pub const optional_from = "total";
     view: u32,
     id: u32,
     off: u32,
     text: []const u8,
     total: u32 = EXPAND_TOTAL_UNKNOWN,
-
-    pub fn decodeFrom(payload: []const u8) !SemExpandResult {
-        var cur = Cur{ .buf = payload };
-        var out: SemExpandResult = .{
-            .view = try cur.readU32(),
-            .id = try cur.readU32(),
-            .off = try cur.readU32(),
-            .text = try cur.readStr(),
-        };
-        out.total = cur.readU32() catch EXPAND_TOTAL_UNKNOWN;
-        return out;
-    }
 };
 
 /// `SemExpandResult.total` when the length is not known.
@@ -3084,6 +2966,7 @@ pub const SemReadIdsResult = struct {
 /// the existing `sem_act_result`; a stale guard answers `ok = 0`.
 pub const SemActGuarded = struct {
     pub const tag: Tag = .sem_act_guarded;
+    pub const optional_from = "motion";
     view: u32,
     doc_gen: u32,
     rev: u32,
@@ -3103,20 +2986,6 @@ pub const SemActGuarded = struct {
         try putU8(gpa, out, self.action);
         try putStr(gpa, out, self.arg);
         if (self.motion != 0) try putU8(gpa, out, self.motion);
-    }
-
-    pub fn decodeFrom(payload: []const u8) !SemActGuarded {
-        var cur = Cur{ .buf = payload };
-        return .{
-            .view = try cur.readU32(),
-            .doc_gen = try cur.readU32(),
-            .rev = try cur.readU32(),
-            .id = try cur.readU32(),
-            .guard = try cur.readU64(),
-            .action = try cur.readU8(),
-            .arg = try cur.readStr(),
-            .motion = if (cur.pos == payload.len) 0 else try cur.readU8(),
-        };
     }
 };
 
@@ -3172,23 +3041,12 @@ pub fn semResultUnwrap(result: SemResult) Frame {
 /// caller's. A short payload from an older helper reads as 0.
 pub const SemEval = struct {
     pub const tag: Tag = .sem_eval;
+    pub const optional_from = "max_str";
     view: u32,
     flags: u8,
     timeout_ms: u32,
     code: Text,
     max_str: u32 = 0,
-
-    pub fn decodeFrom(payload: []const u8) !SemEval {
-        var cur = Cur{ .buf = payload };
-        var out: SemEval = .{
-            .view = try cur.readU32(),
-            .flags = try cur.readU8(),
-            .timeout_ms = try cur.readU32(),
-            .code = try cur.readText(),
-        };
-        out.max_str = cur.readU32() catch 0;
-        return out;
-    }
 };
 
 /// `flags` bit of `SemEval`: await a thenable result.
@@ -3708,17 +3566,13 @@ pub const NetPolicySet = struct {
 /// ACK-capable helpers echo a nonzero query serial instead of the installed policy serial.
 pub const NetPolicyReq = struct {
     pub const tag: Tag = .net_policy_req;
+    pub const optional_from = "serial";
     view: u32,
     serial: u32 = 0,
 
     pub fn encodeTo(self: NetPolicyReq, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
         try putU32(gpa, out, self.view);
         if (self.serial != 0) try putU32(gpa, out, self.serial);
-    }
-
-    pub fn decodeFrom(payload: []const u8) !NetPolicyReq {
-        var cur = Cur{ .buf = payload };
-        return .{ .view = try cur.readU32(), .serial = if (cur.pos < payload.len) try cur.readU32() else 0 };
     }
 };
 
@@ -4223,6 +4077,7 @@ pub const ENGINE_VIEW_BASE: u32 = 0x4000_0000;
 /// never overwrites anything the engine's own writer would not.
 pub const PrintPdf = struct {
     pub const tag: Tag = .print_pdf;
+    pub const optional_from = "stage";
     view: u32,
     /// `print_flag_*` bits; a bit this helper does not know is ignored.
     flags: u8,
@@ -4235,18 +4090,6 @@ pub const PrintPdf = struct {
     /// An older helper ignores the byte and writes `path` itself, which
     /// is why a client sends it only when the capability is advertised.
     stage: u8 = 0,
-
-    pub fn decodeFrom(payload: []const u8) !PrintPdf {
-        var cur = Cur{ .buf = payload };
-        var out: PrintPdf = .{
-            .view = try cur.readU32(),
-            .flags = try cur.readU8(),
-            .paper = try cur.readU8(),
-            .path = try cur.readStr(),
-        };
-        out.stage = cur.readU8() catch 0;
-        return out;
-    }
 };
 
 /// `PrintPdf.flags` bits.
@@ -4282,6 +4125,7 @@ pub fn paperInches(paper: u8) ?PaperSize {
 /// keeping a correlation id.
 pub const EvPrintPdfDone = struct {
     pub const tag: Tag = .ev_print_pdf_done;
+    pub const optional_from = "staged";
     view: u32,
     ok: u8,
     path: []const u8,
@@ -4289,17 +4133,6 @@ pub const EvPrintPdfDone = struct {
     /// host; empty for an unstaged print or a failure (a failed staging
     /// file is removed by the helper).
     staged: []const u8 = "",
-
-    pub fn decodeFrom(payload: []const u8) !EvPrintPdfDone {
-        var cur = Cur{ .buf = payload };
-        var out: EvPrintPdfDone = .{
-            .view = try cur.readU32(),
-            .ok = try cur.readU8(),
-            .path = try cur.readStr(),
-        };
-        out.staged = cur.readStr() catch "";
-        return out;
-    }
 };
 
 // -- performance (0xA6 block, capability "web-perf") -------------------
@@ -5226,6 +5059,7 @@ pub const StreamEncoding = enum(u8) {
 /// (`req` 0). Answered by exactly one `ev_stream_open`.
 pub const StreamOpen = struct {
     pub const tag: Tag = .stream_open;
+    pub const optional_from = "encoding";
     view: u32,
     req: u32,
     audio: u8,
@@ -5243,17 +5077,6 @@ pub const StreamOpen = struct {
         if (self.popups == 0) return;
         try putU8(gpa, out, self.popups);
     }
-
-    pub fn decodeFrom(payload: []const u8) !StreamOpen {
-        var cur = Cur{ .buf = payload };
-        var out: StreamOpen = .{ .view = try cur.readU32(), .req = try cur.readU32(), .audio = try cur.readU8() };
-        if (cur.pos == payload.len) return out;
-        out.encoding = @enumFromInt(try cur.readU8());
-        out.codecs = if (cur.pos == payload.len) "" else try cur.readStr();
-        if (cur.pos == payload.len) return out;
-        out.popups = try cur.readU8();
-        return out;
-    }
 };
 
 /// Helper -> client: the answer to `stream_open`. Success has an empty
@@ -5268,6 +5091,7 @@ pub const StreamOpen = struct {
 /// means raw.
 pub const EvStreamOpen = struct {
     pub const tag: Tag = .ev_stream_open;
+    pub const optional_from = "audio";
     view: u32,
     req: u32,
     path: []const u8,
@@ -5287,15 +5111,6 @@ pub const EvStreamOpen = struct {
         if (self.encoding == .raw) return;
         try putU8(gpa, out, @intFromEnum(self.encoding));
         try putU8(gpa, out, self.codec);
-    }
-
-    pub fn decodeFrom(payload: []const u8) !EvStreamOpen {
-        var cur = Cur{ .buf = payload };
-        var out: EvStreamOpen = .{ .view = try cur.readU32(), .req = try cur.readU32(), .path = try cur.readStr(), .token = try cur.readStr(), .err = try cur.readStr() };
-        out.audio = cur.readU8() catch 0;
-        out.encoding = @enumFromInt(cur.readU8() catch 0);
-        out.codec = cur.readU8() catch 0;
-        return out;
     }
 };
 
@@ -5704,7 +5519,10 @@ pub fn encodePayload(gpa: std.mem.Allocator, out: *std.ArrayList(u8), value: any
                 i32 => try putI32(gpa, out, v),
                 []const u8 => try putStr(gpa, out, v),
                 Text => try putText(gpa, out, v),
-                else => @compileError("unsupported wire field type " ++ @typeName(f.type)),
+                else => {
+                    wireEnum(f.type);
+                    try putU8(gpa, out, @intFromEnum(v));
+                },
             }
         }
     }
@@ -5712,27 +5530,70 @@ pub fn encodePayload(gpa: std.mem.Allocator, out: *std.ArrayList(u8), value: any
 
 /// Decode a payload into `T`. String fields BORROW from `payload`.
 /// Types with list fields provide `decodeAlloc` instead; a type with a
-/// `decodeFrom` (a bounded array, or an optional trailing field) owns
-/// its own reader and is routed to it, so callers never have to know
-/// which shape a frame has.
+/// `decodeFrom` (a bounded array, an optional or nested field) owns its
+/// own reader and is routed to it, so callers never have to know which
+/// shape a frame has.
+///
+/// A frame that GREW names its first added field in a pub
+/// `optional_from` declaration: from that field on, every field has a
+/// default and the payload may end before any of them, which then reads
+/// as its default, so an older peer's shorter frame still decodes. A
+/// partial trailing field is still `error.Truncated`, and a frame
+/// without the declaration has no optional field at all.
 pub fn decode(comptime T: type, payload: []const u8) !T {
     if (@hasDecl(T, "decodeAlloc")) @compileError(@typeName(T) ++ " needs decodeAlloc");
     if (@hasDecl(T, "decodeFrom")) return T.decodeFrom(payload);
+    const first_optional = comptime optionalFrom(T);
     var cur = Cur{ .buf = payload };
     var out: T = undefined;
-    inline for (reflect.fields(T)) |f| {
-        @field(out, f.name) = switch (f.type) {
-            u8 => try cur.readU8(),
-            u16 => try cur.readU16(),
-            u32 => try cur.readU32(),
-            u64 => try cur.readU64(),
-            i32 => try cur.readI32(),
-            []const u8 => try cur.readStr(),
-            Text => try cur.readText(),
-            else => @compileError("unsupported wire field type " ++ @typeName(f.type)),
-        };
+    inline for (reflect.fields(T), 0..) |f, i| {
+        @field(out, f.name) = if (comptime i < first_optional)
+            try readField(f.type, &cur)
+        else if (cur.pos == payload.len)
+            comptime f.defaultValue().?
+        else
+            try readField(f.type, &cur);
     }
     return out;
+}
+
+fn readField(comptime F: type, cur: *Cur) !F {
+    return switch (F) {
+        u8 => cur.readU8(),
+        u16 => cur.readU16(),
+        u32 => cur.readU32(),
+        u64 => cur.readU64(),
+        i32 => cur.readI32(),
+        []const u8 => cur.readStr(),
+        Text => cur.readText(),
+        else => blk: {
+            wireEnum(F);
+            break :blk std.enums.fromInt(F, try cur.readU8()) orelse error.BadEnum;
+        },
+    };
+}
+
+/// A generic wire enum is one byte; an unknown value is `error.BadEnum` unless the enum is non-exhaustive.
+fn wireEnum(comptime E: type) void {
+    comptime {
+        const info = @typeInfo(E);
+        if (info != .@"enum" or info.@"enum".tag_type != u8)
+            @compileError("unsupported wire field type " ++ @typeName(E));
+    }
+}
+
+/// The index of `T.optional_from` (the field count without one); every field from it on must have a default.
+fn optionalFrom(comptime T: type) usize {
+    comptime {
+        const all = reflect.fields(T);
+        if (!@hasDecl(T, "optional_from")) return all.len;
+        for (all, 0..) |f, i| if (std.mem.eql(u8, f.name, T.optional_from)) {
+            for (all[i..]) |g| if (g.defaultValue() == null)
+                @compileError(@typeName(T) ++ "." ++ g.name ++ " is an optional trailing wire field without a default");
+            return i;
+        };
+        @compileError(@typeName(T) ++ ".optional_from names no field");
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -6092,7 +5953,7 @@ test "EvContextMenu: optional trailing fields absent reads as empty" {
     try putI32(gpa, &out, 220);
     try putU8(gpa, &out, ctx_flag_link);
     try putStr(gpa, &out, "https://example.com/a");
-    const ev = try EvContextMenu.decodeFrom(out.items);
+    const ev = try decode(EvContextMenu, out.items);
     try std.testing.expectEqualStrings("https://example.com/a", ev.link_url);
     try std.testing.expectEqualStrings("", ev.src_url);
     try std.testing.expectEqualStrings("", ev.selection_text);
@@ -6171,7 +6032,7 @@ test "an ev_download_offer without the trailing req still decodes" {
     try putStr(gpa, &out, "https://example.com/x.bin");
     try putStr(gpa, &out, "x.bin");
     try putStr(gpa, &out, "");
-    const ev = try EvDownloadOffer.decodeFrom(out.items);
+    const ev = try decode(EvDownloadOffer, out.items);
     try std.testing.expectEqual(@as(u32, 0), ev.req);
     try std.testing.expectEqualStrings("x.bin", ev.name);
 }
@@ -6183,7 +6044,7 @@ test "legacy download decisions and progress default staging and errors" {
     try putU32(a, &bytes, 7);
     try putU32(a, &bytes, 41);
     try putStr(a, &bytes, "/tmp/file.bin");
-    const decision = try DownloadDecide.decodeFrom(bytes.items);
+    const decision = try decode(DownloadDecide, bytes.items);
     try std.testing.expectEqual(@as(u8, 0), decision.stage);
     bytes.clearRetainingCapacity();
     try putU32(a, &bytes, 7);
@@ -6192,7 +6053,7 @@ test "legacy download decisions and progress default staging and errors" {
     try putU64(a, &bytes, 10);
     try putU8(a, &bytes, 1);
     try putU8(a, &bytes, 0);
-    const progress = try EvDownloadProgress.decodeFrom(bytes.items);
+    const progress = try decode(EvDownloadProgress, bytes.items);
     try std.testing.expectEqual(@as(u32, 0), progress.req);
     try std.testing.expectEqualStrings("", progress.path);
     try std.testing.expectEqual(@as(i32, 0), progress.interrupt_reason);
@@ -6206,10 +6067,32 @@ test "a sem_eval without the trailing max_str decodes as the serializer default"
     try putU8(gpa, &out, eval_flag_await);
     try putU32(gpa, &out, 5000);
     try putText(gpa, &out, .{ .s = "1+1" });
-    const ev = try SemEval.decodeFrom(out.items);
+    const ev = try decode(SemEval, out.items);
     try std.testing.expectEqual(@as(u32, 0), ev.max_str);
     try std.testing.expectEqualStrings("1+1", ev.code.s);
     try roundTrip(SemEval, .{ .view = 7, .flags = 0, .timeout_ms = 5000, .code = .{ .s = "1+1" }, .max_str = 60_000 });
+}
+
+test "generic decode: defaulted fields are optional trailers, a partial one is truncated" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    // A V1 stream_open: three fields, every trailer at its default.
+    try putU32(gpa, &out, 7);
+    try putU32(gpa, &out, 9);
+    try putU8(gpa, &out, 1);
+    const v1 = try decode(StreamOpen, out.items);
+    try std.testing.expectEqual(StreamEncoding.raw, v1.encoding);
+    try std.testing.expectEqualStrings("", v1.codecs);
+    try std.testing.expectEqual(@as(u8, 0), v1.popups);
+    // An encoding byte this build does not name still decodes (non-exhaustive enum).
+    try putU8(gpa, &out, 7);
+    const newer = try decode(StreamOpen, out.items);
+    try std.testing.expectEqual(@as(u8, 7), @intFromEnum(newer.encoding));
+    try std.testing.expectEqualStrings("", newer.codecs);
+    // Half of the codecs length prefix is a broken frame, not an absent field.
+    try putU8(gpa, &out, 3);
+    try std.testing.expectError(error.Truncated, decode(StreamOpen, out.items));
 }
 
 // The one growable frame on this wire: a helper that predates the
