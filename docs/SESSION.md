@@ -1,5 +1,22 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-14: overstrike (mintty `CSI 8:7 m` / DECSET 20)
+
+While overstrike is on, a print draws on top of the cell under the
+cursor instead of replacing it: the cell keeps its glyph, rendition and
+background, the new glyph keeps the current rendition, and the cursor
+advances (pending wrap first, wide right half strikes its base, insert
+mode shifts nothing). `8:7` no longer reads as conceal + reverse; `28`,
+`0`, DECSTR and RIS clear it, DECSC/DECRC carry it, DECRQM ?20 and
+DECRQSS `8:7` report it. Layers are a style-entry ID into an interned
+table (at most 4 per cell, oldest dropped), so every cell operation
+carries them and copy returns the base text; the border-set table and
+this one are now one generic `grid/slot_table.zig`. Both CellPass and
+GridPass draw layers above base glyphs without repainting the
+background; smoke-cell asserts both colours, the kept background and
+pass parity. Snapshot v14 carries layers and the flags; v13 restores
+without. `docs/overstrike.md` has the details and limits.
+
 ## 2026-11-14: cell borders (draft `DCS 1 + b cell-border` protocol)
 
 Apps can draw panel outlines and underlines on cell edges without
