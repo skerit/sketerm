@@ -1,5 +1,21 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-14: smell sweep (devtools detach, wire trailers, DECAWM wide char)
+
+- A DevTools agent detach no longer fails a view with media emulation: the
+  next method attaches a fresh agent, so the media override and a non-default
+  CPU throttle are re-submitted (navigations wait for the new ack), a running
+  trace finishes with what arrived, pending methods fail naming the detach.
+- `protocol.decode` reads optional trailing fields for a frame that names
+  its first grown field in `optional_from`; 17 hand-written `decodeFrom` and
+  2 `encodeTo` went away, wire bytes unchanged.
+- With DECAWM off a wide char that does not fit at the last column is
+  dropped (xterm `dotext`), not wrapped.
+- GridPass's auto-detected URL underline skips concealed (SGR 8) cells.
+- `SKETERM_WEB_STDERR=/abs/path` appends the helper's stderr to a file.
+- Smaller: `resolveMaps` holds no pointer into its cache, the web tool
+  count test derives from the browser group, `zig fmt` on six files.
+
 ## 2026-11-14: a leftover scroll offset no longer skews the alt screen
 
 Shift+PageUp, scrollback_top and the wheel could set `view_offset` while
