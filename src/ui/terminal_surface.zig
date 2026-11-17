@@ -594,6 +594,11 @@ pub const TerminalSurface = struct {
         return widgetshot.widgetToPng(@ptrCast(self.area));
     }
 
+    /// `screenshotPng` with the reason for a failure.
+    pub fn screenshot(self: *TerminalSurface) widgetshot.Error!*c.GBytes {
+        return widgetshot.widgetPng(@ptrCast(self.area));
+    }
+
     /// Build an Atlas at the surface's current size. Resolution
     /// order: explicit file path → family name via fontconfig →
     /// $SKETERM_FONT → built-in candidate list. Returns null when

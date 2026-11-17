@@ -683,15 +683,27 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         const path = req.data orelse return ipc_protocol.writeErr(out, allocator, .invalid_request, "screenshot requires data (output .png path)");
         const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
         // A pane showing a web page must be photographed as the PAGE:
-        // the terminal surface underneath it is the hidden shell.
+        // the terminal surface underneath it is the hidden shell, so a
+        // failed page capture is reported as itself, never as the shell's.
         const bytes = blk: {
             if (pane.webFaceVisible()) {
                 if (@import("webface.zig").WebFace.fromPane(pane)) |wf| {
-                    if (wf.screenshotPng()) |png| break :blk png;
+                    break :blk wf.screenshotPng() catch |err| return ipc_protocol.writeErr(out, allocator, .failed, switch (err) {
+                        error.NoSize => "screenshot failed: the web page has no size yet (never laid out; its tab may not have been shown)",
+                        error.NotShown => "screenshot failed: the web page is not on screen (its tab is not the selected one); focus it first",
+                        error.NotInWindow => "screenshot failed: the web page is not in a window",
+                        error.NothingPainted => "screenshot failed: the web page has drawn nothing yet",
+                        error.RenderFailed => "screenshot failed: GTK could not render the web page",
+                    });
                 }
             }
-            break :blk pane.screenshotPng() orelse
-                return ipc_protocol.writeErr(out, allocator, .failed, "screenshot failed (pane not mapped/realized yet)");
+            break :blk pane.surface.screenshot() catch |err| return ipc_protocol.writeErr(out, allocator, .failed, switch (err) {
+                error.NoSize => "screenshot failed: the pane has no size yet (never laid out; its tab may not have been shown)",
+                error.NotShown => "screenshot failed: the pane is not on screen (its tab is not the selected one); focus it first",
+                error.NotInWindow => "screenshot failed: the pane is not in a window",
+                error.NothingPainted => "screenshot failed: the pane has drawn nothing yet",
+                error.RenderFailed => "screenshot failed: GTK could not render the pane",
+            });
         };
         defer c.g_bytes_unref(bytes);
         var sz: c.gsize = 0;

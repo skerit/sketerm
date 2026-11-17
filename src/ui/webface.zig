@@ -1957,9 +1957,9 @@ pub const WebFace = struct {
     /// terminal surface, which on a web pane is the hidden shell
     /// underneath — so the face renders its view widget instead,
     /// with the same widget-paintable technique.
-    pub fn screenshotPng(self: *WebFace) ?*c.GBytes {
-        if (self.widgets_dead) return null;
-        return widgetshot.widgetToPng(self.overlay);
+    pub fn screenshotPng(self: *WebFace) widgetshot.Error!*c.GBytes {
+        if (self.widgets_dead) return error.NotInWindow;
+        return widgetshot.widgetPng(self.overlay);
     }
 
     /// Every `sem_snapshot` frame answers a request now: the helper
