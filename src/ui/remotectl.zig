@@ -1401,6 +1401,10 @@ const WebViewInfo = struct {
     /// This tab's network route in web/route.zig text; "direct" for a
     /// plain tab. `web_tabs` shows it and `web_open route:` sets it.
     route: []const u8,
+    /// A Watch viewer's page (`webwatch.zig`): another browser's tab,
+    /// shown here. Listed so a caller can find the viewer; every verb but
+    /// `web-close` refuses it, since it is not this GUI's to drive.
+    observed: bool,
 };
 
 fn webFaceOf(self: *Window, req: ipc_protocol.Request) ?*webface.WebFace {
@@ -1443,6 +1447,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
                         .cert = if (face.cert_rec) |*rec| rec.wire() else null,
                         .load_error = if (face.load_error_rec) |*rec| rec.wire() else null,
                         .route = face.routeSpec().format(try arena.alloc(u8, webroute.MAX_TEXT)) orelse face.routeSpec().kind.word(),
+                        .observed = face.observed,
                     });
                 }
             }
@@ -1552,6 +1557,8 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
 
     const face = webFaceOf(self, req) orelse
         return ipc_protocol.writeErr(out, allocator, .not_found, "no web view on that pane (web_tabs lists them; web_open makes one)");
+    if (face.observed)
+        return ipc_protocol.writeErr(out, allocator, .unsupported, "that pane is a Watch viewer of another browser's tab, not a page of this GUI's browser; its owner drives it (web_tabs lists this browser's own tabs)");
 
     if (eql(u8, req.cmd, "web-navigate")) {
         if (req.data) |url| {

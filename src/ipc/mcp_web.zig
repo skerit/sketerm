@@ -1111,6 +1111,9 @@ pub const View = struct {
     /// in `web-list`; headless it is the route of the ENGINE the view
     /// lives in, since a route there is a whole helper instance.
     route: []const u8 = "direct",
+    /// GUI: a Watch viewer's page, another browser's tab the user is
+    /// watching. Never one of this server's tabs; `listViews` drops it.
+    observed: bool = false,
     /// Manual handoff is independent of the automation backend's ownership.
     handoff_available: bool = false,
     browser_name: []const u8 = "",
@@ -1700,10 +1703,13 @@ fn listViews(drv: Driver, arena: std.mem.Allocator) !?Views {
                 helper_reason: []const u8 = "",
             }, arena, resp, .{ .ignore_unknown_fields = true }) catch return null;
             if (!parsed.ok) return null;
-            const own = try arena.dupe(View, parsed.views);
-            try annotate(arena, .gui, own);
+            // A Watch viewer shows ANOTHER browser's tab: listing it made
+            // it a handle this server "drove" while the GUI did nothing.
+            var own: std.ArrayList(View) = .empty;
+            for (parsed.views) |v| if (!v.observed) try own.append(arena, v);
+            try annotate(arena, .gui, own.items);
             return Views{
-                .views = own,
+                .views = own.items,
                 .helper = parsed.helper,
                 .helper_reason = parsed.helper_reason,
             };
@@ -11245,6 +11251,33 @@ test "web_close with a GUI closes one PAGE of the pane, and falls back to the pa
     try t.expect(std.mem.indexOf(u8, old.requests.items[2], "\"cmd\":\"close-pane\"") != null);
     const oparsed = try mcp.expectToolResultShape(arena, "web_close", old_out);
     try t.expect(oparsed.object.get("structuredContent").?.object.get("pane_closed").?.bool);
+}
+
+test "a GUI's Watch viewer is not one of this server's tabs" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    // Pane 40 shows another assistant's tab (observed); pane 41 is a real
+    // page of the user's browser. Only 41 is listed.
+    const MIXED = "{\"ok\":true,\"views\":[{\"pane\":40,\"view\":6,\"url\":\"https://example.com/\",\"active\":true,\"observed\":true,\"load_seq\":0},{\"pane\":41,\"view\":7,\"url\":\"https://b.example/\",\"active\":true,\"load_seq\":1}],\"helper\":\"ready\"}";
+    var tabs = ScriptedBackend{ .allocator = t.allocator, .responses = &.{MIXED} };
+    defer tabs.deinit();
+    const out = try webTool(arena, tabs.backend(), "web_tabs", try jsonArgs(arena, "{}"));
+    const parsed = try mcp.expectToolResultShape(arena, "web_tabs", out);
+    const views = parsed.object.get("structuredContent").?.object.get("views").?.array.items;
+    try t.expectEqual(@as(usize, 1), views.len);
+    try t.expectEqual(@as(i64, 41), views[0].object.get("pane").?.integer);
+
+    // The incident: the viewer was the ONLY view, so a navigate naming it
+    // "succeeded" while nothing moved. Now no verb reaches the GUI.
+    const ONLY_WATCH = "{\"ok\":true,\"views\":[{\"pane\":40,\"view\":6,\"url\":\"https://example.com/\",\"active\":true,\"observed\":true,\"load_seq\":0}],\"helper\":\"ready\"}";
+    var nav = ScriptedBackend{ .allocator = t.allocator, .responses = &.{ ONLY_WATCH, ONLY_WATCH, ONLY_WATCH } };
+    defer nav.deinit();
+    const nav_out = try webTool(arena, nav.backend(), "web_navigate", try jsonArgs(arena, "{\"pane\":40,\"url\":\"https://c.example/\"}"));
+    try t.expect(std.mem.indexOf(u8, nav_out, "\"isError\":true") != null);
+    for (nav.requests.items) |rq| try t.expect(std.mem.indexOf(u8, rq, "\"cmd\":\"web-navigate\"") == null);
 }
 
 test "web_profile_save result shapes: a live flush and a no-engine answer" {
