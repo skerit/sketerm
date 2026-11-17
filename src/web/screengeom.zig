@@ -53,6 +53,24 @@ pub fn engine(lever: ScaleLever, w: u16, h: u16, scale_x1000: u16, report: ?prot
     };
 }
 
+pub const FrameSize = struct { w: u16, h: u16 };
+
+/// The size CEF's `on_accelerated_paint` delivers for a view of `pw`x`ph`
+/// physical pixels: each axis evened down (measured on CEF 156 under
+/// Wayland ozone, 575x751 -> 574x750). `on_paint` keeps the exact size.
+pub fn acceleratedFrameSize(pw: u16, ph: u16) FrameSize {
+    return .{ .w = pw & ~@as(u16, 1), .h = ph & ~@as(u16, 1) };
+}
+
+test "a GPU frame is the view evened down on each axis" {
+    // Measured pairs (view -> coded_size), CEF 156 on a 1.3 scale display.
+    try std.testing.expectEqual(FrameSize{ .w = 1300, .h = 750 }, acceleratedFrameSize(1300, 751));
+    try std.testing.expectEqual(FrameSize{ .w = 574, .h = 750 }, acceleratedFrameSize(575, 751));
+    try std.testing.expectEqual(FrameSize{ .w = 644, .h = 750 }, acceleratedFrameSize(645, 751));
+    try std.testing.expectEqual(FrameSize{ .w = 650, .h = 750 }, acceleratedFrameSize(650, 751));
+    try std.testing.expectEqual(FrameSize{ .w = 1280, .h = 800 }, acceleratedFrameSize(1280, 800));
+}
+
 pub const Point = struct { x: i32, y: i32 };
 
 /// Where the view point `x`,`y` (the view rect's space) lies on the

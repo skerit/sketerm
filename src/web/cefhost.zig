@@ -458,6 +458,9 @@ pub const View = struct {
     buf_unpainted: bool = false,
     gen: u32 = 0,
     hidden: bool = false,
+    /// Warned once that the engine paints this view's CURRENT geometry
+    /// at a size `screengeom.acceleratedFrameSize` does not predict.
+    accel_mismatch_warned: bool = false,
     /// Client-set frame-rate cap (`view_max_fps`), 0 = uncapped.
     max_fps: u16 = 0,
     /// Last address CEF reported, owned; the `ev_nav_state` payload,
@@ -7598,9 +7601,22 @@ fn onAcceleratedPaint(
     if (n <= 0 or n > proto.MAX_PLANES) return;
 
     // A frame for the pre-resize geometry, dropped exactly like its
-    // software counterpart: the resize brings its own full repaint.
+    // software counterpart: the resize brings its own full repaint. The
+    // GPU frame is the view evened down (screengeom.acceleratedFrameSize),
+    // so it is compared against that, never against pw x ph.
     const coded = inf.extra.coded_size;
-    if (coded.width != @as(c_int, v.pw) or coded.height != @as(c_int, v.ph)) return;
+    const want = screengeom.acceleratedFrameSize(v.pw, v.ph);
+    if (coded.width != @as(c_int, want.w) or coded.height != @as(c_int, want.h)) {
+        // A stale frame carries the previous geometry; one within a pixel
+        // of the current view means the engine's rounding changed, and
+        // every frame of this view would be dropped: say so, once.
+        const near = @abs(coded.width - @as(c_int, v.pw)) <= 1 and @abs(coded.height - @as(c_int, v.ph)) <= 1;
+        if (near and !v.accel_mismatch_warned) {
+            v.accel_mismatch_warned = true;
+            std.debug.print("sketerm-web: view {d}: the engine paints {d}x{d} for a {d}x{d} view, expected {d}x{d}; its GPU frames are dropped and the page shows nothing\n", .{ v.id, coded.width, coded.height, v.pw, v.ph, want.w, want.h });
+        }
+        return;
+    }
 
     var fds: [proto.MAX_PLANES]i32 = @splat(-1);
     var planes: [proto.MAX_PLANES]proto.Plane = @splat(.{ .stride = 0, .offset = 0 });
@@ -7624,8 +7640,8 @@ fn onAcceleratedPaint(
         .view = v.id,
         .buf_id = v.poolId(inodeOf(fds[0]), @intCast(v.gen)),
         .gen = v.gen,
-        .w = v.pw,
-        .h = v.ph,
+        .w = want.w,
+        .h = want.h,
         .fourcc = fourccOf(inf.format),
         .modifier = inf.modifier,
         .nplanes = got,
