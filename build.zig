@@ -1057,10 +1057,19 @@ pub fn build(b: *std.Build) void {
     const env_removal_step = b.step("lint-env-removal", "Reject environment removals that bypass env.unset");
     env_removal_step.dependOn(&env_removal.step);
 
+    // 0.17's `zig fmt` rewrites @intFromEnum/@enumFromInt to builtins 0.16
+    // does not have; the tree must keep building on both.
+    const zig16_builtins = b.addSystemCommand(&.{"bash"});
+    zig16_builtins.addFileArg(b.path("dist/test-zig16-builtins.sh"));
+    zig16_builtins.has_side_effects = true;
+    const zig16_builtins_step = b.step("lint-zig16-builtins", "Reject Zig 0.17-only builtins that 0.17's zig fmt writes");
+    zig16_builtins_step.dependOn(&zig16_builtins.step);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_roots.step);
     test_step.dependOn(&lint_errdefer.step);
     test_step.dependOn(&env_removal.step);
+    test_step.dependOn(&zig16_builtins.step);
     test_step.dependOn(&run_tests.step);
 
     const atomicwrite_tests_mod = b.createModule(.{
@@ -1112,6 +1121,7 @@ pub fn build(b: *std.Build) void {
     core_test_step.dependOn(&test_roots.step);
     core_test_step.dependOn(&lint_errdefer.step);
     core_test_step.dependOn(&env_removal.step);
+    core_test_step.dependOn(&zig16_builtins.step);
     const run_coretests = b.addRunArtifact(coretests);
     unitTestDaemon(run_coretests, dev_bins);
     core_test_step.dependOn(&run_coretests.step);
@@ -1121,7 +1131,7 @@ pub fn build(b: *std.Build) void {
     // step, the binary distribution is never downloaded unless the fetch
     // step is asked for by name, and the CEF headers are only translated
     // when that distribution is already on disk.
-    addCef(b, target, optimize, strip, use_lld, have_opus, core_cbindings_mod, dev, dev_mux_exe, dev_bins, smoke_mcp_run, &test_roots.step, &lint_errdefer.step, &env_removal.step);
+    addCef(b, target, optimize, strip, use_lld, have_opus, core_cbindings_mod, dev, dev_mux_exe, dev_bins, smoke_mcp_run, &test_roots.step, &lint_errdefer.step, &env_removal.step, &zig16_builtins.step);
 }
 
 /// How one family of artifacts compiles and links; `build` declares the
@@ -1364,6 +1374,7 @@ fn addCef(
     test_roots: *std.Build.Step,
     lint_errdefer: *std.Build.Step,
     env_removal: *std.Build.Step,
+    zig16_builtins: *std.Build.Step,
 ) void {
     // Default cache location, XDG-correct: $XDG_CACHE_HOME/sketerm/cef/
     // <version>/ (~/.cache/... when unset). Version-scoped so several
@@ -1537,6 +1548,7 @@ fn addCef(
     test_web_step.dependOn(test_roots);
     test_web_step.dependOn(lint_errdefer);
     test_web_step.dependOn(env_removal);
+    test_web_step.dependOn(zig16_builtins);
     const smoke_web_step = b.step("smoke-web", "browser-helper end-to-end smoke (headless)");
     const bench_wreq_step = b.step("bench-webreq", "Blocking-webRequest added-latency benchmark (real helper, real page)");
     const native_untrusted_step = if (target.result.os.tag == .linux)
