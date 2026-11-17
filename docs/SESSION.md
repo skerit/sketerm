@@ -1,5 +1,28 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-17: gray GUI browser tabs on CEF 156, and four follow-ups
+
+- CEF 156 paints `on_accelerated_paint` frames at the view's physical size
+  evened down per axis (1300x751 -> 1300x750). The helper's stale-frame
+  check compared against the exact size, so a GUI browser tab with an odd
+  physical width or height (any 577px-tall pane at scale 1.3) dropped every
+  frame and stayed gray. `screengeom.acceleratedFrameSize` is the rule; a
+  view whose engine paints its current geometry at another size now warns
+  once instead of failing silently.
+- A Watch viewer's page is listed by `web-list` as `observed`, the MCP's
+  GUI adapter no longer counts it as one of its tabs (a web_gui assistant
+  "navigated" another assistant's watched tab and nothing moved), and every
+  pane-addressed web verb but `web-close` refuses it.
+- `screenshot` names the real failure (no size, not on screen, nothing
+  drawn, not in a window, render failed) and never reports the hidden
+  terminal's failure for a web pane (`widgetshot.widgetPng`).
+- The web watch e2e stage passes again: the dim badge subtitle is read as
+  its own line (`waitOcrLineBelow`), the pane chip is the accent run below
+  the tab-bar chip rather than below a fixed 120px band, and resizes wait
+  for the committed geometry (`resizeSettled`).
+- `zig build lint-zig16-builtins` rejects `@backingInt`/`@fromBackingInt`,
+  which 0.17's `zig fmt` writes and 0.16 cannot compile.
+
 ## 2026-11-14: smell sweep (devtools detach, wire trailers, DECAWM wide char)
 
 - A DevTools agent detach no longer fails a view with media emulation: the
