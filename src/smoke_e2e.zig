@@ -3687,7 +3687,57 @@ fn spawnIsolatedMcp(allocator: std.mem.Allocator, fake_log: ?[*:0]const u8) ?Mcp
 /// below what OCR reads reliably; its colour is unique in the band.
 const ChipBox = struct { x: f64, y: f64, w: f64, h: f64 };
 const MIN_CHIP_PX: usize = 200;
+/// How far down the tab bar's chip can sit. The pane titlebar's lease
+/// chip ALSO lies inside it (y 96..111 of a 729px window, 2026-11), so
+/// the two are told apart by `accentRun`, never by this depth.
 const CHIP_BAND_PX: usize = 120;
+
+fn isAccent(px: []const u8, i: usize) bool {
+    const b: i32 = px[i];
+    const g: i32 = px[i + 1];
+    const r: i32 = px[i + 2];
+    return r > 220 and g > 85 and g < 160 and b < 90;
+}
+
+/// The topmost run of rows in `first..end` holding accent pixels, ended by
+/// the first accent-free row: ONE chip, never two stacked ones merged.
+fn accentRun(px: []const u8, width: usize, first: usize, end: usize) ?ChipBox {
+    var n: usize = 0;
+    var min_x: usize = width;
+    var min_y: usize = end;
+    var max_x: usize = 0;
+    var max_y: usize = 0;
+    var y: usize = first;
+    while (y < end) : (y += 1) {
+        var row_hits: usize = 0;
+        var x: usize = 0;
+        while (x < width) : (x += 1) {
+            if (!isAccent(px, (y * width + x) * 4)) continue;
+            row_hits += 1;
+            min_x = @min(min_x, x);
+            min_y = @min(min_y, y);
+            max_x = @max(max_x, x);
+            max_y = @max(max_y, y);
+        }
+        n += row_hits;
+        if (row_hits == 0 and n > 0) {
+            if (n >= MIN_CHIP_PX) break;
+            // A few stray pixels (antialiasing) are not a chip: start over.
+            n = 0;
+            min_x = width;
+            min_y = end;
+            max_x = 0;
+            max_y = 0;
+        }
+    }
+    if (n < MIN_CHIP_PX) return null;
+    return .{
+        .x = @floatFromInt(min_x),
+        .y = @floatFromInt(min_y),
+        .w = @floatFromInt(max_x - min_x + 1),
+        .h = @floatFromInt(max_y - min_y + 1),
+    };
+}
 
 fn assistantChipBox(app: *appdrive.App, win_id: u32) ?ChipBox {
     for (app.windows.items) |w| {
@@ -3696,36 +3746,7 @@ fn assistantChipBox(app: *appdrive.App, win_id: u32) ?ChipBox {
         const height: usize = @intCast(w.h);
         const px = w.pixels.items;
         if (px.len < width * height * 4) return null;
-        var n: usize = 0;
-        var min_x: usize = width;
-        var min_y: usize = height;
-        var max_x: usize = 0;
-        var max_y: usize = 0;
-        const rows = @min(height, CHIP_BAND_PX);
-        var y: usize = 0;
-        while (y < rows) : (y += 1) {
-            var x: usize = 0;
-            while (x < width) : (x += 1) {
-                const i = (y * width + x) * 4;
-                const b: i32 = px[i];
-                const g: i32 = px[i + 1];
-                const r: i32 = px[i + 2];
-                if (r > 220 and g > 85 and g < 160 and b < 90) {
-                    n += 1;
-                    min_x = @min(min_x, x);
-                    min_y = @min(min_y, y);
-                    max_x = @max(max_x, x);
-                    max_y = @max(max_y, y);
-                }
-            }
-        }
-        if (n < MIN_CHIP_PX) return null;
-        return .{
-            .x = @floatFromInt(min_x),
-            .y = @floatFromInt(min_y),
-            .w = @floatFromInt(max_x - min_x + 1),
-            .h = @floatFromInt(max_y - min_y + 1),
-        };
+        return accentRun(px, width, 0, @min(height, CHIP_BAND_PX));
     }
     return null;
 }
@@ -3958,7 +3979,8 @@ fn colorBox(app: *appdrive.App, win_id: u32, comptime pred: fn (r: i32, g: i32, 
     return null;
 }
 
-/// The pane titlebar's accent lease chip (below the tab-bar band).
+/// The pane titlebar's accent lease chip: the first accent run below the
+/// tab bar's own chip (or below `CHIP_BAND_PX` when that chip is absent).
 fn paneChipBox(app: *appdrive.App, win_id: u32) ?ChipBox {
     for (app.windows.items) |w| {
         if (w.id != win_id or w.w <= 0 or w.h <= 0) continue;
@@ -3966,35 +3988,9 @@ fn paneChipBox(app: *appdrive.App, win_id: u32) ?ChipBox {
         const height: usize = @intCast(w.h);
         const px = w.pixels.items;
         if (px.len < width * height * 4) return null;
-        var n: usize = 0;
-        var min_x: usize = width;
-        var min_y: usize = height;
-        var max_x: usize = 0;
-        var max_y: usize = 0;
-        var y: usize = CHIP_BAND_PX;
-        while (y < height) : (y += 1) {
-            var x: usize = 0;
-            while (x < width) : (x += 1) {
-                const i = (y * width + x) * 4;
-                const b: i32 = px[i];
-                const g: i32 = px[i + 1];
-                const r: i32 = px[i + 2];
-                if (r > 220 and g > 85 and g < 160 and b < 90) {
-                    n += 1;
-                    min_x = @min(min_x, x);
-                    min_y = @min(min_y, y);
-                    max_x = @max(max_x, x);
-                    max_y = @max(max_y, y);
-                }
-            }
-        }
-        if (n < MIN_CHIP_PX) return null;
-        return .{
-            .x = @floatFromInt(min_x),
-            .y = @floatFromInt(min_y),
-            .w = @floatFromInt(max_x - min_x + 1),
-            .h = @floatFromInt(max_y - min_y + 1),
-        };
+        const tab_chip = accentRun(px, width, 0, @min(height, CHIP_BAND_PX));
+        const first: usize = if (tab_chip) |t| @intFromFloat(t.y + t.h) else @min(height, CHIP_BAND_PX);
+        return accentRun(px, width, first, height);
     }
     return null;
 }
@@ -4199,6 +4195,24 @@ fn parseClickTitle(reply: []const u8) ?ClickReport {
     return .{ .x = x, .y = y, .vw = vw, .vh = vh };
 }
 
+/// Resize `win_id` to a `w`x`h` window geometry and wait until the app
+/// has committed that geometry and the pixels settled. False when the
+/// app never reached it: `waitVisualSettle` alone can report a frame
+/// that is still the OLD size, before the configure was applied.
+fn resizeSettled(app: *appdrive.App, win_id: u32, w: i32, h: i32, timeout_ms: u32) bool {
+    app.resizeWindow(win_id, w, h) catch return false;
+    var waited: u32 = 0;
+    while (waited < timeout_ms) : (waited += 100) {
+        pumpFor(app, 100);
+        const g = app.windowGeometry(win_id) orelse continue;
+        if (g.w == w and g.h == h) {
+            _ = app.waitVisualSettle(win_id, 400, 5_000, 0.1, null);
+            return true;
+        }
+    }
+    return false;
+}
+
 fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
     if (!@import("util/ocr.zig").available()) {
         say("SKIP assistant web watch: tesseract unavailable; the chip and popover are driven by OCR");
@@ -4257,7 +4271,9 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
     const pop_id = waitPopup(app, true, 10_000) orelse return "the assistant chip opened no popover surface";
     if (waitOcrWordCenter(allocator, app, pop_id, "Login", 10_000) == null)
         return "the AI badge did not show the assistant's browser name";
-    if (waitOcrWordCenter(allocator, app, pop_id, "Local", 10_000) == null)
+    // The subtitle sits under the browser name, dim and small: read as
+    // its own line (see waitOcrLineBelow), never by whole-popover OCR.
+    if (!waitOcrLineBelow(allocator, app, pop_id, "Login", "Local page", 10_000))
         return "the AI badge did not show the page subtitle";
     if (app.screenshotPng(pop_id, 0, null, 0)) |shot| {
         defer allocator.free(shot.png);
@@ -4408,15 +4424,13 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
 
     // Reallocation alone must fit the existing frame: the page is static,
     // so a new browser paint cannot accidentally repair stale geometry.
-    const original_size = app.windowSize(win_id) orelse return "watch window has no size";
-    app.resizeWindow(win_id, 800, 600) catch return "shrinking the watch failed";
-    _ = app.waitVisualSettle(win_id, 400, 5_000, 0.1, null);
+    const original_size = app.windowGeometry(win_id) orelse return "watch window has no size";
+    if (!resizeSettled(app, win_id, 800, 600, 8_000)) return "the watch window never took the 800x600 size";
     const small = waitColorBox(app, win_id, isLime, 5_000) orelse return "watch vanished after shrinking";
     // The external-display rig currently does not grant GTK's maximize
     // request (set_maximized is sent, no configure comes back). Exercise
     // the larger allocation explicitly rather than calling that a pass.
-    app.resizeWindow(win_id, 1500, 1000) catch return "enlarging the watch failed";
-    _ = app.waitVisualSettle(win_id, 400, 5_000, 0.1, null);
+    if (!resizeSettled(app, win_id, 1500, 1000, 8_000)) return "the watch window never took the 1500x1000 size";
     const large = waitColorBox(app, win_id, isLime, 5_000) orelse return "watch vanished after enlarging";
     if (large.w <= small.w or large.h <= small.h) {
         if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
@@ -4425,8 +4439,7 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
         } else |_| {}
         return whyf("enlarged watch did not grow: {d:.0}x{d:.0} -> {d:.0}x{d:.0}", .{ small.w, small.h, large.w, large.h });
     }
-    app.resizeWindow(win_id, @intCast(original_size.w), @intCast(original_size.h)) catch return "restoring the watch size failed";
-    _ = app.waitVisualSettle(win_id, 400, 5_000, 0.1, null);
+    if (!resizeSettled(app, win_id, original_size.w, original_size.h, 8_000)) return "restoring the watch size failed";
 
     // Closing the owner's LAST page retains this exact viewer, and its
     // control preference applies to the replacement without another click.
@@ -7955,6 +7968,59 @@ fn waitOcrWordCenter(
         }
     }
     return null;
+}
+
+/// Wait until the line directly beneath the word `anchor` reads `want`.
+/// Small dim text (a popover row's subtitle) is invisible to sparse
+/// whole-surface OCR, which reads only the bright title above it (measured
+/// on the AI badge: psm 11 at 2x/3x/4x sees "Login review..." and nothing
+/// of "Local page"); cropped to its one line it reads every time (psm 7).
+fn waitOcrLineBelow(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    win_id: u32,
+    anchor: []const u8,
+    want: []const u8,
+    timeout_ms: i64,
+) bool {
+    const ocr = @import("util/ocr.zig");
+    const png_util = @import("util/png.zig");
+    if (!ocr.available()) return false;
+    const deadline = clock.nowMs() + timeout_ms;
+    while (clock.nowMs() < deadline) {
+        _ = app.drainLive(2_000);
+        pumpFor(app, 200);
+        const shot = app.snapshotRgba(win_id, null) catch continue;
+        defer allocator.free(shot.px);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const scale: u32 = 2;
+        const big = png_util.upscaleRgba(a, shot.px, shot.w, shot.h, scale) catch continue;
+        const words = (ocr.recognize(a, big, shot.w * scale, shot.h * scale, .{ .psm = 11 }) catch continue).words;
+        for (words) |found| {
+            if (!std.ascii.eqlIgnoreCase(ocrWordCore(found.text), anchor)) continue;
+            // The anchor's box in surface pixels; the line below starts at
+            // its left edge and is about as tall as the anchor's own line.
+            const ax = found.x / scale;
+            const line_h = @max(found.h / scale, 8);
+            const y0 = (found.y + found.h) / scale;
+            if (ax >= shot.w or y0 >= shot.h) continue;
+            const cw = shot.w - ax;
+            const ch = @min(line_h * 3 / 2 + 4, shot.h - y0);
+            const crop = a.alloc(u8, @as(usize, cw) * ch * 4) catch continue;
+            var row: u32 = 0;
+            while (row < ch) : (row += 1) {
+                const src = (@as(usize, y0 + row) * shot.w + ax) * 4;
+                @memcpy(crop[@as(usize, row) * cw * 4 ..][0 .. @as(usize, cw) * 4], shot.px[src..][0 .. @as(usize, cw) * 4]);
+            }
+            const line_scale: u32 = 3;
+            const line = png_util.upscaleRgba(a, crop, cw, ch, line_scale) catch continue;
+            const res = ocr.recognize(a, line, cw * line_scale, ch * line_scale, .{ .psm = 7 }) catch continue;
+            if (ocr.shows(res.text, want)) return true;
+        }
+    }
+    return false;
 }
 
 /// Non-blocking post-mortem on the `sketerm view` child, consumed once.
