@@ -928,12 +928,14 @@ pub fn webglMode() ?ozone.Webgl {
 
 /// The adapter supports frame-rate options before startup and requires the helper's capability afterwards.
 pub fn frameRateCapability() struct { supported: bool, default: u16 } {
-    const supported = !guiDrivesWeb() and g_headless_alloc != null;
-    const default_fps = g_default_max_fps orelse web_proto.DEFAULT_HEADLESS_FPS;
-    if (currentEngine()) |e| {
-        if (e.state == .ready) return .{ .supported = supported and e.has(.view_max_fps), .default = default_fps };
-    }
-    return .{ .supported = supported, .default = default_fps };
+    return .{ .supported = adapterCapability(.view_max_fps), .default = g_default_max_fps orelse web_proto.DEFAULT_HEADLESS_FPS };
+}
+
+/// A headless-only open option `cap` gates: offered before the engine starts, then only when its helper advertises `cap`.
+pub fn adapterCapability(cap: web_proto.Cap) bool {
+    if (guiDrivesWeb() or g_headless_alloc == null) return false;
+    const e = currentEngine() orelse return true;
+    return e.state != .ready or e.has(cap);
 }
 
 /// The engine-lifecycle half of the preflight: whether the broker lane
@@ -2439,6 +2441,7 @@ fn openViewConfigured(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, w
                     error.UntrustedModeConflict => fail(.conflict, "a running ordinary helper cannot switch to untrusted mode; use a new dedicated engine"),
                     error.UntrustedUnsupported => fail(.unavailable, "the helper did not advertise untrusted-web; nothing was opened"),
                     error.EmulationUnsupported => fail(.unavailable, "the helper did not advertise web-emulation; nothing was opened"),
+                    error.ScrollbarsUnsupported => fail(.unavailable, "the helper did not advertise hide-scrollbars, so its pages would paint scrollbars; nothing was opened"),
                     error.PerfUnsupported => fail(.unavailable, "the helper did not advertise web-perf, so cpu_throttle cannot be applied; nothing was opened"),
                     error.InvalidEmulation => fail(.invalid_args, "invalid web emulation options; nothing was opened"),
                     error.FrameRateUnsupported => fail(.unavailable, "the helper did not advertise view-max-fps; nothing was opened"),
@@ -3105,6 +3108,7 @@ fn openResult(
         if (v.emulation.color_scheme) |value| try res.fact("color_scheme", @tagName(value));
         if (v.emulation.reduced_motion) |value| try res.fact("reduced_motion", if (value == .reduce) "reduce" else "no-preference");
         if (v.emulation.device_scale_factor != null) try res.fact("device_scale_factor", @as(f64, @floatFromInt(v.emulation.scale())) / 1000);
+        if (v.emulation.hide_scrollbars) try res.fact("hide_scrollbars", true);
         if (v.emulation.cpu_throttle) |r| {
             try res.fact("cpu_throttle", r);
             try res.textf("cpu throttle {d}x requested (applied right after the first navigation started; web_perf and web_cpu_profile report the active rate)", .{r});
@@ -6288,6 +6292,10 @@ fn parseEmulation(arena: std.mem.Allocator, args: std.json.Value) !EmulationPars
             .float => |n| n,
             else => return .{ .err = fail(.invalid_args, "device_scale_factor must be numeric, from 0.5 through 4") },
         };
+    }
+    if (args.object.get("hide_scrollbars")) |v| {
+        if (v != .bool) return .{ .err = fail(.invalid_args, "hide_scrollbars must be a boolean") };
+        out.hide_scrollbars = v.bool;
     }
     if (args.object.get("cpu_throttle")) |v| {
         out.cpu_throttle = switch (v) {
@@ -11739,6 +11747,14 @@ test "emulation parser accepts only specified media values and bounded numeric s
     try std.testing.expect(sc.get("untrusted").?.bool);
     try std.testing.expectEqualStrings("dark", sc.get("color_scheme").?.string);
     try std.testing.expectEqual(@as(f64, 1.25), sc.get("device_scale_factor").?.float);
+    try std.testing.expect(sc.get("hide_scrollbars") == null);
+    const hidden = try parseEmulation(arena, try jsonArgs(arena, "{\"hide_scrollbars\":true}"));
+    try std.testing.expect(hidden.value.hide_scrollbars and hidden.value.present());
+    try std.testing.expect(!(try parseEmulation(arena, try jsonArgs(arena, "{\"hide_scrollbars\":false}"))).value.present());
+    try std.testing.expect((try parseEmulation(arena, try jsonArgs(arena, "{\"hide_scrollbars\":\"yes\"}"))) == .err);
+    const hidden_out = try openResult(arena, .headless, .{ .pane = 1, .emulation = hidden.value }, true, false, null, null, null, "none", null, 1, .{});
+    const hidden_sc = (try mcp.expectToolResultShape(arena, "web_open", hidden_out)).object.get("structuredContent").?.object;
+    try std.testing.expect(hidden_sc.get("hide_scrollbars").?.bool);
 }
 
 test "ordinary and untrusted engine addresses remain stable across route table growth" {

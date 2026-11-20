@@ -287,6 +287,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     try res.fact("web_policy_ack", @import("mcp_web.zig").restrictedCapability(.net_policy_ack));
     try res.fact("web_navigation_guard", @import("mcp_web.zig").restrictedCapability(.navigation_guard));
     try res.fact("web_emulation", @import("mcp_web.zig").restrictedCapability(.web_emulation));
+    try res.fact("web_hide_scrollbars", @import("mcp_web.zig").adapterCapability(.hide_scrollbars));
     try res.fact("web_untrusted_mode", @import("mcp_web.zig").untrustedMode());
     try res.fact("web_review", .{ .inspection = true, .checkpoints = true, .evidence_export = true, .requires_helper_capability = "review", .gui_console = false });
     try res.fact("web_diagnostics", .{ .direct_capture = true, .broker_capture = "requires engine_open diagnostics capability", .gui_capture = false, .retention = "last attempt per route until next attempt or MCP shutdown" });
@@ -458,6 +459,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try verdicts.add(arena, "policy acks", @import("mcp_web.zig").restrictedCapability(.net_policy_ack));
         try verdicts.add(arena, "navigation guard", @import("mcp_web.zig").restrictedCapability(.navigation_guard));
         try verdicts.add(arena, "emulation", @import("mcp_web.zig").restrictedCapability(.web_emulation));
+        try verdicts.add(arena, "hidden scrollbars", @import("mcp_web.zig").adapterCapability(.hide_scrollbars));
         try verdicts.add(arena, "software WebGL", @import("mcp_web.zig").webglCapability(.software_webgl));
         try verdicts.add(arena, "max_fps", frame_rate.supported);
         try res.fact("web_accept_cert", !gui_web);

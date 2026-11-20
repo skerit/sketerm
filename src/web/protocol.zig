@@ -417,6 +417,13 @@ pub const CAP_OBSERVE_NOTIFY = "observe-notify";
 pub const CAP_LOAD_RETRY = "load-retry";
 pub const CAP_UNTRUSTED_WEB = "untrusted-web";
 pub const CAP_WEB_EMULATION = "web-emulation";
+/// `view_emulation` honours its optional trailing `scrollbars` byte
+/// (`Scrollbars`): a hidden view paints no scrollbar and lays its page
+/// out over the full viewport width (DevTools
+/// `Emulation.setScrollbarsHidden`, acknowledged before the first
+/// document like the media features). An older helper skips the byte and
+/// paints classic scrollbars, so a client must refuse instead of sending it.
+pub const CAP_HIDE_SCROLLBARS = "hide-scrollbars";
 /// DevTools-protocol performance ops on one view (`perf_req`/`ev_perf_result`,
 /// 0xA6/0xA7): metrics samples, CPU throttling and the sampling CPU profiler.
 /// The helper attaches a DevTools agent to a view only once one of these is
@@ -574,6 +581,7 @@ pub const Cap = enum {
     load_retry,
     untrusted_web,
     web_emulation,
+    hide_scrollbars,
     net_policy_ack,
     net_log_detail,
     net_log_long_urls,
@@ -1293,17 +1301,21 @@ pub const ViewDestroy = struct {
 
 pub const ColorScheme = enum(u8) { unchanged = 0, light = 1, dark = 2 };
 pub const ReducedMotion = enum(u8) { unchanged = 0, reduce = 1, no_preference = 2 };
+pub const Scrollbars = enum(u8) { unchanged = 0, hidden = 1, shown = 2 };
 
 /// Sent before view creation; zero fields leave the engine's defaults unchanged.
 pub const ViewEmulation = struct {
     pub const tag: Tag = .view_emulation;
+    pub const optional_from = "scrollbars";
     view: u32,
     color_scheme: u8 = 0,
     reduced_motion: u8 = 0,
     scale_x1000: u16 = 0,
+    /// A `Scrollbars` value, gated by `CAP_HIDE_SCROLLBARS`.
+    scrollbars: u8 = 0,
 
     pub fn valid(self: ViewEmulation) bool {
-        return self.color_scheme <= 2 and self.reduced_motion <= 2 and
+        return self.color_scheme <= 2 and self.reduced_motion <= 2 and self.scrollbars <= 2 and
             (self.scale_x1000 == 0 or (self.scale_x1000 >= 500 and self.scale_x1000 <= 4000));
     }
 };
@@ -7413,10 +7425,19 @@ test "one message carries a descriptor per plane, and only on the first write" {
 
 test "emulation frame is append-only and validates wire values" {
     try std.testing.expectEqual(@as(u8, 0x1A), @intFromEnum(Tag.view_emulation));
-    try roundTrip(ViewEmulation, .{ .view = 4, .color_scheme = 2, .reduced_motion = 1, .scale_x1000 = 1500 });
+    try roundTrip(ViewEmulation, .{ .view = 4, .color_scheme = 2, .reduced_motion = 1, .scale_x1000 = 1500, .scrollbars = 1 });
     try std.testing.expect((ViewEmulation{ .view = 1 }).valid());
     try std.testing.expect(!(ViewEmulation{ .view = 1, .color_scheme = 3 }).valid());
     try std.testing.expect(!(ViewEmulation{ .view = 1, .scale_x1000 = 499 }).valid());
+    try std.testing.expect(!(ViewEmulation{ .view = 1, .scrollbars = 3 }).valid());
+    // An older client's frame ends before `scrollbars`: it reads as unchanged.
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(std.testing.allocator);
+    try encodePayload(std.testing.allocator, &bytes, ViewEmulation{ .view = 4, .color_scheme = 2, .scrollbars = 1 });
+    const short = try decode(ViewEmulation, bytes.items[0 .. bytes.items.len - 1]);
+    try std.testing.expectEqual(@as(u8, 0), short.scrollbars);
+    try std.testing.expectEqual(@as(u8, 2), short.color_scheme);
+    try std.testing.expectEqualStrings("hide-scrollbars", Cap.hide_scrollbars.name());
     try std.testing.expectEqualStrings("untrusted-web", Cap.untrusted_web.name());
     try std.testing.expectEqualStrings("web-emulation", Cap.web_emulation.name());
     try std.testing.expectEqual(@as(u32, 2), NetPolicySet.flag_untrusted);

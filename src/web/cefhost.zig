@@ -1800,7 +1800,7 @@ pub const Host = struct {
         if (!req.valid()) return error.InvalidEmulation;
         if (self.find(req.view)) |v| {
             const merged = emulation.merge(v.media, req);
-            const media_changed = merged.color_scheme != v.media.color_scheme or merged.reduced_motion != v.media.reduced_motion;
+            const media_changed = merged.color_scheme != v.media.color_scheme or merged.reduced_motion != v.media.reduced_motion or merged.scrollbars != v.media.scrollbars;
             v.media = merged;
             if (req.scale_x1000 != 0) self.resizeView(.{
                 .view = v.id,
@@ -4750,6 +4750,64 @@ test "media initial navigation waits for execution success and hides bootstrap b
     }
     host.destroyView(51);
     try std.testing.expectEqual(@as(usize, 1), MediaTest.registration_releases);
+}
+
+test "hidden scrollbars hold the first document until their own acknowledgment, and a rejection fails the view" {
+    try std.testing.expect(apiHash());
+    for ([_]bool{ true, false }) |accepted| {
+        MediaTest.reset();
+        var out = proto.Outbox.init(std.testing.allocator);
+        defer out.deinit();
+        var host = Host.init(std.testing.allocator, &out);
+        defer host.deinit();
+        host.inline_mode = true;
+        g_host = &host;
+        defer g_host = null;
+        var ops = system_browser_spawn_ops;
+        ops.create_browser = MediaTest.create;
+        // Media and scrollbars together: two messages, both must succeed.
+        try host.setEmulation(.{ .view = 61, .color_scheme = 2, .scrollbars = @intFromEnum(proto.Scrollbars.hidden) });
+        try host.createViewAtWith(ViewConstructionTest.req(61, 0), "https://first.test/", &ops);
+        const v = host.find(61).?;
+        try std.testing.expect(MediaTest.create_url_empty);
+        const ack = v.media_ack.?;
+        try std.testing.expect(ack.message_id > 0 and ack.scrollbar_id > 0 and ack.message_id != ack.scrollbar_id);
+        MediaTest.result(ack.message_id, true);
+        host.watchdog(nowMs());
+        try std.testing.expectEqual(@as(usize, 0), MediaTest.navigations);
+        MediaTest.result(ack.scrollbar_id, accepted);
+        host.watchdog(nowMs());
+        if (accepted) {
+            try std.testing.expectEqual(@as(usize, 1), MediaTest.navigations);
+            try std.testing.expectEqualStrings("https://first.test/", MediaTest.loaded_url[0..MediaTest.loaded_len]);
+            host.destroyView(61);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), MediaTest.navigations);
+            try std.testing.expect(host.find(61) == null);
+            try MediaTest.expectFailure(&out, 61);
+        }
+    }
+    // Scrollbars alone still defer the first document: no media message is sent.
+    MediaTest.reset();
+    var out = proto.Outbox.init(std.testing.allocator);
+    defer out.deinit();
+    var host = Host.init(std.testing.allocator, &out);
+    defer host.deinit();
+    host.inline_mode = true;
+    g_host = &host;
+    defer g_host = null;
+    var ops = system_browser_spawn_ops;
+    ops.create_browser = MediaTest.create;
+    try host.setEmulation(.{ .view = 62, .scrollbars = @intFromEnum(proto.Scrollbars.hidden) });
+    try host.createViewAtWith(ViewConstructionTest.req(62, 0), "https://only.test/", &ops);
+    const v = host.find(62).?;
+    try std.testing.expect(MediaTest.create_url_empty);
+    try std.testing.expectEqual(@as(c_int, 0), v.media_ack.?.message_id);
+    try std.testing.expectEqual(@as(c_int, 1), MediaTest.queued_id);
+    MediaTest.result(v.media_ack.?.scrollbar_id, true);
+    host.watchdog(nowMs());
+    try std.testing.expectEqual(@as(usize, 1), MediaTest.navigations);
+    host.destroyView(62);
 }
 
 test "media rejection timeout browser destruction and submission refusal preserve unrelated views" {

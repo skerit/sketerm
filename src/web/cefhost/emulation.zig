@@ -1,4 +1,4 @@
-//! Native media emulation; viewport size and device scale remain the host's geometry responsibility.
+//! Native media and scrollbar emulation; viewport size and device scale remain the host's geometry responsibility.
 
 const std = @import("std");
 const c = @import("cbindings");
@@ -20,19 +20,28 @@ pub fn merge(stored: proto.ViewEmulation, patch: proto.ViewEmulation) proto.View
         .color_scheme = if (patch.color_scheme != 0) patch.color_scheme else stored.color_scheme,
         .reduced_motion = if (patch.reduced_motion != 0) patch.reduced_motion else stored.reduced_motion,
         .scale_x1000 = if (patch.scale_x1000 != 0) patch.scale_x1000 else stored.scale_x1000,
+        .scrollbars = if (patch.scrollbars != 0) patch.scrollbars else stored.scrollbars,
     };
 }
 
+/// Whether `req` carries an override the DevTools agent must acknowledge before the first document.
 pub fn hasMedia(req: proto.ViewEmulation) bool {
+    return hasMediaFeatures(req) or req.scrollbars != 0;
+}
+
+fn hasMediaFeatures(req: proto.ViewEmulation) bool {
     return req.color_scheme != 0 or req.reduced_motion != 0;
 }
 
-/// The acknowledgment state of a view's media override, read from its DevTools session.
+/// The acknowledgment state of a view's media and scrollbar overrides, read from its DevTools session.
 pub const Media = struct {
     view: u32,
     generation: u64,
     browser_id: c_int,
+    /// `Emulation.setEmulatedMedia`, 0 when no media feature is overridden.
     message_id: c_int = 0,
+    /// `Emulation.setScrollbarsHidden`, 0 when scrollbars are not overridden.
+    scrollbar_id: c_int = 0,
     deadline_ms: i64 = 0,
     acknowledged: bool = false,
     failure: []const u8 = "",
@@ -47,18 +56,27 @@ pub const Media = struct {
     pub fn submit(self: *Media, session: *devtools.Session, browser: *cef.cef_browser_t, req: proto.ViewEmulation, now_ms: i64) bool {
         if (!self.active or self.failure.len != 0) return false;
         if (self.message_id > 0) session.forget(self.message_id);
+        if (self.scrollbar_id > 0) session.forget(self.scrollbar_id);
         self.acknowledged = false;
         self.dropped = false;
         self.reapply = false;
         self.detaches_seen = session.detaches;
-        self.message_id = apply(browser, req);
         self.deadline_ms = now_ms + timeout_ms;
-        if (self.message_id <= 0 or !session.track(self.message_id, 2 * timeout_ms, .memory, "")) self.failure = "media emulation submission was refused";
+        self.message_id = 0;
+        self.scrollbar_id = 0;
+        if (hasMediaFeatures(req)) {
+            self.message_id = apply(browser, req);
+            if (self.message_id <= 0 or !session.track(self.message_id, 2 * timeout_ms, .memory, "")) self.failure = "media emulation submission was refused";
+        }
+        if (self.failure.len == 0 and req.scrollbars != 0) {
+            self.scrollbar_id = applyScrollbars(browser, req);
+            if (self.scrollbar_id <= 0 or !session.track(self.scrollbar_id, 2 * timeout_ms, .memory, "")) self.failure = "scrollbar emulation submission was refused";
+        }
         return self.failure.len == 0;
     }
 
     pub fn expired(self: *const Media, now_ms: i64) bool {
-        return self.message_id > 0 and !self.acknowledged and now_ms >= self.deadline_ms;
+        return (self.message_id > 0 or self.scrollbar_id > 0) and !self.acknowledged and now_ms >= self.deadline_ms;
     }
 
     /// Take what the session learned since the last call.
@@ -74,30 +92,44 @@ pub const Media = struct {
             self.reapply = true;
             return;
         }
-        if (self.message_id <= 0 or self.acknowledged or self.dropped) return;
-        const out = session.outcome(self.message_id);
-        if (out == .pending) return;
+        if ((self.message_id <= 0 and self.scrollbar_id <= 0) or self.acknowledged or self.dropped) return;
         // Ignore only this native result; it stays unanswered until the deadline.
-        if (self.browser_id == fault_media_browser and self.message_id == fault_media_message) {
+        if (self.message_id > 0 and self.browser_id == fault_media_browser and self.message_id == fault_media_message) {
+            const out = session.outcome(self.message_id);
+            if (out == .pending) return;
             host_mod.logLine("fault media drop browser={d} message={d} success={d}", .{ self.browser_id, self.message_id, @intFromBool(out == .ok) });
             self.dropped = true;
             return;
         }
-        switch (out) {
-            .pending => {},
-            .ok => if (session.answeredAt(self.message_id) > self.deadline_ms) {
-                self.failure = "media emulation execution acknowledgment timed out";
-            } else {
-                self.acknowledged = true;
-            },
-            .failed => self.failure = "engine rejected media emulation",
+        var settled = true;
+        for ([_]c_int{ self.message_id, self.scrollbar_id }) |id| {
+            if (id <= 0) continue;
+            switch (session.outcome(id)) {
+                .pending => settled = false,
+                .ok => if (session.answeredAt(id) > self.deadline_ms) {
+                    self.failure = if (id == self.scrollbar_id) "scrollbar emulation execution acknowledgment timed out" else "media emulation execution acknowledgment timed out";
+                    return;
+                },
+                .failed => {
+                    self.failure = if (id == self.scrollbar_id) "engine rejected scrollbar emulation" else "engine rejected media emulation";
+                    return;
+                },
+            }
         }
+        if (settled) self.acknowledged = true;
     }
 };
 
+/// Queue `Emulation.setScrollbarsHidden`; a positive ID means queued only.
+pub fn applyScrollbars(browser: *cef.cef_browser_t, req: proto.ViewEmulation) c_int {
+    if (!req.valid() or req.scrollbars == 0) return 0;
+    const json = if (req.scrollbars == @intFromEnum(proto.Scrollbars.hidden)) "{\"hidden\":true}" else "{\"hidden\":false}";
+    return devtools.execute(browser, "Emulation.setScrollbarsHidden", json);
+}
+
 /// A positive ID means queued only; `Media` waits for the matching execution result.
 pub fn apply(browser: *cef.cef_browser_t, req: proto.ViewEmulation) c_int {
-    if (!req.valid() or !hasMedia(req)) return 0;
+    if (!req.valid() or !hasMediaFeatures(req)) return 0;
     const Fault = enum { reject, drop };
     const fault: ?Fault = blk: {
         const ordinal = c.getenv("SKETERM_WEB_FAULT_MEDIA_APPLY") orelse break :blk null;
@@ -149,6 +181,8 @@ test "media emulation submits native CDP parameters and rejects missing methods 
         var params_json: [512]u8 = undefined;
         var params_len: usize = 0;
         var method_ok = false;
+        var method_name: [64]u8 = undefined;
+        var method_len: usize = 0;
         var return_null = false;
 
         fn getHost(_: [*c]cef.cef_browser_t) callconv(.c) [*c]cef.cef_browser_host_t {
@@ -164,6 +198,8 @@ test "media emulation submits native CDP parameters and rejects missing methods 
             var name = host_mod.Utf8.init(method);
             defer name.free();
             method_ok = id == 0 and std.mem.eql(u8, name.slice(), "Emulation.setEmulatedMedia");
+            method_len = @min(method_name.len, name.slice().len);
+            @memcpy(method_name[0..method_len], name.slice()[0..method_len]);
             const value: *cef.cef_value_t = cef.cef_value_create() orelse return 0;
             defer host_mod.release(&value.base);
             // Keep our callback argument while set_dictionary consumes a reference.
@@ -209,6 +245,20 @@ test "media emulation submits native CDP parameters and rejects missing methods 
             }, features[1].object.get("value").?.string);
         }
     }
+    for ([_]struct { u8, bool }{ .{ 1, true }, .{ 2, false } }) |case| {
+        try std.testing.expectEqual(@as(c_int, 42), applyScrollbars(&browser, .{ .view = 1, .color_scheme = 2, .scrollbars = case[0] }));
+        try std.testing.expectEqualStrings("Emulation.setScrollbarsHidden", Fake.method_name[0..Fake.method_len]);
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, Fake.params_json[0..Fake.params_len], .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.object.count());
+        try std.testing.expectEqual(case[1], parsed.value.object.get("hidden").?.bool);
+    }
+    // Neither sends the other's method: scrollbars alone are no media, media alone no scrollbars.
+    const sent = Fake.calls;
+    try std.testing.expectEqual(@as(c_int, 0), apply(&browser, .{ .view = 1, .scrollbars = 1 }));
+    try std.testing.expectEqual(@as(c_int, 0), applyScrollbars(&browser, .{ .view = 1, .color_scheme = 1 }));
+    try std.testing.expectEqual(@as(c_int, 0), applyScrollbars(&browser, .{ .view = 1, .scrollbars = 3 }));
+    try std.testing.expectEqual(sent, Fake.calls);
     try std.testing.expectEqual(Fake.calls, Fake.releases);
     const before = Fake.calls;
     try std.testing.expectEqual(@as(c_int, 0), apply(&browser, .{ .view = 1, .scale_x1000 = 1500 }));
@@ -242,4 +292,11 @@ test "zero emulation patches retain color motion and bounded geometry scale" {
     }, merge(full, .{ .view = 7, .reduced_motion = 2, .scale_x1000 = 500 }));
     for ([_]u16{ 500, 1000, 1500, 4000 }) |scale| try std.testing.expect((proto.ViewEmulation{ .view = 7, .scale_x1000 = scale }).valid());
     for ([_]u16{ 1, 499, 4001, 65535 }) |scale| try std.testing.expect(!(proto.ViewEmulation{ .view = 7, .scale_x1000 = scale }).valid());
+    // Scrollbars patch like the media features: zero keeps, nonzero replaces.
+    const hidden = merge(full, .{ .view = 7, .scrollbars = 1 });
+    try std.testing.expectEqual(@as(u8, 1), hidden.scrollbars);
+    try std.testing.expectEqual(@as(u8, 1), merge(hidden, .{ .view = 7, .color_scheme = 1 }).scrollbars);
+    try std.testing.expectEqual(@as(u8, 2), merge(hidden, .{ .view = 7, .scrollbars = 2 }).scrollbars);
+    try std.testing.expect(hasMedia(.{ .view = 7, .scrollbars = 1 }));
+    try std.testing.expect(!hasMedia(.{ .view = 7, .scale_x1000 = 1500 }));
 }

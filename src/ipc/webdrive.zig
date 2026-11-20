@@ -781,9 +781,11 @@ pub const Emulation = struct {
     device_scale_factor: ?f64 = null,
     /// CPU slowdown factor (1 = off, max 20), a perf op (capability `web-perf`) sent right after the create.
     cpu_throttle: ?f64 = null,
+    /// No painted scrollbars: the page lays out over the whole viewport (capability `hide-scrollbars`).
+    hide_scrollbars: bool = false,
 
     pub fn present(self: Emulation) bool {
-        return self.color_scheme != null or self.reduced_motion != null or self.device_scale_factor != null;
+        return self.color_scheme != null or self.reduced_motion != null or self.device_scale_factor != null or self.hide_scrollbars;
     }
 
     pub fn scale(self: Emulation) u16 {
@@ -2548,6 +2550,7 @@ pub const Engine = struct {
         if (!self.ensure()) return error.Unavailable;
         errdefer if (self.untrusted and self.views.items.len == 0) self.stopUntrusted();
         if (wants_untrusted and !self.has(.untrusted_web)) return error.UntrustedUnsupported;
+        if (emulation.hide_scrollbars and !self.has(.hide_scrollbars)) return error.ScrollbarsUnsupported;
         if (emulation.present() and !self.has(.web_emulation)) return error.EmulationUnsupported;
         if (emulation.cpu_throttle != null and !self.has(.web_perf)) return error.PerfUnsupported;
         if (requested_fps != null and !self.has(.view_max_fps)) return error.FrameRateUnsupported;
@@ -2629,6 +2632,7 @@ pub const Engine = struct {
             .color_scheme = if (emulation.color_scheme) |value| @intFromEnum(value) else 0,
             .reduced_motion = if (emulation.reduced_motion) |value| @intFromEnum(value) else 0,
             .scale_x1000 = if (emulation.device_scale_factor != null) emulation.scale() else 0,
+            .scrollbars = if (emulation.hide_scrollbars) @intFromEnum(proto.Scrollbars.hidden) else 0,
         }) catch return error.Unavailable;
         if (policy) |p| {
             const serial = self.mintPolicySerial();
@@ -7246,6 +7250,27 @@ test "emulation capability refuses before publication and precedes the first doc
     var reader = proto.Reader.init(pair.drain(&buf));
     const resized = try proto.decode(proto.ViewResize, (try reader.next()).?.payload);
     try std.testing.expectEqual(@as(u16, 1500), resized.scale_x1000);
+}
+
+test "hidden scrollbars are refused by a helper without hide-scrollbars and ride the emulation frame otherwise" {
+    var pair = try Pair.init(std.testing.allocator);
+    defer pair.deinit();
+    var buf: [16384]u8 = undefined;
+    var tags: [8]proto.Tag = undefined;
+    const emulation = Emulation{ .hide_scrollbars = true };
+    try std.testing.expect(emulation.present());
+    // An emulation-only helper would skip the byte and paint scrollbars: refused, nothing sent.
+    pair.eng.caps.insert(.web_emulation);
+    try std.testing.expectError(error.ScrollbarsUnsupported, pair.eng.openViewConfigured("https://site.example/", 640, 360, .ephemeral, null, null, emulation, null));
+    try std.testing.expectEqual(@as(usize, 0), pair.drain(&buf).len);
+    pair.eng.caps.insert(.hide_scrollbars);
+    _ = try pair.eng.openViewConfigured("https://site.example/", 640, 360, .ephemeral, null, null, emulation, null);
+    const bytes = pair.drain(&buf);
+    try std.testing.expectEqualSlices(proto.Tag, &.{ .context_create, .view_emulation, .view_create_url, .view_show }, tagsOf(bytes, &tags));
+    const sent = frameOf(proto.ViewEmulation, bytes).?;
+    try std.testing.expectEqual(@as(u8, @intFromEnum(proto.Scrollbars.hidden)), sent.scrollbars);
+    try std.testing.expectEqual(@as(u8, 0), sent.color_scheme);
+    try std.testing.expectEqual(@as(u16, 0), sent.scale_x1000);
 }
 
 test "view_screen goes to a view-screen helper after the create, before the show, and again only when it changes" {

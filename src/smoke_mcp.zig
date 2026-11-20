@@ -585,6 +585,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         webScreenStage(allocator, exe, rt);
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBSCROLLBARS_ONLY") != null) {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine missing for the scrollbar stage");
+        _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+        webScrollbarStage(allocator, exe, rt);
+        return 0;
+    }
     // The headful audit alone, in the product's default MCP lane.
     if (c.getenv("SKETERM_SMOKE_MCP_HEADFUL_ONLY") != null) {
         var bin_buf: [4096:0]u8 = undefined;
@@ -4337,6 +4345,80 @@ fn webScreenStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     say("smoke-mcp: headless pages report the configured screen, a 32x129 window at 10,10 pulled onto it, resize and ladder, profile and config facts; an old helper keeps view == screen");
 }
 
+/// The page's `[innerWidth, documentElement.clientWidth]`, polled until it is `want` (or, with null, until they differ).
+fn expectLayoutWidths(m: *Mcp, arena: std.mem.Allocator, want: ?[]const u8, comptime what: []const u8) void {
+    const deadline = nowMs() + 10_000;
+    while (true) {
+        const got = capSc(arena, m.callTool("web_eval", "{\"code\":\"[innerWidth,document.documentElement.clientWidth].join(',')\"}"), "layout width probe", false).get("value").?.object.get("value").?.string;
+        const ok = if (want) |w| std.mem.eql(u8, got, w) else blk: {
+            var it = std.mem.splitScalar(u8, got, ',');
+            const inner = std.fmt.parseInt(u32, it.next() orelse "", 10) catch 0;
+            const client = std.fmt.parseInt(u32, it.next() orelse "", 10) catch 0;
+            break :blk inner == 640 and client > 0 and client < inner;
+        };
+        if (ok) return;
+        if (nowMs() > deadline) {
+            std.debug.print("smoke-mcp: {s}: innerWidth,clientWidth = {s}\n", .{ what, got });
+            fail("the page's layout width is not what the scrollbar option promises: " ++ what);
+        }
+        _ = c.usleep(100_000);
+    }
+}
+
+/// `web_open hide_scrollbars`: a page taller than its 640x360 viewport
+/// lays out over all 640 px with it and loses the scrollbar's width
+/// without it; a helper withholding hide-scrollbars refuses the open.
+fn webScrollbarStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    removeSmokeConfig(rt);
+    const page = "data:text/html,<title>tall</title><style>body{margin:0;height:3000px}</style><p>tall</p>";
+    const open_plain = "{\"url\":\"" ++ page ++ "\",\"ephemeral\":true,\"width\":640,\"height\":360,\"snapshot\":\"none\"}";
+    const open_hidden = "{\"url\":\"" ++ page ++ "\",\"ephemeral\":true,\"width\":640,\"height\":360,\"snapshot\":\"none\",\"hide_scrollbars\":true}";
+    {
+        var m = Mcp.spawn(allocator, exe, &.{});
+        defer m.closeStdinWait();
+        m.initialize();
+        // Before the engine starts the adapter offers the option; the helper's capability decides afterwards.
+        if (!capSc(arena, m.callTool("capabilities", "{}"), "scrollbar stage preflight", false).get("web_hide_scrollbars").?.bool)
+            fail("web_hide_scrollbars was not offered before the engine started");
+        m.sendTool("web_open", open_plain);
+        const plain = capSc(arena, m.recvLine(60_000), "scrollbar stage plain open", false);
+        if (plain.get("hide_scrollbars") != null) fail("a plain open reported hidden scrollbars");
+        expectLayoutWidths(&m, arena, null, "without hide_scrollbars the scrollbar takes its width");
+        const caps = capSc(arena, m.callTool("capabilities", "{}"), "scrollbar stage capabilities", false);
+        if (caps.get("web_hide_scrollbars").? != .bool or !caps.get("web_hide_scrollbars").?.bool) fail("a helper with hide-scrollbars did not report web_hide_scrollbars true");
+        _ = capSc(arena, m.callTool("web_close", "{}"), "scrollbar stage plain close", false);
+        m.sendTool("web_open", open_hidden);
+        const hidden = capSc(arena, m.recvLine(60_000), "scrollbar stage hidden open", false);
+        if (hidden.get("hide_scrollbars") == null or !hidden.get("hide_scrollbars").?.bool) fail("a hidden-scrollbar open did not acknowledge hide_scrollbars");
+        expectLayoutWidths(&m, arena, "640,640", "with hide_scrollbars the page lays out over the full viewport");
+        // The override survives a navigation to a new document.
+        _ = capSc(arena, m.callTool("web_navigate", "{\"url\":\"" ++ page ++ "<p>again</p>\"}"), "scrollbar stage navigate", false);
+        expectLayoutWidths(&m, arena, "640,640", "hidden scrollbars after a navigation");
+        _ = capSc(arena, m.callTool("web_close", "{}"), "scrollbar stage hidden close", false);
+    }
+    {
+        _ = c.setenv("SKETERM_WEB_DISABLE_HIDE_SCROLLBARS", "1", 1);
+        defer _ = unsetEnv("SKETERM_WEB_DISABLE_HIDE_SCROLLBARS");
+        var m = Mcp.spawn(allocator, exe, &.{});
+        defer m.closeStdinWait();
+        m.initialize();
+        m.sendTool("web_open", open_hidden);
+        const refused_line = m.recvLine(60_000);
+        const refused = std.json.parseFromSliceLeaky(std.json.Value, arena, refused_line, .{}) catch fail("scrollbar refusal: reply is not JSON");
+        const result = refused.object.get("result") orelse fail("scrollbar refusal: no result");
+        if (result.object.get("isError") == null or !result.object.get("isError").?.bool or std.mem.indexOf(u8, refused_line, "hide-scrollbars") == null) {
+            say(refused_line);
+            fail("a helper without hide-scrollbars did not refuse a hidden-scrollbar open");
+        }
+        const caps = capSc(arena, m.callTool("capabilities", "{}"), "scrollbar stage withheld capabilities", false);
+        if (caps.get("web_hide_scrollbars").? != .bool or caps.get("web_hide_scrollbars").?.bool) fail("a withheld hide-scrollbars was still reported");
+    }
+    say("smoke-mcp: hide_scrollbars lays a tall 640x360 page out at clientWidth 640 (and keeps it across a navigation), a plain view loses the scrollbar width, and a helper without hide-scrollbars refuses");
+}
+
 /// Recorded-motion replay through MCP: `capabilities.web_motion*`
 /// before and after `sketerm motion install`, `web_act motion:"replay"`
 /// reporting `motion:"replayed"` with a duration, the configured
@@ -5758,6 +5840,7 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     webStreamStage(allocator, exe, rt);
     if (@import("builtin").os.tag == .linux) webglPolicyStage(allocator, exe, rt);
     webScreenStage(allocator, exe, rt);
+    webScrollbarStage(allocator, exe, rt);
 
     // ── named profiles against REAL CEF ─────────────────────────────
     //

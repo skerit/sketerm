@@ -162,6 +162,7 @@ const unconditional_caps = [_]proto.Cap{
     .net_log_long_urls,
     .load_retry,
     .web_emulation,
+    .hide_scrollbars,
     .web_stream,
     .view_max_fps,
     .view_flags,
@@ -186,6 +187,8 @@ fn withheld(cap: proto.Cap) bool {
         .capture => "SKETERM_WEB_DISABLE_CAPTURE",
         .untrusted_web => "SKETERM_WEB_DISABLE_UNTRUSTED",
         .web_emulation => "SKETERM_WEB_DISABLE_EMULATION",
+        // Scrollbar hiding rides on the emulation frame.
+        .hide_scrollbars => if (withheld(.web_emulation)) return true else "SKETERM_WEB_DISABLE_HIDE_SCROLLBARS",
         .web_perf => "SKETERM_WEB_DISABLE_PERF",
         // A web-perf helper predating tracing: the client must never send it a trace op.
         .web_trace => if (withheld(.web_perf)) return true else "SKETERM_WEB_DISABLE_TRACE",
