@@ -23909,3 +23909,17 @@ keybind) as two side-by-side panes; `Window.newTabCommand` is the one entry poin
 share. Every split used to leave no widget focused, because `splitPane` grabbed focus on
 the pane's non-focusable wrapper box: the first keystrokes typed after a split were lost.
 It now focuses the pane's GLArea.
+
+## 2026-11-20: web_open hide_scrollbars
+
+A headless view at 640x360 showing a page taller than the viewport painted a classic
+15 px scrollbar and laid the page out at `documentElement.clientWidth` 625. `web_open
+hide_scrollbars:true` now hides it at the engine: the optional trailing `scrollbars` byte
+of `view_emulation` becomes DevTools `Emulation.setScrollbarsHidden`, acknowledged before
+the first document like the media features (`cefhost/emulation.zig` tracks both
+messages). The helper advertises `hide-scrollbars`; MCP reports
+`capabilities.web_hide_scrollbars` (true before the engine starts, then the helper's answer,
+like `web_max_fps`) and the open as `hide_scrollbars: true`, and an open on a helper
+without it is refused, never shot with a scrollbar. `smoke-mcp`'s scrollbar stage
+(`SKETERM_SMOKE_MCP_WEBSCROLLBARS_ONLY`) proves 640,640 with it, a narrower layout without
+it, the override across a navigation, and the refusal (`SKETERM_WEB_DISABLE_HIDE_SCROLLBARS`).
