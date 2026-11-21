@@ -254,6 +254,7 @@ comptime {
     _ = @import("mux/predict.zig");
     _ = @import("mux/pulse.zig");
     _ = @import("mux/client.zig");
+    _ = @import("mux/attachprobe.zig");
     _ = @import("mux/capabilities.zig");
     _ = @import("mux/tombstones.zig");
     _ = @import("mux/peermail.zig");

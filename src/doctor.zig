@@ -17,6 +17,7 @@ const opuscodec = @import("mux/opuscodec.zig");
 const vcodec = @import("wlhost/vcodec.zig");
 const procinv = @import("procinv.zig");
 const relisten = @import("mux/relisten.zig");
+const attachprobe = @import("mux/attachprobe.zig");
 
 /// Daemon `list` reply; pre-doctor daemons omit version/caps fields
 /// and show up as version "" (reported as "pre-0.1.0 or stale").
@@ -33,10 +34,15 @@ const Welcome = struct {
 
     const Sess = struct {
         name: []const u8 = "",
+        origin_id: []const u8 = "",
         app: bool = false,
         exited: bool = false,
         /// The session child's pid, which is how a session is tied to its worker process.
         pid: i64 = 0,
+        /// No-viewer TTL; a probe attach would restart its countdown.
+        ttl_secs: u32 = 0,
+        /// Build of the binary serving the session ("" = a daemon predating the field).
+        worker_build: []const u8 = "",
     };
 };
 
@@ -131,7 +137,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
                     "Checks: local daemon reachability + PID + version/proto/capability\n" ++
                     "skew, active MCP servers, GUI sockets, terminfo install, and every\n" ++
                     "running sketerm process of this user (daemons, session workers,\n" ++
-                    "helpers), warning about a daemon its own socket no longer reaches.\n" ++
+                    "helpers), warning about a daemon its own socket no longer reaches\n" ++
+                    "and about a session a brief view-only attach cannot reach.\n" ++
                     "With a host ([domain.<name>], user@box or udp:box): probes the\n" ++
                     "remote sketerm-mux for the same skew.\n\nExit: 0 healthy, 1 warnings.\n",
                 platform.stdout(),
@@ -457,7 +464,22 @@ const DaemonProbe = struct {
     sessions: ?u32 = null,
     /// Whether an unreachable daemon gets its socket back by itself (relisten.zig).
     support: relisten.Support = .old_build,
+    /// Listed sessions a view-only attach could not reach.
+    unattachable: []const Unattachable = &.{},
 };
+
+/// A session that lists but does not attach.
+const Unattachable = struct {
+    name: []const u8,
+    /// Build serving it; "" = unknown (the daemon predates `worker_build`).
+    build: []const u8,
+    /// The listed process holding it; 0 = not found.
+    worker_pid: c.pid_t,
+    reason: []const u8,
+};
+
+/// Deadline for one session's attach probe, connect to snapshot.
+const attach_probe_ms: i64 = 3_000;
 
 /// Session names keyed by the listed process holding each session.
 const SessionNames = std.AutoHashMapUnmanaged(c.pid_t, std.ArrayList([]const u8));
@@ -488,25 +510,49 @@ fn probeDaemon(a: std.mem.Allocator, inv: *const procinv.Inventory, p: *const pr
         .allocate = .alloc_always,
     }) catch return probe;
     var live: u32 = 0;
+    var failed: std.ArrayList(Unattachable) = .empty;
     for (welcome.sessions) |s| {
         if (s.exited) continue;
         live += 1;
-        const holder = inv.sessionHolder(std.math.cast(c.pid_t, s.pid) orelse continue) orelse continue;
-        const entry = names.getOrPut(a, holder.pid) catch continue;
-        if (!entry.found_existing) entry.value_ptr.* = .empty;
-        entry.value_ptr.append(a, s.name) catch {};
+        const holder = if (std.math.cast(c.pid_t, s.pid)) |pid| inv.sessionHolder(pid) else null;
+        if (holder) |h| {
+            const entry = names.getOrPut(a, h.pid) catch null;
+            if (entry) |e| {
+                if (!e.found_existing) e.value_ptr.* = .empty;
+                e.value_ptr.append(a, s.name) catch {};
+            }
+        }
+        // A TTL session counts viewers as occupancy: a probe would
+        // postpone its expiry, so doctor leaves it alone.
+        if (s.ttl_secs > 0) continue;
+        const r = attachprobe.probeAt(a, path, s.name, s.origin_id, attach_probe_ms);
+        if (r.outcome.healthy()) continue;
+        failed.append(a, .{
+            .name = s.name,
+            .build = s.worker_build,
+            .worker_pid = if (holder) |h| h.pid else 0,
+            .reason = a.dupe(u8, r.reason()) catch r.outcome.describe(),
+        }) catch {};
     }
     probe.sessions = live;
+    probe.unattachable = failed.items;
     return probe;
 }
 
-/// Warnings a probe raises: a live daemon no client can reach.
+/// A live daemon no client can reach.
+fn unreachableDaemon(p: *const procinv.Proc, probe: DaemonProbe) bool {
+    if (!p.isDaemon()) return false;
+    return switch (probe.state) {
+        .gone, .taken, .refused => true,
+        .serving, .unknown, .adopted => false,
+    };
+}
+
+/// Warnings a probe raises: an unreachable daemon, and each session it
+/// lists that does not attach.
 fn probeWarns(p: *const procinv.Proc, probe: DaemonProbe) u32 {
     if (!p.isDaemon()) return 0;
-    return switch (probe.state) {
-        .gone, .taken, .refused => 1,
-        .serving, .unknown, .adopted => 0,
-    };
+    return @as(u32, @intCast(probe.unattachable.len)) + @intFromBool(unreachableDaemon(p, probe));
 }
 
 fn formatAge(buf: []u8, ms: i64) []const u8 {
@@ -559,7 +605,13 @@ fn writeProcRow(writer: *std.Io.Writer, palette: Palette, p: *const procinv.Proc
     if (p.replaced) try writer.print(" {s}[binary replaced since start]{s}", .{ zspan(palette.note), zspan(palette.reset) });
     try writer.writeByte('\n');
 
-    if (probeWarns(p, probe) == 0) return;
+    for (probe.unattachable) |u| {
+        for (0..indent + 2) |_| try writer.writeByte(' ');
+        try writer.print("{s}WARN session '{s}' cannot be attached: {s} (", .{ zspan(palette.warn), u.name, u.reason });
+        if (u.worker_pid > 0) try writer.print("worker pid {d}, ", .{u.worker_pid});
+        try writer.print("build {s}){s}\n", .{ if (u.build.len > 0) u.build else "unknown", zspan(palette.reset) });
+    }
+    if (!unreachableDaemon(p, probe)) return;
     for (0..indent + 2) |_| try writer.writeByte(' ');
     const why = switch (probe.state) {
         .gone => "its socket file was removed",
@@ -777,6 +829,20 @@ test "doctor process rows nest by depth and name what a daemon serves" {
     try writeProcRow(&serving.writer, Palette.init(false), &broker, .{ .path = "/tmp/a/mux.sock", .state = .serving, .sessions = 2 }, &.{});
     try contains(serving.written(), "/tmp/a/mux.sock  2 session(s)");
     try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, serving.written(), "WARN"));
+
+    // A serving daemon whose sessions list but do not attach warns once per session.
+    const stuck = DaemonProbe{ .path = "/tmp/a/mux.sock", .state = .serving, .sessions = 2, .unattachable = &.{
+        .{ .name = "Mail", .build = "v0.1.4-12-g8bc57f22", .worker_pid = 4242, .reason = "connection dropped during the attach" },
+        .{ .name = "old", .build = "", .worker_pid = 0, .reason = "no screen snapshot arrived" },
+    } };
+    var unattachable: std.Io.Writer.Allocating = .init(allocator);
+    defer unattachable.deinit();
+    try writeProcRow(&unattachable.writer, Palette.init(false), &broker, stuck, &.{});
+    try contains(unattachable.written(), "WARN session 'Mail' cannot be attached: connection dropped during the attach (worker pid 4242, build v0.1.4-12-g8bc57f22)");
+    try contains(unattachable.written(), "WARN session 'old' cannot be attached: no screen snapshot arrived (build unknown)");
+    try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, unattachable.written(), "unreachable"));
+    try std.testing.expectEqual(@as(u32, 2), probeWarns(&broker, stuck));
+    try std.testing.expectEqual(@as(u32, 0), probeWarns(&worker, stuck));
 }
 
 test "doctor ages read at a glance" {

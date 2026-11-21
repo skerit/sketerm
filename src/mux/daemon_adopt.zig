@@ -417,6 +417,7 @@ pub fn brokerOnAdoptRecord(self: *Daemon, w: *Worker, payload: []const u8) void 
     w.gpu = rec.gpu;
     w.output_width = rec.output_width;
     w.output_height = rec.output_height;
+    w.setOwned(&w.build, rec.build);
     w.limits = daemon_control.WorkerLimits.reported(rec.limits, rec.snapshot_max);
     w.adopting = false;
     w.ready = true;

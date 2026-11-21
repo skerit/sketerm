@@ -982,6 +982,7 @@ pub fn brokerList(self: *Daemon, cl: *Client) void {
             .ttl_secs = w.ttl_secs,
             .viewers = w.viewers,
             .controller = if (w.controller) |p| p else "",
+            .worker_build = if (w.build) |b| b else build_options.commit,
             // A dropped reply is a hang on the far side: the client is
             // blocked in recvExpect(.welcome). `.err` is an answer there.
         }) catch {

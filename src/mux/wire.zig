@@ -1763,6 +1763,9 @@ pub const SessionInfo = struct {
     /// for the life of the connection, meaningless across daemons.
     viewers: u32 = 0,
     controller: []const u8 = "",
+    /// Build id (git describe) of the binary serving this session: an
+    /// adopted worker keeps its old one. "" = a daemon predating the field.
+    worker_build: []const u8 = "",
 };
 
 test "the reader accepts frames larger than any writer here will produce" {

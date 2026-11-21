@@ -545,6 +545,9 @@ pub const Worker = struct {
     /// What the worker's binary can serve; an adopted worker may be older
     /// than this broker, so every handoff is capped to it.
     limits: @import("daemon_control.zig").WorkerLimits = .this_build,
+    /// Build id of an ADOPTED worker's binary (its 'D' record); null = this
+    /// broker's own build, which a forked worker runs.
+    build: ?[]u8 = null,
     /// Why the session ended, once known: the worker's 'T' report, or a
     /// kill this broker forwarded. Recorded as a tombstone when the
     /// record is retired.
@@ -564,6 +567,7 @@ pub const Worker = struct {
         if (self.x_display) |p| self.allocator.free(p);
         if (self.xauthority) |p| self.allocator.free(p);
         if (self.controller) |p| self.allocator.free(p);
+        if (self.build) |p| self.allocator.free(p);
         self.freeAudioInfos(self.audio_streams);
         self.allocator.destroy(self);
     }

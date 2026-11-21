@@ -470,6 +470,7 @@ comptime {
     _ = @import("mux/cast_play.zig");
     _ = @import("replay.zig");
     _ = @import("mux/client.zig");
+    _ = @import("mux/attachprobe.zig");
     _ = @import("mux/punch.zig");
     _ = @import("mux/rudp.zig");
     _ = @import("mux/display.zig");
