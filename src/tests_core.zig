@@ -67,6 +67,7 @@ comptime {
     _ = @import("filebrowser/dragout.zig");
     _ = @import("filebrowser/crumbs.zig");
     _ = @import("filebrowser/desktop.zig");
+    _ = @import("filebrowser/openwith.zig");
     _ = @import("filebrowser/emblems.zig");
     _ = @import("filebrowser/entry.zig");
     _ = @import("filebrowser/incomplete.zig");

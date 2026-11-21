@@ -418,6 +418,7 @@ comptime {
     _ = @import("filebrowser/progress.zig");
     _ = @import("filebrowser/xferqueue.zig");
     _ = @import("filebrowser/desktop.zig");
+    _ = @import("filebrowser/openwith.zig");
     _ = @import("filebrowser/hexdump.zig");
     _ = @import("filebrowser/previewers.zig");
     _ = @import("filebrowser/pdflocal.zig");

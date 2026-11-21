@@ -52,7 +52,7 @@ pub const CELL_SPACING = 4;
 /// content, which for a remote entry would mean reading the file. That
 /// is how the user's icon theme (Papirus, Breeze, ...) ends up
 /// deciding what a .png or a .zip looks like, exactly as in Nemo.
-fn entryIconImage(anchor: *c.GtkWidget, e: Entry, px: i32) ?*c.GtkWidget {
+pub fn entryIconImage(anchor: *c.GtkWidget, e: Entry, px: i32) ?*c.GtkWidget {
     if (fileicon.folderIconName(e.kind, e.tdir)) |name| {
         var fz: [32:0]u8 = undefined;
         return iconload.newImageIcon(anchor, copyZN(&fz, name), px);

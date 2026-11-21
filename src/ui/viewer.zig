@@ -22,7 +22,7 @@ const Terminal = @import("../terminal.zig").Terminal;
 const Playbar = @import("playbar.zig").Playbar;
 const input = @import("input.zig");
 const classicmenu = @import("browser/classicmenu.zig");
-const browser_open = @import("browser/open.zig");
+const browser_openwith = @import("browser/openwith.zig");
 const format = @import("../filebrowser/format.zig");
 const appmenu = @import("appmenu.zig");
 const remotestream = @import("remotestream.zig");
@@ -2810,18 +2810,18 @@ fn delayedChooserCopyCleanup(user: ?*anyopaque) callconv(.c) c.gboolean {
     return 0;
 }
 
-/// GDestroyNotify on the chooser popover: begin the delayed unlink of
-/// the materialized temp copy once the popover is gone, so an app the
+/// GDestroyNotify on the chooser dialog: begin the delayed unlink of
+/// the materialized temp copy once the dialog is gone, so an app the
 /// user just launched still has 60 seconds to open the file (the same
 /// grace the old dialog gave after its launch).
-fn chooserCopyPopoverGone(user: ?*anyopaque) callconv(.c) void {
+fn chooserCopyDialogGone(user: ?*anyopaque) callconv(.c) void {
     if (c.g_timeout_add_seconds(60, @ptrCast(&delayedChooserCopyCleanup), user) == 0)
         freeChooserCopy(user);
 }
 
 /// Show the file manager's local-app chooser for `path`. With
 /// `owned_copy`, a returned `true` transfers ownership of the temp
-/// file to the chooser (unlinked 60s after the popover closes);
+/// file to the chooser (unlinked 60s after the dialog closes);
 /// `false` leaves ownership with the caller.
 fn showAppChooserPath(self: *ViewerWindow, path: []const u8, owned_copy: bool) bool {
     var copy: ?*ChooserCopy = null;
@@ -2834,7 +2834,11 @@ fn showAppChooserPath(self: *ViewerWindow, path: []const u8, owned_copy: bool) b
         } };
         copy = cp;
     }
-    const popover = browser_open.openWithLocalPopover(std.heap.c_allocator, self.window, path) orelse {
+    const dialog = browser_openwith.present(.{
+        .allocator = std.heap.c_allocator,
+        .parent = self.window,
+        .path = path,
+    }) orelse {
         if (copy) |cp| {
             // No unlink here: on failure the temp file stays owned by
             // the caller's LoadResult, which removes it itself.
@@ -2845,7 +2849,7 @@ fn showAppChooserPath(self: *ViewerWindow, path: []const u8, owned_copy: bool) b
         return false;
     };
     if (copy) |cp|
-        c.g_object_set_data_full(@ptrCast(popover), "sketerm-viewer-open-copy", @ptrCast(cp), @ptrCast(&chooserCopyPopoverGone));
+        c.g_object_set_data_full(@ptrCast(dialog), "sketerm-viewer-open-copy", @ptrCast(cp), @ptrCast(&chooserCopyDialogGone));
     return true;
 }
 

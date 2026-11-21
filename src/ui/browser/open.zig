@@ -10,19 +10,16 @@ const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
 const EditWatch = @import("types.zig").EditWatch;
 const HostConn = @import("types.zig").HostConn;
-const WireApp = @import("types.zig").WireApp;
-const buildHostExecCmd = @import("../../filebrowser/desktop.zig").buildHostExecCmd;
 const colview = @import("colview.zig");
-const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 const hostmount = @import("../hostmount.zig");
-const mimeListContains = @import("../../filebrowser/desktop.zig").mimeListContains;
+const openwith = @import("../../filebrowser/openwith.zig");
+const openwith_dialog = @import("openwith.zig");
 const paths = @import("../../filebrowser/paths.zig");
 const platform = @import("../../util/platform.zig");
 const dirsweep = @import("../../util/dirsweep.zig");
 const viewer_model = @import("../../viewer.zig");
 const views = @import("views.zig");
 const cast = @import("../../util/cast.zig");
-
 /// One remote open waiting for its host's FUSE mount to come up.
 pub const PendingOpen = struct {
     allocator: std.mem.Allocator,
@@ -115,7 +112,11 @@ fn launchMounted(self: *BrowserView, host: []const u8, path: []const u8, appid: 
         const hc = self.hostConnFor(host) orelse return;
         return downloadAndOpen(self, hc, host, path, appid);
     };
-    if (appid) |id| launchLocalWithApp(id, local) else launchLocal(local);
+    var ebuf: [256]u8 = undefined;
+    if (launchLocalOpener(appid, local, &ebuf)) |why| {
+        self.setStatusFmt("could not open {s}: {s}", .{ std.fs.path.basename(path), why });
+        return;
+    }
     self.setStatusFmt("opening {s} from the {s} mount", .{ std.fs.path.basename(path), host });
 }
 
@@ -420,287 +421,24 @@ pub fn launchCastPlayer(self: *BrowserView, spec: []const u8) void {
     self.setStatusFmt("playing {s} in Sketerm", .{std.fs.path.basename(spec)});
 }
 
-/// Heap context for one Open With popover; owned by the popover.
-pub const OpenWithCtx = struct {
-    allocator: std.mem.Allocator,
-    view: *BrowserView,
-    tab: *BTab,
-    path: []u8,
-    /// In-flight host `apps` request (0 = none).
-    req: u32 = 0,
-    host_box: *c.GtkWidget,
-    host_label: *c.GtkWidget,
-    popover: *c.GtkWidget,
-
-    fn free(user: ?*anyopaque) callconv(.c) void {
-        const ctx = cast.userData(OpenWithCtx, user);
-        if (ctx.view.openwith == ctx) ctx.view.openwith = null;
-        ctx.allocator.free(ctx.path);
-        ctx.allocator.destroy(ctx);
-    }
-};
-
-/// Heap context for one app button (GClosureNotify-freed).
-/// `view`/`tab` are null in the standalone (viewer-hosted) chooser,
-/// where every launch is local.
-pub const AppBtnCtx = struct {
-    allocator: std.mem.Allocator,
-    view: ?*BrowserView,
-    tab: ?*BTab,
-    path: []u8,
-    /// Local application id (GAppInfo) — launch locally.
-    appid: ?[]u8 = null,
-    /// Host .desktop Exec line — launch on the file's host.
-    exec: ?[]u8 = null,
-    popover: *c.GtkWidget,
-
-    fn free(user: ?*anyopaque, closure: ?*anyopaque) callconv(.c) void {
-        _ = closure;
-        const a = cast.userData(AppBtnCtx, user);
-        a.allocator.free(a.path);
-        if (a.appid) |s| a.allocator.free(s);
-        if (a.exec) |s| a.allocator.free(s);
-        a.allocator.destroy(a);
-    }
-};
-
-/// The application chooser: local apps for the guessed type plus,
-/// on a remote tab, the apps installed on the file's host.
+/// The Open With chooser for a file in `tab`: local applications plus,
+/// on a remote tab, the ones installed on the file's host.
 pub fn openWithDialog(self: *BrowserView, tab: *BTab, path: []const u8) void {
-    const is_local = tab.hc.host == null;
-    const popover = c.gtk_popover_new();
-    const ctx = self.allocator.create(OpenWithCtx) catch return;
-    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
-    const host_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
-    const host_label = c.gtk_label_new("");
-    ctx.* = .{
+    if (self.widgets_dead) return;
+    if (openwith_dialog.present(.{
         .allocator = self.allocator,
+        .parent = self.root_box,
+        .path = path,
         .view = self,
-        .tab = tab,
-        .path = self.allocator.dupe(u8, path) catch {
-            self.allocator.destroy(ctx);
-            return;
-        },
-        .host_box = host_box,
-        .host_label = host_label,
-        .popover = popover,
-    };
-    c.g_object_set_data_full(@ptrCast(popover), "sketerm-openwith", @ptrCast(ctx), @ptrCast(&OpenWithCtx.free));
-
-    // Local applications for the file's guessed content type.
-    const sec = c.gtk_label_new(if (is_local) "Open with:" else "Open locally (through the host mount):");
-    c.gtk_widget_add_css_class(sec, "dim-label");
-    c.gtk_label_set_xalign(@ptrCast(sec), 0);
-    c.gtk_box_append(@ptrCast(box), sec);
-
-    const owdef = c.gtk_check_button_new_with_label("Always use for this file type");
-    c.g_object_set_data(@ptrCast(popover), "sketerm-owdef", @ptrCast(owdef));
-
-    const app_count = appendLocalApps(self.allocator, self, tab, popover, box, path);
-    if (app_count == 0) {
-        const none = c.gtk_label_new("(no known local handler)");
-        c.gtk_widget_add_css_class(none, "dim-label");
-        c.gtk_box_append(@ptrCast(box), none);
-    }
-    c.gtk_box_append(@ptrCast(box), owdef);
-
-    // Host applications (remote tabs): one daemon round trip.
-    // The widgets always join the tree (hidden locally) so they
-    // never dangle as floating refs.
-    c.gtk_widget_add_css_class(host_label, "dim-label");
-    c.gtk_label_set_xalign(@ptrCast(host_label), 0);
-    c.gtk_box_append(@ptrCast(box), host_label);
-    c.gtk_box_append(@ptrCast(box), host_box);
-    if (!is_local) {
-        c.gtk_label_set_text(@ptrCast(host_label), "On host: loading…");
-        if (tab.hc.state == .ready) {
-            ctx.req = self.nextReq();
-            self.openwith = ctx;
-            self.sendOp(tab.hc, .{ .req = ctx.req, .op = "apps", .path = "/" });
-        } else {
-            c.gtk_label_set_text(@ptrCast(host_label), "On host: not connected");
-        }
-    } else {
-        c.gtk_widget_set_visible(host_label, 0);
-        c.gtk_widget_set_visible(host_box, 0);
-    }
-
-    const scroll = c.gtk_scrolled_window_new();
-    c.gtk_widget_set_size_request(scroll, 320, 380);
-    c.gtk_scrolled_window_set_child(@ptrCast(scroll), box);
-    c.gtk_popover_set_child(@ptrCast(popover), scroll);
-    c.gtk_widget_set_parent(popover, tab.page);
-    connectPopoverAutoUnparent(popover);
-    const rect = c.GdkRectangle{ .x = 320, .y = 200, .width = 1, .height = 1 };
-    c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
-    c.gtk_popover_popup(@ptrCast(popover));
-}
-
-pub fn appChoiceButton(
-    self: *BrowserView,
-    box: *c.GtkWidget,
-    ctx: *OpenWithCtx,
-    name: []const u8,
-    appid: ?[]const u8,
-    exec: ?[]const u8,
-) void {
-    addAppChoiceButton(self.allocator, self, ctx.tab, ctx.popover, box, ctx.path, name, appid, exec);
-}
-
-/// The chooser-row builder behind appChoiceButton, callable without a
-/// BrowserView (`view`/`tab` null = local-only launches).
-fn addAppChoiceButton(
-    allocator: std.mem.Allocator,
-    view: ?*BrowserView,
-    tab: ?*BTab,
-    popover: *c.GtkWidget,
-    box: *c.GtkWidget,
-    path: []const u8,
-    name: []const u8,
-    appid: ?[]const u8,
-    exec: ?[]const u8,
-) void {
-    const actx = allocator.create(AppBtnCtx) catch return;
-    actx.* = .{
-        .allocator = allocator,
-        .view = view,
-        .tab = tab,
-        .path = allocator.dupe(u8, path) catch {
-            allocator.destroy(actx);
-            return;
-        },
-        .appid = if (appid) |s| (allocator.dupe(u8, s) catch null) else null,
-        .exec = if (exec) |s| (allocator.dupe(u8, s) catch null) else null,
-        .popover = popover,
-    };
-    var lbl: [256:0]u8 = undefined;
-    const ltxt = std.fmt.bufPrintSentinel(&lbl, "{s}", .{name}, 0) catch return;
-    const btn = c.gtk_button_new_with_label(ltxt.ptr);
-    c.gtk_button_set_has_frame(@ptrCast(btn), 0);
-    c.gtk_widget_set_halign(c.gtk_button_get_child(@ptrCast(btn)), c.GTK_ALIGN_START);
-    _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onAppBtnClicked), @ptrCast(actx), @ptrCast(&AppBtnCtx.free), c.G_CONNECT_DEFAULT);
-    c.gtk_box_append(@ptrCast(box), btn);
-}
-
-/// Local applications for the file's guessed content type, one chooser
-/// row each (bounded). Shared by the browser dialog and the
-/// standalone popover. @return the number of rows added.
-fn appendLocalApps(
-    allocator: std.mem.Allocator,
-    view: ?*BrowserView,
-    tab: ?*BTab,
-    popover: *c.GtkWidget,
-    box: *c.GtkWidget,
-    path: []const u8,
-) usize {
-    var namez: [512:0]u8 = undefined;
-    const base = std.fs.path.basename(path);
-    var app_count: usize = 0;
-    if (std.fmt.bufPrintSentinel(&namez, "{s}", .{base}, 0)) |bz| {
-        var uncertain: c.gboolean = 0;
-        const ct = c.g_content_type_guess(bz.ptr, null, 0, &uncertain);
-        if (ct != null) {
-            const apps = c.g_app_info_get_all_for_type(ct);
-            var it = apps;
-            while (it != null and app_count < 20) : (it = it.*.next) {
-                const app: *c.GAppInfo = @ptrCast(@alignCast(it.*.data orelse continue));
-                const id = c.g_app_info_get_id(app) orelse continue;
-                const nm = c.g_app_info_get_name(app) orelse continue;
-                addAppChoiceButton(allocator, view, tab, popover, box, path, std.mem.span(nm), std.mem.span(id), null);
-                app_count += 1;
-            }
-            if (apps != null) c.g_list_free_full(apps, @ptrCast(&c.g_object_unref));
-            c.g_free(ct);
-        }
-    } else |_| {}
-    return app_count;
-}
-
-/// Standalone local-only Open With chooser for windows without a
-/// BrowserView (the image viewer): local apps for the file's guessed
-/// content type plus the "Always use" default toggle. The popover is
-/// parented to `parent`, anchored at its centre, and unparents itself
-/// on close. @return the popover, or null on allocation failure.
-pub fn openWithLocalPopover(allocator: std.mem.Allocator, parent: *c.GtkWidget, path: []const u8) ?*c.GtkWidget {
-    const popover = c.gtk_popover_new() orelse return null;
-    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
-    const sec = c.gtk_label_new("Open with:");
-    c.gtk_widget_add_css_class(sec, "dim-label");
-    c.gtk_label_set_xalign(@ptrCast(sec), 0);
-    c.gtk_box_append(@ptrCast(box), sec);
-    const owdef = c.gtk_check_button_new_with_label("Always use for this file type");
-    c.g_object_set_data(@ptrCast(popover), "sketerm-owdef", @ptrCast(owdef));
-    const app_count = appendLocalApps(allocator, null, null, popover, box, path);
-    if (app_count == 0) {
-        const none = c.gtk_label_new("(no known local handler)");
-        c.gtk_widget_add_css_class(none, "dim-label");
-        c.gtk_box_append(@ptrCast(box), none);
-    }
-    c.gtk_box_append(@ptrCast(box), owdef);
-    const scroll = c.gtk_scrolled_window_new();
-    c.gtk_widget_set_size_request(scroll, 320, 380);
-    c.gtk_scrolled_window_set_child(@ptrCast(scroll), box);
-    c.gtk_popover_set_child(@ptrCast(popover), scroll);
-    c.gtk_widget_set_parent(popover, parent);
-    connectPopoverAutoUnparent(popover);
-    const rect = c.GdkRectangle{
-        .x = @divTrunc(c.gtk_widget_get_width(parent), 2),
-        .y = @divTrunc(c.gtk_widget_get_height(parent), 2),
-        .width = 1,
-        .height = 1,
-    };
-    c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
-    c.gtk_popover_popup(@ptrCast(popover));
-    return popover;
-}
-
-pub fn onAppBtnClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const actx: *AppBtnCtx = @ptrCast(@alignCast(user.?));
-    if (actx.exec) |exec| {
-        // Host application: substituted Exec runs as an app
-        // session on the file's host; its window forwards here.
-        // Host rows only exist in the browser chooser, so view/tab
-        // are always present on this branch.
-        const self = actx.view orelse return;
-        const tab = actx.tab orelse return;
-        if (self.on_host_exec) |cb| {
-            if (self.hooks_ctx) |hctx| {
-                if (buildHostExecCmd(self.allocator, exec, actx.path)) |cmd| {
-                    defer self.allocator.free(cmd);
-                    var z: [4600:0]u8 = undefined;
-                    if (std.fmt.bufPrintSentinel(&z, "{s}", .{cmd}, 0)) |cz| {
-                        cb(hctx, tab.hc.host orelse "", cz);
-                        self.setStatus("opening on host (app window forwards here)…");
-                    } else |_| {}
-                }
-            }
-        }
-    } else if (actx.appid) |appid| {
-        // "Always use for this type": register the association
-        // before launching.
-        if (c.g_object_get_data(@ptrCast(actx.popover), "sketerm-owdef")) |cb| {
-            if (c.gtk_check_button_get_active(@ptrCast(@alignCast(cb))) != 0)
-                setDefaultAppForPath(appid, actx.path);
-        }
-        const remote_tab: ?*BTab = if (actx.tab) |tab| (if (tab.hc.host != null) tab else null) else null;
-        if (remote_tab) |tab| {
-            if (actx.view) |self| self.openRemoteFile(tab, actx.path, appid) else launchLocalWithApp(appid, actx.path);
-        } else {
-            launchLocalWithApp(appid, actx.path);
-        }
-    }
-    c.gtk_popover_popdown(@ptrCast(actx.popover));
+        .host = tab.hc.host,
+    }) == null) self.setStatus("could not open the application chooser");
 }
 
 /// The MIME type GIO guesses from a file NAME alone (no content
 /// sniffing: the file may live on another host).
 /// @return "" when nothing could be guessed or `buf` is too small.
 pub fn guessMime(buf: []u8, name: []const u8) []const u8 {
-    var namez: [512:0]u8 = undefined;
-    const bz = std.fmt.bufPrintSentinel(&namez, "{s}", .{name}, 0) catch return "";
-    var uncertain: c.gboolean = 0;
-    const ct = c.g_content_type_guess(bz.ptr, null, 0, &uncertain);
-    if (ct == null) return "";
+    const ct = guessContentType(name) orelse return "";
     defer c.g_free(ct);
     const m = c.g_content_type_get_mime_type(ct) orelse return "";
     defer c.g_free(m);
@@ -708,45 +446,6 @@ pub fn guessMime(buf: []u8, name: []const u8) []const u8 {
     if (ms.len > buf.len) return "";
     @memcpy(buf[0..ms.len], ms);
     return buf[0..ms.len];
-}
-
-/// Fill the chooser's host section from the daemon's app list,
-/// filtered by the file's locally-guessed MIME type.
-pub fn populateHostApps(self: *BrowserView, ow: *OpenWithCtx, ok: bool, apps: []const WireApp) void {
-    ow.req = 0;
-    if (!ok) {
-        // Any refused app-list query: the section simply has nothing
-        // to offer. Local apps are listed regardless.
-        c.gtk_label_set_text(@ptrCast(ow.host_label), "On host: unavailable");
-        return;
-    }
-    var hostz: [280:0]u8 = undefined;
-    const htxt = std.fmt.bufPrintSentinel(&hostz, "On {s}:", .{ow.tab.hc.label()}, 0) catch "On host:";
-    c.gtk_label_set_text(@ptrCast(ow.host_label), htxt.ptr);
-
-    // Guess the MIME locally from the file name.
-    var mime_buf: [256]u8 = undefined;
-    const mime = guessMime(&mime_buf, std.fs.path.basename(ow.path));
-
-    var shown: usize = 0;
-    if (mime.len > 0) {
-        for (apps) |app| {
-            if (shown >= 20) break;
-            if (!mimeListContains(app.mimes, mime)) continue;
-            self.appChoiceButton(ow.host_box, ow, app.name, null, app.exec);
-            shown += 1;
-        }
-    }
-    if (shown == 0) {
-        // No MIME match: offer everything, bounded.
-        for (apps) |app| {
-            if (shown >= 30) break;
-            self.appChoiceButton(ow.host_box, ow, app.name, null, app.exec);
-            shown += 1;
-        }
-    }
-    if (shown == 0)
-        c.gtk_label_set_text(@ptrCast(ow.host_label), "On host: no applications found");
 }
 
 /// Watch a landed download; local saves upload back to the host.
@@ -821,16 +520,74 @@ pub fn uploadEditWatch(self: *BrowserView, wt: *EditWatch) void {
 }
 
 pub fn launchLocal(path: []const u8) void {
-    const uri = filenameUri(path) orelse return;
-    defer c.g_free(uri);
-    _ = c.g_app_info_launch_default_for_uri(uri, null, null);
+    launchLocalWithApp(null, path);
 }
 
-/// Launch a specific installed application (by GAppInfo id) on a
-/// local path; falls back to the default handler if the id vanished.
-pub fn launchLocalWithApp(appid: []const u8, path: []const u8) void {
-    const uri = filenameUri(path) orelse return;
+/// Fire-and-forget launch for paths with no UI to report to; a failure
+/// is logged rather than dropped.
+pub fn launchLocalWithApp(app_id: ?[]const u8, path: []const u8) void {
+    var buf: [512]u8 = undefined;
+    if (launchLocalOpener(app_id, path, &buf)) |why|
+        std.debug.print("sketerm: could not open {s}: {s}\n", .{ path, why });
+}
+
+/// Launch a local path with an opener string (`filebrowser/openwith.zig`
+/// `Opener`: desktop id, encoded custom command, or null for the
+/// default handler). A desktop id that vanished falls back to the
+/// default handler.
+/// @return why the launch failed, written into `err_buf`, or null.
+pub fn launchLocalOpener(app_id: ?[]const u8, path: []const u8, err_buf: []u8) ?[]const u8 {
+    var err: [*c]c.GError = null;
+    defer if (err != null) c.g_error_free(err);
+    const app: ?*c.GAppInfo = switch (openwith.parseOpener(app_id)) {
+        .default => null,
+        .desktop_id => |id| appInfoById(id),
+        .command => |cmd| commandAppInfo(cmd, &err) orelse return errorText(err, err_buf),
+    };
+    defer if (app) |a| c.g_object_unref(a);
+    return launchInfo(app, path, err_buf);
+}
+
+/// Launch a local path with `app`, or the default handler when null.
+/// @return why the launch failed, written into `err_buf`, or null.
+pub fn launchInfo(app: ?*c.GAppInfo, path: []const u8, err_buf: []u8) ?[]const u8 {
+    const uri = filenameUri(path) orelse
+        return std.fmt.bufPrint(err_buf, "not a usable local path", .{}) catch "";
     defer c.g_free(uri);
+    var err: [*c]c.GError = null;
+    defer if (err != null) c.g_error_free(err);
+    const ok = if (app) |a| launchUri(a, uri, &err) else c.g_app_info_launch_default_for_uri(uri, null, &err) != 0;
+    return if (ok) null else errorText(err, err_buf);
+}
+
+/// A GError's message copied into `buf` (the error stays the caller's).
+pub fn errorText(err: [*c]c.GError, buf: []u8) []const u8 {
+    const why: []const u8 = if (err != null and err.*.message != null)
+        std.mem.span(@as([*:0]const u8, @ptrCast(err.*.message)))
+    else
+        "the application did not start";
+    const n = @min(why.len, buf.len);
+    @memcpy(buf[0..n], why[0..n]);
+    return buf[0..n];
+}
+
+fn launchUri(app: *c.GAppInfo, uri: [*c]c.gchar, err: [*c][*c]c.GError) bool {
+    var list: ?*c.GList = null;
+    list = c.g_list_append(list, @ptrCast(uri));
+    defer c.g_list_free(list);
+    return c.g_app_info_launch_uris(app, list, null, err) != 0;
+}
+
+/// A GAppInfo for a custom command line (G_APP_INFO_CREATE_NONE); the
+/// caller owns the ref.
+pub fn commandAppInfo(cmdline: []const u8, err: [*c][*c]c.GError) ?*c.GAppInfo {
+    var z: [4096:0]u8 = undefined;
+    const cz = std.fmt.bufPrintSentinel(&z, "{s}", .{cmdline}, 0) catch return null;
+    return c.g_app_info_create_from_commandline(cz.ptr, null, c.G_APP_INFO_CREATE_NONE, err);
+}
+
+/// The installed application with desktop id `appid`; the caller owns the ref.
+pub fn appInfoById(appid: []const u8) ?*c.GAppInfo {
     const apps = c.g_app_info_get_all();
     defer if (apps != null) c.g_list_free_full(apps, @ptrCast(&c.g_object_unref));
     var it = apps;
@@ -838,13 +595,10 @@ pub fn launchLocalWithApp(appid: []const u8, path: []const u8) void {
         const app: *c.GAppInfo = @ptrCast(@alignCast(it.*.data orelse continue));
         const id = c.g_app_info_get_id(app) orelse continue;
         if (!std.mem.eql(u8, std.mem.span(id), appid)) continue;
-        var list: ?*c.GList = null;
-        list = c.g_list_append(list, @ptrCast(uri));
-        _ = c.g_app_info_launch_uris(app, list, null, null);
-        c.g_list_free(list);
-        return;
+        _ = c.g_object_ref(app);
+        return app;
     }
-    launchLocal(path);
+    return null;
 }
 
 pub fn filenameUri(path: []const u8) ?[*c]c.gchar {
@@ -854,23 +608,11 @@ pub fn filenameUri(path: []const u8) ?[*c]c.gchar {
     return if (uri == null) null else uri;
 }
 
-/// Make `appid` the default handler for `path`'s guessed type.
-pub fn setDefaultAppForPath(appid: []const u8, path: []const u8) void {
+/// The content type GIO guesses from a file NAME alone; caller frees with g_free.
+pub fn guessContentType(name: []const u8) ?[*c]c.gchar {
     var namez: [512:0]u8 = undefined;
-    const base = std.fs.path.basename(path);
-    const bz = std.fmt.bufPrintSentinel(&namez, "{s}", .{base}, 0) catch return;
+    const bz = std.fmt.bufPrintSentinel(&namez, "{s}", .{name}, 0) catch return null;
     var uncertain: c.gboolean = 0;
     const ct = c.g_content_type_guess(bz.ptr, null, 0, &uncertain);
-    if (ct == null) return;
-    defer c.g_free(ct);
-    const apps = c.g_app_info_get_all();
-    defer if (apps != null) c.g_list_free_full(apps, @ptrCast(&c.g_object_unref));
-    var it = apps;
-    while (it != null) : (it = it.*.next) {
-        const app: *c.GAppInfo = @ptrCast(@alignCast(it.*.data orelse continue));
-        const id = c.g_app_info_get_id(app) orelse continue;
-        if (!std.mem.eql(u8, std.mem.span(id), appid)) continue;
-        _ = c.g_app_info_set_as_default_for_type(app, ct, null);
-        return;
-    }
+    return if (ct == null) null else ct;
 }

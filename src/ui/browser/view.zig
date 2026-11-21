@@ -52,7 +52,7 @@ const JobPanel = @import("jobpanel.zig").Panel;
 const JobRow = @import("types.zig").JobRow;
 const LabelProbe = @import("props.zig").LabelProbe;
 const MAX_ATTR_COLUMNS = @import("render.zig").MAX_ATTR_COLUMNS;
-const OpenWithCtx = @import("open.zig").OpenWithCtx;
+const openwith_dialog = @import("openwith.zig");
 const PendingOpen = @import("open.zig").PendingOpen;
 const OwnedSearch = @import("types.zig").OwnedSearch;
 const OwnedAlias = @import("types.zig").OwnedAlias;
@@ -261,8 +261,9 @@ pub const BrowserView = struct {
     last_listing_render_ms: i64 = 0,
     /// Live local-edit sync-back watches (remote files opened here).
     watches: std.ArrayList(*EditWatch) = .empty,
-    /// The one open Open With chooser (its popover owns the ctx).
-    openwith: ?*OpenWithCtx = null,
+    /// The one open Open With chooser (its dialog owns the ctx; this
+    /// slot is the fence for the host `apps` reply).
+    openwith: ?*openwith_dialog.Ctx = null,
     /// The one open compare/sync window.
     compare: ?*CompareCtx = null,
     /// Places sidebar (bookmarks / recent / devices).
@@ -798,9 +799,6 @@ pub const BrowserView = struct {
     pub const openWithDialog = @import("open.zig").openWithDialog;
     pub const launchViewer = @import("open.zig").launchViewer;
     pub const launchCastPlayer = @import("open.zig").launchCastPlayer;
-    pub const appChoiceButton = @import("open.zig").appChoiceButton;
-    pub const onAppBtnClicked = @import("open.zig").onAppBtnClicked;
-    pub const populateHostApps = @import("open.zig").populateHostApps;
     pub const registerEditWatch = @import("open.zig").registerEditWatch;
     pub const onEditWatchChanged = @import("open.zig").onEditWatchChanged;
     pub const uploadEditWatch = @import("open.zig").uploadEditWatch;
@@ -1108,6 +1106,7 @@ pub const BrowserView = struct {
     fn fenceWidgets(self: *BrowserView) void {
         self.widgets_dead = true;
         @import("ops.zig").cancelExternalPaste(self, null);
+        if (self.openwith) |ow| openwith_dialog.sever(ow);
         self.severPreviewAnimation();
         if (self.bar_idle_src != 0) {
             _ = c.g_source_remove(self.bar_idle_src);
@@ -1417,6 +1416,7 @@ pub const BrowserView = struct {
         if (recent_flush.source != 0) _ = c.g_source_remove(recent_flush.source);
         if (sidebar_flush.persist or recent_flush.persist) _ = self.savePlaces();
         @import("places.zig").unregisterView(self);
+        if (self.openwith) |ow| openwith_dialog.sever(ow);
         // Close the quick-look viewer FIRST: its destroy handler and
         // activate callback carry a raw pointer to this view, and the
         // choke-point contract (see preview.State.quick_look) is that

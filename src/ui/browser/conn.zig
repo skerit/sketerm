@@ -1663,8 +1663,8 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
     }
     // Open With host-apps reply?
     if (self.openwith) |ow| {
-        if (ow.req != 0 and ow.req == rep.req) {
-            self.populateHostApps(ow, rep.ok, rep.apps);
+        if (@import("openwith.zig").wantsReply(ow, rep.req)) {
+            @import("openwith.zig").onHostApps(ow, rep.ok, rep.apps);
             return false;
         }
     }

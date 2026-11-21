@@ -465,8 +465,8 @@ fn addOpenAppItem(
 
 /// Nemo-style open block for a file: "Open with <Default>" launches
 /// directly, then an "Open With" hover submenu lists every candidate
-/// plus "Other Application…" (the full chooser, with the always-use
-/// checkbox and host-side apps).
+/// plus "Other Application…" (the full chooser: every installed app,
+/// a custom command, the always-use switch and host-side apps).
 ///
 /// On a remote tab the candidates are still LOCAL applications — the
 /// launch downloads a cache copy first (openRemoteFile), same as the
@@ -1052,7 +1052,7 @@ pub fn onMenuOpenWith(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const orig = mctx.path orelse return menuDone(mctx);
     const tab = mctx.tab;
     // Copy the path out and close the menu popover FIRST — its
-    // popdown must not race the new popover's grab.
+    // popdown must not race the chooser dialog's grab.
     var pbuf: [4096]u8 = undefined;
     if (orig.len >= pbuf.len) return menuDone(mctx);
     @memcpy(pbuf[0..orig.len], orig);
