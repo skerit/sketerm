@@ -23944,3 +23944,24 @@ command on a remote file rides the mount / cached-copy path unchanged, and fire-
 launches log their failure instead of dropping it. The dialog owns its ctx ("closed"
 destroy-notify); `BrowserView.openwith` is the fence for the host reply and a view teardown
 severs and closes the dialog.
+
+## 2026-11-21: Transfers popover in the Files header
+
+The bottom transfers strip is gone. Files' toolbar has a Transfers menu button beside Search
+whose icon is a progress ring: the mean of the LIVE rows (settled ones only tint it full green
+or red), a dot when a failure hides behind live work or a name conflict waits for its dialog.
+It is hidden while there are no rows, so an idle toolbar is pixel-identical to before, and it
+pulses (CSS animation, 1.7 s timer, fenced in `fenceWidgets`) when a new transfer appears; it
+never opens itself. Clicking it, or Ctrl+Shift+J (the strip's old chord), opens a 380px
+popover: "Transfers" + a count summary + Clear Finished, then one card per top-level row (live
+first, failures next, newest first in each): state icon or a running ring, a title such as
+"Copying 312 items to archdev", the src -> dst route, a bar, the existing stats line, the
+error message, and the row's existing pause/resume/retry/cancel/dismiss controls (reordering
+stays in the Transfer Center). "Show All Transfers" opens the Transfer Center, which keeps its
+place at the bottom, gains a close button, and lost the error cards' coloured left border.
+The pure rules (`State`/`Tone` vocabularies, order, summary, ring, title) live in
+`filebrowser/xferlist.zig`, tested in both roots; both surfaces write cards through one
+`applyRow` over per-surface `Card` widget sets. Also fixed: `hourglass-symbolic` and
+`emblem-ok-symbolic` (absent from Adwaita 50) are now `document-open-recent-symbolic` and
+`object-select-symbolic`. `smoke-e2e`'s files-transfers stage drives the popover, Show All
+and the center's close button.
