@@ -1065,11 +1065,30 @@ pub fn build(b: *std.Build) void {
     const zig16_builtins_step = b.step("lint-zig16-builtins", "Reject Zig 0.17-only builtins that 0.17's zig fmt writes");
     zig16_builtins_step.dependOn(&zig16_builtins.step);
 
+    // Real OLD sketerm-mux builds (dist/skew-baselines.txt, built once per
+    // machine) against this tree: handover, adoption and GUI attach in both
+    // directions. See src/smoke_skew.zig; every test step depends on it.
+    const skew_mod = dev.module(b, target, "src/smoke_skew.zig");
+    configureCoreDeps(b, skew_mod, core_cbindings_mod);
+    skew_mod.addImport("build_options", dev.noglib_opts);
+    addVideo(b, skew_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
+    if (native_sck) addSckBackend(b, skew_mod);
+    if (have_vtenc) addVtEnc(b, skew_mod);
+    const skew = b.addSystemCommand(&.{"bash"});
+    skew.addFileArg(b.path("dist/test-skew.sh"));
+    skew.addArg(compat.zigExe(b));
+    skew.addArtifactArg(dev_mux_exe);
+    skew.addArtifactArg(dev.executable(b, "sketerm-test-skew", skew_mod));
+    skew.has_side_effects = true;
+    const skew_step = b.step("test-skew", "Version-skew gate: real old sketerm-mux builds hand over to and adopt this one, both ways");
+    skew_step.dependOn(&skew.step);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_roots.step);
     test_step.dependOn(&lint_errdefer.step);
     test_step.dependOn(&env_removal.step);
     test_step.dependOn(&zig16_builtins.step);
+    test_step.dependOn(&skew.step);
     test_step.dependOn(&run_tests.step);
 
     const atomicwrite_tests_mod = b.createModule(.{
@@ -1122,6 +1141,7 @@ pub fn build(b: *std.Build) void {
     core_test_step.dependOn(&lint_errdefer.step);
     core_test_step.dependOn(&env_removal.step);
     core_test_step.dependOn(&zig16_builtins.step);
+    core_test_step.dependOn(&skew.step);
     const run_coretests = b.addRunArtifact(coretests);
     unitTestDaemon(run_coretests, dev_bins);
     core_test_step.dependOn(&run_coretests.step);
@@ -2670,6 +2690,12 @@ const compat = struct {
     /// and a maker process running the steps; environment changes made
     /// here never reach the latter.
     const separate_maker = v017;
+
+    /// The running compiler, for steps that build another tree with it.
+    fn zigExe(b: *std.Build) []const u8 {
+        if (comptime @hasField(std.Build.Graph, "zig_exe")) return b.graph.zig_exe;
+        return "zig";
+    }
 
     /// A file under the build root read at configure time; on 0.17 also
     /// declared as a configure input so the cached configuration follows it.

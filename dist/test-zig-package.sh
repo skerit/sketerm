@@ -54,6 +54,8 @@ shopt -u dotglob nullglob
 # The dist/ files the packaged test steps read; the rest of dist/ is
 # installer and rig tooling a package consumer never builds.
 dist_entries=(
+    skew-baselines.txt
+    test-skew.sh
     test-test-roots.sh
     test-web-supervisor.c
     test-web-untrusted.c

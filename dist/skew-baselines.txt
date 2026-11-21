@@ -1,0 +1,6 @@
+# Old sketerm-mux builds the version-skew gate (`zig build test-skew`,
+# src/smoke_skew.zig) runs against this tree. One full commit SHA per line,
+# then a reason; `#` starts a comment. Adding a baseline is one line here.
+e991f1b0cd71c84858754bcc36c5013e0e6c62bc adoption introduced: the oldest worker a broker can ever adopt
+4e95f488631f24c9970a970153aa1698ca97e563 a build running in the wild (2026-10-21)
+8bc57f22e62b8e0049126ed9830b50b291f722ec a build running in the wild (2026-11-10)

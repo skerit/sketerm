@@ -9,6 +9,8 @@
         "build.zig.zon",
         "src",
         "data",
+        "dist/skew-baselines.txt",
+        "dist/test-skew.sh",
         "dist/test-test-roots.sh",
         "dist/test-web-supervisor.c",
         "dist/test-web-untrusted.c",

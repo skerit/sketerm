@@ -81,24 +81,15 @@ fn leakCheckedWorker(
 /// a thread yet.
 pub fn forkBroker(comptime rig: []const u8, sock_path: []const u8) c.pid_t {
     if (!lifetime.armed()) fail(rig, "the lifetime fence must be armed before the broker is forked");
-    var bin_buf: [4096:0]u8 = undefined;
-    const exec_bin: ?[:0]const u8 = if (c.getenv(BROKER_BIN_ENV)) |v|
-        std.fmt.bufPrintSentinel(&bin_buf, "{s}", .{std.mem.span(@as([*:0]const u8, @ptrCast(v)))}, 0) catch fail(rig, BROKER_BIN_ENV ++ " is too long")
-    else
-        null;
-    var sock_z_buf: [4096:0]u8 = undefined;
-    const sock_z = std.fmt.bufPrintSentinel(&sock_z_buf, "{s}", .{sock_path}, 0) catch fail(rig, "socket path too long");
+    if (c.getenv(BROKER_BIN_ENV)) |v| {
+        var bin_buf: [4096:0]u8 = undefined;
+        const bin = std.fmt.bufPrintSentinel(&bin_buf, "{s}", .{std.mem.span(@as([*:0]const u8, @ptrCast(v)))}, 0) catch fail(rig, BROKER_BIN_ENV ++ " is too long");
+        return execBroker(rig, bin, sock_path);
+    }
 
     const pid = c.fork();
     if (pid < 0) fail(rig, "fork broker");
     if (pid == 0) {
-        if (exec_bin) |bin| {
-            // The fence read end is inheritable and named in the
-            // environment, so the exec'd daemon fences itself.
-            const argv = [_:null]?[*:0]const u8{ selfexec.BINARY, selfexec.SOCKET_FLAG, sock_z.ptr, null };
-            _ = c.execv(bin.ptr, @ptrCast(@constCast(&argv)));
-            c._exit(@intFromEnum(Exit.init));
-        }
         // A forked (non-exec) child inherited the fence's WRITE end too:
         // drop it, or this child keeps its own fence alive.
         lifetime.dropWriteEnd();
@@ -122,6 +113,25 @@ pub fn forkBroker(comptime rig: []const u8, sock_path: []const u8) c.pid_t {
         }
         if (failures != 0) c._exit(@intFromEnum(Exit.worker_failed));
         c._exit(0);
+    }
+    waitForSocket(rig, sock_path);
+    return pid;
+}
+
+/// Fork and exec `bin` as the broker serving `sock_path`, and wait until
+/// it listens. The exec'd daemon fences itself: the fence read end is
+/// inheritable and named in the environment, so the caller must have
+/// armed it.
+pub fn execBroker(comptime rig: []const u8, bin: [:0]const u8, sock_path: []const u8) c.pid_t {
+    if (!lifetime.armed()) fail(rig, "the lifetime fence must be armed before the broker is exec'd");
+    var sock_z_buf: [4096:0]u8 = undefined;
+    const sock_z = std.fmt.bufPrintSentinel(&sock_z_buf, "{s}", .{sock_path}, 0) catch fail(rig, "socket path too long");
+    const pid = c.fork();
+    if (pid < 0) fail(rig, "fork broker");
+    if (pid == 0) {
+        const argv = [_:null]?[*:0]const u8{ selfexec.BINARY, selfexec.SOCKET_FLAG, sock_z.ptr, null };
+        _ = c.execv(bin.ptr, @ptrCast(@constCast(&argv)));
+        c._exit(@intFromEnum(Exit.init));
     }
     waitForSocket(rig, sock_path);
     return pid;
