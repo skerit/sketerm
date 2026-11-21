@@ -1,5 +1,6 @@
-//! The jobs and transfers panel: one compact row per job with an
-//! expandable detail area, live speed/ETA, and per-job controls.
+//! The transfers UI: a header button whose ring shows aggregate
+//! progress, its popover of transfer cards, and the fuller Transfer
+//! Center at the bottom of the browser ("Show All Transfers").
 //!
 //! Three sources feed one list: daemon jobs this view started, the
 //! client-mediated transfers it drives itself, and the window-level
@@ -7,17 +8,19 @@
 //! progress.Sampler plus its rate history) lives in a Meter that
 //! OUTLIVES the widgets, so a rebuild never resets a rate.
 //!
-//! Rebuild vs refresh: renderJobs hashes the structural shape of the
-//! list (identities, states, which controls apply). An unchanged shape
-//! only rewrites label text and queues one sparkline redraw, so a
-//! progress event costs no widget churn. A 500 ms tick samples the
-//! same rows while anything is active -- that is what makes a stall
-//! visible even though the daemon emits progress only every 4 MB.
+//! Rebuild vs refresh: renderJobs hashes the structural shape of each
+//! surface (identities, states, which controls apply). An unchanged
+//! shape only rewrites label text and queues redraws, so a progress
+//! event costs no widget churn. A 500 ms tick samples the same rows
+//! while anything is active -- that is what makes a stall visible
+//! even though the daemon emits progress only every 4 MB -- and stops
+//! when nothing is, so an idle browser never redraws.
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
 const clipboard = @import("../clipboard.zig");
 const progress = @import("../../filebrowser/progress.zig");
+const xferlist = @import("../../filebrowser/xferlist.zig");
 
 const ActiveTransfer = @import("types.zig").ActiveTransfer;
 const BrowserView = @import("view.zig").BrowserView;
@@ -34,6 +37,11 @@ const cast = @import("../../util/cast.zig");
 const TICK_MS: c.guint = 500;
 /// Bounded Transfer Center height; the cards scroll inside it.
 const CENTER_MAX_HEIGHT = 340;
+/// The popover's card column width and its scroll bound.
+const POP_WIDTH = 380;
+const POP_MAX_HEIGHT = 420;
+/// How long the header button pulses when a new transfer starts.
+const PULSE_MS: c.guint = 1700;
 const SPARK_W = 110;
 const SPARK_H = 16;
 
@@ -73,7 +81,7 @@ const Key = struct {
     }
 };
 
-const RowState = enum { queued, waiting_retry, running, paused, finished, failed, canceled };
+const RowState = xferlist.State;
 
 /// Which controls this row's underlying job actually supports. A
 /// control that cannot work is never rendered, rather than rendered
@@ -142,7 +150,7 @@ const Row = struct {
     deferred: ?*jobs.DeferredTransfer = null,
 
     fn active(self: Row) bool {
-        return self.state == .queued or self.state == .waiting_retry or self.state == .running or self.state == .paused;
+        return self.state.active();
     }
 
     /// The operation this row performs; a transfer row's `move` flag
@@ -205,15 +213,18 @@ const BarData = struct {
     kind: PaintKind = .accent,
 };
 
-/// Aggregate progress ring on the ambient strip, same ownership rule.
+/// Progress ring (the header button, a running popover card), same
+/// ownership rule.
 const RingData = struct {
     allocator: std.mem.Allocator,
     fraction: f64 = 0,
     indeterminate: bool = false,
     kind: PaintKind = .accent,
+    /// A dot on the ring when something needs the user.
+    attention: ?PaintKind = null,
 };
 
-const PaintKind = enum(u8) { accent, ok, err, warn, dim };
+const PaintKind = xferlist.Tone;
 
 fn paintColor(kind: PaintKind, cr: ?*c.cairo_t, alpha: f64) void {
     switch (kind) {
@@ -225,7 +236,29 @@ fn paintColor(kind: PaintKind, cr: ?*c.cairo_t, alpha: f64) void {
     }
 }
 
-/// Per-row measurement plus the widgets of the current build.
+/// The widgets of one card on one surface; all borrowed from the
+/// widget tree of the current build.
+const Card = struct {
+    state_icon: ?*c.GtkWidget = null,
+    ring: ?*c.GtkWidget = null,
+    ring_data: ?*RingData = null,
+    title_label: ?*c.GtkLabel = null,
+    name_label: ?*c.GtkLabel = null,
+    dest_label: ?*c.GtkLabel = null,
+    route_label: ?*c.GtkLabel = null,
+    stats_label: ?*c.GtkLabel = null,
+    badge_label: ?*c.GtkLabel = null,
+    chip_resumed: ?*c.GtkWidget = null,
+    cur_label: ?*c.GtkLabel = null,
+    msg_label: ?*c.GtkLabel = null,
+    bar: ?*c.GtkWidget = null,
+    /// Borrowed: owned by the drawing areas.
+    bar_data: ?*BarData = null,
+    spark: ?*c.GtkWidget = null,
+    spark_data: ?*Spark = null,
+};
+
+/// Per-row measurement plus the widgets of each surface's current build.
 const Meter = struct {
     key: Key,
     /// Owned copy of a token-bearing row's token (Key.token points at it).
@@ -234,9 +267,9 @@ const Meter = struct {
     status: progress.Status = .{},
     expanded: bool = false,
     seen: bool = false,
-    /// Presentation order, assigned once at first sight: a card keeps
-    /// its position for its lifetime; state changes never reshuffle
-    /// the list under the cursor.
+    /// Presentation order, assigned once at first sight: a Transfer
+    /// Center card keeps its position for its lifetime; state changes
+    /// never reshuffle that list under the cursor.
     order: u64 = 0,
     /// First seen running / first seen settled — the finished card's
     /// honest "1.1 GB in 3:12".
@@ -244,34 +277,8 @@ const Meter = struct {
     settled_ms: i64 = 0,
     /// Sticky: the daemon reports it only on the terminal event.
     resumed_from: u64 = 0,
-    state_icon: ?*c.GtkWidget = null,
-    name_label: ?*c.GtkLabel = null,
-    dest_label: ?*c.GtkLabel = null,
-    stats_label: ?*c.GtkLabel = null,
-    badge_label: ?*c.GtkLabel = null,
-    chip_resumed: ?*c.GtkWidget = null,
-    cur_label: ?*c.GtkLabel = null,
-    msg_label: ?*c.GtkLabel = null,
-    bar: ?*c.GtkWidget = null,
-    /// Borrowed: owned by the drawing areas below.
-    bar_data: ?*BarData = null,
-    spark: ?*c.GtkWidget = null,
-    spark_data: ?*Spark = null,
-
-    fn forgetWidgets(self: *Meter) void {
-        self.state_icon = null;
-        self.name_label = null;
-        self.dest_label = null;
-        self.stats_label = null;
-        self.badge_label = null;
-        self.chip_resumed = null;
-        self.cur_label = null;
-        self.msg_label = null;
-        self.bar = null;
-        self.bar_data = null;
-        self.spark = null;
-        self.spark_data = null;
-    }
+    center: Card = .{},
+    pop: Card = .{},
 
     fn destroy(self: *Meter, allocator: std.mem.Allocator) void {
         if (self.token.len > 0) allocator.free(self.token);
@@ -282,40 +289,56 @@ const Meter = struct {
 /// The panel's own state, owned by the BrowserView through one field.
 pub const Panel = struct {
     meters: std.ArrayList(*Meter) = .empty,
-    /// Structural shape of the last build; an equal shape refreshes.
-    signature: u64 = 0,
-    built: bool = false,
     tick: c.guint = 0,
     /// Guards the tick source against being removed from inside its
     /// own dispatch.
     in_tick: bool = false,
-    /// Tier 2 visible? Toggled by the strip's Details button, a click
-    /// on the strip, or Ctrl+Shift+J. Session-local.
-    center_open: bool = false,
     /// Monotonic source for Meter.order.
     next_order: u64 = 1,
-    rows_box: ?*c.GtkWidget = null,
+    /// A top-level row appeared since the last render: pulse the button.
+    fresh: bool = false,
+
+    /// The Transfer Center, opened by "Show All Transfers" or the View
+    /// menu. Session-local.
+    center_open: bool = false,
+    /// Structural shape of the last Transfer Center build.
+    center_signature: u64 = 0,
+    center_built: bool = false,
     summary: ?*c.GtkLabel = null,
-    strip_label: ?*c.GtkLabel = null,
-    strip_nums: ?*c.GtkLabel = null,
-    strip_ring: ?*c.GtkWidget = null,
-    /// Borrowed: owned by the ring drawing area.
-    ring_data: ?*RingData = null,
     scroller: ?*c.GtkWidget = null,
     scroll_restore: c.guint = 0,
     scroll_state: ?ScrollState = null,
 
-    /// Disarm the rate/stall tick. Idempotent, and the one to call when
-    /// the widget tree dies: `onTick` renders into `jobs_box`.
-    pub fn cancelTick(self: *Panel) void {
+    /// The header button and its popover; null in view harnesses
+    /// without a toolbar. Owned by the widget tree.
+    button: ?*c.GtkWidget = null,
+    button_ring: ?*c.GtkWidget = null,
+    /// Borrowed: owned by the ring drawing area.
+    button_ring_data: ?*RingData = null,
+    popover: ?*c.GtkWidget = null,
+    pop_rows: ?*c.GtkWidget = null,
+    pop_summary: ?*c.GtkLabel = null,
+    pop_clear: ?*c.GtkWidget = null,
+    pop_scroller: ?*c.GtkWidget = null,
+    pop_signature: u64 = 0,
+    pop_built: bool = false,
+    pulse_src: c.guint = 0,
+
+    /// Disarm the rate/stall tick and the pulse timer. Idempotent, and
+    /// the one to call when the widget tree dies: both end in widgets.
+    pub fn cancelSources(self: *Panel) void {
         if (self.tick != 0) {
             _ = c.g_source_remove(self.tick);
             self.tick = 0;
         }
+        if (self.pulse_src != 0) {
+            _ = c.g_source_remove(self.pulse_src);
+            self.pulse_src = 0;
+        }
     }
 
     pub fn deinit(self: *Panel, allocator: std.mem.Allocator) void {
-        self.cancelTick();
+        self.cancelSources();
         if (self.scroll_restore != 0) {
             _ = c.g_source_remove(self.scroll_restore);
             self.scroll_restore = 0;
@@ -330,6 +353,11 @@ pub const Panel = struct {
             if (m.key.eql(key)) return m;
         }
         return null;
+    }
+
+    fn popoverOpen(self: *const Panel) bool {
+        const popover = self.popover orelse return false;
+        return c.gtk_widget_get_visible(popover) != 0;
     }
 };
 
@@ -927,6 +955,8 @@ fn syncMeters(self: *BrowserView, rows: []const Row) void {
                 m.destroy(self.allocator);
                 continue;
             };
+            // A new top-level row is a transfer the user should notice.
+            if (!r.batch_child and r.active() and r.kind().inTransfers()) panel.fresh = true;
             break :blk m;
         };
         meter.seen = true;
@@ -967,14 +997,14 @@ const StateLook = struct { icon: [*:0]const u8, class: [*:0]const u8 };
 
 fn stateLook(state: RowState, stalled: bool) StateLook {
     return switch (state) {
-        .queued => .{ .icon = "hourglass-symbolic", .class = "dim-label" },
+        .queued => .{ .icon = "document-open-recent-symbolic", .class = "dim-label" },
         .waiting_retry => .{ .icon = "view-refresh-symbolic", .class = "warning" },
         .running => if (stalled)
             .{ .icon = "network-offline-symbolic", .class = "warning" }
         else
             .{ .icon = "network-transmit-receive-symbolic", .class = "accent" },
         .paused => .{ .icon = "media-playback-pause-symbolic", .class = "dim-label" },
-        .finished => .{ .icon = "emblem-ok-symbolic", .class = "success" },
+        .finished => .{ .icon = "object-select-symbolic", .class = "success" },
         .failed => .{ .icon = "dialog-error-symbolic", .class = "error" },
         .canceled => .{ .icon = "process-stop-symbolic", .class = "dim-label" },
     };
@@ -1061,32 +1091,32 @@ fn statsText(buf: []u8, row: Row, meter: *const Meter) []const u8 {
     return w.buffered();
 }
 
-// ── the ambient strip's aggregate ───────────────────────────────
+// ── the overview sentence (the header button's tooltip) ─────────
 
-const StripMode = enum { hidden, active, queued_only, failed, done };
+const OverviewMode = enum { hidden, active, queued_only, failed, done };
 
-/// Everything the one-line strip shows, computed from the top-level
-/// rows (batch children are detail, not additional operations).
-const StripInfo = struct {
-    mode: StripMode = .hidden,
-    fraction: f64 = 0,
-    indeterminate: bool = false,
-    kind: PaintKind = .accent,
+/// The one-line account of everything in flight, computed from the
+/// top-level rows (batch children are detail, not additional
+/// operations).
+const Overview = struct {
+    mode: OverviewMode = .hidden,
     text_buf: [256]u8 = undefined,
     text_len: usize = 0,
     nums_buf: [96]u8 = undefined,
     nums_len: usize = 0,
 
-    fn text(self: *const StripInfo) []const u8 {
+    fn text(self: *const Overview) []const u8 {
         return self.text_buf[0..self.text_len];
     }
-    fn nums(self: *const StripInfo) []const u8 {
+    fn nums(self: *const Overview) []const u8 {
         return self.nums_buf[0..self.nums_len];
     }
 };
 
-fn stripInfo(rows: []const Row, panel: *Panel) StripInfo {
-    var info = StripInfo{};
+/// @param percent the ring's aggregate (0..1), printed for active work.
+fn overview(rows: []const Row, panel: *Panel, percent: f64) Overview {
+    var info = Overview{};
+    var counted: usize = 0;
     var running: usize = 0;
     var waiting: usize = 0;
     var failed: usize = 0;
@@ -1102,8 +1132,6 @@ fn stripInfo(rows: []const Row, panel: *Panel) StripInfo {
     var rate: u64 = 0;
     var remaining: u64 = 0;
     var remaining_known = true;
-    var frac_sum: f64 = 0;
-    var frac_n: usize = 0;
     var done_bytes: u64 = 0;
     var done_bytes_all = true;
     var first_name: []const u8 = "";
@@ -1113,12 +1141,11 @@ fn stripInfo(rows: []const Row, panel: *Panel) StripInfo {
         if (r.batch_child) continue;
         const op = r.kind();
         // A query streams into its own tab, whose status line already
-        // describes it; in the strip it only ever read as a stalled copy.
-        if (!op.inStrip()) continue;
+        // describes it; here it only ever read as a stalled copy.
+        if (!op.inTransfers()) continue;
         const meter = panel.find(r.key);
         const n: usize = if (r.key.kind == .batch) @max(r.files_total, 1) else 1;
-        frac_sum += fraction(r);
-        frac_n += 1;
+        counted += 1;
         switch (r.state) {
             .running, .paused => {
                 running += 1;
@@ -1161,16 +1188,13 @@ fn stripInfo(rows: []const Row, panel: *Panel) StripInfo {
             .canceled => {},
         }
     }
-    if (frac_n == 0) return info;
-    info.fraction = frac_sum / @as(f64, @floatFromInt(frac_n));
+    if (counted == 0) return info;
     var w = std.Io.Writer.fixed(&info.text_buf);
     var nw = std.Io.Writer.fixed(&info.nums_buf);
     const verb = active_ops.activeVerb();
     const items = active_items;
     if (running > 0) {
         info.mode = .active;
-        info.kind = if (stalled) .warn else .accent;
-        info.indeterminate = !remaining_known and rate == 0;
         if (items == 1 and first_name.len > 0) {
             w.print("{s} {s}", .{ verb, first_name }) catch {};
         } else {
@@ -1179,7 +1203,7 @@ fn stripInfo(rows: []const Row, panel: *Panel) StripInfo {
         if (first_host.len > 0) w.print(" to {s}", .{displayHost(first_host)}) catch {};
         if (items > 1 and first_name.len > 0) w.print(" — {s}", .{first_name}) catch {};
         if (failed > 0) w.print(" · {d} failed", .{failed}) catch {};
-        nw.print("{d}%", .{@as(u64, @intFromFloat(info.fraction * 100.0))}) catch {};
+        nw.print("{d}%", .{@as(u64, @intFromFloat(std.math.clamp(percent, 0.0, 1.0) * 100.0))}) catch {};
         if (stalled) {
             nw.print(" · stalled", .{}) catch {};
         } else if (rate > 0) {
@@ -1192,13 +1216,9 @@ fn stripInfo(rows: []const Row, panel: *Panel) StripInfo {
         }
     } else if (waiting > 0 and failed == 0) {
         info.mode = .queued_only;
-        info.kind = .dim;
-        info.indeterminate = true;
         w.print("{d} queued — waiting to start", .{waiting}) catch {};
     } else if (failed > 0) {
         info.mode = .failed;
-        info.kind = .err;
-        info.fraction = 1;
         if (failed == 1) {
             w.print("1 transfer failed — {s}", .{fail_msg}) catch {};
         } else {
@@ -1206,8 +1226,6 @@ fn stripInfo(rows: []const Row, panel: *Panel) StripInfo {
         }
     } else if (finished > 0) {
         info.mode = .done;
-        info.kind = .ok;
-        info.fraction = 1;
         var size_buf: [48:0]u8 = undefined;
         const plural: []const u8 = if (done_items == 1) "" else "s";
         if (done_ops.mixed) {
@@ -1224,7 +1242,6 @@ fn stripInfo(rows: []const Row, panel: *Panel) StripInfo {
         }
     } else {
         info.mode = .queued_only;
-        info.kind = .dim;
         w.print("{d} operation{s}", .{ items, if (items == 1) "" else "s" }) catch {};
     }
     info.text_len = w.buffered().len;
@@ -1278,7 +1295,7 @@ pub const JobBtnCtx = struct {
     meter_key: Key,
     /// Owned storage when meter_key carries a durable token.
     meter_token: ?[]u8 = null,
-    kind: enum { pause, resume_, cancel, dismiss, move_up, move_down, expand, retry, center, clear_done },
+    kind: enum { pause, resume_, cancel, dismiss, move_up, move_down, expand, retry, close_center, show_all, clear_done },
 
     fn free(user: ?*anyopaque, closure: ?*anyopaque) callconv(.c) void {
         _ = closure;
@@ -1290,14 +1307,33 @@ pub const JobBtnCtx = struct {
 };
 
 pub fn jobsButton(self: *BrowserView, row: *c.GtkWidget, icon: [*:0]const u8, ctx_in: JobBtnCtx) void {
+    _ = jobsButtonIn(self, row, icon, ctx_in);
+}
+
+/// `jobsButton` returning the button, or null when its context could
+/// not be allocated (then no button exists at all).
+fn jobsButtonIn(self: *BrowserView, row: *c.GtkWidget, icon: [*:0]const u8, ctx_in: JobBtnCtx) ?*c.GtkWidget {
+    const btn = c.gtk_button_new_from_icon_name(icon) orelse return null;
+    c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+    if (!wireJobsButton(self, btn, ctx_in)) {
+        _ = c.g_object_ref_sink(@ptrCast(btn));
+        c.g_object_unref(@ptrCast(btn));
+        return null;
+    }
+    c.gtk_box_append(@ptrCast(row), btn);
+    return btn;
+}
+
+/// Give `btn` its tooltip and click handler; the handler owns a heap
+/// copy of `ctx_in`, freed with the connection. @return false when the
+/// copy could not be made (`ctx_in`'s owned strings are freed then).
+fn wireJobsButton(self: *BrowserView, btn: *c.GtkWidget, ctx_in: JobBtnCtx) bool {
     const ctx = self.allocator.create(JobBtnCtx) catch {
         if (ctx_in.service_token) |token| ctx_in.allocator.free(token);
         if (ctx_in.meter_token) |token| ctx_in.allocator.free(token);
-        return;
+        return false;
     };
     ctx.* = ctx_in;
-    const btn = c.gtk_button_new_from_icon_name(icon);
-    c.gtk_button_set_has_frame(@ptrCast(btn), 0);
     const tip: [*:0]const u8 = switch (ctx_in.kind) {
         .pause => "Pause",
         .resume_ => "Resume",
@@ -1307,12 +1343,13 @@ pub fn jobsButton(self: *BrowserView, row: *c.GtkWidget, icon: [*:0]const u8, ct
         .move_down => "Move down in the queue",
         .expand => "Show details",
         .retry => "Retry this transfer using its saved progress; completed items stay completed",
-        .center => "Transfer details (Ctrl+Shift+J)",
-        .clear_done => "Clear finished",
+        .close_center => "Close the Transfer Center",
+        .show_all => "Open the Transfer Center",
+        .clear_done => "Clear Finished",
     };
     c.gtk_widget_set_tooltip_text(btn, tip);
     _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onJobBtn), @ptrCast(ctx), @ptrCast(&JobBtnCtx.free), c.G_CONNECT_DEFAULT);
-    c.gtk_box_append(@ptrCast(row), btn);
+    return true;
 }
 
 pub fn onJobBtn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -1326,8 +1363,18 @@ pub fn onJobBtn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         self.renderJobs();
         return;
     }
-    if (ctx.kind == .center) {
-        self.jobs_panel.center_open = !self.jobs_panel.center_open;
+    if (ctx.kind == .close_center) {
+        self.jobs_panel.center_open = false;
+        self.renderJobs();
+        // The focused close button just died with the center.
+        self.focusListing();
+        return;
+    }
+    if (ctx.kind == .show_all) {
+        // The popover's way to the Transfer Center: it closes itself so
+        // the full list is what the user is looking at.
+        if (self.jobs_panel.button) |btn| c.gtk_menu_button_popdown(@ptrCast(btn));
+        self.jobs_panel.center_open = true;
         self.renderJobs();
         return;
     }
@@ -1482,7 +1529,7 @@ pub fn onJobBtn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
                 }
             }
         },
-        .move_up, .move_down, .expand, .center, .clear_done => {},
+        .move_up, .move_down, .expand, .close_center, .show_all, .clear_done => {},
     }
     self.renderJobs();
 }
@@ -1532,10 +1579,24 @@ fn clearFinished(self: *BrowserView) void {
     self.renderJobs();
 }
 
-/// Public entry for the Ctrl+Shift+J chord and the palette.
+/// Public entry for the View menu's Transfer Center check.
 pub fn toggleTransferCenter(self: *BrowserView) void {
     self.jobs_panel.center_open = !self.jobs_panel.center_open;
     self.renderJobs();
+}
+
+/// Ctrl+Shift+J: open or close the header popover. The button shows
+/// for as long as the popover is open, even with nothing in it.
+pub fn togglePopover(self: *BrowserView) void {
+    const panel = &self.jobs_panel;
+    // A face without the header button keeps the chord useful.
+    const btn = panel.button orelse return toggleTransferCenter(self);
+    if (panel.popoverOpen()) {
+        c.gtk_menu_button_popdown(@ptrCast(btn));
+        return;
+    }
+    c.gtk_widget_set_visible(btn, 1);
+    c.gtk_menu_button_popup(@ptrCast(btn));
 }
 
 /// The meter a button belongs to, from the identity it carries.
@@ -1653,27 +1714,36 @@ fn drawRing(_: ?*c.GtkDrawingArea, cr: ?*c.cairo_t, width: c_int, height: c_int,
     const start = -std.math.pi / 2.0;
     if (ring.indeterminate) {
         c.cairo_arc(cr, cx, cy, radius, start, start + std.math.pi * 0.6);
+        c.cairo_stroke(cr);
     } else {
         const frac = std.math.clamp(ring.fraction, 0.0, 1.0);
-        if (frac <= 0.005) return;
-        c.cairo_arc(cr, cx, cy, radius, start, start + std.math.pi * 2 * frac);
+        if (frac > 0.005) {
+            c.cairo_arc(cr, cx, cy, radius, start, start + std.math.pi * 2 * frac);
+            c.cairo_stroke(cr);
+        }
     }
-    c.cairo_stroke(cr);
+    if (ring.attention) |kind| {
+        // The dot sits on the ring's upper-right shoulder, inside the box.
+        const dot = @max(2.0, radius * 0.38);
+        paintColor(kind, cr, 1.0);
+        c.cairo_arc(cr, w - dot, dot, dot, 0, std.math.pi * 2);
+        c.cairo_fill(cr);
+    }
 }
 
-/// One-time CSS for the panel's badge pill.
+/// One-time CSS for the cards, the badge pill and the button's pulse.
 fn ensurePanelCss() void {
     const css =
         ".job-badge { padding: 1px 8px; border-radius: 10px; font-size: 0.85em; " ++
         "background: alpha(currentColor, 0.12); }\n" ++
-        ".xfer-strip { border-top: 1px solid alpha(currentColor, 0.15); " ++
-        "padding: 3px 10px; }\n" ++
         ".xfer-card { background: alpha(currentColor, 0.05); border-radius: 8px; " ++
         "border: 1px solid alpha(currentColor, 0.08); padding: 6px 10px 5px 10px; }\n" ++
-        ".xfer-card-err { border-left: 3px solid @error_color; }\n" ++
         ".xfer-card-dim { background: transparent; border-color: transparent; " ++
         "padding-top: 1px; padding-bottom: 1px; }\n" ++
-        ".xfer-name { font-weight: 600; }\n";
+        ".xfer-name { font-weight: 600; }\n" ++
+        "@keyframes xfer-pulse { from { background-color: alpha(@accent_bg_color, 0.55); } " ++
+        "to { background-color: transparent; } }\n" ++
+        "menubutton.xfer-pulse > button { animation: xfer-pulse 0.8s ease-out 2; }\n";
     cssutil.install("browser_jobpanel", null, css);
 }
 
@@ -1685,15 +1755,47 @@ fn setColorClass(widget: *c.GtkWidget, class: [*:0]const u8) void {
     c.gtk_widget_add_css_class(widget, class);
 }
 
-/// Write every dynamic part of a card into its widgets. Shared by the
-/// initial build and every refresh, so the two can never drift.
-fn applyRow(row: Row, meter: *Meter) void {
+/// The bar/ring paint for a row's state.
+fn barKind(row: Row, meter: *const Meter) PaintKind {
+    return switch (row.state) {
+        .failed => .err,
+        .paused, .queued, .waiting_retry => .dim,
+        .running => if (meter.status.stalled) .warn else .accent,
+        else => .accent,
+    };
+}
+
+/// Whether the row can say how far along it is.
+fn progressKnown(row: Row) bool {
+    return !row.active() or row.total > 0 or row.frac_hint > 0 or row.files_total > 0;
+}
+
+/// A popover card's sentence ("Copying 312 items to archdev").
+fn rowTitle(buf: []u8, row: Row) []const u8 {
+    const items: usize = if (row.key.kind == .batch) row.files_total else 1;
+    // A daemon job's name carries its own verb ("copy big-video.bin");
+    // the source's basename is the thing being moved.
+    const name = if (row.key.kind != .batch and row.src.len > 0)
+        std.fs.path.basename(row.src)
+    else if (row.name.len > 0) row.name else row.label;
+    return xferlist.title(buf, row.kind(), row.state, name, items, displayHost(row.dest_host));
+}
+
+/// Write every dynamic part of a card into `card`'s widgets (one
+/// surface's build of `meter`). Shared by every build and refresh of
+/// both surfaces, so they can never drift.
+fn applyRow(row: Row, meter: *Meter, card: *Card) void {
     const look = stateLook(row.state, meter.status.stalled);
-    if (meter.name_label) |label| {
+    if (card.title_label) |label| {
+        var buf: [256]u8 = undefined;
+        var z: [256:0]u8 = undefined;
+        c.gtk_label_set_text(label, copyZ(&z, rowTitle(&buf, row)));
+    }
+    if (card.name_label) |label| {
         var z: [512:0]u8 = undefined;
         c.gtk_label_set_text(label, copyZ(&z, if (row.name.len > 0) row.name else row.label));
     }
-    if (meter.dest_label) |label| {
+    if (card.dest_label) |label| {
         var buf: [512]u8 = undefined;
         var z: [512:0]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
@@ -1706,11 +1808,26 @@ fn applyRow(row: Row, meter: *Meter) void {
         }
         c.gtk_label_set_text(label, copyZ(&z, w.buffered()));
     }
-    if (meter.state_icon) |icon| {
+    if (card.route_label) |label| {
+        var buf: [1024]u8 = undefined;
+        var z: [1024:0]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        if (row.src.len > 0) w.print("{s} ", .{row.src}) catch {};
+        if (row.dst.len > 0) w.print("→ {s}", .{row.dst}) catch {};
+        c.gtk_label_set_text(label, copyZ(&z, w.buffered()));
+        c.gtk_widget_set_visible(@ptrCast(@alignCast(label)), if (w.buffered().len > 0) 1 else 0);
+    }
+    if (card.state_icon) |icon| {
         c.gtk_image_set_from_icon_name(@ptrCast(icon), look.icon);
         setColorClass(icon, look.class);
     }
-    if (meter.badge_label) |badge| {
+    if (card.ring_data) |data| {
+        data.fraction = fraction(row);
+        data.indeterminate = !progressKnown(row);
+        data.kind = barKind(row, meter);
+        if (card.ring) |ring| c.gtk_widget_queue_draw(ring);
+    }
+    if (card.badge_label) |badge| {
         if (linkBadge(row)) |bd| {
             c.gtk_label_set_text(badge, bd.text);
             setColorClass(@ptrCast(@alignCast(badge)), bd.class);
@@ -1720,7 +1837,7 @@ fn applyRow(row: Row, meter: *Meter) void {
             c.gtk_widget_set_visible(@ptrCast(@alignCast(badge)), 0);
         }
     }
-    if (meter.stats_label) |label| {
+    if (card.stats_label) |label| {
         var buf: [160]u8 = undefined;
         var z: [192:0]u8 = undefined;
         c.gtk_label_set_text(label, copyZ(&z, statsText(&buf, row, meter)));
@@ -1731,22 +1848,17 @@ fn applyRow(row: Row, meter: *Meter) void {
             else => "dim-label",
         });
     }
-    if (meter.bar_data) |bar| {
+    if (card.bar_data) |bar| {
         bar.fraction = fraction(row);
         const resumed = @max(meter.resumed_from, row.resumed_from);
         bar.resumed = if (row.total > 0 and resumed > 0)
             @as(f64, @floatFromInt(resumed)) / @as(f64, @floatFromInt(row.total))
         else
             0;
-        bar.kind = switch (row.state) {
-            .failed => .err,
-            .paused, .queued, .waiting_retry => .dim,
-            .running => if (meter.status.stalled) .warn else .accent,
-            else => .accent,
-        };
-        if (meter.bar) |bar_widget| c.gtk_widget_queue_draw(bar_widget);
+        bar.kind = barKind(row, meter);
+        if (card.bar) |bar_widget| c.gtk_widget_queue_draw(bar_widget);
     }
-    if (meter.chip_resumed) |chip| {
+    if (card.chip_resumed) |chip| {
         const resumed = @max(meter.resumed_from, row.resumed_from);
         if (resumed > 0 and row.active()) {
             var size_buf: [48:0]u8 = undefined;
@@ -1759,7 +1871,7 @@ fn applyRow(row: Row, meter: *Meter) void {
             c.gtk_widget_set_visible(chip, 0);
         }
     }
-    if (meter.cur_label) |label| {
+    if (card.cur_label) |label| {
         var buf: [512]u8 = undefined;
         var z: [512:0]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
@@ -1780,13 +1892,13 @@ fn applyRow(row: Row, meter: *Meter) void {
         c.gtk_label_set_text(label, copyZ(&z, text));
         c.gtk_widget_set_visible(@ptrCast(@alignCast(label)), if (text.len > 0) 1 else 0);
     }
-    if (meter.msg_label) |label| {
+    if (card.msg_label) |label| {
         var z: [512:0]u8 = undefined;
         c.gtk_label_set_text(label, copyZ(&z, row.message));
         c.gtk_widget_set_visible(@ptrCast(@alignCast(label)), if (row.message.len > 0) 1 else 0);
     }
-    if (meter.spark_data) |data| data.take(&meter.sampler);
-    if (meter.spark) |spark| c.gtk_widget_queue_draw(spark);
+    if (card.spark_data) |data| data.take(&meter.sampler);
+    if (card.spark) |spark| c.gtk_widget_queue_draw(spark);
 }
 
 /// Owned by the card's right-click gesture: the full endpoint paths a
@@ -1848,6 +1960,34 @@ fn onCardMenu(gesture: ?*c.GtkGestureClick, _: c.gint, x: f64, y: f64, user: ?*a
     _ = root.popupVia(ctx.card, ctx.view.root_box, x, y);
 }
 
+/// Full endpoints stay reachable from a card: a tooltip, plus (when
+/// `menu`) the right-click copy menu.
+fn attachEndpoints(self: *BrowserView, card: *c.GtkWidget, row: Row, menu: bool) void {
+    if (row.src.len == 0 and row.dst.len == 0) return;
+    var tip_buf: [1024]u8 = undefined;
+    var tip_z: [1024:0]u8 = undefined;
+    var w = std.Io.Writer.fixed(&tip_buf);
+    if (row.src.len > 0) w.print("{s}", .{row.src}) catch {};
+    if (row.dst.len > 0) w.print("\n→ {s}", .{row.dst}) catch {};
+    c.gtk_widget_set_tooltip_text(card, copyZ(&tip_z, w.buffered()));
+    if (!menu) return;
+    const ctx = self.allocator.create(CardMenuCtx) catch return;
+    const src_owned = self.allocator.dupe(u8, row.src) catch {
+        self.allocator.destroy(ctx);
+        return;
+    };
+    const dst_owned = self.allocator.dupe(u8, row.dst) catch {
+        self.allocator.free(src_owned);
+        self.allocator.destroy(ctx);
+        return;
+    };
+    ctx.* = .{ .allocator = self.allocator, .view = self, .card = card, .src = src_owned, .dst = dst_owned };
+    const click = c.gtk_gesture_click_new();
+    c.gtk_gesture_single_set_button(@ptrCast(click), 3);
+    _ = c.g_signal_connect_data(click, "pressed", @ptrCast(&onCardMenu), @ptrCast(ctx), @ptrCast(&CardMenuCtx.free), c.G_CONNECT_DEFAULT);
+    c.gtk_widget_add_controller(card, @ptrCast(click));
+}
+
 /// One Transfer Center card: name-first head line, byte-driven bar
 /// with the resumed prefix shaded, a live second line for tree
 /// progress and throughput, and a full-sentence message when the row
@@ -1857,42 +1997,15 @@ fn buildCard(self: *BrowserView, parent: *c.GtkWidget, row: Row, meter: *Meter) 
     const card = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
     c.gtk_widget_add_css_class(card, "xfer-card");
     const settled = row.state == .finished or row.state == .canceled;
-    if (row.state == .failed) c.gtk_widget_add_css_class(card, "xfer-card-err");
     if (settled) c.gtk_widget_add_css_class(card, "xfer-card-dim");
     if (row.batch_child) c.gtk_widget_set_margin_start(card, 26);
-
-    // Full endpoints stay reachable: tooltip + right-click copy.
-    if (row.src.len > 0 or row.dst.len > 0) {
-        var tip_buf: [1024]u8 = undefined;
-        var tip_z: [1024:0]u8 = undefined;
-        var w = std.Io.Writer.fixed(&tip_buf);
-        if (row.src.len > 0) w.print("{s}", .{row.src}) catch {};
-        if (row.dst.len > 0) w.print("\n→ {s}", .{row.dst}) catch {};
-        c.gtk_widget_set_tooltip_text(card, copyZ(&tip_z, w.buffered()));
-        const menu_ctx = self.allocator.create(CardMenuCtx) catch null;
-        if (menu_ctx) |ctx| blk: {
-            const src_owned = self.allocator.dupe(u8, row.src) catch {
-                self.allocator.destroy(ctx);
-                break :blk;
-            };
-            const dst_owned = self.allocator.dupe(u8, row.dst) catch {
-                self.allocator.free(src_owned);
-                self.allocator.destroy(ctx);
-                break :blk;
-            };
-            ctx.* = .{ .allocator = self.allocator, .view = self, .card = card.?, .src = src_owned, .dst = dst_owned };
-            const click = c.gtk_gesture_click_new();
-            c.gtk_gesture_single_set_button(@ptrCast(click), 3);
-            _ = c.g_signal_connect_data(click, "pressed", @ptrCast(&onCardMenu), @ptrCast(ctx), @ptrCast(&CardMenuCtx.free), c.G_CONNECT_DEFAULT);
-            c.gtk_widget_add_controller(card, @ptrCast(click));
-        }
-    }
+    attachEndpoints(self, card.?, row, true);
 
     const head = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 7);
     if (row.key.kind == .batch)
         jobsButton(self, head, if (meter.expanded) "pan-down-symbolic" else "pan-end-symbolic", identityCtx(self, row, .expand));
 
-    const icon = c.gtk_image_new_from_icon_name("hourglass-symbolic");
+    const icon = c.gtk_image_new();
     c.gtk_box_append(@ptrCast(head), icon);
 
     const name = c.gtk_label_new("");
@@ -2007,105 +2120,335 @@ fn buildCard(self: *BrowserView, parent: *c.GtkWidget, row: Row, meter: *Meter) 
 
     c.gtk_box_append(@ptrCast(parent), card);
 
-    meter.state_icon = icon;
-    meter.name_label = @ptrCast(@alignCast(name));
-    meter.dest_label = @ptrCast(@alignCast(dest));
-    meter.stats_label = @ptrCast(@alignCast(stats));
-    meter.badge_label = @ptrCast(@alignCast(badge));
-    meter.chip_resumed = chip_resumed;
-    meter.cur_label = if (cur) |widget| @ptrCast(@alignCast(widget)) else null;
-    meter.msg_label = if (msg) |widget| @ptrCast(@alignCast(widget)) else null;
-    meter.bar = bar;
-    meter.bar_data = bar_data;
-    meter.spark = spark;
-    meter.spark_data = spark_data;
-    applyRow(row, meter);
+    meter.center = .{
+        .state_icon = icon,
+        .name_label = @ptrCast(@alignCast(name)),
+        .dest_label = @ptrCast(@alignCast(dest)),
+        .stats_label = @ptrCast(@alignCast(stats)),
+        .badge_label = @ptrCast(@alignCast(badge)),
+        .chip_resumed = chip_resumed,
+        .cur_label = if (cur) |widget| @ptrCast(@alignCast(widget)) else null,
+        .msg_label = if (msg) |widget| @ptrCast(@alignCast(widget)) else null,
+        .bar = bar,
+        .bar_data = bar_data,
+        .spark = spark,
+        .spark_data = spark_data,
+    };
+    applyRow(row, meter, &meter.center);
 }
 
-fn onStripClick(_: ?*c.GtkGestureClick, _: c.gint, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+/// A drawing area painting `drawRing`, with its data owned by the area.
+fn newRing(self: *BrowserView, px: c_int) struct { widget: *c.GtkWidget, data: ?*RingData } {
+    const ring = c.gtk_drawing_area_new().?;
+    c.gtk_widget_set_size_request(ring, px, px);
+    c.gtk_widget_set_valign(ring, c.GTK_ALIGN_CENTER);
+    const data = self.allocator.create(RingData) catch return .{ .widget = ring, .data = null };
+    data.* = .{ .allocator = self.allocator };
+    c.gtk_drawing_area_set_draw_func(@ptrCast(ring), @ptrCast(&drawRing), @ptrCast(data), @ptrCast(cast.destroyCtx(RingData)));
+    return .{ .widget = ring, .data = data };
+}
+
+/// A bar drawing area painting `drawBar`, its data owned by the area.
+fn newBar(self: *BrowserView) struct { widget: *c.GtkWidget, data: ?*BarData } {
+    const bar = c.gtk_drawing_area_new().?;
+    c.gtk_widget_set_size_request(bar, -1, 5);
+    c.gtk_widget_set_hexpand(bar, 1);
+    c.gtk_widget_set_margin_top(bar, 1);
+    c.gtk_widget_set_margin_bottom(bar, 1);
+    const data = self.allocator.create(BarData) catch return .{ .widget = bar, .data = null };
+    data.* = .{ .allocator = self.allocator };
+    c.gtk_drawing_area_set_draw_func(@ptrCast(bar), @ptrCast(&drawBar), @ptrCast(data), @ptrCast(cast.destroyCtx(BarData)));
+    return .{ .widget = bar, .data = data };
+}
+
+/// A caption label: left-aligned, dim unless the caller recolors it.
+fn captionLabel(ellipsize: c.PangoEllipsizeMode) *c.GtkWidget {
+    const label = c.gtk_label_new("").?;
+    c.gtk_label_set_xalign(@ptrCast(label), 0);
+    c.gtk_label_set_ellipsize(@ptrCast(label), ellipsize);
+    c.gtk_widget_add_css_class(label, "caption");
+    c.gtk_widget_add_css_class(label, "dim-label");
+    return label;
+}
+
+/// One popover card: state icon (a progress ring while running), the
+/// title and the row's controls; the route; a bar for live and failed
+/// work; the numbers; and the row's message when it has one.
+fn buildPopCard(self: *BrowserView, parent: *c.GtkWidget, row: Row, meter: *Meter) void {
+    ensurePanelCss();
+    const card = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 3).?;
+    c.gtk_widget_add_css_class(card, "xfer-card");
+    if (row.state == .finished or row.state == .canceled) c.gtk_widget_add_css_class(card, "xfer-card-dim");
+    // The copy menu stays in the Transfer Center: a menu popped from
+    // inside this autohide popover would close it.
+    attachEndpoints(self, card, row, false);
+    var out: Card = .{};
+
+    const head = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 7);
+    if (row.state == .running) {
+        const ring = newRing(self, 16);
+        out.ring = ring.widget;
+        out.ring_data = ring.data;
+        c.gtk_box_append(@ptrCast(head), ring.widget);
+    } else {
+        const icon = c.gtk_image_new();
+        out.state_icon = icon;
+        c.gtk_box_append(@ptrCast(head), icon);
+    }
+    const title = c.gtk_label_new("");
+    c.gtk_label_set_xalign(@ptrCast(title), 0);
+    c.gtk_widget_set_hexpand(title, 1);
+    c.gtk_label_set_ellipsize(@ptrCast(title), c.PANGO_ELLIPSIZE_END);
+    c.gtk_widget_add_css_class(title, "xfer-name");
+    c.gtk_box_append(@ptrCast(head), title);
+    out.title_label = @ptrCast(@alignCast(title));
+    const badge = c.gtk_label_new("");
+    c.gtk_widget_add_css_class(badge, "job-badge");
+    c.gtk_widget_set_valign(badge, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_set_visible(badge, 0);
+    c.gtk_box_append(@ptrCast(head), badge);
+    out.badge_label = @ptrCast(@alignCast(badge));
+    // Reordering stays in the Transfer Center; the popover carries the
+    // controls that change what a transfer is doing.
+    if (row.controls.unpause)
+        jobsButton(self, head, "media-playback-start-symbolic", identityCtx(self, row, .resume_));
+    if (row.controls.pause)
+        jobsButton(self, head, "media-playback-pause-symbolic", identityCtx(self, row, .pause));
+    if (row.controls.retry)
+        jobsButton(self, head, "view-refresh-symbolic", identityCtx(self, row, .retry));
+    if (row.controls.cancel)
+        jobsButton(self, head, "process-stop-symbolic", identityCtx(self, row, .cancel));
+    if (row.controls.dismiss)
+        jobsButton(self, head, "window-close-symbolic", identityCtx(self, row, .dismiss));
+    c.gtk_box_append(@ptrCast(card), head);
+
+    const route = captionLabel(c.PANGO_ELLIPSIZE_MIDDLE);
+    c.gtk_box_append(@ptrCast(card), route);
+    out.route_label = @ptrCast(@alignCast(route));
+
+    if (row.active() or row.state == .failed) {
+        const bar = newBar(self);
+        out.bar = bar.widget;
+        out.bar_data = bar.data;
+        c.gtk_box_append(@ptrCast(card), bar.widget);
+    }
+
+    const stats = captionLabel(c.PANGO_ELLIPSIZE_END);
+    c.gtk_widget_add_css_class(stats, "numeric");
+    c.gtk_box_append(@ptrCast(card), stats);
+    out.stats_label = @ptrCast(@alignCast(stats));
+
+    if (row.state == .failed or row.state == .canceled or
+        (row.state == .queued and row.message.len > 0))
+    {
+        const msg = captionLabel(c.PANGO_ELLIPSIZE_END);
+        c.gtk_label_set_wrap(@ptrCast(msg), 1);
+        c.gtk_label_set_wrap_mode(@ptrCast(msg), c.PANGO_WRAP_WORD_CHAR);
+        c.gtk_label_set_lines(@ptrCast(msg), 3);
+        c.gtk_label_set_selectable(@ptrCast(msg), 1);
+        if (row.state == .failed) setColorClass(msg, "error");
+        c.gtk_widget_set_visible(msg, 0);
+        c.gtk_box_append(@ptrCast(card), msg);
+        out.msg_label = @ptrCast(@alignCast(msg));
+    }
+
+    c.gtk_box_append(@ptrCast(parent), card);
+    meter.pop = out;
+    applyRow(row, meter, &meter.pop);
+}
+
+/// The header button: a progress ring that opens the transfers
+/// popover. Hidden while there is nothing to show, so an idle toolbar
+/// is exactly what it was before transfers existed.
+pub fn buildButton(self: *BrowserView, bar: *c.GtkWidget) void {
+    ensurePanelCss();
+    const panel = &self.jobs_panel;
+    const btn = c.gtk_menu_button_new().?;
+    c.gtk_menu_button_set_has_frame(@ptrCast(btn), 0);
+    c.gtk_widget_add_css_class(btn, "flat");
+    c.gtk_widget_set_can_focus(btn, 0);
+    c.gtk_widget_set_tooltip_text(btn, "Transfers");
+    const ring = newRing(self, 16);
+    c.gtk_menu_button_set_child(@ptrCast(btn), ring.widget);
+
+    const popover = c.gtk_popover_new().?;
+    const content = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 8);
+    c.gtk_widget_set_size_request(content, POP_WIDTH, -1);
+
+    const header = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 10);
+    const title = c.gtk_label_new("Transfers");
+    c.gtk_widget_add_css_class(title, "heading");
+    c.gtk_box_append(@ptrCast(header), title);
+    const summary = c.gtk_label_new("");
+    c.gtk_label_set_xalign(@ptrCast(summary), 0);
+    c.gtk_widget_set_hexpand(summary, 1);
+    c.gtk_label_set_ellipsize(@ptrCast(summary), c.PANGO_ELLIPSIZE_END);
+    c.gtk_widget_add_css_class(summary, "dim-label");
+    c.gtk_box_append(@ptrCast(header), summary);
+    const clear = jobsButtonIn(self, header, "edit-clear-all-symbolic", identityCtx(self, .{ .key = .{ .kind = .batch }, .label = "", .state = .finished }, .clear_done));
+    c.gtk_box_append(@ptrCast(content), header);
+
+    const scroller = c.gtk_scrolled_window_new();
+    c.gtk_scrolled_window_set_policy(@ptrCast(scroller), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
+    c.gtk_scrolled_window_set_propagate_natural_height(@ptrCast(scroller), 1);
+    c.gtk_scrolled_window_set_max_content_height(@ptrCast(scroller), POP_MAX_HEIGHT);
+    const rows = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 6);
+    c.gtk_scrolled_window_set_child(@ptrCast(scroller), rows);
+    c.gtk_box_append(@ptrCast(content), scroller);
+
+    const show_all = c.gtk_button_new_with_label("Show All Transfers").?;
+    c.gtk_widget_add_css_class(show_all, "flat");
+    if (wireJobsButton(self, show_all, identityCtx(self, .{ .key = .{ .kind = .batch }, .label = "", .state = .running }, .show_all))) {
+        c.gtk_box_append(@ptrCast(content), show_all);
+    } else {
+        _ = c.g_object_ref_sink(@ptrCast(show_all));
+        c.g_object_unref(@ptrCast(show_all));
+    }
+
+    c.gtk_popover_set_child(@ptrCast(popover), content);
+    c.gtk_menu_button_set_popover(@ptrCast(btn), popover);
+    // The view outlives its widgets and renderJobs fences on
+    // `widgets_dead`, so these need no destroy notify (mechanism 2).
+    _ = c.g_signal_connect_data(popover, "show", @ptrCast(&onPopoverShow), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(popover, "closed", @ptrCast(&onPopoverClosed), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+
+    c.gtk_widget_set_visible(btn, 0);
+    c.gtk_box_append(@ptrCast(bar), btn);
+    panel.button = btn;
+    panel.button_ring = ring.widget;
+    panel.button_ring_data = ring.data;
+    panel.popover = popover;
+    panel.pop_rows = rows;
+    panel.pop_scroller = scroller;
+    panel.pop_summary = @ptrCast(@alignCast(summary));
+    panel.pop_clear = clear;
+}
+
+fn onPopoverShow(_: ?*c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(BrowserView, user);
-    self.jobs_panel.center_open = !self.jobs_panel.center_open;
+    // Closed, the cards were not kept current: build them fresh.
+    self.jobs_panel.pop_built = false;
     self.renderJobs();
 }
 
-/// Tier 1: the one-line ambient strip. Ring + sentence + numbers +
-/// Details toggle; a click anywhere on it opens the Transfer Center.
-fn buildStrip(self: *BrowserView, parent: *c.GtkWidget, info: *const StripInfo) void {
-    ensurePanelCss();
-    const panel = &self.jobs_panel;
-    const strip = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 10);
-    c.gtk_widget_add_css_class(strip, "xfer-strip");
-
-    const ring = c.gtk_drawing_area_new();
-    c.gtk_widget_set_size_request(ring, 16, 16);
-    c.gtk_widget_set_valign(ring, c.GTK_ALIGN_CENTER);
-    const ring_data = self.allocator.create(RingData) catch null;
-    if (ring_data) |data| {
-        data.* = .{ .allocator = self.allocator };
-        c.gtk_drawing_area_set_draw_func(@ptrCast(ring), @ptrCast(&drawRing), @ptrCast(data), @ptrCast(cast.destroyCtx(RingData)));
-    }
-    c.gtk_box_append(@ptrCast(strip), ring);
-
-    const label = c.gtk_label_new("");
-    c.gtk_label_set_xalign(@ptrCast(label), 0);
-    c.gtk_widget_set_hexpand(label, 1);
-    c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_END);
-    c.gtk_box_append(@ptrCast(strip), label);
-
-    const nums = c.gtk_label_new("");
-    c.gtk_label_set_xalign(@ptrCast(nums), 1);
-    c.gtk_widget_add_css_class(nums, "numeric");
-    c.gtk_widget_add_css_class(nums, "dim-label");
-    c.gtk_box_append(@ptrCast(strip), nums);
-
-    if (info.mode == .done or info.mode == .failed)
-        jobsButton(self, strip, "edit-clear-all-symbolic", identityCtx(self, .{ .key = .{ .kind = .batch }, .label = "", .state = .finished }, .clear_done));
-    jobsButton(
-        self,
-        strip,
-        if (panel.center_open) "pan-down-symbolic" else "pan-up-symbolic",
-        identityCtx(self, .{ .key = .{ .kind = .batch }, .label = "", .state = .running }, .center),
-    );
-
-    // A click on the strip itself (buttons keep their own clicks)
-    // toggles the Transfer Center.
-    const click = c.gtk_gesture_click_new();
-    _ = c.g_signal_connect_data(click, "released", @ptrCast(&onStripClick), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-    c.gtk_widget_add_controller(strip, @ptrCast(click));
-
-    c.gtk_box_append(@ptrCast(parent), strip);
-    panel.strip_ring = ring;
-    panel.ring_data = ring_data;
-    panel.strip_label = @ptrCast(@alignCast(label));
-    panel.strip_nums = @ptrCast(@alignCast(nums));
-    applyStrip(panel, info);
+fn onPopoverClosed(_: ?*c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
+    // Re-evaluates the button: an empty list hides it again.
+    cast.userData(BrowserView, user).renderJobs();
 }
 
-/// Write the strip's dynamic content; shared by build and refresh.
-fn applyStrip(panel: *Panel, info: *const StripInfo) void {
-    if (panel.strip_label) |label| {
-        var z: [280:0]u8 = undefined;
-        c.gtk_label_set_text(label, copyZ(&z, info.text()));
-        setColorClass(@ptrCast(@alignCast(label)), switch (info.mode) {
-            .failed => "error",
-            .done => "success",
-            .queued_only => "dim-label",
-            else => "accent",
-        });
-        // The sentence carries the meaning; only failure/success tint
-        // it. An active line reads in the normal foreground.
-        if (info.mode == .active) c.gtk_widget_remove_css_class(@ptrCast(@alignCast(label)), "accent");
+/// Briefly flash the header button: a new transfer started. It never
+/// opens the popover over the user's work.
+fn pulse(self: *BrowserView) void {
+    const panel = &self.jobs_panel;
+    const btn = panel.button orelse return;
+    if (panel.pulse_src != 0) _ = c.g_source_remove(panel.pulse_src);
+    c.gtk_widget_add_css_class(btn, "xfer-pulse");
+    panel.pulse_src = c.g_timeout_add(PULSE_MS, @ptrCast(&onPulseEnd), @ptrCast(self));
+}
+
+fn onPulseEnd(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self = cast.userData(BrowserView, user);
+    self.jobs_panel.pulse_src = 0;
+    if (!self.widgets_dead) {
+        if (self.jobs_panel.button) |btn| c.gtk_widget_remove_css_class(btn, "xfer-pulse");
     }
-    if (panel.strip_nums) |nums| {
-        var z: [112:0]u8 = undefined;
-        c.gtk_label_set_text(nums, copyZ(&z, info.nums()));
+    return 0;
+}
+
+/// A top-level row with its popover-order facts.
+const PopRow = struct {
+    row: Row,
+    item: xferlist.Item,
+
+    fn lessThan(_: void, a: PopRow, b: PopRow) bool {
+        return xferlist.lessThan({}, a.item, b.item);
     }
-    if (panel.ring_data) |data| {
-        data.fraction = info.fraction;
-        data.indeterminate = info.indeterminate;
-        data.kind = info.kind;
-        if (panel.strip_ring) |ring| c.gtk_widget_queue_draw(ring);
+};
+
+/// The header button's ring, tooltip and visibility, and the popover's
+/// cards while it is open.
+fn renderPopover(self: *BrowserView, arena: std.mem.Allocator, rows: []const Row) void {
+    const panel = &self.jobs_panel;
+    const btn = panel.button orelse return;
+    var list: std.ArrayList(PopRow) = .empty;
+    for (rows) |r| {
+        if (r.batch_child or !r.kind().inTransfers()) continue;
+        const meter = panel.find(r.key);
+        list.append(arena, .{ .row = r, .item = .{
+            .state = r.state,
+            .fraction = fraction(r),
+            .known = progressKnown(r),
+            .stalled = if (meter) |m| m.status.stalled else false,
+            .order = if (meter) |m| m.order else 0,
+        } }) catch return;
     }
+    std.mem.sort(PopRow, list.items, {}, PopRow.lessThan);
+    const items = arena.alloc(xferlist.Item, list.items.len) catch return;
+    for (list.items, items) |p, *item| item.* = p.item;
+
+    const ring = xferlist.ring(items);
+    if (panel.button_ring_data) |data| {
+        data.fraction = ring.fraction;
+        data.indeterminate = ring.indeterminate;
+        data.kind = ring.tone;
+        // A parked name conflict waits for an answer too; its dialog
+        // shows itself, the dot says where the batch went.
+        data.attention = ring.attention orelse if (self.conflicts.queue.items.len > 0) PaintKind.warn else null;
+        if (panel.button_ring) |widget| c.gtk_widget_queue_draw(widget);
+    }
+    {
+        const info = overview(rows, panel, ring.fraction);
+        var buf: [400]u8 = undefined;
+        var z: [400:0]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        w.writeAll("Transfers") catch {};
+        if (info.text().len > 0) w.print("\n{s}", .{info.text()}) catch {};
+        if (info.nums().len > 0) w.print(" · {s}", .{info.nums()}) catch {};
+        c.gtk_widget_set_tooltip_text(btn, copyZ(&z, w.buffered()));
+    }
+    const open = panel.popoverOpen();
+    c.gtk_widget_set_visible(btn, if (items.len > 0 or open) 1 else 0);
+    if (panel.fresh) {
+        panel.fresh = false;
+        pulse(self);
+    }
+    if (!open) return;
+    // An empty list would leave a blank gap under the header.
+    if (panel.pop_scroller) |scroller| c.gtk_widget_set_visible(scroller, if (items.len > 0) 1 else 0);
+
+    if (panel.pop_summary) |label| {
+        var buf: [128]u8 = undefined;
+        var z: [128:0]u8 = undefined;
+        c.gtk_label_set_text(label, copyZ(&z, xferlist.summary(&buf, items)));
+    }
+    if (panel.pop_clear) |clear| {
+        var settled = false;
+        for (items) |item| settled = settled or !item.state.active();
+        c.gtk_widget_set_sensitive(clear, if (settled) 1 else 0);
+    }
+    var h = std.hash.Wyhash.init(0x9a3);
+    for (list.items) |p| {
+        p.row.key.hash(&h);
+        h.update(std.mem.asBytes(&@intFromEnum(p.row.state)));
+        h.update(std.mem.asBytes(&p.row.controls));
+    }
+    const sig = h.final();
+    if (panel.pop_built and sig == panel.pop_signature) {
+        for (list.items) |p| {
+            const meter = panel.find(p.row.key) orelse continue;
+            applyRow(p.row, meter, &meter.pop);
+        }
+        return;
+    }
+    const box = panel.pop_rows orelse return;
+    while (c.gtk_widget_get_first_child(box)) |child| c.gtk_box_remove(@ptrCast(box), child);
+    for (panel.meters.items) |m| m.pop = .{};
+    for (list.items) |p| {
+        const meter = panel.find(p.row.key) orelse continue;
+        buildPopCard(self, box, p.row, meter);
+    }
+    panel.pop_built = true;
+    panel.pop_signature = sig;
 }
 
 fn fraction(row: Row) f64 {
@@ -2187,9 +2530,10 @@ fn restoreScrollIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     return 0;
 }
 
-fn rebuild(self: *BrowserView, rows: []const Row, info: *const StripInfo) void {
+/// Empty the Transfer Center's box; no meter may keep a pointer into
+/// the widgets that go with it.
+fn clearCenter(self: *BrowserView) void {
     const panel = &self.jobs_panel;
-    const old_scroll = panel.scroll_state orelse captureScroll(panel);
     if (panel.scroll_restore != 0) {
         _ = c.g_source_remove(panel.scroll_restore);
         panel.scroll_restore = 0;
@@ -2197,104 +2541,100 @@ fn rebuild(self: *BrowserView, rows: []const Row, info: *const StripInfo) void {
     while (c.gtk_widget_get_first_child(self.jobs_box)) |child| {
         c.gtk_box_remove(@ptrCast(self.jobs_box), child);
     }
-    // Widgets are gone: no meter may keep a pointer into them, and the
-    // rows that vanished can now release their measurement state.
-    for (panel.meters.items) |m| m.forgetWidgets();
-    panel.rows_box = null;
+    for (panel.meters.items) |m| m.center = .{};
     panel.summary = null;
-    panel.strip_label = null;
-    panel.strip_nums = null;
-    panel.strip_ring = null;
-    panel.ring_data = null;
     panel.scroller = null;
-    dropUnseenMeters(self);
+    panel.center_built = false;
+}
+
+fn rebuildCenter(self: *BrowserView, rows: []const Row) void {
+    const panel = &self.jobs_panel;
+    const old_scroll = panel.scroll_state orelse captureScroll(panel);
+    clearCenter(self);
+
+    // The Transfer Center opens at the bottom of the browser, scrolling
+    // inside a bounded height so many cards never push the listing
+    // off the pane.
+    const center = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 6);
+    c.gtk_widget_set_margin_start(center, 8);
+    c.gtk_widget_set_margin_end(center, 8);
+    c.gtk_widget_set_margin_top(center, 6);
+    c.gtk_widget_set_margin_bottom(center, 6);
+
+    const header = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 10);
+    const title = c.gtk_label_new("Transfers");
+    c.gtk_widget_add_css_class(title, "heading");
+    c.gtk_box_append(@ptrCast(header), title);
+    var sbuf: [128]u8 = undefined;
+    var sz: [160:0]u8 = undefined;
+    const summary = c.gtk_label_new(copyZ(&sz, centerSummary(&sbuf, rows, panel)));
+    c.gtk_label_set_xalign(@ptrCast(summary), 0);
+    c.gtk_widget_set_hexpand(summary, 1);
+    c.gtk_widget_add_css_class(summary, "dim-label");
+    c.gtk_box_append(@ptrCast(header), summary);
+    panel.summary = @ptrCast(@alignCast(summary));
+    const anchor: Row = .{ .key = .{ .kind = .batch }, .label = "", .state = .finished };
+    if (rows.len > 0) jobsButton(self, header, "edit-clear-all-symbolic", identityCtx(self, anchor, .clear_done));
+    jobsButton(self, header, "window-close-symbolic", identityCtx(self, anchor, .close_center));
+    c.gtk_box_append(@ptrCast(center), header);
+
     if (rows.len == 0) {
         panel.scroll_state = null;
-        if (panel.center_open) {
-            const center = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 8);
-            c.gtk_widget_set_margin_start(center, 8);
-            c.gtk_widget_set_margin_end(center, 8);
-            c.gtk_widget_set_margin_top(center, 6);
-            c.gtk_widget_set_margin_bottom(center, 6);
-            const title = c.gtk_label_new("Transfers");
-            c.gtk_label_set_xalign(@ptrCast(title), 0);
-            c.gtk_widget_add_css_class(title, "heading");
-            c.gtk_box_append(@ptrCast(center), title);
-            const empty = c.gtk_label_new("No transfers");
-            c.gtk_label_set_xalign(@ptrCast(empty), 0);
-            c.gtk_widget_add_css_class(empty, "dim-label");
-            c.gtk_box_append(@ptrCast(center), empty);
-            c.gtk_box_append(@ptrCast(self.jobs_box), center);
-            panel.built = true;
-        } else {
-            panel.built = false;
-        }
+        const empty = c.gtk_label_new("No transfers");
+        c.gtk_label_set_xalign(@ptrCast(empty), 0);
+        c.gtk_widget_add_css_class(empty, "dim-label");
+        c.gtk_box_append(@ptrCast(center), empty);
+        c.gtk_box_append(@ptrCast(self.jobs_box), center);
+        panel.center_built = true;
         return;
     }
 
-    // Tier 2 above tier 1: the Transfer Center opens upward from the
-    // strip, scrolling inside a bounded height so many cards never
-    // push the listing off the pane.
-    if (panel.center_open) {
-        const center = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 6);
-        c.gtk_widget_set_margin_start(center, 8);
-        c.gtk_widget_set_margin_end(center, 8);
-        c.gtk_widget_set_margin_top(center, 6);
+    const scroller = c.gtk_scrolled_window_new();
+    c.gtk_scrolled_window_set_policy(@ptrCast(scroller), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
+    c.gtk_scrolled_window_set_propagate_natural_height(@ptrCast(scroller), 1);
+    c.gtk_scrolled_window_set_max_content_height(@ptrCast(scroller), CENTER_MAX_HEIGHT);
+    const rows_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 6);
+    for (rows) |r| {
+        const meter = panel.find(r.key) orelse continue;
+        buildCard(self, rows_box, r, meter);
+    }
+    c.gtk_scrolled_window_set_child(@ptrCast(scroller), rows_box);
+    c.gtk_box_append(@ptrCast(center), scroller);
+    c.gtk_box_append(@ptrCast(self.jobs_box), center);
+    panel.scroller = scroller;
+    panel.center_built = true;
+    if (old_scroll) |state| restoreScroll(self, scroller.?, state);
+}
 
-        const header = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 10);
-        const title = c.gtk_label_new("Transfers");
-        c.gtk_widget_add_css_class(title, "heading");
-        c.gtk_box_append(@ptrCast(header), title);
+fn refreshCenter(self: *BrowserView, rows: []const Row) void {
+    const panel = &self.jobs_panel;
+    for (rows) |r| {
+        const meter = panel.find(r.key) orelse continue;
+        applyRow(r, meter, &meter.center);
+    }
+    if (panel.summary) |summary| {
         var sbuf: [128]u8 = undefined;
         var sz: [160:0]u8 = undefined;
-        const summary = c.gtk_label_new(copyZ(&sz, centerSummary(&sbuf, rows, panel)));
-        c.gtk_label_set_xalign(@ptrCast(summary), 0);
-        c.gtk_widget_set_hexpand(summary, 1);
-        c.gtk_widget_add_css_class(summary, "dim-label");
-        c.gtk_box_append(@ptrCast(header), summary);
-        panel.summary = @ptrCast(@alignCast(summary));
-        jobsButton(self, header, "edit-clear-all-symbolic", identityCtx(self, .{ .key = .{ .kind = .batch }, .label = "", .state = .finished }, .clear_done));
-        c.gtk_box_append(@ptrCast(center), header);
-
-        const scroller = c.gtk_scrolled_window_new();
-        c.gtk_scrolled_window_set_policy(@ptrCast(scroller), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
-        c.gtk_scrolled_window_set_propagate_natural_height(@ptrCast(scroller), 1);
-        c.gtk_scrolled_window_set_max_content_height(@ptrCast(scroller), CENTER_MAX_HEIGHT);
-        const rows_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 6);
-        for (rows) |r| {
-            const meter = panel.find(r.key) orelse continue;
-            buildCard(self, rows_box, r, meter);
-        }
-        c.gtk_scrolled_window_set_child(@ptrCast(scroller), rows_box);
-        c.gtk_box_append(@ptrCast(center), scroller);
-        c.gtk_box_append(@ptrCast(self.jobs_box), center);
-        panel.rows_box = rows_box;
-        panel.scroller = scroller;
-    }
-
-    buildStrip(self, self.jobs_box, info);
-    panel.built = true;
-    if (panel.center_open) {
-        if (old_scroll) |state| {
-            if (panel.scroller) |scroller| restoreScroll(self, scroller, state);
-        }
+        c.gtk_label_set_text(summary, copyZ(&sz, centerSummary(&sbuf, rows, panel)));
     }
 }
 
-fn refresh(self: *BrowserView, rows: []const Row, info: *const StripInfo) void {
+/// The Transfer Center: built only while open, emptied on close.
+fn renderCenter(self: *BrowserView, rows: []const Row) void {
     const panel = &self.jobs_panel;
-    if (panel.center_open) {
-        for (rows) |r| {
-            const meter = panel.find(r.key) orelse continue;
-            applyRow(r, meter);
-        }
-        if (panel.summary) |summary| {
-            var sbuf: [128]u8 = undefined;
-            var sz: [160:0]u8 = undefined;
-            c.gtk_label_set_text(summary, copyZ(&sz, centerSummary(&sbuf, rows, panel)));
-        }
+    c.gtk_widget_set_visible(self.jobs_box, if (panel.center_open) 1 else 0);
+    if (!panel.center_open) {
+        if (panel.center_built) clearCenter(self);
+        panel.scroll_state = null;
+        return;
     }
-    applyStrip(panel, info);
+    const sig = signature(rows, panel);
+    if (panel.center_built and sig == panel.center_signature) {
+        refreshCenter(self, rows);
+    } else {
+        rebuildCenter(self, rows);
+        panel.center_signature = sig;
+    }
 }
 
 /// Run the sampling tick while anything can still move. Rows only
@@ -2358,30 +2698,25 @@ fn orderedRows(self: *BrowserView, arena: std.mem.Allocator, rows: []const Row) 
     return out.items;
 }
 
-/// Rebuild or refresh the two-tier transfers UI (hidden when empty).
+/// Render every transfers surface: the header button (with its popover
+/// while open) and the Transfer Center while it is open.
 pub fn renderJobs(self: *BrowserView) void {
+    if (self.widgets_dead) return;
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
     const raw = collectRows(self, arena.allocator());
     const grouped = groupedRows(self, arena.allocator(), raw);
-    c.gtk_widget_set_visible(self.jobs_box, if (grouped.len > 0 or self.jobs_panel.center_open) 1 else 0);
     syncMeters(self, grouped);
+    // Cards hold identities, never meters, so a vanished row's
+    // measurement state can go now.
+    dropUnseenMeters(self);
     const rows = orderedRows(self, arena.allocator(), grouped);
-    const info = stripInfo(rows, &self.jobs_panel);
-    var h = std.hash.Wyhash.init(signature(rows, &self.jobs_panel));
-    h.update(std.mem.asBytes(&self.jobs_panel.center_open));
-    h.update(std.mem.asBytes(&@intFromEnum(info.mode)));
-    const sig = h.final();
-    if (self.jobs_panel.built and sig == self.jobs_panel.signature) {
-        refresh(self, rows, &info);
-    } else {
-        rebuild(self, rows, &info);
-        self.jobs_panel.signature = sig;
-    }
+    renderPopover(self, arena.allocator(), rows);
+    renderCenter(self, rows);
     armTick(self, rows);
 }
 
-test "strip aggregates an active transfer into one honest line" {
+test "the overview aggregates an active transfer into one honest line" {
     var panel = Panel{};
     const rows = [_]Row{
         .{
@@ -2395,14 +2730,35 @@ test "strip aggregates an active transfer into one honest line" {
         },
         .{ .key = .{ .kind = .copy, .ptr = 1 }, .label = "next", .name = "next", .state = .queued },
     };
-    const info = stripInfo(&rows, &panel);
-    try std.testing.expectEqual(StripMode.active, info.mode);
+    const info = overview(&rows, &panel, 0.25);
+    try std.testing.expectEqual(OverviewMode.active, info.mode);
     try std.testing.expectEqualStrings("Copying 2 items to mercer — video-project.bin", info.text());
-    // Half of one item plus a queued one: 25%.
-    try std.testing.expect(info.fraction > 0.24 and info.fraction < 0.26);
+    try std.testing.expectEqualStrings("25%", info.nums());
 }
 
-test "strip failure and completion lines" {
+test "a batch card's title counts its items and names a remote destination" {
+    var buf: [128]u8 = undefined;
+    const batch = Row{
+        .key = .{ .kind = .batch, .job = 1 },
+        .label = "Copy 312 items to archdev:/srv",
+        .name = "Copy 312 items",
+        .dest_host = "ssh:archdev",
+        .state = .running,
+        .files_total = 312,
+    };
+    try std.testing.expectEqualStrings("Copying 312 items to archdev", rowTitle(&buf, batch));
+    var moved = batch;
+    moved.key = .{ .kind = .xfer, .ptr = 1 };
+    moved.name = "demo.webm";
+    moved.dest_host = "";
+    moved.move = true;
+    try std.testing.expectEqualStrings("Moving demo.webm", rowTitle(&buf, moved));
+    // A daemon job's own label carries a verb; the source names it.
+    const job = Row{ .key = .{ .kind = .daemon, .job = 3 }, .label = "copy big.bin on this computer", .name = "copy big.bin", .src = "/data/big.bin", .state = .running };
+    try std.testing.expectEqualStrings("Copying big.bin", rowTitle(&buf, job));
+}
+
+test "overview failure and completion lines" {
     var panel = Panel{};
     const failed = [_]Row{.{
         .key = .{ .kind = .daemon, .ptr = 1, .job = 7 },
@@ -2411,8 +2767,8 @@ test "strip failure and completion lines" {
         .state = .failed,
         .message = "the copy is complete and installed; delete failed",
     }};
-    const fail_info = stripInfo(&failed, &panel);
-    try std.testing.expectEqual(StripMode.failed, fail_info.mode);
+    const fail_info = overview(&failed, &panel, 1);
+    try std.testing.expectEqual(OverviewMode.failed, fail_info.mode);
     try std.testing.expectEqualStrings(
         "1 transfer failed — the copy is complete and installed; delete failed",
         fail_info.text(),
@@ -2424,12 +2780,12 @@ test "strip failure and completion lines" {
         .state = .finished,
         .total = 1 << 30,
     }};
-    const done_info = stripInfo(&done, &panel);
-    try std.testing.expectEqual(StripMode.done, done_info.mode);
+    const done_info = overview(&done, &panel, 1);
+    try std.testing.expectEqual(OverviewMode.done, done_info.mode);
     try std.testing.expectEqualStrings("Copied 1 item — 1.0 GB", done_info.text());
 }
 
-test "the strip names trash, restore and delete jobs, and counts only what is active" {
+test "the overview names trash, restore and delete jobs, and counts only what is active" {
     var panel = Panel{};
     // A trash job's done/total are ENTRIES, not bytes: it once read
     // "Copied 1 item — 1 B".
@@ -2442,7 +2798,7 @@ test "the strip names trash, restore and delete jobs, and counts only what is ac
         .total = 1,
         .op = .trash,
     }};
-    try std.testing.expectEqualStrings("Trashed 1 item", stripInfo(&trashed, &panel).text());
+    try std.testing.expectEqualStrings("Trashed 1 item", overview(&trashed, &panel, 1).text());
     // Trash then restore: two kinds, no byte total, neutral verb.
     const mixed = [_]Row{ trashed[0], .{
         .key = .{ .kind = .daemon, .ptr = 1, .job = 7 },
@@ -2453,7 +2809,7 @@ test "the strip names trash, restore and delete jobs, and counts only what is ac
         .total = 1,
         .op = .restore,
     } };
-    try std.testing.expectEqualStrings("2 operations finished", stripInfo(&mixed, &panel).text());
+    try std.testing.expectEqualStrings("2 operations finished", overview(&mixed, &panel, 1).text());
     // A finished copy beside a running delete: the active sentence
     // counts the delete alone and phrases it as one.
     const rows = [_]Row{ .{
@@ -2471,10 +2827,10 @@ test "the strip names trash, restore and delete jobs, and counts only what is ac
         .total = 10,
         .op = .delete,
     } };
-    const info = stripInfo(&rows, &panel);
-    try std.testing.expectEqual(StripMode.active, info.mode);
+    const info = overview(&rows, &panel, 0.3);
+    try std.testing.expectEqual(OverviewMode.active, info.mode);
     try std.testing.expectEqualStrings("Deleting old", info.text());
-    // A live query belongs to its tab, never to the strip.
+    // A live query belongs to its tab, never to the transfers.
     const query = [_]Row{.{
         .key = .{ .kind = .daemon, .ptr = 1, .job = 10 },
         .label = "live \"copy\"",
@@ -2482,7 +2838,7 @@ test "the strip names trash, restore and delete jobs, and counts only what is ac
         .state = .running,
         .op = .query,
     }};
-    try std.testing.expectEqual(StripMode.hidden, stripInfo(&query, &panel).mode);
+    try std.testing.expectEqual(OverviewMode.hidden, overview(&query, &panel, 0).mode);
 }
 
 test "batch fraction moves with the running member's bytes" {

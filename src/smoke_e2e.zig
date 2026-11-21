@@ -1117,7 +1117,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const app = drive orelse return fail("focused files-transfers smoke has no display driver");
         if (!have_wl) return fail("focused files-transfers smoke is GTK/Wayland-only");
         if (filesTransfersStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
-        say("files transfers: the conflict dialog's Replace and Skip and the Transfer Center all held");
+        say("files transfers: the conflict dialog's Replace and Skip, the transfers popover and the Transfer Center all held");
         teardown();
         return 0;
     }
@@ -1820,10 +1820,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (filesCompareSyncStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
             say("files compare: a mirror deletion waited for its confirmation, a cancel deleted nothing, a confirm trashed it");
 
-            // 6c-10g. The conflict dialog (Replace / Skip per item) and
-            // the Transfer Center behind Ctrl+Shift+J.
+            // 6c-10g. The conflict dialog (Replace / Skip per item), the
+            // transfers popover behind Ctrl+Shift+J and the Transfer Center.
             if (filesTransfersStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
-            say("files transfers: the conflict dialog's Replace and Skip and the Transfer Center all held");
+            say("files transfers: the conflict dialog's Replace and Skip, the transfers popover and the Transfer Center all held");
 
             // 6c-10h. A remote tab's Trash is that host's trash.
             if (filesRemoteTrashStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
@@ -10299,11 +10299,12 @@ fn fileHas(path: [:0]const u8, want: []const u8) bool {
     return std.mem.eql(u8, buf[0..n], want);
 }
 
-/// The conflict dialog and the Transfer Center, driven as a user
-/// does: a two-file paste onto two existing names asks per item,
-/// Replace overwrites exactly that one and Skip leaves the other
-/// alone; Ctrl+Shift+J then opens the Transfer Center with the copy's
-/// card in it, and closes it again.
+/// The conflict dialog, the transfers popover and the Transfer Center,
+/// driven as a user does: a two-file paste onto two existing names
+/// asks per item, Replace overwrites exactly that one and Skip leaves
+/// the other alone; Ctrl+Shift+J then opens the header popover with the
+/// copy's card, whose "Show All Transfers" opens the Transfer Center,
+/// and the center's close button closes it.
 fn filesTransfersStage(
     allocator: std.mem.Allocator,
     app: *appdrive.App,
@@ -10408,22 +10409,32 @@ fn filesTransfersStage(
     if (!fileHas(d_skip, "old skip\n")) return "files transfers: Skip still overwrote SKIPME.txt";
     say("files transfers: the conflict dialog replaced one item and skipped the other");
 
-    // The Transfer Center: a click on the transfers strip opens it
-    // (its documented entry beside Ctrl+Shift+J), with the paste's
-    // card; a second click closes it.
+    // The transfers popover: Ctrl+Shift+J opens it from the header
+    // button (the paste's card is there, finished), and its "Show All
+    // Transfers" opens the Transfer Center.
     _ = waitPopup(app, false, 5_000);
     _ = app.waitVisualSettle(child.win, 400, 5_000, 0.002, null);
-    if (!clickOcrWordScaled(allocator, app, child.win, "Copied", 1, 4_000) and
-        !clickOcrWordScaled(allocator, app, child.win, "queued", 1, 4_000))
-        return "files transfers: no transfers strip to open the Transfer Center from";
+    app.pressKey(child.win, "ctrl+shift+j") catch return "files transfers: injecting ctrl+shift+j failed";
+    const xpop = waitPopup(app, true, 5_000) orelse {
+        viewerShot(allocator, app, child.win, "files-tx-nopopover");
+        return "files transfers: Ctrl+Shift+J opened no transfers popover";
+    };
+    pumpRenameFor(app, 800);
+    if (!viewerWaitOcr(allocator, app, xpop, "Copied", 10_000)) {
+        viewerShot(allocator, app, xpop, "files-tx-popover");
+        return "files transfers: the transfers popover shows no card for the copy";
+    }
+    if (!clickOcrWordScaled(allocator, app, xpop, "Show", 1, 4_000)) {
+        viewerShot(allocator, app, xpop, "files-tx-popover");
+        return "files transfers: the popover has no Show All Transfers";
+    }
     pumpRenameFor(app, 1_000);
     if (!viewerWaitOcr(allocator, app, child.win, "Transfers", 10_000)) {
         viewerShot(allocator, app, child.win, "files-tx-center");
-        return "files transfers: the strip opened no Transfer Center";
+        return "files transfers: Show All Transfers opened no Transfer Center";
     }
-    // The paste is one batch card ("Copy 2 items"; the strip says
-    // "Copied"), finished, with nothing left active or queued once the
-    // skipped member has settled.
+    // The paste is one batch card ("Copy 2 items"), finished, with
+    // nothing left active or queued once the skipped member has settled.
     var settled = false;
     const settle_deadline = clock.nowMs() + 20_000;
     while (!settled and clock.nowMs() < settle_deadline) {
@@ -10440,17 +10451,20 @@ fn filesTransfersStage(
         viewerShot(allocator, app, child.win, "files-tx-card");
         return "files transfers: the Transfer Center shows no card for the copy";
     }
-    // The strip sits under the open center; its sentence is the last
-    // "Copied"/"queued" on screen.
-    if (!clickOcrWordScaled(allocator, app, child.win, "Copied", 1, 4_000) and
-        !clickOcrWordScaled(allocator, app, child.win, "waiting to", 1, 4_000))
-        return "files transfers: no strip to close the Transfer Center with";
+    // The center's close button is the last control on its heading
+    // row: the browser's right edge, inside the window's ~25px CSD
+    // shadow margin.
+    const heading = ocrWordCenter(allocator, app, child.win, "Transfers") orelse
+        return "files transfers: lost the Transfer Center heading";
+    const win_w = if (app.winById(child.win)) |fw| fw.w else return "files transfers: the Files window vanished";
+    app.clickEx(child.win, @as(f64, @floatFromInt(win_w)) - 50, heading.y, 1, 60, 1) catch
+        return "files transfers: clicking the Transfer Center's close button failed";
     pumpRenameFor(app, 1_000);
     if ((ocrCountScaled(allocator, app, child.win, "Transfers", 2) orelse 0) != 0) {
         viewerShot(allocator, app, child.win, "files-tx-close");
-        return "files transfers: the strip did not close the Transfer Center";
+        return "files transfers: the close button did not close the Transfer Center";
     }
-    say("files transfers: the strip opened the Transfer Center with the paste's card and closed it");
+    say("files transfers: the popover showed the paste's card, Show All opened the Transfer Center and its close button closed it");
 
     if (!closeRenameFiles(app, child)) return "files transfers: the Files window did not close cleanly";
     return null;

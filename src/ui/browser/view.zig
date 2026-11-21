@@ -1117,7 +1117,7 @@ pub const BrowserView = struct {
             self.switch_idle = 0;
         }
         self.cancelRetryTimer();
-        self.jobs_panel.cancelTick();
+        self.jobs_panel.cancelSources();
         self.cancelPathCompletion();
     }
 
@@ -1767,6 +1767,8 @@ pub const BrowserView = struct {
         const keep = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 2);
         const search_btn = self.barToggle(keep, "system-search-symbolic", "Search", "Search this directory (Ctrl+F; daemon-side, recursive)", &onSearchToggled);
         self.search_toggle = @ptrCast(@alignCast(search_btn));
+        // The transfers button sits beside search; hidden while idle.
+        @import("jobpanel.zig").buildButton(self, keep);
         // Its own bundled icon: Adwaita ships utilities-terminal-symbolic
         // only under symbolic/legacy/, so on a Breeze theme chain this
         // button -- the one that leaves the browser -- rendered blank.

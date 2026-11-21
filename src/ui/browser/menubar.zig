@@ -343,7 +343,7 @@ fn openMenu(btn: *c.GtkButton, ctx: *BarCtx) ?*c.GtkWidget {
             const tab = if (bv) |v| v.currentTab() else null;
             addCheck(root, toggles, a, win, target_pane, "Show Hidden Files", if (tab) |t| t.show_hidden else false, .toggle_hidden);
             addCheck(root, toggles, a, win, target_pane, "Places Sidebar", if (bv) |v| v.places_on else true, .toggle_sidebar);
-            addCheck(root, toggles, a, win, target_pane, "Transfers", if (bv) |v| v.jobs_panel.center_open else false, .toggle_transfers);
+            addCheck(root, toggles, a, win, target_pane, "Transfer Center", if (bv) |v| v.jobs_panel.center_open else false, .toggle_transfers);
             const modes = m.section();
             const mode: ?browser_model.ViewMode = if (tab) |t| t.view_mode else null;
             addCheck(root, modes, a, win, target_pane, "Details List", mode == .details, .mode_details);

@@ -742,7 +742,7 @@ pub const browser_chords = [_]Chord{
     .{
         .keyval = c.GDK_KEY_j,
         .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK,
-        .what = "toggle the transfer center",
+        .what = "toggle the transfers popover",
         .run = &chordTransfers,
     },
     .{
@@ -820,7 +820,7 @@ fn chordUndo(self: *BrowserView) bool {
 }
 
 fn chordTransfers(self: *BrowserView) bool {
-    @import("jobpanel.zig").toggleTransferCenter(self);
+    @import("jobpanel.zig").togglePopover(self);
     return true;
 }
 

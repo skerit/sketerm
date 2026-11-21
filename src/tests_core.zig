@@ -80,6 +80,7 @@ comptime {
     _ = @import("filebrowser/model.zig");
     _ = @import("filebrowser/paths.zig");
     _ = @import("filebrowser/jobop.zig");
+    _ = @import("filebrowser/xferlist.zig");
     _ = @import("filebrowser/bypass.zig");
     _ = @import("filebrowser/selection_set.zig");
     _ = @import("filebrowser/batchrename.zig");

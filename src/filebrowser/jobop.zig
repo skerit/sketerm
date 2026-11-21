@@ -1,5 +1,5 @@
 //! What kind of work a daemon job is, from the wire verb that started
-//! it. The transfers strip and the status line phrase a job by this,
+//! it. The transfers button, its popover and the status line phrase a job by this,
 //! and it decides whether the job's `done`/`total` are bytes or items.
 //!
 //! The verb vocabulary is `fsjob.Op`; the switch below is exhaustive
@@ -16,7 +16,7 @@ pub const JobOp = enum {
     restore,
     delete,
     /// A search, live query or panelize stream: it fills a tab of its
-    /// own and never belongs in the transfers strip.
+    /// own and never belongs in the transfers popover.
     query,
     other,
 
@@ -61,8 +61,8 @@ pub const JobOp = enum {
         return self == .copy or self == .move;
     }
 
-    /// Whether the job shows in the ambient transfers strip at all.
-    pub fn inStrip(self: JobOp) bool {
+    /// Whether the job shows in the transfers button and popover at all.
+    pub fn inTransfers(self: JobOp) bool {
         return self != .query;
     }
 
@@ -112,7 +112,7 @@ test "wire verbs classify, and only copies count bytes" {
     try t.expectEqual(JobOp.other, JobOp.fromWire("flat", false));
     try t.expect(JobOp.copy.countsBytes());
     try t.expect(!JobOp.trash.countsBytes());
-    try t.expect(!JobOp.query.inStrip());
+    try t.expect(!JobOp.query.inTransfers());
     try t.expectEqualStrings("Copying", JobOp.copy.activeVerb());
     try t.expectEqualStrings("Moved", JobOp.move.doneVerb());
 }

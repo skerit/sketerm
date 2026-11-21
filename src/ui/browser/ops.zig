@@ -3175,7 +3175,7 @@ const ExternalPasteTest = struct {
         if (self.clip) |clip| _ = c.gdk_clipboard_set_content(clip, null);
         conflict.cancelTab(&self.view, &self.tab);
         self.view.conflicts.deinit(self.view.allocator);
-        self.view.jobs_panel.cancelTick();
+        self.view.jobs_panel.cancelSources();
         if (self.window) |window| {
             c.gtk_window_destroy(@ptrCast(window));
             c.g_object_unref(window);
