@@ -901,7 +901,7 @@ pub fn brokerAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
         .video_codecs = cl.video_codecs,
         .kind = kind,
         .native_state_max = cl.native_state_max,
-        .snapshot_version = cl.snapshot_version,
+        .snapshot_version = @min(cl.snapshot_version, w.snapshot_max),
         .audio_channels = cl.audio_channels,
         .winstream_channels = cl.winstream_channels,
         .read_only = parsed.value.read_only,

@@ -55,6 +55,16 @@ const palette_default_256 = @import("../grid/palette.zig").default_256;
 /// and saved-overstrike flags. Older bodies restore with no layers.
 pub const SNAPSHOT_VERSION = 14;
 pub const LEGACY_SNAPSHOT_VERSION = 3;
+/// The newest body an adopted worker whose record carries no `snapshot_max`
+/// can write: adoption shipped (e991f1b0) at v11, and such a worker rejects
+/// any higher version and drops the client, so its sessions cannot attach.
+pub const ADOPT_FALLBACK_SNAPSHOT_VERSION = 11;
+
+/// The snapshot version a broker may hand an adopted worker that reported `reported` (0 = not reported).
+pub fn adoptedWorkerMax(reported: u8) u8 {
+    if (reported == 0) return ADOPT_FALLBACK_SNAPSHOT_VERSION;
+    return @min(reported, SNAPSHOT_VERSION);
+}
 
 /// What a `Screen` field means to a snapshot.
 const FieldClass = enum {

@@ -542,6 +542,9 @@ pub const Worker = struct {
     /// handover may leave it running. A worker that cannot be adopted
     /// makes a handover refuse instead of orphaning it unreachable.
     adoptable: bool = false,
+    /// Newest snapshot body the worker's binary writes; an adopted worker
+    /// may be older than this broker, so handoffs are capped to it.
+    snapshot_max: u8 = snapshot.SNAPSHOT_VERSION,
     /// Why the session ended, once known: the worker's 'T' report, or a
     /// kill this broker forwarded. Recorded as a tombstone when the
     /// record is retired.
@@ -686,6 +689,9 @@ pub const WorkerAdopt = struct {
     gpu: bool = false,
     output_width: u32 = wlcomp.DEFAULT_OUTPUT_WIDTH,
     output_height: u32 = wlcomp.DEFAULT_OUTPUT_HEIGHT,
+    /// Newest snapshot body this worker writes; 0 = a record from before
+    /// the field, read as `snapshot.ADOPT_FALLBACK_SNAPSHOT_VERSION`.
+    snapshot_max: u8 = 0,
 };
 
 /// Worker→broker metadata push payload (JSON over the 'M' control datagram).

@@ -226,7 +226,7 @@ pub const PassedClient = struct {
             else
                 0,
             .snapshot_version = if (bytes.len >= 5)
-                bytes[4]
+                @min(bytes[4], snapshot.SNAPSHOT_VERSION)
             else
                 snapshot.negotiateVersion(proto, 0, false),
             .audio_channels = if (bytes.len >= 6) bytes[5] != 0 else proto >= 5,

@@ -56,6 +56,7 @@ const nowMs = @import("../util/clock.zig").nowMs;
 const Daemon = dmod.Daemon;
 const Worker = dmod.Worker;
 const WorkerAdopt = dmod.WorkerAdopt;
+const snapshot = @import("snapshot.zig");
 
 /// The offer layout this build sends. A worker accepts any version: the
 /// offer carries nothing but the channel, and the answer is its own
@@ -226,6 +227,7 @@ fn sendAdoptRecord(self: *Daemon) bool {
         .gpu = s.gpu,
         .output_width = s.output_width,
         .output_height = s.output_height,
+        .snapshot_max = snapshot.SNAPSHOT_VERSION,
     };
     var aw: std.Io.Writer.Allocating = .init(self.allocator);
     defer aw.deinit();
@@ -413,10 +415,11 @@ pub fn brokerOnAdoptRecord(self: *Daemon, w: *Worker, payload: []const u8) void 
     w.gpu = rec.gpu;
     w.output_width = rec.output_width;
     w.output_height = rec.output_height;
+    w.snapshot_max = snapshot.adoptedWorkerMax(rec.snapshot_max);
     w.adopting = false;
     w.ready = true;
     w.adoptable = true;
-    log.info("adopted worker pid={d} session='{s}' (record v{d}, build {s})", .{ w.pid, w.name, rec.v, rec.build });
+    log.info("adopted worker pid={d} session='{s}' (record v{d}, build {s}, snapshot v{d})", .{ w.pid, w.name, rec.v, rec.build, w.snapshot_max });
 }
 
 fn nameInUse(self: *Daemon, name: []const u8, except: *Worker) bool {
@@ -555,4 +558,58 @@ test "a handover refuses while a worker could not be adopted" {
     try t.expect(handoverBlocker(&d, &buf) == null);
     w.ready = false;
     try t.expect(handoverBlocker(&d, &buf) != null);
+}
+
+test "a broker caps the snapshot version it hands an adopted worker to what that worker writes" {
+    const a = t.allocator;
+    var empty: [0]u8 = .{};
+    var broker = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    defer broker.workers.deinit(a);
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.controlSocketpair(&pair, 4096));
+    defer _ = c.close(pair[1]);
+    const origin = "10000000000000000000000000000001";
+    const w = try a.create(Worker);
+    w.* = .{
+        .allocator = a,
+        .name = try a.dupe(u8, origin),
+        .origin_name = try a.dupe(u8, origin),
+        .origin_id = origin.*,
+        .pid = 0,
+        .control_fd = pair[0],
+        .adopted = true,
+        .adopting = true,
+    };
+    defer w.deinit();
+    try broker.workers.append(a, w);
+
+    // A record from before `snapshot_max` existed: the worker rejects
+    // anything past v11, so the broker must never hand it v14.
+    brokerOnAdoptRecord(&broker, w,
+        \\{"v":1,"wpid":4242,"name":"Mail","origin_id":"10000000000000000000000000000001","build":"8bc57f22"}
+    );
+    try t.expect(w.ready);
+    try t.expectEqual(snapshot.ADOPT_FALLBACK_SNAPSHOT_VERSION, w.snapshot_max);
+
+    var conn: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&conn));
+    defer _ = c.close(conn[1]);
+    var cl = dmod.Client{ .allocator = a, .fd = conn[0], .id = 1, .proto = @import("wire.zig").PROTO_VERSION, .snapshot_version = snapshot.SNAPSHOT_VERSION };
+    defer cl.rbuf.deinit(a);
+    defer cl.wbuf.deinit(a);
+    defer cl.audio_wbuf.deinit(a);
+    broker.handleAttach(&cl, "{\"name\":\"Mail\",\"kind\":\"gui\"}");
+    try t.expect(cl.dead);
+    _ = c.close(conn[0]);
+    var buf: [256]u8 = undefined;
+    var passed: c_int = -1;
+    const n = daemon_control.controlRecv(pair[1], &buf, &passed);
+    try t.expect(n > 1 and buf[0] == 'A');
+    if (passed >= 0) _ = c.close(passed);
+    const got = daemon_control.PassedClient.decode(buf[1..@intCast(n)]);
+    try t.expectEqual(snapshot.ADOPT_FALLBACK_SNAPSHOT_VERSION, got.snapshot_version);
+
+    // A reported maximum is used as is, and never above this build's.
+    try t.expectEqual(@as(u8, 12), snapshot.adoptedWorkerMax(12));
+    try t.expectEqual(snapshot.SNAPSHOT_VERSION, snapshot.adoptedWorkerMax(255));
 }
