@@ -23923,3 +23923,24 @@ like `web_max_fps`) and the open as `hide_scrollbars: true`, and an open on a he
 without it is refused, never shot with a scrollbar. `smoke-mcp`'s scrollbar stage
 (`SKETERM_SMOKE_MCP_WEBSCROLLBARS_ONLY`) proves 640,640 with it, a narrower layout without
 it, the override across a navigation, and the refusal (`SKETERM_WEB_DISABLE_HIDE_SCROLLBARS`).
+
+## 2026-11-21: Open With chooser
+
+"Other Application…" in Files listed the same `g_app_info_get_all_for_type` apps as the
+submenu above it, so no other application could ever be picked; it was a popover pinned at
+(320,200), capped at 20 rows, with no search, no custom command, and launch errors dropped.
+It is now a modal AdwDialog (`ui/browser/openwith.zig`): file icon, type and location, a live
+search over name, desktop id and program, then "On <host>" (remote tabs: the daemon's `apps`
+reply, loading / not-connected / empty states, launched through `on_host_exec`),
+"Recommended" (or "On This Computer" on a remote tab; default app tagged), "All Applications"
+(every `should_show` app, deduped, sorted, no cap, "N of M" while searching) and "Custom
+Command" (`g_app_info_create_from_commandline`). One radio group spans every section; a
+double-click opens at once. "Always use" sets the default for local choices and is
+insensitive for host apps. A failed launch stays in the dialog with GIO's message and goes
+to the status line. The image viewer's chooser is the same dialog in local-only mode; both
+old popovers are deleted. Every local launch path now takes an opener string
+(`filebrowser/openwith.zig` `Opener`: desktop id or `sketerm-cmdline:` command), so a custom
+command on a remote file rides the mount / cached-copy path unchanged, and fire-and-forget
+launches log their failure instead of dropping it. The dialog owns its ctx ("closed"
+destroy-notify); `BrowserView.openwith` is the fence for the host reply and a view teardown
+severs and closes the dialog.
