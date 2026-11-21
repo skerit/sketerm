@@ -896,23 +896,32 @@ pub fn brokerAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
         return;
     }
     const kind = clientKindNamed(parsed.value.kind);
-    const encoded = (PassedClient{
+    // Capped to what the worker's binary serves: an adopted worker may be
+    // older than the versions negotiated with this client.
+    var req = (PassedClient{
         .proto = cl.proto,
         .video_codecs = cl.video_codecs,
         .kind = kind,
         .native_state_max = cl.native_state_max,
-        .snapshot_version = @min(cl.snapshot_version, w.snapshot_max),
+        .snapshot_version = cl.snapshot_version,
         .audio_channels = cl.audio_channels,
         .winstream_channels = cl.winstream_channels,
         .read_only = parsed.value.read_only,
         .want_control = parsed.value.control,
         .panel_only = parsed.value.panel_only,
         .panel_rpc = panel_rpc,
-        .identity_first = parsed.value.identity_first and panel_rpc > 0 and kind == .gui and
-            !parsed.value.panel_only,
         .answers_paste = cl.answers_paste,
         .view_only = parsed.value.view_only,
-    }).encode();
+    }).cappedTo(w.limits);
+    // A panel-only requester's version is its routing contract: never
+    // silently downgrade it to one a presenter could not honour.
+    if (req.panel_only and req.panel_rpc < panel_rpc) {
+        cl.queueErr("session worker is too old for this panel_rpc version");
+        return;
+    }
+    req.identity_first = parsed.value.identity_first and req.panel_rpc > 0 and kind == .gui and
+        !parsed.value.panel_only;
+    const encoded = req.encode();
     var msg: [1 + PassedClient.WIRE_SIZE]u8 = undefined;
     msg[0] = 'A';
     @memcpy(msg[1..], &encoded);

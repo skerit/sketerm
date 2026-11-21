@@ -108,6 +108,14 @@ next broker on the same socket adopts the running workers
   parsed with unknown fields ignored, so a new broker adopts workers
   forked by an older binary and vice versa. A record a broker cannot use
   leaves that worker running and serving its clients, never killed.
+  An adopted worker keeps running its OLD binary, so every negotiated
+  version the broker hands it in an `'A'` handoff (protocol, snapshot,
+  native state, panel RPC) is capped to what that build serves:
+  `daemon_control.WorkerLimits`, reported as `limits` in `'D'` (records
+  without it read as e991f1b0's values, adoption's origin). Every
+  `PassedClient` field is classified in `handoff_policy`, and an
+  unclassified one fails the build. A worker also clamps a too-new
+  handoff to its own build instead of dropping the client.
   Welcome capabilities are the BROKER's: a feature a newer broker
   advertises but an older adopted worker does not serve fails on that
   session with the worker's `.err`. Workers forked before adoption

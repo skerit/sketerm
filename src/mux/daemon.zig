@@ -542,9 +542,9 @@ pub const Worker = struct {
     /// handover may leave it running. A worker that cannot be adopted
     /// makes a handover refuse instead of orphaning it unreachable.
     adoptable: bool = false,
-    /// Newest snapshot body the worker's binary writes; an adopted worker
-    /// may be older than this broker, so handoffs are capped to it.
-    snapshot_max: u8 = snapshot.SNAPSHOT_VERSION,
+    /// What the worker's binary can serve; an adopted worker may be older
+    /// than this broker, so every handoff is capped to it.
+    limits: @import("daemon_control.zig").WorkerLimits = .this_build,
     /// Why the session ended, once known: the worker's 'T' report, or a
     /// kill this broker forwarded. Recorded as a tombstone when the
     /// record is retired.
@@ -689,9 +689,12 @@ pub const WorkerAdopt = struct {
     gpu: bool = false,
     output_width: u32 = wlcomp.DEFAULT_OUTPUT_WIDTH,
     output_height: u32 = wlcomp.DEFAULT_OUTPUT_HEIGHT,
-    /// Newest snapshot body this worker writes; 0 = a record from before
-    /// the field, read as `snapshot.ADOPT_FALLBACK_SNAPSHOT_VERSION`.
+    /// The worker's flat snapshot maximum as 2a35649f-built workers sent
+    /// it (0 = absent); still written so a 2a35649f broker caps us.
     snapshot_max: u8 = 0,
+    /// Every negotiated maximum this worker serves; null = an older
+    /// record, read through `WorkerLimits.reported`.
+    limits: ?@import("daemon_control.zig").WorkerLimits = null,
 };
 
 /// Worker→broker metadata push payload (JSON over the 'M' control datagram).

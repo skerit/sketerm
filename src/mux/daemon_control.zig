@@ -24,6 +24,7 @@ const cwdOfPid = dmod.cwdOfPid;
 const daemon_adopt = @import("daemon_adopt.zig");
 const lifetime = @import("../util/lifetime.zig");
 const daemon_peers = @import("daemon_peers.zig");
+const reflect = @import("../util/reflect.zig");
 
 // ── broker ↔ worker control channel (process isolation) ─────────
 //
@@ -154,6 +155,130 @@ fn workerRenameResult(self: *Daemon, payload: []const u8) void {
     }
 }
 
+/// The newest version of every negotiated `PassedClient` value a worker's
+/// build can serve. Field names and types match the `PassedClient` fields
+/// they cap. An adopted worker keeps running its OLD binary, so a broker
+/// must never hand it a value its build rejects (a snapshot version past
+/// its own once dropped every client of nine durable sessions).
+///
+/// The defaults are the values at e991f1b0, where adoption shipped: the
+/// oldest build a broker can ever adopt. They are what a record without
+/// `limits` reads as, and what a field added here later reads as for a
+/// worker built before it, which is safe as long as each value only grows.
+pub const WorkerLimits = struct {
+    /// `wire.PROTO_VERSION` at e991f1b0.
+    proto: u32 = 6,
+    /// `wire.NATIVE_STATE_VERSION` at e991f1b0.
+    native_state_max: u8 = 11,
+    /// `snapshot.SNAPSHOT_VERSION` at e991f1b0; its `serializeVersion`
+    /// rejects anything higher and the client is dropped after ten retries.
+    snapshot_version: u8 = 11,
+    /// `wire.PANEL_RPC_VERSION` at e991f1b0.
+    panel_rpc: u8 = 2,
+
+    /// What the oldest adoptable build serves.
+    pub const oldest: WorkerLimits = .{};
+    /// What this build serves; a forked worker runs this very binary.
+    pub const this_build: WorkerLimits = .{
+        .proto = wire.PROTO_VERSION,
+        .native_state_max = wire.NATIVE_STATE_VERSION,
+        .snapshot_version = snapshot.SNAPSHOT_VERSION,
+        .panel_rpc = wire.PANEL_RPC_VERSION,
+    };
+
+    /// The field-wise minimum of two limit sets.
+    pub fn meet(a: WorkerLimits, b: WorkerLimits) WorkerLimits {
+        var out = a;
+        inline for (comptime reflect.fields(WorkerLimits)) |f| {
+            @field(out, f.name) = @min(@field(a, f.name), @field(b, f.name));
+        }
+        return out;
+    }
+
+    /// The limits an adoption record vouches for, never above this build's.
+    /// `flat_snapshot_max` is the lone key workers built at 2a35649f sent
+    /// (0 = absent); `limits` supersedes it.
+    pub fn reported(limits: ?WorkerLimits, flat_snapshot_max: u8) WorkerLimits {
+        var out = limits orelse oldest;
+        if (limits == null and flat_snapshot_max != 0) out.snapshot_version = flat_snapshot_max;
+        return out.meet(this_build);
+    }
+
+    comptime {
+        for (reflect.fields(WorkerLimits)) |f| {
+            if (@field(oldest, f.name) > @field(this_build, f.name))
+                @compileError("WorkerLimits." ++ f.name ++ " fell below its e991f1b0 fallback; a fallback must never exceed what the oldest adoptable build serves");
+        }
+    }
+};
+
+/// How a broker treats each `PassedClient` field when the worker it hands
+/// the client to may run an older build.
+pub const HandoffClass = enum {
+    /// A negotiated version, capped to the `WorkerLimits` field of the same name.
+    capped,
+    /// Something the client CAN receive; a worker sends only what its own
+    /// build produces, so a newer capability is inert there.
+    worker_filtered,
+    /// A per-attach request or identity; a worker that predates its byte
+    /// ignores it.
+    request,
+};
+
+/// Every `PassedClient` field, classified. An unclassified field fails the
+/// build: a new negotiated value must decide whether it needs a cap.
+pub const handoff_policy = [_]struct { name: []const u8, class: HandoffClass }{
+    .{ .name = "proto", .class = .capped },
+    .{ .name = "native_state_max", .class = .capped },
+    .{ .name = "snapshot_version", .class = .capped },
+    .{ .name = "panel_rpc", .class = .capped },
+    .{ .name = "video_codecs", .class = .worker_filtered },
+    .{ .name = "audio_channels", .class = .worker_filtered },
+    .{ .name = "winstream_channels", .class = .worker_filtered },
+    .{ .name = "answers_paste", .class = .worker_filtered },
+    .{ .name = "kind", .class = .request },
+    .{ .name = "read_only", .class = .request },
+    .{ .name = "want_control", .class = .request },
+    .{ .name = "panel_only", .class = .request },
+    .{ .name = "identity_first", .class = .request },
+    .{ .name = "view_only", .class = .request },
+};
+
+fn handoffClassOf(comptime name: []const u8) ?HandoffClass {
+    for (handoff_policy) |p| {
+        if (std.mem.eql(u8, p.name, name)) return p.class;
+    }
+    return null;
+}
+
+fn hasField(comptime T: type, comptime name: []const u8) bool {
+    for (reflect.fields(T)) |f| {
+        if (std.mem.eql(u8, f.name, name)) return true;
+    }
+    return false;
+}
+
+comptime {
+    @setEvalBranchQuota(20_000);
+    for (reflect.fields(PassedClient)) |f| {
+        const class = handoffClassOf(f.name) orelse
+            @compileError("PassedClient." ++ f.name ++ " is not classified in daemon_control.zig handoff_policy:" ++
+                " a negotiated version is .capped (and gets a WorkerLimits field), else .worker_filtered or .request");
+        if ((class == .capped) != hasField(WorkerLimits, f.name))
+            @compileError("PassedClient." ++ f.name ++ ": .capped fields and WorkerLimits fields must match one to one");
+        if (class == .capped and f.type != @FieldType(WorkerLimits, f.name))
+            @compileError("PassedClient." ++ f.name ++ " and WorkerLimits." ++ f.name ++ " differ in type");
+    }
+    for (handoff_policy) |p| {
+        if (!hasField(PassedClient, p.name))
+            @compileError("handoff_policy classifies PassedClient." ++ p.name ++ ", which no longer exists");
+    }
+    for (reflect.fields(WorkerLimits)) |f| {
+        if (handoffClassOf(f.name) != .capped)
+            @compileError("WorkerLimits." ++ f.name ++ " caps no .capped PassedClient field");
+    }
+}
+
 /// Decoded 'A' worker-handoff datagram. A struct rather than a
 /// parameter list because every new attach-time client property has
 /// to travel here: a field left out of this hop makes the worker see a
@@ -206,8 +331,24 @@ pub const PassedClient = struct {
         return out;
     }
 
+    /// This request with every negotiated version capped to `limits`.
+    pub fn cappedTo(self: PassedClient, limits: WorkerLimits) PassedClient {
+        var out = self;
+        inline for (comptime reflect.fields(WorkerLimits)) |f| {
+            @field(out, f.name) = @min(@field(self, f.name), @field(limits, f.name));
+        }
+        return out;
+    }
+
     /// Decode every historical prefix and default only fields not present.
+    /// Negotiated versions are clamped to this build: a newer broker that
+    /// misjudged this worker is served at the newest version we have
+    /// rather than dropped.
     pub fn decode(bytes: []const u8) PassedClient {
+        return decodeRaw(bytes).cappedTo(.this_build);
+    }
+
+    fn decodeRaw(bytes: []const u8) PassedClient {
         const proto: u32 = if (bytes.len >= 1) bytes[0] else 1;
         return .{
             .proto = proto,
@@ -226,7 +367,7 @@ pub const PassedClient = struct {
             else
                 0,
             .snapshot_version = if (bytes.len >= 5)
-                @min(bytes[4], snapshot.SNAPSHOT_VERSION)
+                bytes[4]
             else
                 snapshot.negotiateVersion(proto, 0, false),
             .audio_channels = if (bytes.len >= 6) bytes[5] != 0 else proto >= 5,
@@ -234,13 +375,49 @@ pub const PassedClient = struct {
             .read_only = bytes.len >= 8 and bytes[7] != 0,
             .want_control = bytes.len >= 9 and bytes[8] != 0,
             .panel_only = bytes.len >= 10 and bytes[9] != 0,
-            .panel_rpc = if (bytes.len >= 11) @min(bytes[10], wire.PANEL_RPC_VERSION) else 0,
+            .panel_rpc = if (bytes.len >= 11) bytes[10] else 0,
             .identity_first = bytes.len >= 12 and bytes[11] != 0,
             .answers_paste = bytes.len > CODECS_END and bytes[CODECS_END] != 0,
             .view_only = bytes.len > VIEW_ONLY_AT and bytes[VIEW_ONLY_AT] != 0,
         };
     }
 };
+
+test "a worker serves a handoff past its own versions at its newest instead of dropping it" {
+    const t = std.testing;
+    var future = (PassedClient{
+        .proto = 1,
+        .kind = .gui,
+        .native_state_max = 1,
+        .snapshot_version = 1,
+        .audio_channels = true,
+        .winstream_channels = true,
+        .panel_rpc = 1,
+    }).encode();
+    future[0] = 255;
+    future[3] = 255;
+    future[4] = 255;
+    future[10] = 255;
+    const got = PassedClient.decode(&future);
+    try t.expectEqual(WorkerLimits.this_build.proto, got.proto);
+    try t.expectEqual(WorkerLimits.this_build.native_state_max, got.native_state_max);
+    try t.expectEqual(WorkerLimits.this_build.snapshot_version, got.snapshot_version);
+    try t.expectEqual(WorkerLimits.this_build.panel_rpc, got.panel_rpc);
+    // Values at or below this build pass through untouched.
+    const low = PassedClient.decode(&(PassedClient{
+        .proto = 5,
+        .kind = .cli,
+        .native_state_max = 7,
+        .snapshot_version = 9,
+        .audio_channels = false,
+        .winstream_channels = false,
+        .panel_rpc = 1,
+    }).encode());
+    try t.expectEqual(@as(u32, 5), low.proto);
+    try t.expectEqual(@as(u8, 7), low.native_state_max);
+    try t.expectEqual(@as(u8, 9), low.snapshot_version);
+    try t.expectEqual(@as(u8, 1), low.panel_rpc);
+}
 
 test "broker attach handoff preserves panel-only capability fields" {
     const t = std.testing;
@@ -277,7 +454,7 @@ test "broker attach handoff preserves panel-only capability fields" {
     try t.expectEqual(original.answers_paste, decoded.answers_paste);
     try t.expectEqual(original.view_only, decoded.view_only);
     // A handoff from before the paste byte never claims it.
-    try t.expect(!PassedClient.decode(encoded[0..PassedClient.VIEW_ONLY_AT - 1]).answers_paste);
+    try t.expect(!PassedClient.decode(encoded[0 .. PassedClient.VIEW_ONLY_AT - 1]).answers_paste);
     // One from before the view-only byte keeps paste and is no watcher.
     const pre_view = PassedClient.decode(encoded[0..PassedClient.VIEW_ONLY_AT]);
     try t.expect(pre_view.answers_paste);

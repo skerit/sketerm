@@ -57,6 +57,7 @@ const Daemon = dmod.Daemon;
 const Worker = dmod.Worker;
 const WorkerAdopt = dmod.WorkerAdopt;
 const snapshot = @import("snapshot.zig");
+const wire = @import("wire.zig");
 
 /// The offer layout this build sends. A worker accepts any version: the
 /// offer carries nothing but the channel, and the answer is its own
@@ -227,7 +228,8 @@ fn sendAdoptRecord(self: *Daemon) bool {
         .gpu = s.gpu,
         .output_width = s.output_width,
         .output_height = s.output_height,
-        .snapshot_max = snapshot.SNAPSHOT_VERSION,
+        .snapshot_max = daemon_control.WorkerLimits.this_build.snapshot_version,
+        .limits = daemon_control.WorkerLimits.this_build,
     };
     var aw: std.Io.Writer.Allocating = .init(self.allocator);
     defer aw.deinit();
@@ -415,11 +417,14 @@ pub fn brokerOnAdoptRecord(self: *Daemon, w: *Worker, payload: []const u8) void 
     w.gpu = rec.gpu;
     w.output_width = rec.output_width;
     w.output_height = rec.output_height;
-    w.snapshot_max = snapshot.adoptedWorkerMax(rec.snapshot_max);
+    w.limits = daemon_control.WorkerLimits.reported(rec.limits, rec.snapshot_max);
     w.adopting = false;
     w.ready = true;
     w.adoptable = true;
-    log.info("adopted worker pid={d} session='{s}' (record v{d}, build {s}, snapshot v{d})", .{ w.pid, w.name, rec.v, rec.build, w.snapshot_max });
+    log.info("adopted worker pid={d} session='{s}' (record v{d}, build {s}, proto {d}, snapshot v{d}, native state v{d}, panel rpc v{d})", .{
+        w.pid,          w.name,                    rec.v,                     rec.build,
+        w.limits.proto, w.limits.snapshot_version, w.limits.native_state_max, w.limits.panel_rpc,
+    });
 }
 
 fn nameInUse(self: *Daemon, name: []const u8, except: *Worker) bool {
@@ -560,7 +565,41 @@ test "a handover refuses while a worker could not be adopted" {
     try t.expect(handoverBlocker(&d, &buf) != null);
 }
 
-test "a broker caps the snapshot version it hands an adopted worker to what that worker writes" {
+/// Adopts `w` from `record`, attaches a GUI client through the broker and
+/// returns the `PassedClient` the worker end of the control pair receives.
+fn testHandoffAfterAdopt(broker: *Daemon, w: *Worker, worker_end: c_int, record: []const u8, attach: []const u8) !daemon_control.PassedClient {
+    const a = t.allocator;
+    w.adopting = true;
+    w.ready = false;
+    brokerOnAdoptRecord(broker, w, record);
+    try t.expect(w.ready);
+    var conn: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&conn));
+    defer _ = c.close(conn[1]);
+    var cl = dmod.Client{
+        .allocator = a,
+        .fd = conn[0],
+        .id = 1,
+        .proto = wire.PROTO_VERSION,
+        .snapshot_version = snapshot.SNAPSHOT_VERSION,
+        .native_state_max = wire.NATIVE_STATE_VERSION,
+        .panel_rpc_support = wire.PANEL_RPC_VERSION,
+    };
+    defer cl.rbuf.deinit(a);
+    defer cl.wbuf.deinit(a);
+    defer cl.audio_wbuf.deinit(a);
+    broker.handleAttach(&cl, attach);
+    _ = c.close(conn[0]);
+    if (!cl.dead) return error.AttachNotHandedOff;
+    var buf: [256]u8 = undefined;
+    var passed: c_int = -1;
+    const n = daemon_control.controlRecv(worker_end, &buf, &passed);
+    try t.expect(n > 1 and buf[0] == 'A');
+    if (passed >= 0) _ = c.close(passed);
+    return daemon_control.PassedClient.decode(buf[1..@intCast(n)]);
+}
+
+test "a broker caps every negotiated version it hands an adopted worker to what that worker serves" {
     const a = t.allocator;
     var empty: [0]u8 = .{};
     var broker = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
@@ -578,38 +617,65 @@ test "a broker caps the snapshot version it hands an adopted worker to what that
         .pid = 0,
         .control_fd = pair[0],
         .adopted = true,
-        .adopting = true,
     };
     defer w.deinit();
     try broker.workers.append(a, w);
+    const gui = "{\"name\":\"Mail\",\"kind\":\"gui\",\"panel_rpc\":2}";
+    const oldest = daemon_control.WorkerLimits.oldest;
 
-    // A record from before `snapshot_max` existed: the worker rejects
-    // anything past v11, so the broker must never hand it v14.
-    brokerOnAdoptRecord(&broker, w,
+    // A record from before any limits (e991f1b0..2a35649f): every field
+    // falls back to adoption's origin; such a worker rejects snapshot v14.
+    var got = try testHandoffAfterAdopt(&broker, w, pair[1],
         \\{"v":1,"wpid":4242,"name":"Mail","origin_id":"10000000000000000000000000000001","build":"8bc57f22"}
-    );
-    try t.expect(w.ready);
-    try t.expectEqual(snapshot.ADOPT_FALLBACK_SNAPSHOT_VERSION, w.snapshot_max);
+    , gui);
+    try t.expectEqual(oldest, w.limits);
+    try t.expectEqual(oldest.proto, got.proto);
+    try t.expectEqual(oldest.snapshot_version, got.snapshot_version);
+    try t.expectEqual(oldest.native_state_max, got.native_state_max);
+    try t.expectEqual(oldest.panel_rpc, got.panel_rpc);
 
-    var conn: [2]c_int = undefined;
-    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&conn));
-    defer _ = c.close(conn[1]);
-    var cl = dmod.Client{ .allocator = a, .fd = conn[0], .id = 1, .proto = @import("wire.zig").PROTO_VERSION, .snapshot_version = snapshot.SNAPSHOT_VERSION };
-    defer cl.rbuf.deinit(a);
-    defer cl.wbuf.deinit(a);
-    defer cl.audio_wbuf.deinit(a);
-    broker.handleAttach(&cl, "{\"name\":\"Mail\",\"kind\":\"gui\"}");
-    try t.expect(cl.dead);
-    _ = c.close(conn[0]);
-    var buf: [256]u8 = undefined;
-    var passed: c_int = -1;
-    const n = daemon_control.controlRecv(pair[1], &buf, &passed);
-    try t.expect(n > 1 and buf[0] == 'A');
-    if (passed >= 0) _ = c.close(passed);
-    const got = daemon_control.PassedClient.decode(buf[1..@intCast(n)]);
-    try t.expectEqual(snapshot.ADOPT_FALLBACK_SNAPSHOT_VERSION, got.snapshot_version);
+    // A 2a35649f worker's flat key still counts.
+    got = try testHandoffAfterAdopt(&broker, w, pair[1],
+        \\{"v":1,"wpid":4242,"name":"Mail","origin_id":"10000000000000000000000000000001","snapshot_max":12}
+    , gui);
+    try t.expectEqual(@as(u8, 12), got.snapshot_version);
+    try t.expectEqual(oldest.native_state_max, got.native_state_max);
 
-    // A reported maximum is used as is, and never above this build's.
-    try t.expectEqual(@as(u8, 12), snapshot.adoptedWorkerMax(12));
-    try t.expectEqual(snapshot.SNAPSHOT_VERSION, snapshot.adoptedWorkerMax(255));
+    // Reported limits below this build cap each field on their own.
+    got = try testHandoffAfterAdopt(&broker, w, pair[1],
+        \\{"v":1,"wpid":4242,"name":"Mail","origin_id":"10000000000000000000000000000001","snapshot_max":13,
+        \\ "limits":{"proto":5,"native_state_max":7,"snapshot_version":9,"panel_rpc":1,"future_version":3}}
+    , "{\"name\":\"Mail\",\"kind\":\"gui\",\"panel_rpc\":2,\"identity_first\":true}");
+    try t.expectEqual(@as(u32, 5), got.proto);
+    try t.expectEqual(@as(u8, 7), got.native_state_max);
+    try t.expectEqual(@as(u8, 9), got.snapshot_version);
+    try t.expectEqual(@as(u8, 1), got.panel_rpc);
+    try t.expect(got.identity_first);
+
+    // A panel-only requester is refused rather than downgraded.
+    try t.expectError(error.AttachNotHandedOff, testHandoffAfterAdopt(&broker, w, pair[1],
+        \\{"v":1,"wpid":4242,"name":"Mail","origin_id":"10000000000000000000000000000001","limits":{"panel_rpc":1}}
+    , "{\"name\":\"Mail\",\"panel_only\":true,\"panel_rpc\":2}"));
+
+    // Limits above this build (a newer worker) are capped to this build.
+    got = try testHandoffAfterAdopt(&broker, w, pair[1],
+        \\{"v":1,"wpid":4242,"name":"Mail","origin_id":"10000000000000000000000000000001",
+        \\ "limits":{"proto":200,"native_state_max":200,"snapshot_version":200,"panel_rpc":200}}
+    , gui);
+    try t.expectEqual(daemon_control.WorkerLimits.this_build, w.limits);
+    try t.expectEqual(@as(u32, wire.PROTO_VERSION), got.proto);
+    try t.expectEqual(@as(u8, snapshot.SNAPSHOT_VERSION), got.snapshot_version);
+    try t.expectEqual(wire.NATIVE_STATE_VERSION, got.native_state_max);
+    try t.expectEqual(wire.PANEL_RPC_VERSION, got.panel_rpc);
+}
+
+test "a record without limits reads as e991f1b0's, and reported limits never exceed this build" {
+    const L = daemon_control.WorkerLimits;
+    try t.expectEqual(L{ .proto = 6, .native_state_max = 11, .snapshot_version = 11, .panel_rpc = 2 }, L.reported(null, 0));
+    var flat = L.oldest;
+    flat.snapshot_version = 12;
+    try t.expectEqual(flat, L.reported(null, 12));
+    try t.expectEqual(L.this_build, L.reported(.{ .proto = 99, .native_state_max = 99, .snapshot_version = 99, .panel_rpc = 99 }, 0));
+    // A flat key past this build is capped too.
+    try t.expectEqual(@as(u8, snapshot.SNAPSHOT_VERSION), L.reported(null, 255).snapshot_version);
 }
