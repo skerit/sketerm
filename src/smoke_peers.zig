@@ -486,7 +486,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
         contains(content, "Peer message from alice (", "5. the composed sender line");
         contains(content, "Reply with peer_send to \"alice\".", "5. the reply hint");
         contains(content, "\n\nhello bob, this is the body", "5. the body after a blank line");
-        if (std.mem.indexOf(u8, content, "while you were offline") != null) fail("5. live delivery reads as offline");
+        if (std.mem.indexOf(u8, content, agentpush.QUEUED_CLAUSE) != null) fail("5. live delivery reads as offline");
     }
     // 6. a second read hands out nothing.
     expectNothing(&bob, arena, "6. bob peer_read again");
@@ -512,7 +512,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8, exe: [*:0]const 
         expectStr(it, "id", away_id, "9. id");
         if (!boolOf(it, "queued", "9.")) fail("9. queued mail is not marked queued");
         const content = str(it, "content", "9.");
-        contains(content, "while you were offline", "9. offline wording");
+        contains(content, agentpush.QUEUED_CLAUSE, "9. offline wording");
         contains(content, "\n\nsent while you were away", "9. body");
     }
     expectNothing(&bob2, arena, "9. bob2 peer_read again");
@@ -1359,7 +1359,7 @@ pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
         "peer_hub = true\n\n[domain." ++ FED_DOMAIN ++ "]\nhost = " ++ FED_DOMAIN ++ "\ntransport = ssh\npeers = true\n\n[domain." ++ FED_CALLIN ++ "]\npeers = true\npeer_link = inbound\n", 0o600);
     writeFileOrFail(std.fmt.allocPrintSentinel(arena, "{s}/sketerm/config.conf", .{cin.cfg}, 0) catch fail("oom"), CALLIN_CONFIG, 0o600);
 
-    const mem_pid = startFedDaemon(arena, &mem, mux_bin, null, null);
+    var mem_pid = startFedDaemon(arena, &mem, mux_bin, null, null);
     const hub_pid = startFedDaemon(arena, &hub, mux_bin, ssh.path.ptr, null);
     const zed_on_mem = std.fmt.allocPrint(arena, "{s}/zed", .{hub_host}) catch fail("oom");
     const mia_on_hub = FED_DOMAIN ++ "/mia";
@@ -1596,6 +1596,37 @@ pub fn runFederation(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
         }
         zh.closeStdinWait();
         std.debug.print("smoke: peers: federated aliases zenit / zenit-1, a new session resumes zenit-1 with its mail, a viewer's title names an untitled session ok ({d} ms)\n", .{nowMs() - t0});
+    }
+
+    // 11. The member's daemon restarts while mia sits idle, and no tool is
+    //     called on her until the hub has an answer: her server dials the
+    //     new daemon by itself, so the hub lists her live again and a
+    //     message from the other host is delivered there, not queued for
+    //     her next tool call. The link is held down across the restart so
+    //     the hub's redial cannot autostart a daemon in between.
+    {
+        const t0 = nowMs();
+        cutLink(arena, &ssh, "f11.");
+        stopFedDaemon(mem_pid);
+        mem_pid = startFedDaemon(arena, &mem, mux_bin, null, null);
+        if (c.unlink(ssh.down.ptr) != 0) fail("f11. could not restore the link");
+        const deadline = nowMs() + 90_000;
+        while (true) {
+            if (listed(&zed, arena, mia_on_hub, "f11. poll")) |p| {
+                if (boolOf(p, "live", "f11.") and std.mem.eql(u8, if (p.get("link")) |v| v.string else "", "up")) break;
+            }
+            if (nowMs() > deadline) {
+                printList(&zed, arena, "f11. mia never came back,");
+                fail("f11. an idle server did not register with its restarted daemon by itself");
+            }
+            _ = c.usleep(200_000);
+        }
+        const r = send(&zed, arena, mia_on_hub, "after your daemon restarted", "f11. send");
+        expectStr(r, "outcome", "delivered", "f11. outcome to an idle server whose daemon restarted");
+        const it = readOne(&mia, arena, 10_000, "f11. mia peer_read");
+        expectStr(it, "text", "after your daemon restarted", "f11. text");
+        if (boolOf(it, "queued", "f11.")) fail("f11. the message was queued for a server that was live");
+        std.debug.print("smoke: peers: an idle server is back on its restarted daemon by itself, and mail from another host is delivered ok ({d} ms)\n", .{nowMs() - t0});
     }
 
     mia.closeStdinWait();
