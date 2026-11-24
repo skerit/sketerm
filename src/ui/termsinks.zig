@@ -27,7 +27,8 @@ const sessname = @import("../mux/sessname.zig");
 pub fn onTermTransfer(ctx: ?*anyopaque, pane: *Pane, ev: Terminal.TransferEvent) void {
     const self = cast.userData(Window, ctx);
     const page = tabPageForPane(self, pane);
-    const host = if (pane.terminal.remote) |r| (if (r.host) |h| h else "local") else "remote";
+    const spec = if (pane.terminal.remote) |r| (if (r.host) |h| h else "local") else "remote";
+    const host = if (self.config.domainForSpec(spec)) |d| d.name else spec;
     switch (ev.phase) {
         .started => if (page) |p| self.setTabProgress(p, 3, 0), // indeterminate
         .progress => if (page) |p| {

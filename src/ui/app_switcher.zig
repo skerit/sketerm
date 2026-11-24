@@ -15,6 +15,7 @@ const mux_cli = @import("../ipc/mux_cli.zig");
 const muxtabs = @import("muxtabs.zig");
 const assistants = @import("assistants.zig");
 const webwatch = @import("webwatch.zig");
+const webpresence = @import("../web/webpresence.zig");
 const editorio = @import("editorio.zig");
 
 /// The assistant label behind a `sock:` daemon host, from the window's
@@ -39,11 +40,18 @@ const SessionTarget = struct {
     session: []u8,
     host: ?[]u8,
     origin_id: ?[]u8 = null,
+    /// Set for a named instance's broker-owned browser engine, which has no mux session: `session` is empty and this names it.
+    engine_label: ?[]u8 = null,
 
     fn deinit(self: *SessionTarget, allocator: std.mem.Allocator) void {
         allocator.free(self.session);
         if (self.host) |host| allocator.free(host);
         if (self.origin_id) |origin_id| allocator.free(origin_id);
+        if (self.engine_label) |label| allocator.free(label);
+    }
+
+    fn isBrowser(self: *const SessionTarget) bool {
+        return self.engine_label != null or assistants.kindOf(self.session, true) == .web;
     }
 };
 
@@ -431,9 +439,16 @@ fn populateAttached(self: *Switcher) void {
     }
 }
 
-fn hostLabel(term: *Terminal) []const u8 {
+const HostBuf = [256]u8;
+
+/// Where `term`'s session runs, by the name the user's config gives that host.
+fn hostLabel(self: *Switcher, buf: *HostBuf, term: *Terminal) []const u8 {
     const remote = term.remote orelse return "local";
-    return if (remote.host) |host| host else "local";
+    return placeOf(self, buf, remote.host orelse return "local");
+}
+
+fn placeOf(self: *Switcher, buf: *HostBuf, host: []const u8) []const u8 {
+    return assistants.placeLabel(&self.win.config, buf, host);
 }
 
 fn addAudioRows(self: *Switcher, term: *Terminal, pane: ?*Pane, app_session: ?*muxtabs.AppSession) void {
@@ -483,12 +498,13 @@ fn addAudioRow(self: *Switcher, term: *Terminal, pane: ?*Pane, app_session: ?*mu
         std.fmt.bufPrint(&subtitle_buf, " - PID {d}", .{info.pid}) catch ""
     else
         "";
+    var host_buf: HostBuf = undefined;
     var subtitle_out: [896:0]u8 = undefined;
     const media = if (info.media.len > 0) info.media else "Active playback stream";
     const subtitle = std.fmt.bufPrintSentinel(&subtitle_out, "{s}{s} - {s} - session {s}{s}", .{
         media,
         if (streams > 1) " (multiple streams)" else "",
-        hostLabel(term),
+        hostLabel(self, &host_buf, term),
         remote.session,
         pid_text,
     }, 0) catch "Playing through Sketerm";
@@ -512,10 +528,11 @@ fn addApplicationRows(self: *Switcher, term: *Terminal, pane: ?*Pane) usize {
         }
         for (infos) |info| {
             const title = std.mem.span(info.title);
+            var host_buf: HostBuf = undefined;
             var subtitle_buf: [640:0]u8 = undefined;
             const app_id = if (info.app_id.len > 0) info.app_id else "application";
             const place = if (info.embedded) "in a pane" else "forwarded window";
-            const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "{s} - {s} - {s} - session {s}", .{ app_id, place, hostLabel(term), remote.session }, 0) catch "Forwarded application";
+            const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "{s} - {s} - {s} - session {s}", .{ app_id, place, hostLabel(self, &host_buf, term), remote.session }, 0) catch "Forwarded application";
             const entry = appendRow(self, .applications, if (title.len > 0) title else app_id, subtitle, info.paintable, "application-x-executable-symbolic", false) orelse continue;
             entry.kind = .native_window;
             entry.native_host = native.host;
@@ -533,8 +550,9 @@ fn addApplicationRows(self: *Switcher, term: *Terminal, pane: ?*Pane) usize {
         }
         for (infos) |info| {
             const title = std.mem.span(info.title);
+            var host_buf: HostBuf = undefined;
             var subtitle_buf: [512:0]u8 = undefined;
-            const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "streamed window - {s} - session {s}", .{ hostLabel(term), remote.session }, 0) catch "Streamed application";
+            const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "streamed window - {s} - session {s}", .{ hostLabel(self, &host_buf, term), remote.session }, 0) catch "Streamed application";
             const entry = appendRow(self, .applications, if (title.len > 0) title else remote.session, subtitle, info.paintable, "application-x-executable-symbolic", false) orelse continue;
             entry.kind = .streamed_window;
             entry.streamed_host = streamed.host;
@@ -549,8 +567,9 @@ fn addApplicationRows(self: *Switcher, term: *Terminal, pane: ?*Pane) usize {
 
 fn addHiddenAppRow(self: *Switcher, app_session: *muxtabs.AppSession) void {
     const remote = app_session.terminal.remote orelse return;
+    var host_buf: HostBuf = undefined;
     var subtitle_buf: [512:0]u8 = undefined;
-    const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "No window is open - {s} - activate to show its log in a tab", .{hostLabel(app_session.terminal)}, 0) catch "Application session without a window";
+    const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "No window is open - {s} - activate to show its log in a tab", .{hostLabel(self, &host_buf, app_session.terminal)}, 0) catch "Application session without a window";
     const entry = appendRow(self, .applications, remote.session, subtitle, null, "view-conceal-symbolic", false) orelse return;
     entry.kind = .hidden_app;
     entry.app_session = app_session;
@@ -562,9 +581,10 @@ fn addPaneRow(self: *Switcher, pane: *Pane) void {
     const term = pane.terminal;
     const remote = term.remote orelse return;
     const title = if (term.screen.last_title) |value| value else remote.session;
+    var host_buf: HostBuf = undefined;
     var subtitle_buf: [768:0]u8 = undefined;
     const kind = if (remote.is_app) "Application session" else "Shell session";
-    const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "{s} - {s} - {s}", .{ kind, hostLabel(term), remote.session }, 0) catch "Attached mux session";
+    const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "{s} - {s} - {s}", .{ kind, hostLabel(self, &host_buf, term), remote.session }, 0) catch "Attached mux session";
     const entry = appendRow(self, .attached, title, subtitle, null, std.mem.span((if (remote.is_app) assistants.Kind.app else assistants.Kind.terminal).icon()), false) orelse return;
     entry.kind = .pane;
     entry.pane = pane;
@@ -612,7 +632,36 @@ fn populateFetched(self: *Switcher) void {
             addAvailableRow(self, daemon, session);
             self.available_sessions += 1;
         }
+        if (listing.value.engine) addEngineRow(self, daemon, listing.value.engine_label, listing.value.engine_domain);
     }
+}
+
+/// The watch target of the browser `session` on daemon `host`; a remote instance's goes through the daemon that reported it.
+fn browserTarget(self: *Switcher, host: ?[]const u8, session: []const u8) webwatch.Target {
+    if (host) |h| {
+        if (self.win.assistants) |watcher| {
+            if (watcher.findByHost(h)) |a| return a.watchTarget(session);
+        }
+    }
+    return .of(host, session);
+}
+
+/// A named instance's browser engine on `daemon`: it has no mux session, so nothing can stop it from here.
+fn addEngineRow(self: *Switcher, daemon: *DaemonState, label: []const u8, domain: []const u8) void {
+    const host = daemon.host orelse return;
+    if (webwatch.placement(self.win, browserTarget(self, host, "")) != .none) return;
+    var meta: webpresence.Metadata = .{};
+    webpresence.copyText(&meta.label, label);
+    webpresence.copyText(&meta.domain, domain);
+    var subtitle_buf: [896:0]u8 = undefined;
+    const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "Browser - {s} - {s}", .{ daemon.origin, meta.subtitle() }, 0) catch "Assistant browser";
+    const entry = appendRow(self, .available, meta.title(), subtitle, null, std.mem.span(assistants.Kind.web.icon()), false) orelse return;
+    entry.kind = .attach;
+    setSessionTarget(self, entry, "", host, "", false);
+    if (entry.target) |*target| target.engine_label = self.allocator.dupe(u8, meta.title()) catch null;
+    addWatchButton(self, entry);
+    setIdentity(self, entry, "engine:{s}", .{host});
+    self.available_sessions += 1;
 }
 
 /// A sub-agent's title for `session` on `host` (`claude-1 (claude)`),
@@ -637,8 +686,9 @@ fn populateAgentsElsewhere(self: *Switcher) void {
             if (self.win.sessionPlacement(s.name, host) == .pane) continue;
             var title_buf: [320]u8 = undefined;
             const title = assistants.rowTitle(&self.win.config, &title_buf, a, s);
+            var host_buf: HostBuf = undefined;
             var subtitle_buf: [768:0]u8 = undefined;
-            const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "Sub-agent - assistant {s} - session {s} at {s}", .{ a.label(), s.name, host }, 0) catch "Sub-agent session";
+            const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "Sub-agent - assistant {s} - session {s} at {s}", .{ a.label(), s.name, placeOf(self, &host_buf, host) }, 0) catch "Sub-agent session";
             const entry = appendRow(self, .available, title, subtitle, null, std.mem.span(s.kind.icon()), false) orelse continue;
             entry.kind = .attach;
             setSessionTarget(self, entry, s.name, host, s.origin_id, false);
@@ -828,10 +878,10 @@ fn setSessionTarget(
 fn addWatchButton(self: *Switcher, entry: *Entry) void {
     const body = c.gtk_list_box_row_get_child(@ptrCast(entry.row)) orelse return;
     const target = entry.target orelse return;
-    const kind = assistants.kindOf(target.session, true);
+    const kind: assistants.Kind = if (target.engine_label != null) .web else assistants.kindOf(target.session, true);
     for (std.enums.values(assistants.AttachAction)) |action| {
         if (!action.appliesTo(kind)) continue;
-        const button = assistants.attachButton(action, target.session);
+        const button = assistants.attachButton(action, target.engine_label orelse target.session);
         c.g_object_set_data(@ptrCast(button), "sketerm-overview-entry", @ptrCast(entry));
         c.g_object_set_data(@ptrCast(button), "sketerm-overview-action", @ptrFromInt(@intFromEnum(action) + 1));
         _ = c.g_signal_connect_data(button, "clicked", @ptrCast(&onAttachClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
@@ -1176,14 +1226,15 @@ fn addDaemon(self: *Switcher, host: ?[]const u8, origin: []const u8) void {
 const optionalEql = @import("../util/strz.zig").eqOpt;
 
 fn discoverDaemons(self: *Switcher) void {
+    var host_buf: HostBuf = undefined;
     addDaemon(self, null, "local daemon");
     for (self.win.panes.items) |pane| {
         const remote = pane.terminal.remote orelse continue;
-        if (remote.host) |host| addDaemon(self, host, host);
+        if (remote.host) |host| addDaemon(self, host, placeOf(self, &host_buf, host));
     }
     for (self.win.app_sessions.items) |app_session| {
         const remote = app_session.terminal.remote orelse continue;
-        if (remote.host) |host| addDaemon(self, host, host);
+        if (remote.host) |host| addDaemon(self, host, placeOf(self, &host_buf, host));
     }
 
     // Assistant daemons come from the window's registry watcher, the
@@ -1514,9 +1565,9 @@ fn startAttach(self: *Switcher, target: SessionTarget, action: ?assistants.Attac
     // An assistant's web session is a BROWSER: watched through its own
     // helper (webwatch.zig), locally by socket, remotely through the
     // host's daemon. The app session is never attached for it.
-    if (assistants.kindOf(target.session, true) == .web) {
-        const label = if (target_host) |h| labelForHost(self, h) else "assistant";
-        const watch_target = webwatch.Target.of(target_host, target.session);
+    if (target.isBrowser()) {
+        const label = target.engine_label orelse if (target_host) |h| labelForHost(self, h) else "assistant";
+        const watch_target = browserTarget(self, target_host, target.session);
         const opened = if (action == @as(?assistants.AttachAction, .beside))
             webwatch.openBeside(self.win, label, watch_target)
         else
