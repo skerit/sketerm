@@ -166,6 +166,9 @@ pub const Welcome = struct {
     /// This host's live MCP servers (capability `assistants`); absent from
     /// an older daemon, which reads as none.
     assistants: []const mcp_registry.Report = &.{},
+    /// The daemon's instance runs a browser engine no session stands for
+    /// (`webpresence.sessionlessEngine`); false from an older daemon.
+    engine: bool = false,
 };
 
 fn isSubcommand(s2: []const u8) bool {

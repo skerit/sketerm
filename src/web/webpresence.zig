@@ -123,6 +123,32 @@ pub const Metadata = struct {
     }
 };
 
+/// The fields of a presence file this resolver reads.
+const Presence = struct {
+    session: []const u8 = "",
+    helper_pid: i64 = 0,
+    label: []const u8 = "",
+    domain: []const u8 = "",
+
+    fn metadata(self: Presence) Metadata {
+        var out: Metadata = .{};
+        copyText(&out.label, self.label);
+        copyText(&out.domain, self.domain);
+        return out;
+    }
+};
+
+fn loadPresence(allocator: std.mem.Allocator, path: [:0]const u8) ?std.json.Parsed(Presence) {
+    const f = c.fopen(path.ptr, "r") orelse return null;
+    defer _ = c.fclose(f);
+    var bytes: [16384]u8 = undefined;
+    const n = c.fread(&bytes, 1, bytes.len, f);
+    return std.json.parseFromSlice(Presence, allocator, bytes[0..n], .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch null;
+}
+
 /// Called on the roster's IO worker, never the GTK thread. Old presence files
 /// remain valid and get a readable fallback instead of the transport id.
 pub fn readMetadata(allocator: std.mem.Allocator, mux_socket: []const u8, session: []const u8) Metadata {
@@ -130,21 +156,32 @@ pub fn readMetadata(allocator: std.mem.Allocator, mux_socket: []const u8, sessio
     const socket = helperSocketFor(&socket_buf, mux_socket, session) orelse return .{};
     var path_buf: [MAX_PATH:0]u8 = undefined;
     const path = std.fmt.bufPrintSentinel(&path_buf, "{s}.json", .{socket[0 .. socket.len - ".sock".len]}, 0) catch return .{};
-    const f = c.fopen(path.ptr, "r") orelse return .{};
-    defer _ = c.fclose(f);
-    var bytes: [16384]u8 = undefined;
-    const n = c.fread(&bytes, 1, bytes.len, f);
-    const parsed = std.json.parseFromSlice(struct {
-        session: []const u8 = "",
-        label: []const u8 = "",
-        domain: []const u8 = "",
-    }, allocator, bytes[0..n], .{ .ignore_unknown_fields = true }) catch return .{};
+    const parsed = loadPresence(allocator, path) orelse return .{};
     defer parsed.deinit();
     if (!std.mem.eql(u8, parsed.value.session, session)) return .{};
-    var out: Metadata = .{};
-    copyText(&out.label, parsed.value.label);
-    copyText(&out.domain, parsed.value.domain);
-    return out;
+    return parsed.value.metadata();
+}
+
+/// The direct-route engine of the MCP instance whose daemon listens on
+/// `mux_socket` when it renders into NO web session: a broker-owned
+/// engine (`mux/daemon_webengine.zig`) or a helper whose session setup
+/// failed. No session of the daemon stands for such a browser, so this
+/// is the only way a roster learns it exists; it is watched through
+/// `helperSocketFor(mux_socket, "")`.
+/// @return null when there is none, its helper process is gone, or `mux_socket` is not an instance daemon's.
+pub fn sessionlessEngine(allocator: std.mem.Allocator, mux_socket: []const u8) ?Metadata {
+    const dir = std.fs.path.dirname(mux_socket) orelse return null;
+    if (!std.mem.startsWith(u8, std.fs.path.basename(dir), "mcp-")) return null;
+    var path_buf: [MAX_PATH:0]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/web.json", .{dir}, 0) catch return null;
+    const parsed = loadPresence(allocator, path) orelse return null;
+    defer parsed.deinit();
+    const p = parsed.value;
+    if (p.session.len != 0 or p.helper_pid <= 0 or p.helper_pid > std.math.maxInt(c.pid_t)) return null;
+    // A crashed engine leaves its record behind: the pid is the liveness.
+    const rc = c.kill(@intCast(p.helper_pid), 0);
+    if (rc != 0 and std.posix.errno(rc) == .SRCH) return null;
+    return p.metadata();
 }
 
 /// Bounded, single-line UTF-8 for labels; always NUL-terminated.
@@ -207,4 +244,42 @@ test "helperSocketFor picks the routed helper whose presence file names the sess
     const other = try std.fmt.bufPrint(&other_buf, "{s}/web.sock", .{dir});
     const miss = helperSocketFor(&buf, mux, "web-9-dead") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(other, miss);
+}
+
+test "sessionlessEngine reports a live engine without a web session, in an instance directory only" {
+    const t = std.testing;
+    var root_buf: [MAX_PATH:0]u8 = undefined;
+    const root = try std.fmt.bufPrintSentinel(&root_buf, "/tmp/sk-engine-{d}", .{c.getpid()}, 0);
+    _ = c.mkdir(root.ptr, 0o700);
+    defer _ = c.rmdir(root.ptr);
+    const Case = struct { dir: []const u8, body_fmt: enum { live, with_session, dead }, present: bool };
+    for ([_]Case{
+        .{ .dir = "mcp-hub", .body_fmt = .live, .present = true },
+        .{ .dir = "mcp-hub", .body_fmt = .with_session, .present = false },
+        .{ .dir = "mcp-hub", .body_fmt = .dead, .present = false },
+        .{ .dir = "plain", .body_fmt = .live, .present = false },
+    }) |case| {
+        var dir_buf: [MAX_PATH:0]u8 = undefined;
+        const dir = try std.fmt.bufPrintSentinel(&dir_buf, "{s}/{s}", .{ root, case.dir }, 0);
+        _ = c.mkdir(dir.ptr, 0o700);
+        defer _ = c.rmdir(dir.ptr);
+        var json_buf: [MAX_PATH:0]u8 = undefined;
+        const json = try std.fmt.bufPrintSentinel(&json_buf, "{s}/web.json", .{dir}, 0);
+        defer _ = c.unlink(json.ptr);
+        var body_buf: [256]u8 = undefined;
+        const body = switch (case.body_fmt) {
+            .live => try std.fmt.bufPrint(&body_buf, "{{\"broker_pid\":1,\"helper_pid\":{d},\"client\":\"sketerm-mux:hub\"}}\n", .{c.getpid()}),
+            .with_session => try std.fmt.bufPrint(&body_buf, "{{\"mcp_pid\":1,\"helper_pid\":{d},\"session\":\"web-1-ab\"}}\n", .{c.getpid()}),
+            .dead => "{\"broker_pid\":1,\"helper_pid\":0}\n",
+        };
+        {
+            const f = c.fopen(json.ptr, "w") orelse return error.TestUnexpectedResult;
+            defer _ = c.fclose(f);
+            _ = c.fwrite(body.ptr, 1, body.len, f);
+        }
+        var mux_buf: [MAX_PATH]u8 = undefined;
+        const mux = try std.fmt.bufPrint(&mux_buf, "{s}/mux.sock", .{dir});
+        try t.expectEqual(case.present, sessionlessEngine(t.allocator, mux) != null);
+    }
+    try t.expect(sessionlessEngine(t.allocator, "/tmp/sk-none-such-dir/mcp-x/mux.sock") == null);
 }

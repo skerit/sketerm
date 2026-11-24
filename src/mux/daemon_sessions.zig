@@ -1008,7 +1008,9 @@ pub fn queueListReply(self: *Daemon, cl: *Client, infos: []const SessionInfo) vo
         break :blk mcp_registry.reports(arena, entries, anchor) catch &.{};
     };
     var vnames: [wlvcodec.CodecList.cap][]const u8 = undefined;
-    cl.queueJson(.welcome, .{ .proto = cl.proto, .daemon_pid = c.getpid(), .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = wlvcodec.canEncode(.h264), .video_codecs = wlvcodec.encodableHere().names(&vnames), .sessions = infos, .assistants = assistants });
+    // Read per list: the engine outlives brokers and may be a predecessor's.
+    const engine = @import("../web/webpresence.zig").sessionlessEngine(arena, self.sock_path) != null;
+    cl.queueJson(.welcome, .{ .proto = cl.proto, .daemon_pid = c.getpid(), .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = wlvcodec.canEncode(.h264), .video_codecs = wlvcodec.encodableHere().names(&vnames), .sessions = infos, .assistants = assistants, .engine = engine });
 }
 
 test "broker list answers an allocation failure instead of dropping the reply" {

@@ -20,6 +20,13 @@
 //! agent's sessions attach where `watchSpec` says: the instance daemon,
 //! or `route:A/B` for one placed on B.
 //!
+//! A browser is normally a `web-*` session of the instance's daemon. A
+//! NAMED instance's engine is owned by that daemon and renders into no
+//! session at all, so it is listed from its presence record instead
+//! (`webpresence.sessionlessEngine`: read beside a local socket, the
+//! `engine` fact of a remote daemon's list) as a browser row with an
+//! empty session name, watched through the helper's direct socket.
+//!
 //! The result feeds four surfaces: the chip at the end of the tab bar
 //! with its popover, the per-pane "AI attached" chip's click, the
 //! Session Overview's assistant daemons and agent rows, and the agent
@@ -221,6 +228,9 @@ pub const Assistant = struct {
     /// surface that shows it is open.
     listing: ?Listing = null,
     listing_fp: u64 = 0,
+    /// The instance's browser engine that no session stands for (a
+    /// named instance's broker-owned one); a row with an empty name.
+    engine: ?webpresence.Metadata = null,
     /// Rows: its daemon's sessions plus its agents' sessions elsewhere.
     sessions: std.ArrayList(Session) = .empty,
     /// A worker thread owns the connection; polls are serialized.
@@ -396,6 +406,9 @@ pub const Assistant = struct {
                 const meta: webpresence.Metadata = if (index < l.browsers.len) l.browsers[index] else .{};
                 self.appendRow(allocator, info.name, info.title, info.origin_id, kindOf(info.name, info.app), info.viewerCount(), meta, null, self.agentAt(self.host, info.name)) catch return;
             }
+        }
+        if (self.engine) |meta| {
+            if (!self.hasRow("", null)) self.appendRow(allocator, "", "", "", .web, 0, meta, null, null) catch return;
         }
         for (self.agents.items, 0..) |ag, i| {
             const own = std.mem.eql(u8, ag.watch, self.host);
@@ -1046,12 +1059,13 @@ pub const Watcher = struct {
         for (self.roster.items) |*a| {
             if (a.reached == null or open_now) {
                 self.startFetch(a);
-            } else if (a.listing != null and !a.busy) {
+            } else if ((a.listing != null or a.engine != null) and !a.busy) {
                 // Nothing shows its daemon's sessions any more: fall back
                 // to what the report publishes rather than keep a stale view.
-                a.listing.?.deinit();
+                if (a.listing) |*l| l.deinit();
                 a.listing = null;
                 a.listing_fp = 0;
+                a.engine = null;
                 a.rebuildRows(self.allocator);
                 changed = true;
             }
@@ -1752,8 +1766,9 @@ pub const Watcher = struct {
         // The assistant's browser opens as a browser: a second client
         // of its own helper, its pages as web pages (webwatch.zig).
         // The mux app session behind it is never attached from here.
-        if (kindOf(session, true) == .web) {
-            const row = a.findSession(session) orelse return;
+        // By the row's kind, not its name: a sessionless engine's is empty.
+        const web_row = if (a.findSession(session)) |r| (if (r.kind == .web and r.host == null) r else null) else null;
+        if (web_row) |row| {
             const label = if (a.reached != null) a.label() else row.browser.title();
             const target = a.watchTarget(session);
             const opened = if (action == .beside)
@@ -1838,6 +1853,11 @@ pub const Watcher = struct {
             a.listing.?.deinit();
             a.listing = null;
             a.listing_fp = 0;
+            a.rebuildRows(self.allocator);
+            changed = true;
+        }
+        if (!engineEql(a.engine, op.engine)) {
+            a.engine = op.engine;
             a.rebuildRows(self.allocator);
             changed = true;
         }
@@ -2286,6 +2306,8 @@ const FetchOp = struct {
     /// The dial found the server's daemon not running (`Reach.idle`).
     idle: bool = false,
     browsers: []webpresence.Metadata = &.{},
+    /// `Assistant.engine` as this poll found it.
+    engine: ?webpresence.Metadata = null,
     why_buf: [160]u8 = undefined,
     why_len: usize = 0,
 
@@ -2346,6 +2368,14 @@ fn fetchThreadMain(op: *FetchOp) void {
                 .{};
         }
     }
+    // A local engine is read where it lives, so a daemon too old to
+    // report it, or one that retired under its lingering engine, still
+    // shows it; a remote one is only what its daemon's list says.
+    if (op.local) {
+        op.engine = webpresence.sessionlessEngine(std.heap.c_allocator, op.key.?["sock:".len..]);
+    } else if (op.parsed) |parsed| {
+        if (parsed.value.engine) op.engine = .{};
+    }
     _ = c.g_idle_add(@ptrCast(&onFetchIdle), @ptrCast(op));
 }
 
@@ -2373,6 +2403,12 @@ fn runList(op: *FetchOp) bool {
     }) catch return false;
     op.ok = true;
     return true;
+}
+
+fn engineEql(x: ?webpresence.Metadata, y: ?webpresence.Metadata) bool {
+    const a = x orelse return y == null;
+    const b = y orelse return false;
+    return std.mem.eql(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
 }
 
 fn onFetchIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
@@ -2609,6 +2645,27 @@ fn testAssistant(pid: c.pid_t, name: []const u8, host: []const u8) !Assistant {
         .detail = try t.allocator.dupe(u8, ""),
         .host = try t.allocator.dupe(u8, host),
     };
+}
+
+test "a sessionless engine is one browser row, by its kind and an empty name" {
+    var a = try testAssistant(7, "hub", "sock:/x/mcp-hub/mux.sock");
+    defer a.deinit(t.allocator);
+    try t.expect(!a.usable());
+    a.engine = .{};
+    a.rebuildRows(t.allocator);
+    a.rebuildRows(t.allocator);
+    try t.expectEqual(@as(usize, 1), a.sessions.items.len);
+    try t.expectEqual(Kind.web, a.findSession("").?.kind);
+    try t.expectEqualStrings("Assistant browser", rowTitle(&.{}, &a, &a.sessions.items[0]));
+    var counts: Counts = .{};
+    for (a.sessions.items) |s| counts.add(s.kind);
+    try t.expectEqual(@as(usize, 1), counts.web);
+    a.engine = null;
+    a.rebuildRows(t.allocator);
+    try t.expect(!a.usable());
+    try t.expect(engineEql(null, null));
+    try t.expect(engineEql(webpresence.Metadata{}, webpresence.Metadata{}));
+    try t.expect(!engineEql(webpresence.Metadata{}, null));
 }
 
 test "two servers sharing a name read apart by pid; one alone keeps its name" {
