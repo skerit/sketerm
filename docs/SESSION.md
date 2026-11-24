@@ -1,5 +1,27 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-24: web_upload, local files into a page's upload field
+
+- New MCP tool `web_upload` (headless backend): a trusted click on the
+  upload control, the engine intercepts the chooser the page opens and
+  sets `files` on that chooser's `<input type=file>`, so the page gets a
+  user selection's `input`/`change` events. Works for the input itself and
+  for a button wired to a hidden one; targets like `web_act`. Reported as
+  `capabilities.web_upload`.
+- Helper: capability `upload`, frames `upload_arm` (0x7D) / `ev_upload`
+  (0x7E), `cefhost/upload.zig`. The mechanism is the view's DevTools
+  session (`Page.setInterceptFileChooserDialog`, `Page.fileChooserOpened`,
+  `DOM.setFileInputFiles`), on only while an upload is armed.
+- Measured on the way (CEF 151): a windowless view's chooser never
+  reaches `cef_dialog_handler_t`, and a trusted click on a file input
+  without interception stalls the page (timers stop, eval and navigation
+  never answer). `web_act` still does that; its description now says to
+  use `web_upload`.
+- smoke-mcp `webUploadStage` (in `SKETERM_SMOKE_MCP_WEB_ONLY`): one file,
+  two files through a hidden multi input, two files refused by a
+  single-file input, a control that opens no chooser, then an upload that
+  still works.
+
 ## 2026-11-24: named-instance browsers in the AI badge, session tab labels
 
 - A NAMED MCP instance's browser engine is owned by its daemon and renders
