@@ -1,5 +1,27 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-24: named-instance browsers in the AI badge, session tab labels
+
+- A NAMED MCP instance's browser engine is owned by its daemon and renders
+  into no `web-*` session, so the AI badge listed the instance as idle while
+  it browsed. `webpresence.sessionlessEngine` reads the instance's `web.json`
+  (no session, helper pid alive); the badge's poll reads it beside a local
+  socket and a daemon's list reply carries it as `engine` for a remote one.
+  The row has an empty session name, is told apart by its kind, and Watch
+  opens it through the helper's direct socket. Its title is the generic
+  "Assistant browser": nobody writes a label into a broker-owned record.
+- A mux tab label names its host by the `[domain.<name>]` that resolves to
+  the spec (`Config.domainForSpec`, `termsinks.sessionLabel`, the one copy
+  of the `⌁ name @ host` format): `sketerm mux archdev` showed
+  `skerit@10.47.1.70` because the CLI resolves the domain before the GUI
+  sees it.
+- A session a person named (`!sessname.isMinted`, not an app session) keeps
+  `⌁ name [@ host]` as its TITLE fact, ahead of its program's OSC title and
+  behind a face title and a peer subject; a minted name still hands the tab
+  to the OSC title. The pane titlebar keeps showing the program's title.
+- smoke-e2e: `SKETERM_SMOKE_E2E_NAMED_WEB_ONLY` and
+  `SKETERM_SMOKE_E2E_NAMED_TITLE_ONLY` run the two new stages alone.
+
 ## 2026-11-17: gray GUI browser tabs on CEF 156, and four follow-ups
 
 - CEF 156 paints `on_accelerated_paint` frames at the view's physical size
