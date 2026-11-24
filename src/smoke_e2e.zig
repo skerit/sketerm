@@ -895,6 +895,21 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_NAMED_WEB_ONLY") != null) {
+        const app = drive orelse return fail("focused named-assistant browser smoke has no display driver");
+        if (!have_web_action) return fail("the named assistant browser stage needs sketerm-webengine (zig build web)");
+        if (assistantNamedWebStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("named assistant browser: the badge listed the broker-owned engine and Watch opened its page");
+        teardown();
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_E2E_NAMED_TITLE_ONLY") != null) {
+        const app = drive orelse return fail("focused named-session title smoke has no display driver");
+        if (namedSessionTitleStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("named session title: the tab kept the session's name over its program's OSC title");
+        teardown();
+        return 0;
+    }
     // The AI badge popover's layout alone.
     if (c.getenv("SKETERM_SMOKE_E2E_BADGE_ONLY") != null) {
         const app = drive orelse return fail("focused badge layout smoke has no display driver");
@@ -1399,6 +1414,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (watchAlongStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("watch-along: driver attach raised the accent indicator, detach retired it, and a read-only watch pane showed the view-only chip");
 
+        if (namedSessionTitleStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("named session title: the tab kept the session's name over its program's OSC title");
         if (badgeLayoutStage(allocator, app, mainWin(app).id, rt)) |why| return failMsg(why);
         if (assistantChipStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("assistant chip: an isolated MCP app raised the tab-bar chip, Watch forced a closable view-only tab under app_view=window with the app EMBEDDED, and closing it left the app alive");
@@ -1408,6 +1425,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (have_web_action) {
             if (assistantWebWatchStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
             say("assistant web watch: Watch opened the assistant's page as a web tab, read-only input was refused, Take control drove it, and closing the tab left the page alive");
+            if (assistantNamedWebStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+            say("named assistant browser: the badge listed the broker-owned engine and Watch opened its page");
         } else {
             say("SKIP assistant web watch stage (sketerm-webengine is not built; run `zig build web` first)");
         }
@@ -3644,7 +3663,8 @@ fn watchAlongStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: 
 /// registry record lands in this run's runtime dir, the one the GUI
 /// under test watches, exactly as a user's assistant would.
 /// `fake_log` makes the server's Claude Code agents the rig's fake, logging there.
-fn spawnIsolatedMcp(allocator: std.mem.Allocator, fake_log: ?[*:0]const u8) ?McpChild {
+/// `name` makes it a NAMED instance (`--name`), whose daemon owns its browser engine.
+fn spawnIsolatedMcp(allocator: std.mem.Allocator, fake_log: ?[*:0]const u8, name: ?[*:0]const u8) ?McpChild {
     var in_pipe: [2]c_int = undefined;
     var out_pipe: [2]c_int = undefined;
     if (c.pipe(&in_pipe) != 0) return null;
@@ -3672,7 +3692,10 @@ fn spawnIsolatedMcp(allocator: std.mem.Allocator, fake_log: ?[*:0]const u8) ?Mcp
             _ = c.setenv(FAKE_AGENT_ENV, "1", 1);
             _ = c.setenv(FAKE_AGENT_LOG_ENV, path, 1);
         }
-        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "mcp", "--no-record", "--structured", null };
+        // A named instance's engine lingers past its last client; keep
+        // that short so it does not outlive the stage by minutes.
+        if (name != null) _ = c.setenv("SKETERM_WEB_LINGER_MS", "2000", 1);
+        const argv = [_:null]?[*:0]const u8{ bindir.path(.sketerm), "mcp", "--no-record", "--structured", if (name != null) "--name" else null, name, null };
         _ = c.execv(bindir.path(.sketerm), @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
@@ -3824,7 +3847,7 @@ fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
 
     if (assistantChipBox(app, win_id) != null)
         return "an assistant chip was already showing before the isolated MCP registered";
-    var m = spawnIsolatedMcp(allocator, null) orelse return "could not spawn an isolated `sketerm mcp`";
+    var m = spawnIsolatedMcp(allocator, null, null) orelse return "could not spawn an isolated `sketerm mcp`";
     var m_open = true;
     defer if (m_open) m.close();
     if (!m.initialize()) return "the isolated MCP server never answered initialize";
@@ -4126,7 +4149,7 @@ fn assistantLocalTermStage(allocator: std.mem.Allocator, app: *appdrive.App, soc
     const log_path = std.fmt.bufPrintSentinel(&log_buf, "{s}/agent-local.log", .{rt}, 0) catch return "log path";
     var self_buf: [4096]u8 = undefined;
     const self_exe = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath("/proc/self/exe", &self_buf) orelse return "realpath of the rig binary")));
-    var m = spawnIsolatedMcp(allocator, log_path.ptr) orelse return "could not spawn an isolated `sketerm mcp`";
+    var m = spawnIsolatedMcp(allocator, log_path.ptr, null) orelse return "could not spawn an isolated `sketerm mcp`";
     var m_open = true;
     defer if (m_open) m.close();
     if (!m.initialize()) return "the isolated MCP server never answered initialize";
@@ -4245,7 +4268,7 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
     defer _ = unsetEnv("SKETERM_WEB_BIN");
     if (assistantChipBox(app, win_id) != null)
         return "an assistant chip was already showing before the web watch MCP registered";
-    var m = spawnIsolatedMcp(allocator, null) orelse return "could not spawn an isolated `sketerm mcp`";
+    var m = spawnIsolatedMcp(allocator, null, null) orelse return "could not spawn an isolated `sketerm mcp`";
     var m_open = true;
     defer if (m_open) m.close();
     if (!m.initialize()) return "the web watch MCP server never answered initialize";
@@ -4514,6 +4537,124 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
     if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
     _ = app.waitIdle(200, 4_000);
     if (!retired) return "the assistant chip survived the browsing assistant exiting";
+    return null;
+}
+
+/// A NAMED assistant's browser (`sketerm mcp --name`): its engine is
+/// its daemon's and renders into no web session, so no session row
+/// stands for it; the badge must list it all the same and Watch must
+/// open its page as a web tab.
+fn assistantNamedWebStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
+    if (app.windows.items.len == 0) return "the display session lost its window";
+    const win_id = mainWin(app).id;
+    var keep_ids: [64]u32 = undefined;
+    var keep_n: usize = 0;
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+            return "list roundtrip failed before the named browser stage";
+        defer allocator.free(r);
+        keep_n = listPaneIds(r, &keep_ids);
+    }
+    var page_buf: [512:0]u8 = undefined;
+    const page = std.fmt.bufPrintSentinel(&page_buf, "{s}/named-page.html", .{rt}, 0) catch return "named page path";
+    if (!writeFile(page, "<html><head><title>named:red</title><style>html,body{margin:0;min-height:100vh;background:red}</style></head><body>named</body></html>"))
+        return "could not write the named page";
+    var web_bin_buf: [4096]u8 = undefined;
+    const web_bin = c.realpath("zig-out/bin/sketerm-webengine", &web_bin_buf) orelse
+        return "could not resolve sketerm-webengine for the named browser stage";
+    _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+    defer _ = unsetEnv("SKETERM_WEB_BIN");
+    if (assistantChipBox(app, win_id) != null)
+        return "an assistant chip was already showing before the named MCP registered";
+    var m = spawnIsolatedMcp(allocator, null, "e2enamed") orelse return "could not spawn a named `sketerm mcp`";
+    var m_open = true;
+    defer if (m_open) m.close();
+    if (!m.initialize()) return "the named MCP server never answered initialize";
+    var args: [1024]u8 = undefined;
+    const open_args = std.fmt.bufPrint(&args, "{{\"url\":\"file://{s}\",\"timeout_ms\":45000,\"snapshot\":\"none\"}}", .{page}) catch
+        return "web_open arguments did not fit";
+    const opened = m.call("web_open", open_args, 90_000) orelse return "web_open on the named MCP timed out";
+    if (mcpHas(opened, "isError"))
+        return whyf("web_open on the named MCP failed: {s}", .{opened[0..@min(opened.len, 400)]});
+    // The lane under test: without it a `web-*` session row would pass this stage for the wrong reason.
+    const caps = m.call("capabilities", "{}", 30_000) orelse return "capabilities timed out";
+    if (!mcpHas(caps, "\"web_engine_owner\":\"broker\""))
+        return whyf("the named MCP's engine is not broker-owned: {s}", .{capsExcerpt(caps, "web_engine_owner")});
+
+    const chip = waitAssistantChip(app, win_id, true, 30_000) orelse
+        return "no assistant chip appeared for the named MCP";
+    // Let a poll find the engine (3 s tick) before the popover is built.
+    pumpFor(app, 4_000);
+    if (openPopup(app) != null) return "a popup surface was already open before the chip was clicked";
+    app.click(win_id, chip.x + chip.w / 2, chip.y + chip.h / 2, 1) catch return "clicking the assistant chip failed";
+    const pop_id = waitPopup(app, true, 10_000) orelse return "the assistant chip opened no popover surface";
+    if (pressNamed(allocator, app, "Watch Assistant browser", pop_id, "zig-out/smoke-e2e-namedweb-popover.png", 15_000)) |why| return why;
+
+    var waited: u32 = 0;
+    var shown = false;
+    while (waited < 30_000 and !shown) : (waited += 250) {
+        pumpFor(app, 250);
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse continue;
+        defer allocator.free(r);
+        shown = std.mem.indexOf(u8, r, "named-page.html") != null;
+    }
+    if (!shown) {
+        shotTo(allocator, app, win_id, "zig-out/smoke-e2e-namedweb-notab.png");
+        return "Watch opened no web tab showing the named assistant's page (see zig-out/smoke-e2e-namedweb-notab.png)";
+    }
+    if (waitColorBox(app, win_id, isRed, 30_000) == null) {
+        shotTo(allocator, app, win_id, "zig-out/smoke-e2e-namedweb-noframe.png");
+        return "the named assistant's page never painted into the web tab (see zig-out/smoke-e2e-namedweb-noframe.png)";
+    }
+    shotTo(allocator, app, win_id, "zig-out/smoke-e2e-namedweb-tab.png");
+
+    closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
+    _ = app.waitIdle(300, 5_000);
+    m.close();
+    m_open = false;
+    const retired = waitAssistantChip(app, win_id, false, 30_000) != null;
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
+    _ = app.waitIdle(200, 4_000);
+    if (!retired) return "the assistant chip survived the named assistant exiting";
+    return null;
+}
+
+/// A session a person named keeps `⌁ name` as its tab label when its
+/// program emits an OSC title; a minted name would hand the tab over.
+fn namedSessionTitleStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
+    const mux_cli = @import("ipc/mux_cli.zig");
+    var keep_ids: [64]u32 = undefined;
+    var keep_n: usize = 0;
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return "list before the named title stage failed";
+        defer allocator.free(r);
+        keep_n = listPaneIds(r, &keep_ids);
+    }
+    if (mux_cli.run(allocator, &.{ "spawn", "e2e-named", "sh", "-c", "sleep 3; printf '\\033]2;osc-wins\\007'; sleep 600" }) != 0)
+        return "could not spawn the named session";
+    defer _ = mux_cli.run(allocator, &.{ "kill", "e2e-named" });
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"attach-session\",\"data\":\"e2e-named\"}\n") orelse return "attaching the named session timed out";
+        defer allocator.free(r);
+        if (std.mem.indexOf(u8, r, "\"ok\":true") == null) return whyf("attaching the named session was refused: {s}", .{r[0..@min(r.len, 200)]});
+    }
+    defer closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
+    // The pane's own title is the OSC one: its arrival is the cue.
+    var waited: u32 = 0;
+    var arrived = false;
+    while (waited < 20_000 and !arrived) : (waited += 250) {
+        pumpFor(app, 250);
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse continue;
+        defer allocator.free(r);
+        arrived = std.mem.indexOf(u8, r, "osc-wins") != null;
+    }
+    if (!arrived) return "the named session's OSC title never reached the GUI";
+    pumpFor(app, 1_000);
+    const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return "list after the OSC title failed";
+    defer allocator.free(r);
+    // TabInfo serializes `"title":...,"selected"`: the tab's label ends in the name.
+    if (std.mem.indexOf(u8, r, "e2e-named\",\"selected\"") == null)
+        return whyf("the tab of a named session did not keep its name: {s}", .{r[0..@min(r.len, 600)]});
     return null;
 }
 
@@ -19001,7 +19142,7 @@ var a11y_hub: ?A11yHub = null;
 /// Whether this run includes the assistant stages: a focused watch run,
 /// or the full run (no `SKETERM_SMOKE_E2E_*_ONLY` selector at all).
 fn popoverA11yRun() bool {
-    for ([_][*:0]const u8{ "SKETERM_SMOKE_E2E_WATCH_ONLY", "SKETERM_SMOKE_E2E_WEB_WATCH_ONLY", "SKETERM_SMOKE_E2E_REMOTE_WEB_WATCH_ONLY", "SKETERM_SMOKE_E2E_BADGE_ONLY" }) |key| {
+    for ([_][*:0]const u8{ "SKETERM_SMOKE_E2E_WATCH_ONLY", "SKETERM_SMOKE_E2E_WEB_WATCH_ONLY", "SKETERM_SMOKE_E2E_NAMED_WEB_ONLY", "SKETERM_SMOKE_E2E_REMOTE_WEB_WATCH_ONLY", "SKETERM_SMOKE_E2E_BADGE_ONLY" }) |key| {
         if (c.getenv(key) != null) return true;
     }
     var i: usize = 0;
