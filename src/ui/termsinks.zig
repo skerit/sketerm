@@ -11,6 +11,7 @@ const Terminal = @import("../terminal.zig").Terminal;
 const Pane = @import("pane.zig").Pane;
 const clipboard = @import("clipboard.zig");
 const ExitAction = @import("../config.zig").ExitAction;
+const Config = @import("../config.zig").Config;
 const winmod = @import("window.zig");
 const Window = winmod.Window;
 const tabPageForPane = winmod.tabPageForPane;
@@ -18,6 +19,7 @@ const showToast = winmod.showToast;
 const tab_effects = @import("tab_effects.zig");
 const remotectl = @import("remotectl.zig");
 const titlefmt = @import("../util/titlefmt.zig");
+const sessname = @import("../mux/sessname.zig");
 
 /// A pane's file transfer (upload or download) changed state: drive
 /// the tab progress ring and, on completion/failure, a toast. Mirrors
@@ -59,20 +61,59 @@ pub fn onTermTransfer(ctx: ?*anyopaque, pane: *Pane, ev: Terminal.TransferEvent)
     }
 }
 
+/// The tab label of a mux session: `⌁ name @ host`, the host by its
+/// `[domain.<name>]` when one resolves to that spec (every command
+/// resolves a domain before the GUI sees it, so the spec alone would
+/// show `user@address` for a host its user calls by name).
+/// @return null when the label does not fit `buf`.
+pub fn sessionLabel(self: *Window, buf: []u8, name: []const u8, host: ?[]const u8) ?[:0]const u8 {
+    return sessionLabelFor(&self.config, buf, name, host);
+}
+
+fn sessionLabelFor(config: *const Config, buf: []u8, name: []const u8, host: ?[]const u8) ?[:0]const u8 {
+    const spec = host orelse return std.fmt.bufPrintSentinel(buf, "⌁ {s}", .{name}, 0) catch null;
+    const shown = if (config.domainForSpec(spec)) |d| d.name else spec;
+    return std.fmt.bufPrintSentinel(buf, "⌁ {s} @ {s}", .{ name, shown }, 0) catch null;
+}
+
+test "a session label names the host by its domain, else by its spec" {
+    const t = std.testing;
+    var cfg = try Config.loadFromBytes(t.allocator, "[domain.archdev]\nhost = skerit@10.47.1.70\n");
+    defer cfg.deinit();
+    var buf: [SESSION_LABEL_MAX:0]u8 = undefined;
+    try t.expectEqualStrings("⌁ Hohenheim @ archdev", sessionLabelFor(&cfg, &buf, "Hohenheim", "skerit@10.47.1.70").?);
+    try t.expectEqualStrings("⌁ work @ udp:skerit@10.47.1.70", sessionLabelFor(&cfg, &buf, "work", "udp:skerit@10.47.1.70").?);
+    try t.expectEqualStrings("⌁ work", sessionLabelFor(&cfg, &buf, "work", null).?);
+    var small: [8]u8 = undefined;
+    try t.expect(sessionLabelFor(&cfg, &small, "Hohenheim", "box") == null);
+}
+
+/// The label a session named by a person keeps as its title fact, ahead
+/// of whatever title its program emits; null for a minted name
+/// (`sessname.isMinted`) and for an app session, whose tab follows the app.
+fn namedSessionLabel(self: *Window, term: *Terminal, buf: []u8) ?[]const u8 {
+    const remote = term.remote orelse return null;
+    if (remote.is_app or remote.session.len == 0 or sessname.isMinted(remote.session)) return null;
+    return sessionLabel(self, buf, remote.session, remote.host);
+}
+
 /// Wired from `Pane.sinks.on_session_renamed` — the daemon confirmed a
 /// session rename; rebuild the "⌁ name [@ host]" tab title.
 pub fn onTermSessionRenamed(ctx: ?*anyopaque, pane: *Pane, name: []const u8) void {
     const self = cast.userData(Window, ctx);
     const page = tabPageForPane(self, pane) orelse return;
     const remote = pane.terminal.remote orelse return;
-    var title_buf: [160:0]u8 = undefined;
-    const title_z = if (remote.host) |h|
-        std.fmt.bufPrintSentinel(&title_buf, "⌁ {s} @ {s}", .{ name, h }, 0) catch return
-    else
-        std.fmt.bufPrintSentinel(&title_buf, "⌁ {s}", .{name}, 0) catch return;
+    var title_buf: [SESSION_LABEL_MAX:0]u8 = undefined;
+    const title_z = sessionLabel(self, &title_buf, name, remote.host) orelse return;
     c.adw_tab_page_set_title(page, title_z.ptr);
     c.adw_tab_page_set_tooltip(page, title_z.ptr);
+    // The name is a title fact too (`namedSessionLabel`): templates follow.
+    titleFactChanged(self, pane, .title);
+    titleFactChanged(self, pane, .session);
 }
+
+/// Room for `sessionLabel`: a 64-byte session name and a host spec.
+pub const SESSION_LABEL_MAX = 320;
 
 pub fn onTermClipboardSet(ctx: ?*anyopaque, text: []const u8) void {
     const self = cast.userData(Window, ctx);
@@ -266,24 +307,26 @@ pub fn abbreviateHome(cwd: []const u8, buf: []u8) []const u8 {
 
 /// Everything a title template can substitute, gathered for one pane.
 ///
-/// `title` comes from `Screen.last_title` — the RAW OSC 0/2 string —
-/// never from `adw_tab_page_get_title`. Reading back the rendered
+/// `title` comes from facts upstream of the label (a face, the peer
+/// subject, a person's session name, `Screen.last_title` — the RAW OSC
+/// 0/2 string), never from `adw_tab_page_get_title`. Reading back the rendered
 /// label would make a template like `"{{ TITLE }} !"` append a `!` on
 /// every render and grow without bound; sourcing the fact upstream of
 /// the label is what makes re-rendering idempotent.
 ///
-/// `rel_buf` must outlive the returned Facts: `relative_path` borrows
-/// it.
-pub fn paneFacts(self: *Window, pane: *Pane, rel_buf: []u8) titlefmt.Facts {
+/// `rel_buf` and `label_buf` must outlive the returned Facts:
+/// `relative_path` and `title` borrow them.
+pub fn paneFacts(self: *Window, pane: *Pane, rel_buf: []u8, label_buf: []u8) titlefmt.Facts {
     const term = pane.terminal;
     const cwd: []const u8 = if (term.cwd) |p| p else "";
     // A face covering the terminal (the file browser's folder, an
     // editor's document, a web page) titles the tab; the shell behind
     // it has nothing to say about what the user is looking at. Else the
     // subject its user set on the peer running in the session does,
-    // ahead of whatever title that app emits itself.
+    // then the name a person gave the session, each ahead of whatever
+    // title that app emits itself.
     var facts = titlefmt.Facts{
-        .title = if (pane.shownFaceTitle()) |ft| ft else if (pane.shownSubject()) |sj| sj else if (term.screen.last_title) |t| t else "",
+        .title = if (pane.shownFaceTitle()) |ft| ft else if (pane.shownSubject()) |sj| sj else if (namedSessionLabel(self, term, label_buf)) |nl| nl else if (term.screen.last_title) |t| t else "",
         .program = term.program(),
         .absolute_path = cwd,
         .relative_path = if (cwd.len > 0) abbreviateHome(cwd, rel_buf) else "",
@@ -312,8 +355,9 @@ pub fn refreshTabTitle(self: *Window, pane: *Pane) void {
     const page = tabPageForPane(self, pane) orelse return;
     if (c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-title-locked") != null) return;
     var rel_buf: [512]u8 = undefined;
+    var label_buf: [SESSION_LABEL_MAX]u8 = undefined;
     var out: [titlefmt.MAX]u8 = undefined;
-    const facts = paneFacts(self, pane, &rel_buf);
+    const facts = paneFacts(self, pane, &rel_buf, &label_buf);
     const rendered = titlefmt.render(&out, self.config.tab_title_template, facts);
     // A template with nothing to say must not WIPE a label somebody
     // else set. Mux session tabs ("⌁ work @ host") and the initial
@@ -333,7 +377,8 @@ pub fn refreshWindowTitle(self: *Window) void {
     if (self.config.window_title_template.len > 0) {
         const pane = self.focusedPane() orelse return;
         var rel_buf: [512]u8 = undefined;
-        const facts = paneFacts(self, pane, &rel_buf);
+        var label_buf: [SESSION_LABEL_MAX]u8 = undefined;
+        const facts = paneFacts(self, pane, &rel_buf, &label_buf);
         self.setWindowTitleText(titlefmt.render(&out, self.config.window_title_template, facts));
         return;
     }

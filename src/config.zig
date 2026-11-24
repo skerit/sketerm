@@ -687,15 +687,27 @@ pub const Domain = struct {
     /// member to call in (`peer_hub_domain` there), so `host` may be empty.
     peer_link: PeerLinkDirection = .outbound,
 
+    /// The prefix that forces `transport` in a host spec (bare = auto).
+    fn specPrefix(transport: DomainTransport) []const u8 {
+        return switch (transport) {
+            .auto => "",
+            .ssh => "ssh:",
+            .udp => "udp:",
+            .tor => "tor:",
+        };
+    }
+
     /// Allocate the transport-prefixed host string the durable-tab
     /// plumbing speaks (bare = auto, "udp:"/"ssh:" = forced).
     pub fn hostSpec(self: *const Domain, allocator: std.mem.Allocator) error{OutOfMemory}![]u8 {
-        return switch (self.transport) {
-            .auto => allocator.dupe(u8, self.host),
-            .ssh => std.fmt.allocPrint(allocator, "ssh:{s}", .{self.host}),
-            .udp => std.fmt.allocPrint(allocator, "udp:{s}", .{self.host}),
-            .tor => std.fmt.allocPrint(allocator, "tor:{s}", .{self.host}),
-        };
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ specPrefix(self.transport), self.host });
+    }
+
+    /// Whether `spec` is exactly what `hostSpec` gives for this domain.
+    fn hasSpec(self: *const Domain, spec: []const u8) bool {
+        const prefix = specPrefix(self.transport);
+        if (self.host.len == 0 or spec.len != prefix.len + self.host.len) return false;
+        return std.mem.startsWith(u8, spec, prefix) and std.mem.endsWith(u8, spec, self.host);
     }
 };
 
@@ -2011,6 +2023,14 @@ pub const Config = struct {
     /// The `[domain.<name>]` section, or null.
     pub fn domainNamed(self: *const Config, name: []const u8) ?*const Domain {
         for (self.domains.items) |*d| if (std.mem.eql(u8, d.name, name)) return d;
+        return null;
+    }
+
+    /// The first `[domain.<name>]` whose host spec is `spec`: the name a
+    /// person knows that host by, since every command resolves a domain
+    /// to its spec before the GUI sees it.
+    pub fn domainForSpec(self: *const Config, spec: []const u8) ?*const Domain {
+        for (self.domains.items) |*d| if (d.hasSpec(spec)) return d;
         return null;
     }
 };
@@ -4509,6 +4529,10 @@ test "config: [domain.name] sections parse, resolve, round-trip" {
     defer std.testing.allocator.free(spec4);
     try std.testing.expectEqualStrings("tor:hidden-service.invalid", spec4);
     try std.testing.expect(cfg.resolveDomain("nope", std.testing.allocator) == null);
+    try std.testing.expectEqualStrings("devbox", cfg.domainForSpec("udp:skerit@192.168.1.2").?.name);
+    try std.testing.expectEqualStrings("work", cfg.domainForSpec("build.example.com").?.name);
+    try std.testing.expect(cfg.domainForSpec("skerit@192.168.1.2") == null);
+    try std.testing.expect(cfg.domainForSpec("") == null);
 
     // Round-trip via serialise.
     var buf: [1024]u8 = undefined;

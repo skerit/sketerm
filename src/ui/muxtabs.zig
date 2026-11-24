@@ -13,6 +13,7 @@ const Terminal = @import("../terminal.zig").Terminal;
 const Pane = @import("pane.zig").Pane;
 const winmod = @import("window.zig");
 const Window = winmod.Window;
+const termsinks = @import("termsinks.zig");
 
 // ── Durable tabs (sketerm-mux) ───────────────────────────────
 
@@ -389,11 +390,8 @@ pub fn adoptAppSessionIntoTab(self: *Window, as: *AppSession) ?*Pane {
     @import("panelhost.zig").adoptTerminalOwner(term, pane, self);
     term.replayRetainedImages();
 
-    var title_buf: [160:0]u8 = undefined;
-    const title_z = if (term.remote.?.host) |h|
-        std.fmt.bufPrintSentinel(&title_buf, "⌁ {s} @ {s}", .{ term.remote.?.session, h }, 0) catch "app"
-    else
-        std.fmt.bufPrintSentinel(&title_buf, "⌁ {s}", .{term.remote.?.session}, 0) catch "app";
+    var title_buf: [termsinks.SESSION_LABEL_MAX:0]u8 = undefined;
+    const title_z = termsinks.sessionLabel(self, &title_buf, term.remote.?.session, term.remote.?.host) orelse "app";
     const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
     c.gtk_widget_set_hexpand(wrapper, 1);
     c.gtk_widget_set_vexpand(wrapper, 1);
@@ -961,11 +959,8 @@ fn attachMuxPreparedMode(self: *Window, conn_in: @import("../mux/client.zig").Co
         }
     }
 
-    var title_buf: [160:0]u8 = undefined;
-    const title_z = if (host) |h|
-        std.fmt.bufPrintSentinel(&title_buf, "⌁ {s} @ {s}", .{ name, h }, 0) catch "mux"
-    else
-        std.fmt.bufPrintSentinel(&title_buf, "⌁ {s}", .{name}, 0) catch "mux";
+    var title_buf: [termsinks.SESSION_LABEL_MAX:0]u8 = undefined;
+    const title_z = termsinks.sessionLabel(self, &title_buf, name, host) orelse "mux";
 
     // From here on the pane is LISTED (panes/terminals) and owns the
     // connection, so a failure must unlist it - leaving it listed with
