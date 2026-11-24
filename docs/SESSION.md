@@ -1,5 +1,29 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-24: the web_open name on the badge, session names for assistants, a file picker for people
+
+- A named instance's browser row carries the name given to `web_open` and
+  its site: the server driving a broker-owned engine writes
+  `web.label.json` beside the daemon's `web.json`
+  (`webpresence.LABEL_FILE`), read by `sessionlessEngine` and carried in a
+  remote daemon's list reply (`engine_label`, `engine_domain`).
+- An assistant reads by what a person called its session: explicit
+  `--name`, else its peer alias, else a session name sketerm did not mint,
+  before the working directory's name (`Entry.displayName`; for a daemon
+  that predates it, `assistants.remoteName` applies the session rule to an
+  unnamed instance). Places read by their `[domain.<name>]`
+  (`Config.domainForHost`, `placeLabel`), so `zenit-workspace on
+  skerit@10.47.1.70` is now `Mail on archdev`.
+- A page that opens a file chooser in a browser pane gets sketerm's file
+  picker, and the pick is set on the page's input (`ui/webface/upload.zig`,
+  `upload_arm.chooser`). On an assistant's page this happens only while
+  the person holds control. Not for a browser running on another machine.
+- 🐛 daemon: a file whose birth time is far outside any real date
+  overflowed `fsserve.btimeMsOf`, which panicked a safety-checked daemon
+  on listing that folder; it saturates now.
+- smoke-e2e `SKETERM_SMOKE_E2E_WEB_UPLOAD_ONLY` drives the picker; the
+  named-browser stage now watches the browser by its `web_open` name.
+
 ## 2026-11-24: web_upload, local files into a page's upload field
 
 - New MCP tool `web_upload` (headless backend): a trusted click on the
