@@ -312,8 +312,8 @@ pub const PeerLinkDirection = enum {
 pub const PeerUnavailable = enum {
     /// The per-user daemon predates peers (no welcome flag `peers`).
     daemon_without_peers,
-    /// No daemon answered (or the link was lost); the next peer tool
-    /// call reconnects once its backoff passed.
+    /// No daemon answered (or the link was lost); the server dials a
+    /// running one again by itself, and a peer tool call starts one.
     daemon_unreachable,
     /// The operator's tool policy withholds the peer group.
     withheld,
@@ -322,7 +322,7 @@ pub const PeerUnavailable = enum {
     pub fn describe(self: PeerUnavailable) []const u8 {
         return switch (self) {
             .daemon_without_peers => "the per-user sketerm daemon predates peer messaging; restart it idle with a newer build",
-            .daemon_unreachable => "the per-user sketerm daemon is not reachable now; the next peer tool call reconnects",
+            .daemon_unreachable => "the per-user sketerm daemon is not reachable now; this server reconnects by itself once one runs, and a later peer tool call starts one",
             .withheld => "the tool policy withholds the peer tools",
         };
     }

@@ -233,7 +233,8 @@ fn label(pi: peermail.PeerInfo) []const u8 {
 }
 
 /// The whole list as compact text, for the `peer_list` tool and `sketerm peer
-/// list` alike: the reader once (`self`), then one row per peer (its alias,
+/// list` alike: the reader once (`self`, with the state the others see it
+/// in), then one row per peer (its alias,
 /// else its address; one state word, `ctx`, its working directory with
 /// `~` for home, subject, pending, how long ago it was seen; the address
 /// last when an alias led), the federation links, and a count of the gone
@@ -261,6 +262,7 @@ pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []c
         try w.print("you: {s}", .{if (s.alias.len > 0) s.alias else addr});
         for (notes[0..n], 0..) |note, i| try w.print("{s}{s}", .{ if (i == 0) " (" else ", ", note });
         if (n > 0) try w.writeAll(")");
+        try writeSeenAs(w, peers, s);
         for (peers) |pi| if (isSelf(pi, self)) try writeNote(w, pi, now_ms);
         try w.writeAll("\n");
     }
@@ -350,6 +352,21 @@ pub fn writeList(w: *std.Io.Writer, peers: []const peermail.PeerInfo, hosts: []c
     if (running_no_mcp) try w.writeAll(NO_MCP_LINE ++ "\n");
 }
 
+/// What the reader's `you:` line says of the reader as the daemon lists
+/// it, which is what every other session sees and what decides whether
+/// mail to it is pushed, held for its next turn, or queued. Nothing before
+/// the registration was answered (no address yet).
+fn writeSeenAs(w: *std.Io.Writer, peers: []const peermail.PeerInfo, self: SelfLine) !void {
+    if (self.address.len == 0) return;
+    const pi: peermail.PeerInfo = for (peers) |p| {
+        if (std.mem.eql(u8, p.address, self.address)) break p;
+    } else .{ .address = self.address, .state = .gone };
+    if (!pi.live) return w.writeAll("  seen as gone: no live server holds this address, so mail to you is queued");
+    try w.print("  seen as {s}", .{@tagName(pi.state)});
+    if (pi.polls) try w.writeAll(", polls");
+    if (pi.pending > 0) try w.print(", {d} pending", .{pi.pending});
+}
+
 /// What `polls` in a list means, once per list.
 pub const POLLS_LINE = "polls = no message is pushed into its session (Claude Code started without the sketerm channel): mail waits for its next turn or peer_read";
 /// What `no_mcp` in a list means, once per list.
@@ -367,6 +384,8 @@ pub fn sentLine(arena: std.mem.Allocator, id: []const u8, x: peermail.RecipientR
     if (x.reason) |why| try w.print(" ({s}: {s})", .{ @tagName(why), why.describe() });
     if (x.to_no_mcp) {
         try w.writeAll(", it is running with its MCP server down, so this waits until the server is back");
+    } else if (x.outcome == .queued and x.to_state == .gone) {
+        try w.writeAll(QUEUED_GONE_NOTE);
     } else if (x.to_state) |s| try w.print(", it is {s}", .{@tagName(s)});
     if (x.to_polls) try w.writeAll("; it polls (nothing is pushed into its session), so this may wait for its next turn");
     return aw.written();
@@ -374,6 +393,10 @@ pub fn sentLine(arena: std.mem.Allocator, id: []const u8, x: peermail.RecipientR
 
 /// What a duplicate's line adds after its outcome.
 const DUPLICATE_NOTE = std.fmt.comptimePrint(" (duplicate: an identical send to it in the last {d} s has this id and outcome; not sent again)", .{@divExact(peermail.DUP_WINDOW_MS, 1000)});
+/// What `queued` for an address without a live server adds: the daemon
+/// cannot tell a closed session from an open one whose server lost its
+/// link, so the line names what it knows and what happens next.
+const QUEUED_GONE_NOTE = ", no sketerm server of that session is connected to its daemon now (the session is closed, or open with its server disconnected); this waits in its mailbox, is delivered when a server of it connects, and expires unread after the mail TTL";
 
 // ── what a received item prints as ──────────────────────────────
 
@@ -1236,6 +1259,10 @@ test "send: --quiet and a comma list of addresses, one line per recipient; the c
     // A recipient that polls: delivered, and the sender reads that it may wait.
     const polled = try sentText(a, "w", "zenit", .{ .id = "m-2", .outcome = .delivered, .to_state = .idle, .to_polls = true }, false);
     try t.expectEqualStrings("m-2 to zenit: delivered, it is idle; it polls (nothing is pushed into its session), so this may wait for its next turn\n", polled);
+    // Queued for an address without a live server: what is known, and what happens next.
+    const away = try sentText(a, "w", "zenit", .{ .id = "m-3", .outcome = .queued, .to_state = .gone }, false);
+    try t.expectEqualStrings("m-3 to zenit: queued" ++ QUEUED_GONE_NOTE ++ "\n", away);
+    try t.expect(std.mem.indexOf(u8, away, "offline") == null);
     try t.expect(std.mem.indexOf(u8, try sentText(a, "w", "zenit", .{ .id = "m-2", .outcome = .delivered, .to_polls = true }, true), "\"to_polls\":true") != null);
 }
 
@@ -1269,7 +1296,7 @@ test "the list: a peer's own note ends its row, with its age from an hour on; th
     var aw: std.Io.Writer.Allocating = .init(a);
     try writeList(&aw.writer, &peers, &.{}, .{ .address = "p-00000009", .alias = "me", .durable = true, .name_taken = false }, now, false);
     try t.expectEqualStrings(
-        \\you: me (p-00000009, durable)  note: reviewing qq
+        \\you: me (p-00000009, durable)  seen as idle  note: reviewing qq
         \\zenit  working  subject Folio  p-3fa9c2e1  note: landing M015; holding the zenit-cms push
         \\qq     idle  p-9c04e2d7  note 2h ago: waiting on zenit's review
         \\
@@ -1334,7 +1361,7 @@ test "the list: you once, one state word, rounded facts, gone peers counted, lin
     var aw: std.Io.Writer.Allocating = .init(a);
     try writeList(&aw.writer, &peers, &hosts, .{ .address = "p-da26a6b5", .durable = true, .name_taken = false }, now, false);
     try t.expectEqualStrings(
-        \\you: p-da26a6b5 (durable)
+        \\you: p-da26a6b5 (durable)  seen as idle
         \\Zenit1              waiting_user  ctx 194k  1 pending
         \\Artefacts           gone 18m  subject Folio  1 pending
         \\dalaran/p-b1e7d4aa  working  seen 16m ago  link down (unreachable)
@@ -1377,7 +1404,7 @@ test "the list: you once, one state word, rounded facts, gone peers counted, lin
     };
     try writeList(&aw.writer, &aliased, &.{}, .{ .address = "p-00000009", .alias = "me", .durable = true, .name_taken = false }, now, false);
     try t.expectEqualStrings(
-        \\you: me (p-00000009, durable)
+        \\you: me (p-00000009, durable)  seen as idle
         \\zenit    idle  p-3fa9c2e1
         \\qq       gone 18m  subject Folio  12 pending  p-da26a6b5
         \\zenit-1  working  dalaran/p-b1e7d4aa
@@ -1401,4 +1428,15 @@ test "the list: you once, one state word, rounded facts, gone peers counted, lin
     try t.expectEqualStrings("zenit  idle  polls\nqq     idle  polls\n" ++ POLLS_LINE ++ "\n", aw.written());
     try t.expect(listLine(.{ .address = "zenit", .live = true, .polls = true }, false, false).polls.?);
     try t.expect(listLine(.{ .address = "zenit", .live = false, .polls = true }, false, false).polls == null);
+    // The reader's own line says how the daemon lists it: polling, with
+    // mail waiting, or without a live server at all.
+    aw.clearRetainingCapacity();
+    try writeList(&aw.writer, &.{.{ .address = "p-00000009", .state = .idle, .live = true, .polls = true, .pending = 2, .last_seen_ms = now }}, &.{}, .{ .address = "p-00000009", .durable = true, .name_taken = false }, now, false);
+    try t.expectEqualStrings("you: p-00000009 (durable)  seen as idle, polls, 2 pending\nno other peers\n", aw.written());
+    aw.clearRetainingCapacity();
+    try writeList(&aw.writer, &.{.{ .address = "p-00000009", .state = .gone, .last_seen_ms = now }}, &.{}, .{ .address = "p-00000009", .durable = true, .name_taken = false }, now, false);
+    try t.expectEqualStrings("you: p-00000009 (durable)  seen as gone: no live server holds this address, so mail to you is queued\nno other peers\n", aw.written());
+    aw.clearRetainingCapacity();
+    try writeList(&aw.writer, &.{}, &.{}, .{ .address = "", .durable = false, .name_taken = false }, now, false);
+    try t.expectEqualStrings("you: (not registered yet)\nno other peers\n", aw.written());
 }

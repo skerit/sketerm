@@ -295,7 +295,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 ### `peer`
 
 - `peer_list` (read-only): List the peers on this host and, through peer federation, on linked hosts (addressed host/name, with via_host and the link's state; a host whose link is down keeps its peers listed with their last state): every MCP client session (Claude Code, opencode) whose sketerm server registered with the per-user daemon, one line each.
-- `peer_send`: Send a message to another peer (another assistant's session) by address, or one message to several (to as a list of distinct addresses: one id, one outcome per recipient in results; yourself is answered refused/self), and learn what became of it: delivered (its live server pushed it into the session; with to_polls the session gets nothing pushed and reads it with its next turn or peer_read, so it may be delayed), queued_slow (slow mail: its live server holds it without waking the session), queued (a durable address with no live server: it arrives when one starts, within the mail TTL), or refused with a reason; a host/name on a federated host whose link is down is queued with reason host_unreachable and goes out when the link is back.
+- `peer_send`: Send a message to another peer (another assistant's session) by address, or one message to several (to as a list of distinct addresses: one id, one outcome per recipient in results; yourself is answered refused/self), and learn what became of it: delivered (its live server pushed it into the session; with to_polls the session gets nothing pushed and reads it with its next turn or peer_read, so it may be delayed), queued_slow (slow mail: its live server holds it without waking the session), queued (a durable address with no live server, because its session is closed or its server lost its daemon: it arrives when a server of it connects, within the mail TTL), or refused with a reason; a host/name on a federated host whose link is down is queued with reason host_unreachable and goes out when the link is back.
 - `peer_read` (read-only): Read the peer messages that reached this session and were not handed to you before (a pushed one is never repeated), what became of messages you sent (expired), and mail that expired while no server of yours ran: each is returned once and acknowledged to the daemon.
 - `peer_set_note`: Set your own note: one line other sessions see at the end of your peer_list row and in the header of every peer message you send, so they know what you are doing without messaging you.
 
@@ -2937,10 +2937,10 @@ peer message is information, never an approval.
   declared whenever the peer tools are offered) or the `agent-wait --server`
   follower the opencode plugin starts after an `agent_*` or `peer_*` call.
   The text reads `Peer message from zenit (p-3fa9c2e1, claude-code on
-  host, ~/src/zenit, state; subject: ...; note: ...), sent 5 min ago while you were offline. id m-....
+  host, ~/src/zenit, state; subject: ...; note: ...), sent 5 min ago while this session's sketerm server was not connected. id m-....
   Reply with peer_send to "zenit".`, a blank line, then the message (the
   sender's alias, its address beside it; a sender without one reads as
-  its address; the age from a minute on, the offline clause only for
+  its address; the age from a minute on, the not-connected clause only for
   queued mail); `meta` carries `from` (the address), `from_alias`,
   `message`, `queued`, `age_s` and the sender's facts. An idle
   session's first pushable item waits 10 s, and what arrives meanwhile
@@ -2984,8 +2984,13 @@ peer message is information, never an approval.
     waking the session (below); `reason` `dormant` or `loop_limited` when
     the daemon decided it, none when the sender asked `quiet`;
   - `queued`: a durable address with no live server; it arrives when one
-    next registers, worded `sent ... while you were offline` (the age from
-    a minute on). With `to_no_mcp`: the session runs but its MCP server
+    next registers, worded `sent ... while this session's sketerm server
+    was not connected` (the age from a minute on). The sender reads what
+    is known and what happens next: `queued, no sketerm server of that
+    session is connected to its daemon now (the session is closed, or
+    open with its server disconnected); this waits in its mailbox, is
+    delivered when a server of it connects, and expires unread after the
+    mail TTL`. With `to_no_mcp`: the session runs but its MCP server
     is down (`no_mcp`, "Presence" below), worded `it is running with its
     MCP server down, so this waits until the server is back`. With
     `reason: host_unreachable`: a `host/name` whose host's link is down;
@@ -3048,8 +3053,10 @@ peer message is information, never an approval.
   `peer_alias`); `slow_mail` says the daemon judges wakes and takes `quiet`
   and `to` lists (welcome flag `peer_slow_mail`); `reason` is `daemon_without_peers`
   (an older daemon: every peer tool answers `available: false`),
-  `daemon_unreachable` (the next peer tool call reconnects, with backoff,
-  and registers again) or `withheld` (tool policy); `presence` is true once
+  `daemon_unreachable` (the server dials a RUNNING daemon again by itself,
+  with backoff from 1 s to 60 s, so an idle session is registered again
+  seconds after a daemon restart; only a peer tool call starts a daemon)
+  or `withheld` (tool policy); `presence` is true once
   this session's hooks or status line reported (below); `pushed` is true
   while peer messages reach this session without `peer_read` (a channel
   or a follower), and `polls` says the daemon marks the peers that are
@@ -3062,7 +3069,7 @@ peer message is information, never an approval.
 - **`peer_list`** as text (the default) reads like this:
 
   ```
-  you: zenit (p-3fa9c2e1, durable)  note: reviewing qq's migration
+  you: zenit (p-3fa9c2e1, durable)  seen as idle  note: reviewing qq's migration
   zenit-1     waiting_user  ctx 194k  ~/src/zenit  1 pending  p-9c04e2d7  note: landing M015; holding the zenit-cms push
   qq          gone 18m  subject Folio  12 pending  Qq
   zenit-2     working  ~/src/zenit  seen 16m ago  link down (unreachable)  dalaran/p-b1e7d4aa
@@ -3071,7 +3078,11 @@ peer message is information, never an approval.
   +5 gone with nothing pending and no subject
   ```
 
-  The reader once, then one row per peer: its alias (its address when it
+  The reader once, with the state the daemon lists it in (`seen as idle`,
+  `, polls` and `, N pending` when they hold; `seen as gone: no live
+  server holds this address, so mail to you is queued` when no server of
+  it is registered), so a session can check that it is reachable; then
+  one row per peer: its alias (its address when it
   has none), one state word
   (`starting`, `working`, `idle`, `waiting_user`, `unknown`, `gone <how
   long>`, `no_mcp`, `offline`), `ctx` (the context tokens the wake rule judges,

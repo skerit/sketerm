@@ -202,6 +202,11 @@ pub const PeerItem = union(enum) {
     expired_away: peermail.Expired,
 };
 
+/// What a queued message's line ends its age with: the recipient's server
+/// held no link to its daemon when it was sent. The session itself may
+/// have been open the whole time, so this never says "offline".
+pub const QUEUED_CLAUSE = " while this session's sketerm server was not connected";
+
 /// A peer message shows its age from this much on.
 pub const PEER_AGE_SHOWN_MS: i64 = 60_000;
 
@@ -239,7 +244,7 @@ pub fn composePeer(arena: std.mem.Allocator, item: PeerItem) !Push {
                 try writeAge(w, m.age_ms);
                 try w.writeAll(" ago");
             }
-            if (m.queued) try w.writeAll(" while you were offline");
+            if (m.queued) try w.writeAll(QUEUED_CLAUSE);
             try w.print(". id {s}.", .{m.id});
             if (m.reply_to) |r| try w.print(" In reply to {s}.", .{r});
             try w.print(" Reply with peer_send to \"{s}\".", .{who});
@@ -558,13 +563,13 @@ test "a peer message reads as the plan's sentence: age from a minute on, offline
 
     // Queued while offline, sender gone since, and an answer to another.
     const queued = try composePeer(a, .{ .message = .{ .id = "m-2", .from = from, .text = "x", .age_ms = 5 * 60_000, .queued = true, .reply_to = "m-1" } });
-    try t.expectEqualStrings("Peer message from Zenit (claude-code on hohenheim, /home/u/zenit-workspace, gone), sent 5 min ago while you were offline. id m-2. In reply to m-1. Reply with peer_send to \"Zenit\".\n\nx", queued.content);
+    try t.expectEqualStrings("Peer message from Zenit (claude-code on hohenheim, /home/u/zenit-workspace, gone), sent 5 min ago while this session's sketerm server was not connected. id m-2. In reply to m-1. Reply with peer_send to \"Zenit\".\n\nx", queued.content);
     try t.expectEqualStrings("true", queued.meta.queued.?);
     try t.expectEqualStrings("m-1", queued.meta.reply_to.?);
 
     // Queued but fresh: offline without an age; an unregistered app and host.
     const quick = try composePeer(a, .{ .message = .{ .id = "m-3", .from = .{ .address = "anon-ab12" }, .text = "x", .age_ms = 30_000, .queued = true, .sender_live = true } });
-    try t.expect(std.mem.startsWith(u8, quick.content, "Peer message from anon-ab12 (unknown app, unknown), sent while you were offline. id m-3."));
+    try t.expect(std.mem.startsWith(u8, quick.content, "Peer message from anon-ab12 (unknown app, unknown), sent while this session's sketerm server was not connected. id m-3."));
     try t.expect(quick.meta.host == null and quick.meta.cwd == null);
 
     // Hours past two hours; the channel line stays newline-free.

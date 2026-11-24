@@ -562,6 +562,16 @@ pub const Conn = struct {
         };
     }
 
+    /// The per-user daemon when one runs already: never starts one and
+    /// never signals an orphan, so a background retry has no side effect.
+    /// @throws error.NoDaemon when none listens on the default socket.
+    pub fn connectLocalExisting(allocator: std.mem.Allocator) !Conn {
+        if (builtin.is_test) return error.TestNeedsPrivateDaemon;
+        const path = try sockpath.defaultSocketPath(allocator);
+        defer allocator.free(path);
+        return probe(allocator, try Conn.connect(allocator, path));
+    }
+
     /// Like `connectLocalAutostart`, but against `sock_path` when given —
     /// a PRIVATE daemon instance (its aux sockets live next to the socket),
     /// used by `sketerm mcp` isolation. null = the shared per-user daemon.

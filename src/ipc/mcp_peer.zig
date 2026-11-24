@@ -408,13 +408,25 @@ pub const Link = struct {
     list_timeout_ms: i64 = LIST_TIMEOUT_MS,
     send_timeout_ms: i64 = SEND_TIMEOUT_MS,
     /// Opens the connection to the per-user daemon (rigs and tests swap it).
-    dial: *const fn (std.mem.Allocator) anyerror!muxclient.Conn = dialDaemon,
+    dial: *const fn (std.mem.Allocator, Dial) anyerror!muxclient.Conn = dialDaemon,
 };
 
 pub var link: Link = .{};
 
-fn dialDaemon(a: std.mem.Allocator) anyerror!muxclient.Conn {
-    return muxclient.Conn.connectLocalAutostartAt(a, null);
+/// Which daemon a dial may reach.
+pub const Dial = enum {
+    /// Startup and tool calls: the per-user daemon, started when none runs.
+    autostart,
+    /// The server loop's own retries: only a daemon that runs already, so
+    /// an idle session never brings back one its user stopped.
+    existing,
+};
+
+fn dialDaemon(a: std.mem.Allocator, how: Dial) anyerror!muxclient.Conn {
+    return switch (how) {
+        .autostart => muxclient.Conn.connectLocalAutostartAt(a, null),
+        .existing => muxclient.Conn.connectLocalExisting(a),
+    };
 }
 
 pub const Config = struct {
@@ -425,8 +437,7 @@ pub const Config = struct {
 };
 
 /// Take part as a peer: keep what picks the address, open the link and
-/// register. A daemon that cannot be reached is retried on the next peer
-/// tool call.
+/// register. A daemon that cannot be reached is retried by the server loop.
 pub fn configure(allocator: std.mem.Allocator, cfg: Config) void {
     link.allocator = allocator;
     link.configured = true;
@@ -439,7 +450,7 @@ pub fn configure(allocator: std.mem.Allocator, cfg: Config) void {
     link.env_name = if (env_name) |v| allocator.dupe(u8, v) catch null else null;
     link.origin_id = if (origin_id) |v| allocator.dupe(u8, v) catch null else null;
     link.cwd = allocator.dupe(u8, cfg.cwd) catch &.{};
-    connect();
+    connect(.autostart);
 }
 
 /// Choose the address (and the alias to ask for) for the daemon just
@@ -514,12 +525,17 @@ pub fn shutdown() void {
     link = .{};
 }
 
-fn connect() void {
+fn connect(how: Dial) void {
     closeConn();
     const a = link.allocator;
     const conn = a.create(muxclient.Conn) catch |e| return lost("connect", e);
-    conn.* = link.dial(a) catch |e| {
+    conn.* = link.dial(a, how) catch |e| {
         a.destroy(conn);
+        // The loop's retries fail silently: the loss was logged once.
+        if (how == .existing) {
+            _ = drop();
+            return;
+        }
         return lost("connect", e);
     };
     link.conn = conn;
@@ -645,15 +661,22 @@ fn closeConn() void {
     link.conn = null;
 }
 
-/// The link failed at `what`: drop it, and log why (the one record of
-/// it); the next peer tool call after the backoff reconnects and
-/// registers again (the broker redelivers unacked mail), and so does the
-/// server loop while acks wait for it (`service`).
-fn lost(what: []const u8, err: anyerror) void {
+/// Drop the link and schedule its next dial.
+/// @return the wait before that dial (ms).
+fn drop() i64 {
     closeConn();
     link.status = .down;
-    const wait = link.backoff.fail(clock.nowMs());
-    mcp.warn("peer link lost at {s} ({s}); the next peer tool call after {d} ms reconnects", .{ what, @errorName(err), wait });
+    return link.backoff.fail(clock.nowMs());
+}
+
+/// The link failed at `what`: drop it, and log why (the one record of
+/// it). The server loop dials a running daemon again by itself once the
+/// backoff passed (`service`), so an idle session is back on a restarted
+/// daemon within seconds; a peer tool call also starts one. Either way it
+/// registers again and the broker redelivers unacked mail.
+fn lost(what: []const u8, err: anyerror) void {
+    const wait = drop();
+    mcp.warn("peer link lost at {s} ({s}); reconnecting to a running daemon in {d} ms, or with the next peer tool call after that", .{ what, @errorName(err), wait });
 }
 
 /// A request got no usable reply. A timeout keeps the link: the late
@@ -677,11 +700,10 @@ fn scheduleRetry() void {
     _ = link.backoff.fail(clock.nowMs());
 }
 
-/// Reconnect a link that is not up once its backoff passed (tool calls,
-/// and the server loop while acks wait).
-fn ensure() void {
+/// Dial again when the link is not up and its backoff passed.
+fn ensure(how: Dial) void {
     if (link.status == .up or !link.backoff.due(clock.nowMs())) return;
-    connect();
+    connect(how);
 }
 
 // ── the server loop ──────────────────────────────────────────────
@@ -693,24 +715,18 @@ pub fn pollFds(out: []c.struct_pollfd) usize {
     return 1;
 }
 
-/// Due when something waits: a push already buffered on the link, the
-/// reconnect that kept acks wait for, or pending items a route can take
+/// Due when something waits: a push already buffered on the link, the next
+/// dial of a link that is not up, or pending items a route can take
 /// once an idle session's `PUSH_DELAY_MS` passed (slow mail waits for the
 /// next turn).
 pub fn dueInMs(now: i64) ?i64 {
     if (!link.configured) return null;
     if (buffered()) return 0;
-    const retry: ?i64 = if (acksWaitForLink()) @max(0, link.backoff.retry_at_ms - now) else null;
+    const retry: ?i64 = if (link.status != .up) @max(0, link.backoff.retry_at_ms - now) else null;
     const m = if (link.mailbox) |*mm| mm else return retry;
     if (!mcp_agent_waiter.looseRouteReady()) return retry;
     const push = m.pushDueIn(now, inTurn()) orelse return retry;
     return if (retry) |r| @min(r, push) else push;
-}
-
-/// Acks wait for a link that is down: the server loop reconnects for them,
-/// or a restart would show their items again.
-fn acksWaitForLink() bool {
-    return link.status == .down and link.acks_unsent.items.len > 0;
 }
 
 /// The session is in a turn, as its hooks reported.
@@ -724,13 +740,15 @@ fn buffered() bool {
     return p.inbox.items.len > 0 or p.conn.unread().len > 0;
 }
 
-/// Between requests: reconnect for kept acks, take what the broker pushed,
-/// then hand pending items to a route, and re-register when the session
-/// became pushed to (a follower attached) or stopped being. Never blocks
-/// on a read: a push is read only when its fd is readable.
+/// Between requests: dial a link that is not up (a session that sits idle
+/// makes no tool call, and without a link nothing can wake it), take what
+/// the broker pushed, then hand pending items to a route, and re-register
+/// when the session became pushed to (a follower attached) or stopped
+/// being. Never blocks on a read: a push is read only when its fd is
+/// readable.
 pub fn service(now: i64) void {
     if (!link.configured) return;
-    if (acksWaitForLink()) ensure();
+    ensure(.existing);
     drain();
     flush(now);
     if (link.status == .up and armed() != link.armed_sent) register();
@@ -910,7 +928,7 @@ fn unavailableRes(arena: std.mem.Allocator, why: vocab.PeerUnavailable) ![]const
 }
 
 pub fn peerTool(arena: std.mem.Allocator, tool: Tool, args: std.json.Value) ![]const u8 {
-    if (link.configured) ensure();
+    if (link.configured) ensure(.autostart);
     return switch (tool) {
         .peer_list => peerList(arena, args),
         .peer_send => peerSend(arena, args),
@@ -1566,12 +1584,69 @@ test "a session nothing is pushed into: it registers as polling, is told once ho
     try t.expect(slowText(a) == null);
 }
 
-/// The far end of the connection `testDial` hands out.
+/// The far end of the connection `testDial` hands out, and how it was asked.
 var test_dial_fd: c_int = -1;
+var test_dial_how: ?Dial = null;
 
-fn testDial(a: std.mem.Allocator) anyerror!muxclient.Conn {
+fn testDial(a: std.mem.Allocator, how: Dial) anyerror!muxclient.Conn {
     const wire = @import("../mux/wire.zig");
+    test_dial_how = how;
+    if (test_dial_fd < 0) return error.NoDaemon;
     return .{ .allocator = a, .fd = test_dial_fd, .proto = wire.PROTO_VERSION, .caps = .{ .peers = true, .peer_slow_mail = true } };
+}
+
+test "an idle server whose daemon restarts is back on it by itself: no tool call, no daemon started, silent while none runs" {
+    const wire = @import("../mux/wire.zig");
+    const platform = @import("../util/platform.zig");
+    var pair1: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair1));
+    var broker1 = muxclient.Conn{ .allocator = t.allocator, .fd = pair1[1], .proto = wire.PROTO_VERSION };
+    defer broker1.deinit();
+    const conn = try t.allocator.create(muxclient.Conn);
+    conn.* = .{ .allocator = t.allocator, .fd = pair1[0], .proto = wire.PROTO_VERSION, .caps = .{ .peers = true, .peer_slow_mail = true } };
+    const saved = link;
+    defer link = saved;
+    link = .{ .allocator = t.allocator, .configured = true, .status = .up, .conn = conn, .peer = peerclient.Peer.init(conn), .mailbox = Mailbox.init(t.allocator), .dial = testDial };
+    defer shutdown();
+    test_dial_fd = -1;
+    test_dial_how = null;
+    // 1. Up and idle: nothing is due.
+    try t.expectEqual(@as(?i64, null), dueInMs(clock.nowMs()));
+    // 2. The daemon goes away. The loop notices, and a dial is due.
+    _ = c.shutdown(pair1[1], c.SHUT_RDWR);
+    service(clock.nowMs());
+    try t.expectEqual(Status.down, link.status);
+    try t.expect(dueInMs(clock.nowMs()) != null);
+    try t.expectEqual(@as(?Dial, null), test_dial_how);
+    // 3. No daemon runs yet: the loop asks only for an existing one, and
+    // keeps a later dial due.
+    link.backoff.retry_at_ms = 0;
+    service(clock.nowMs());
+    try t.expectEqual(@as(?Dial, .existing), test_dial_how);
+    try t.expectEqual(Status.down, link.status);
+    try t.expect(dueInMs(clock.nowMs()).? > 0);
+    // 4. The replacement daemon is up: the next dial registers, with no
+    // tool call and nothing waiting to be acked.
+    var pair2: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair2));
+    var broker2 = muxclient.Conn{ .allocator = t.allocator, .fd = pair2[1], .proto = wire.PROTO_VERSION };
+    defer broker2.deinit();
+    test_dial_fd = pair2[0];
+    link.backoff.retry_at_ms = 0;
+    service(clock.nowMs());
+    try t.expectEqual(Status.up, link.status);
+    const reg_frame = try broker2.recvFrameFor(2_000);
+    defer reg_frame.deinit(t.allocator);
+    try t.expectEqual(wire.FrameType.peer_register, reg_frame.ftype);
+    // 5. A tool call may start a daemon.
+    _ = c.shutdown(pair2[1], c.SHUT_RDWR);
+    service(clock.nowMs());
+    test_dial_fd = -1;
+    link.backoff.retry_at_ms = 0;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    _ = try peerTool(arena_state.allocator(), .peer_list, .null);
+    try t.expectEqual(@as(?Dial, .autostart), test_dial_how);
 }
 
 test "an ack the link could not carry is kept, and goes out with the next registration answer before redelivered mail" {
