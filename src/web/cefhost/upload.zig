@@ -29,6 +29,8 @@ const proto = @import("../protocol.zig");
 const host_mod = @import("../cefhost.zig");
 const devtools = @import("devtools_session.zig");
 const Host = host_mod.Host;
+const pathz = @import("../../util/pathz.zig");
+const c = @import("cbindings");
 const View = host_mod.View;
 
 const method_timeout_ms: i64 = 10_000;
@@ -47,6 +49,8 @@ pub const State = struct {
         armed,
         /// The chooser opened; the answer is sent from `pump`.
         opened,
+        /// `DOM.describeNode` is in flight: a folder input is refused, not answered.
+        describing,
         /// `DOM.setFileInputFiles` is in flight.
         setting,
     } = .idle,
@@ -66,6 +70,8 @@ pub const State = struct {
     pending_node: i64 = 0,
     pending_multiple: bool = false,
     next_chooser: u32 = 0,
+    /// Trees handed out by `upload_stage`, owned and removed with the view.
+    staged: std.ArrayList([]u8) = .empty,
 
     fn count(self: State) u32 {
         var n: u32 = 0;
@@ -83,6 +89,11 @@ pub const State = struct {
     /// Free what is owned; the view is going away with its session.
     pub fn clear(self: *State, gpa: std.mem.Allocator) void {
         if (self.paths.len != 0) gpa.free(self.paths);
+        for (self.staged.items) |dir| {
+            pathz.removeTree(dir);
+            gpa.free(dir);
+        }
+        self.staged.deinit(gpa);
         self.* = .{};
     }
 };
@@ -149,6 +160,62 @@ pub fn uploadWatch(self: *Host, req: proto.UploadWatch) void {
     const v = self.find(req.view) orelse return;
     v.upload.watch = req.enabled != 0;
     _ = sync(self, v);
+}
+
+/// `upload_stage`: a private tree for files a client on another host delivers before arming them.
+pub fn uploadStage(self: *Host, req: proto.UploadStage) void {
+    const v = self.find(req.view) orelse return;
+    var buf: [host_mod.STAGING_PATH_MAX:0]u8 = undefined;
+    const dir = stageTree(self, v, &buf, req.count) orelse "";
+    self.post(proto.EvUploadStaged{ .view = v.id, .req = req.req, .dir = dir });
+}
+
+fn stageTree(host: *Host, v: *View, buf: [:0]u8, count: u32) ?[]const u8 {
+    if (count == 0 or count > proto.upload_stage_max) return null;
+    const dir = host_mod.stagingTree(buf, "webup") orelse return null;
+    sweepStale(std.fs.path.dirname(dir) orelse "/tmp");
+    const owned = host.gpa.dupe(u8, dir) catch {
+        pathz.removeTree(dir);
+        return null;
+    };
+    v.upload.staged.append(host.gpa, owned) catch {
+        host.gpa.free(owned);
+        pathz.removeTree(dir);
+        return null;
+    };
+    for (0..count) |i| {
+        var sub_buf: [host_mod.STAGING_PATH_MAX + 16:0]u8 = undefined;
+        const sub = std.fmt.bufPrintSentinel(&sub_buf, "{s}/{d}", .{ dir, i }, 0) catch return null;
+        if (c.mkdir(sub.ptr, 0o700) != 0) return null;
+    }
+    return dir;
+}
+
+const TREE_PREFIX = "sketerm-webup-";
+/// A tree this old belongs to a helper that died without freeing its views.
+const STALE_SECS: i64 = 7 * 24 * 3600;
+var g_swept = false;
+
+/// Remove what a killed helper left behind, once per process: a tree is otherwise removed only with its view.
+fn sweepStale(root: []const u8) void {
+    if (g_swept) return;
+    g_swept = true;
+    var root_buf: [host_mod.STAGING_PATH_MAX:0]u8 = undefined;
+    const root_z = std.fmt.bufPrintSentinel(&root_buf, "{s}", .{root}, 0) catch return;
+    const d = c.opendir(root_z.ptr) orelse return;
+    defer _ = c.closedir(d);
+    const now: i64 = @intCast(c.time(null));
+    while (c.readdir(d)) |ent| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (!std.mem.startsWith(u8, name, TREE_PREFIX)) continue;
+        var path_buf: [host_mod.STAGING_PATH_MAX + 32:0]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ root, name }, 0) catch continue;
+        var st: c.struct_stat = undefined;
+        // lstat: a planted symlink is never a tree of ours.
+        if (c.lstat(path.ptr, &st) != 0 or st.st_uid != c.geteuid() or (st.st_mode & 0o170000) != 0o040000) continue;
+        if (now - @as(i64, @intCast(st.st_mtim.tv_sec)) < STALE_SECS) continue;
+        pathz.removeTree(path);
+    }
 }
 
 /// `upload_arm`: replace what is armed for the view; empty paths disarm.
@@ -221,7 +288,7 @@ fn onChooser(ctx: *anyopaque, _: []const u8, params: []const u8) void {
             });
         },
         // A second chooser while the first is being answered: the page's own queue.
-        .opened, .setting => {},
+        .opened, .describing, .setting => {},
     }
 }
 
@@ -247,19 +314,51 @@ pub fn pump(host: *Host) void {
         switch (v.upload.phase) {
             .idle, .armed => {},
             .opened => answer(host, v),
-            .setting => {
+            .describing, .setting => {
                 const session = v.devtools orelse {
                     finish(host, v, proto.upload_failed);
                     continue;
                 };
+                const describing = v.upload.phase == .describing;
                 switch (session.outcome(v.upload.set_id)) {
                     .pending => {},
-                    .ok => finish(host, v, proto.upload_answered),
-                    .failed => finish(host, v, proto.upload_failed),
+                    .ok => |result| if (!describing)
+                        finish(host, v, proto.upload_answered)
+                    else if (takesFolder(host.gpa, result))
+                        finish(host, v, proto.upload_folder_input)
+                    else
+                        setFiles(host, v),
+                    // An input that cannot be described is still worth trying to fill.
+                    .failed => if (describing) setFiles(host, v) else finish(host, v, proto.upload_failed),
                 }
             },
         }
     }
+}
+
+/// Whether a `DOM.describeNode` result is a folder input (`webkitdirectory`).
+///
+/// The engine answers `DOM.setFileInputFiles` on one with success and sets
+/// nothing: its directory enumeration is the embedder's, and a windowless
+/// view has none (measured on CEF 151).
+fn takesFolder(gpa: std.mem.Allocator, result: []const u8) bool {
+    const Described = struct { node: struct { attributes: []const []const u8 = &.{} } = .{} };
+    const parsed = std.json.parseFromSlice(Described, gpa, result, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    // A flat name, value, name, value list.
+    var i: usize = 0;
+    while (i < parsed.value.node.attributes.len) : (i += 2) {
+        if (std.ascii.eqlIgnoreCase(parsed.value.node.attributes[i], "webkitdirectory")) return true;
+    }
+    return false;
+}
+
+test "a folder input is told from a file input by its described attributes" {
+    const t = std.testing;
+    try t.expect(takesFolder(t.allocator, "{\"node\":{\"nodeName\":\"INPUT\",\"attributes\":[\"id\",\"dir\",\"type\",\"file\",\"webkitdirectory\",\"\"]}}"));
+    try t.expect(!takesFolder(t.allocator, "{\"node\":{\"nodeName\":\"INPUT\",\"attributes\":[\"type\",\"file\",\"title\",\"webkitdirectory\"]}}"));
+    try t.expect(!takesFolder(t.allocator, "{\"node\":{\"nodeName\":\"INPUT\"}}"));
+    try t.expect(!takesFolder(t.allocator, "not json"));
 }
 
 fn answer(host: *Host, v: *View) void {
@@ -268,6 +367,18 @@ fn answer(host: *Host, v: *View) void {
     if (n > 1 and !v.upload.multiple) return finish(host, v, proto.upload_too_many);
     const session = v.devtools orelse return finish(host, v, proto.upload_failed);
     const browser = v.browser orelse return finish(host, v, proto.upload_failed);
+    var buf: [64]u8 = undefined;
+    const params = std.fmt.bufPrint(&buf, "{{\"backendNodeId\":{d}}}", .{v.upload.node}) catch unreachable;
+    v.upload.set_id = session.send(browser, "DOM.describeNode", params, method_timeout_ms, .memory, "") catch
+        return finish(host, v, proto.upload_failed);
+    v.upload.phase = .describing;
+}
+
+fn setFiles(host: *Host, v: *View) void {
+    const session = v.devtools orelse return finish(host, v, proto.upload_failed);
+    const browser = v.browser orelse return finish(host, v, proto.upload_failed);
+    session.forget(v.upload.set_id);
+    v.upload.set_id = 0;
     const params = setFilesParams(host.gpa, v.upload) catch return finish(host, v, proto.upload_failed);
     defer host.gpa.free(params);
     v.upload.set_id = session.send(browser, "DOM.setFileInputFiles", params, method_timeout_ms, .memory, "") catch

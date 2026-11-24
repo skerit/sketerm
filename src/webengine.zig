@@ -34,4 +34,5 @@ test {
     _ = @import("web/cefhost/devtools_session.zig");
     _ = @import("web/cefhost/trace.zig");
     _ = @import("web/cefhost/dragdrop.zig");
+    _ = @import("web/cefhost/upload.zig");
 }

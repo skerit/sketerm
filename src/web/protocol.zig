@@ -180,6 +180,10 @@ pub const CAP_DOWNLOAD_ERRORS = "download-errors";
 /// `ev_upload`. Without it a client cannot upload a local file at all:
 /// nobody can operate the engine's own chooser in a windowless view.
 pub const CAP_UPLOAD = "upload";
+/// The helper allocates a private directory for files a client on
+/// ANOTHER host delivers before arming them (`upload_stage`), and removes
+/// it with the view. Without it such a client has nowhere to put them.
+pub const CAP_UPLOAD_STAGING = "upload-staging";
 /// The helper accepts `a11y_enable` and, for a view it was enabled on,
 /// streams the engine's accessibility tree as `ev_a11y_tree` /
 /// `ev_a11y_loc` / `ev_a11y_event` frames (the 0x70 block). Nothing is
@@ -608,6 +612,7 @@ pub const Cap = enum {
     web_perf,
     web_trace,
     upload,
+    upload_staging,
 
     /// The wire name `hello_ack` carries.
     pub fn name(self: Cap) []const u8 {
@@ -953,6 +958,9 @@ pub const Tag = enum(u8) {
     ev_cookie_apply_done = 0xE3,
     cookie_dump_req = 0xE4,
     ev_cookie_dump = 0xE5,
+    // Capability "upload-staging": the upload family's overflow (0x7D-0x7F is full).
+    upload_stage = 0xED,
+    ev_upload_staged = 0xEE,
     // 0xF0-0xF7: cross-connection view observation, capability
     // "observe" (see CAP_OBSERVE).
     observe_enable = 0xF0,
@@ -1012,6 +1020,7 @@ pub fn observerAllows(tag: Tag, control: bool) bool {
         .clipboard_read,
         // Answering the file chooser its own click opened.
         .upload_arm,
+        .upload_stage,
         .navigate,
         .nav_action,
         .find,
@@ -2424,6 +2433,9 @@ pub const upload_too_many: u8 = 2;
 /// Nothing set: the helper could not arm or answer (no DevTools session,
 /// a trace holding its events, the engine refusing the files).
 pub const upload_failed: u8 = 3;
+/// Nothing set: the input takes a FOLDER (`webkitdirectory`), which this
+/// engine cannot fill (it would answer success and set nothing).
+pub const upload_folder_input: u8 = 4;
 
 /// The outcome of the `upload_arm` whose `req` this echoes, or (`req` 0)
 /// a chooser nobody armed.
@@ -2451,6 +2463,30 @@ pub const UploadWatch = struct {
     pub const tag: Tag = .upload_watch;
     view: u32,
     enabled: u8,
+};
+
+/// Most files one `upload_stage` makes room for.
+pub const upload_stage_max: u32 = 32;
+
+/// Ask for a private directory on the helper's machine holding `count`
+/// empty subdirectories `0`..`count-1`, one per file to deliver, so two
+/// files of one name never collide and each keeps its name. Answered by
+/// `ev_upload_staged`. The helper removes the tree when the view goes
+/// away, never earlier: a page reads a file it was handed lazily. A
+/// controlling observer may send it, its `req` carrying `upload_req_observer`.
+pub const UploadStage = struct {
+    pub const tag: Tag = .upload_stage;
+    view: u32,
+    req: u32,
+    count: u32,
+};
+
+/// The answer to `upload_stage`; an empty `dir` is a refusal.
+pub const EvUploadStaged = struct {
+    pub const tag: Tag = .ev_upload_staged;
+    view: u32,
+    req: u32,
+    dir: []const u8,
 };
 
 // -- accessibility (0x70 block, capability "a11y") --------------------
@@ -4480,7 +4516,7 @@ pub const EvRequestRefused = struct {
 /// Capabilities an untrusted helper leaves out of `hello_ack`; `untrustedWithheld` refuses their frames.
 pub fn untrustedWithholdsCap(cap: Cap) bool {
     return switch (cap) {
-        .devtools, .clipboard, .popup_open, .downloads, .download_start, .download_staging, .download_errors, .upload, .userscripts, .userscripts_gm, .webext, .webext_tabs, .webext_action, .webext_events, .webext_transaction, .filter_subscribe, .cookie_sync, .observe, .observe_notify, .drag_drop => true,
+        .devtools, .clipboard, .popup_open, .downloads, .download_start, .download_staging, .download_errors, .upload, .upload_staging, .userscripts, .userscripts_gm, .webext, .webext_tabs, .webext_action, .webext_events, .webext_transaction, .filter_subscribe, .cookie_sync, .observe, .observe_notify, .drag_drop => true,
         else => false,
     };
 }
@@ -4504,6 +4540,7 @@ pub fn untrustedWithheld(tag: Tag) bool {
         .download_cancel,
         .download_start,
         .upload_arm,
+        .upload_stage,
         .upload_watch,
         .us_script_set,
         .us_style_set,
@@ -6096,6 +6133,9 @@ test "round-trip: download frames" {
     try roundTrip(UploadWatch, .{ .view = 7, .enabled = 1 });
     try roundTrip(UploadArm, .{ .view = 7, .req = upload_req_observer | 2, .paths = "/home/x/a.png", .chooser = 5 });
     try roundTrip(EvUpload, .{ .view = 7, .req = 0, .outcome = upload_unanswered, .multiple = 0, .count = 0, .chooser = 5 });
+    try roundTrip(UploadStage, .{ .view = 7, .req = upload_req_observer | 3, .count = 2 });
+    try roundTrip(EvUploadStaged, .{ .view = 7, .req = upload_req_observer | 3, .dir = "/tmp/sketerm-webup-abc123" });
+    try roundTrip(EvUploadStaged, .{ .view = 7, .req = 9, .dir = "" });
     try roundTrip(EvDownloadProgress, .{
         .view = 7,
         .id = 41,

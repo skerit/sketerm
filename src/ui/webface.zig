@@ -1051,6 +1051,9 @@ pub const WebFace = struct {
     upload_watched: bool = false,
     /// The `upload_arm.req` of the pick awaiting its outcome; 0 = none.
     upload_req: u32 = 0,
+    /// A pick being delivered to a helper on another host, with its poll timer (mechanism 2, severed with `dl_timer`).
+    upload_job: ?*wf_upload.Job = null,
+    upload_timer: c.guint = 0,
     obs_fit: watchgeom.Fit = .{ .x = 0, .y = 0, .w = 0, .h = 0, .scale = 1 },
     /// The `webwatch.Watch` this page belongs to; told on deinit.
     watch: ?*anyopaque = null,
@@ -1770,6 +1773,7 @@ pub const WebFace = struct {
         self.stopLatProbe();
         self.stopDiscardTimer();
         self.stopDlTimer();
+        self.dropUploadJob();
         // The a11y bus watch carries this face as user-data too.
         self.axTeardown();
         // Mechanism 2: one disconnect for every widget/controller that
@@ -1866,6 +1870,7 @@ pub const WebFace = struct {
         }
         self.stopDiscardTimer();
         self.stopDlTimer();
+        self.dropUploadJob();
         // The helper cancels this view's engine-side downloads when the
         // ViewDestroy above lands; a handed-off upload is the durable
         // transfer service's and deliberately survives the pane.
@@ -2924,6 +2929,8 @@ pub const WebFace = struct {
         self.enc_on = false;
         self.syncFrameEncode();
         self.upload_watched = false;
+        // Its chooser belonged to the view that is gone.
+        self.dropUploadJob();
         self.syncUploadWatch();
         // A fresh helper connection knows no cap; force the send.
         self.sent_max_fps = 0xffff;
@@ -2978,6 +2985,8 @@ pub const WebFace = struct {
     pub const syncFrameEncode = wf_frames.syncFrameEncode;
     pub const syncUploadWatch = wf_upload.syncUploadWatch;
     pub const onUpload = wf_upload.onUpload;
+    pub const onUploadStaged = wf_upload.onUploadStaged;
+    pub const dropUploadJob = wf_upload.dropUploadJob;
     pub const onDamage = wf_frames.onDamage;
     pub fn onTitle(self: *WebFace, title: []const u8) void {
         if (self.title) |t| self.allocator.free(t);

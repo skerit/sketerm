@@ -3569,6 +3569,8 @@ fn uploadArm(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: 
         var st: lc.struct_stat = undefined;
         if (lc.stat(z.ptr, &st) != 0 or lc.access(z.ptr, lc.R_OK) != 0)
             return .{ .err = fail(.not_found, try std.fmt.allocPrint(arena, "files[{d}] does not exist or cannot be read: {s}", .{ i, path })) };
+        if (st.st_mode & 0o170000 == 0o040000)
+            return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "files[{d}] is a folder: {s}. A folder cannot be uploaded as such; pass the files in it, one path each", .{ i, path })) };
         if (st.st_mode & 0o170000 != 0o100000)
             return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "files[{d}] is not a regular file: {s}", .{ i, path })) };
         files[i] = .{ .path = path, .bytes = @intCast(@max(st.st_size, 0)) };
@@ -3600,6 +3602,7 @@ fn uploadAwait(drv: Driver, arena: std.mem.Allocator, u: Upload) !UploadAwait {
     return switch (o.outcome) {
         web_proto.upload_answered => .{ .outcome = o },
         web_proto.upload_too_many => .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "the page's file chooser takes ONE file and {d} were given; nothing was uploaded. Pass one file per call", .{u.files.len})) },
+        web_proto.upload_folder_input => .{ .err = fail(.unavailable, "this upload field takes a whole FOLDER (<input webkitdirectory>), which this browser engine cannot fill: it accepts the files and hands the page nothing. Nothing was uploaded. Use a control of the page that takes files, if it has one") },
         else => .{ .err = fail(.io_failed, "the browser helper could not hand the files to the page's file chooser; nothing was uploaded") },
     };
 }

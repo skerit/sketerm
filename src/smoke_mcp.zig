@@ -3660,11 +3660,12 @@ fn webUploadStage(m: *Mcp, rt: []const u8) void {
         "<input id=one type=file aria-label='Single file'>" ++
         "<input id=many type=file multiple accept='image/*,.pdf' style='display:none'>" ++
         "<button id=add onclick=\"document.getElementById('many').click()\">Add files</button>" ++
+        "<input id=dir type=file webkitdirectory aria-label='Folder'>" ++
         "<button id=plain>Plain</button><script>" ++
-        "for(const el of [document.getElementById('one'),document.getElementById('many')])" ++
-        "el.addEventListener('change',async e=>{const fs=[...e.target.files];" ++
-        "const ts=await Promise.all(fs.map(f=>f.text()));" ++
-        "document.title=e.target.id+':'+fs.map((f,i)=>f.name+'='+ts[i]).join('|')+(e.isTrusted?':trusted':'')});" ++
+        "for(const el of [document.getElementById('one'),document.getElementById('many'),document.getElementById('dir')])" ++
+        "el.addEventListener('change',async e=>{const fs=[...e.target.files].sort((a,b)=>a.name<b.name?-1:1);" ++
+        "const ts=await Promise.all(fs.map(f=>f.text().catch(x=>'ERR')));" ++
+        "document.title=e.target.id+':'+fs.map((f,i)=>(f.webkitRelativePath||f.name)+'='+ts[i]).join('|')+(e.isTrusted?':trusted':'')});" ++
         "</script></body></html>";
     writeFileExact(path, html, 0o600) catch fail("cannot write upload fixture");
     var a_buf: [512]u8 = undefined;
@@ -3744,8 +3745,28 @@ fn webUploadStage(m: *Mcp, rt: []const u8) void {
     if (std.mem.indexOf(u8, after_plain, "isError") != null or !waitTitleHas(m, "many:up-a.txt=ALPHA:trusted"))
         fail("an upload after an unanswered chooser did not go through");
 
+    // 7. Folders: a folder path is refused before the click, and a FOLDER
+    //    input is refused by name instead of reported filled (the engine
+    //    answers success there and hands the page nothing).
+    var dir_buf: [512]u8 = undefined;
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}/up-dir", .{rt}, 0) catch unreachable;
+    _ = c.mkdir(dir.ptr, 0o700);
+    const folder = m.callTool("web_upload", std.fmt.bufPrint(&args, "{{\"id\":{d},\"files\":[\"{s}\"]}}", .{ one_id, dir }) catch unreachable);
+    if (std.mem.indexOf(u8, folder, "\"code\":\"invalid_args\"") == null or std.mem.indexOf(u8, folder, "is a folder") == null)
+        fail("a folder path was not refused as a folder");
+    const dir_el = m.callTool("web_eval", "{\"code\":\"document.getElementById('dir')\"}");
+    const dir_id = uintField(dir_el, "semantic_id") orelse fail("web_eval named no semantic id for the folder input");
+    const into_dir = m.callTool("web_upload", std.fmt.bufPrint(&args, "{{\"id\":{d},\"files\":[\"{s}\"]}}", .{ dir_id, file_a }) catch unreachable);
+    if (std.mem.indexOf(u8, into_dir, "\"code\":\"unavailable\"") == null or std.mem.indexOf(u8, into_dir, "FOLDER") == null) {
+        say(into_dir[0..@min(into_dir.len, 900)]);
+        fail("an upload into a folder input was not refused as one");
+    }
+    const after_dir = m.callTool("web_upload", std.fmt.bufPrint(&args, "{{\"id\":{d},\"files\":[\"{s}\"]}}", .{ one_id, file_a }) catch unreachable);
+    if (std.mem.indexOf(u8, after_dir, "isError") != null or !waitTitleHas(m, "one:up-a.txt=ALPHA:trusted"))
+        fail("an upload after a refused folder input did not go through");
+
     _ = m.callTool("web_close", std.fmt.bufPrint(&args, "{{\"pane\":{d}}}", .{view}) catch unreachable);
-    say("smoke-mcp: web_upload (file input, button-wired hidden input, refusals, nothing left armed) ok");
+    say("smoke-mcp: web_upload (file input, button-wired hidden input, refusals, folder input, nothing left armed) ok");
 }
 
 const StreamRig = struct {

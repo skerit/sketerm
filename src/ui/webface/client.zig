@@ -1183,6 +1183,10 @@ pub const Client = struct {
                 const ev = proto.decode(proto.EvUpload, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| face.onUpload(ev);
             },
+            .ev_upload_staged => {
+                const ev = proto.decode(proto.EvUploadStaged, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onUploadStaged(ev);
+            },
             .ev_cookie_change => {
                 const ev = proto.EvCookieChange.decodeFrom(frame.payload) catch return;
                 onCookieChange(self, ev);

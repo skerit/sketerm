@@ -3257,6 +3257,7 @@ pub const Host = struct {
     pub const downloadStart = host_dl.downloadStart;
     pub const uploadArm = host_upload.uploadArm;
     pub const uploadWatch = host_upload.uploadWatch;
+    pub const uploadStage = host_upload.uploadStage;
     pub const dlPendingReq = host_dl.dlPendingReq;
     pub const expireDlPending = host_dl.expireDlPending;
 
@@ -6409,6 +6410,14 @@ pub fn stagingFile(buf: [:0]u8, comptime kind: []const u8) ?[:0]u8 {
     const fd = c.mkstemp(path.ptr);
     if (fd < 0) return null;
     _ = c.close(fd);
+    return path;
+}
+
+/// Create a private, empty directory `<stagingDir>/sketerm-<kind>-XXXXXX` in `buf` for files a client delivers.
+pub fn stagingTree(buf: [:0]u8, comptime kind: []const u8) ?[:0]u8 {
+    const dir = stagingDir() orelse return null;
+    const path = std.fmt.bufPrintSentinel(buf, "{s}/sketerm-" ++ kind ++ "-XXXXXX", .{dir}, 0) catch return null;
+    if (c.mkdtemp(path.ptr) == null) return null;
     return path;
 }
 
