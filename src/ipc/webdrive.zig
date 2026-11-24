@@ -1264,6 +1264,8 @@ pub const Engine = struct {
     /// and how many of them a caller was told about (`takeUnarmedChooser`).
     unarmed_choosers: u32 = 0,
     unarmed_reported: u32 = 0,
+    /// This client wrote `webpresence.LABEL_FILE` and removes it.
+    label_file_written: bool = false,
     /// Prints asked for and not yet collected by `takePrint`.
     prints: std.ArrayList(Print) = .empty,
     /// Perf requests asked for and not yet collected by `takePerf`.
@@ -1808,16 +1810,20 @@ pub const Engine = struct {
     /// Write `web.json` next to the socket (see the header). Best
     /// effort: enumeration metadata, never load-bearing.
     pub fn writePresence(self: *Engine) void {
-        // This file also locates the owner's watchable session. An adopted
-        // connection has neither its pid nor its session; publishing our
-        // local view state would erase the real owner's discovery record.
-        if (self.state != .ready or self.owner != .self_spawned) return;
-        if (self.presence_started_ms == 0) self.presence_started_ms = clock.nowMs();
-        var path_z: [4096:0]u8 = undefined;
-        const p = self.routePathZ(&path_z, ".json") orelse return;
+        if (self.state != .ready) return;
         const url = if (self.findView(self.current)) |v| v.url orelse "" else "";
         const host = @import("../web/urlhost.zig").hostOf(url, .{ .require_scheme = true });
         const domain = if (host.len != 0) host else if (url.len != 0) "Local page" else if (self.tabCount() == 0) "Waiting for a page" else "Opening page";
+        // A broker-owned engine's record is the broker's: this client
+        // only names the browser, in the label file beside it.
+        if (self.owner == .broker and self.route_kind == .direct) return self.writeLabelFile(domain);
+        // This file also locates the owner's watchable session. An adopted
+        // connection has neither its pid nor its session; publishing our
+        // local view state would erase the real owner's discovery record.
+        if (self.owner != .self_spawned) return;
+        if (self.presence_started_ms == 0) self.presence_started_ms = clock.nowMs();
+        var path_z: [4096:0]u8 = undefined;
+        const p = self.routePathZ(&path_z, ".json") orelse return;
         const body = std.json.Stringify.valueAlloc(self.gpa, .{
             .mcp_pid = c.getpid(),
             .helper_pid = self.pid,
@@ -1830,6 +1836,24 @@ pub const Engine = struct {
         }, .{}) catch return;
         defer self.gpa.free(body);
         @import("../util/atomicwrite.zig").writeCacheFile(p, body, 0o600) catch {};
+    }
+
+    fn labelFilePath(self: *const Engine, buf: *[4096:0]u8) ?[:0]const u8 {
+        return std.fmt.bufPrintSentinel(buf, "{s}/" ++ @import("../web/webpresence.zig").LABEL_FILE, .{self.dir}, 0) catch null;
+    }
+
+    /// `webpresence.LABEL_FILE`: what a roster shows for a browser whose record this client does not own.
+    fn writeLabelFile(self: *Engine, domain: []const u8) void {
+        var path_z: [4096:0]u8 = undefined;
+        const p = self.labelFilePath(&path_z) orelse return;
+        const body = std.json.Stringify.valueAlloc(self.gpa, .{
+            .mcp_pid = c.getpid(),
+            .label = std.mem.sliceTo(&self.browser_label, 0),
+            .domain = domain,
+        }, .{}) catch return;
+        defer self.gpa.free(body);
+        @import("../util/atomicwrite.zig").writeCacheFile(p, body, 0o600) catch return;
+        self.label_file_written = true;
     }
 
     pub fn setBrowserLabel(self: *Engine, label: []const u8) void {
@@ -1859,6 +1883,11 @@ pub const Engine = struct {
     }
 
     fn removePresence(self: *Engine) void {
+        if (self.label_file_written) {
+            self.label_file_written = false;
+            var label_z: [4096:0]u8 = undefined;
+            if (self.labelFilePath(&label_z)) |p| _ = c.unlink(p.ptr);
+        }
         if (self.owner != .self_spawned) return;
         self.presence_started_ms = 0;
         var path_z: [4096:0]u8 = undefined;

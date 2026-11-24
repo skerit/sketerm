@@ -169,6 +169,10 @@ pub const Welcome = struct {
     /// The daemon's instance runs a browser engine no session stands for
     /// (`webpresence.sessionlessEngine`); false from an older daemon.
     engine: bool = false,
+    /// What the server driving that engine calls its browser, and the
+    /// site it shows; empty when it published neither.
+    engine_label: []const u8 = "",
+    engine_domain: []const u8 = "",
 };
 
 fn isSubcommand(s2: []const u8) bool {

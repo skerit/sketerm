@@ -1009,8 +1009,10 @@ pub fn queueListReply(self: *Daemon, cl: *Client, infos: []const SessionInfo) vo
     };
     var vnames: [wlvcodec.CodecList.cap][]const u8 = undefined;
     // Read per list: the engine outlives brokers and may be a predecessor's.
-    const engine = @import("../web/webpresence.zig").sessionlessEngine(arena, self.sock_path) != null;
-    cl.queueJson(.welcome, .{ .proto = cl.proto, .daemon_pid = c.getpid(), .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = wlvcodec.canEncode(.h264), .video_codecs = wlvcodec.encodableHere().names(&vnames), .sessions = infos, .assistants = assistants, .engine = engine });
+    const engine = @import("../web/webpresence.zig").sessionlessEngine(arena, self.sock_path);
+    const engine_label: []const u8 = if (engine) |*m| std.mem.sliceTo(&m.label, 0) else "";
+    const engine_domain: []const u8 = if (engine) |*m| std.mem.sliceTo(&m.domain, 0) else "";
+    cl.queueJson(.welcome, .{ .proto = cl.proto, .daemon_pid = c.getpid(), .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = wlvcodec.canEncode(.h264), .video_codecs = wlvcodec.encodableHere().names(&vnames), .sessions = infos, .assistants = assistants, .engine = engine != null, .engine_label = engine_label, .engine_domain = engine_domain });
 }
 
 test "broker list answers an allocation failure instead of dropping the reply" {

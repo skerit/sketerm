@@ -162,6 +162,11 @@ pub fn readMetadata(allocator: std.mem.Allocator, mux_socket: []const u8, sessio
     return parsed.value.metadata();
 }
 
+/// Where the MCP server driving an engine it does not own (a
+/// broker-owned one) publishes `{"label","domain"}` for it, beside the
+/// owner's `web.json`.
+pub const LABEL_FILE = "web.label.json";
+
 /// The direct-route engine of the MCP instance whose daemon listens on
 /// `mux_socket` when it renders into NO web session: a broker-owned
 /// engine (`mux/daemon_webengine.zig`) or a helper whose session setup
@@ -181,7 +186,16 @@ pub fn sessionlessEngine(allocator: std.mem.Allocator, mux_socket: []const u8) ?
     // A crashed engine leaves its record behind: the pid is the liveness.
     const rc = c.kill(@intCast(p.helper_pid), 0);
     if (rc != 0 and std.posix.errno(rc) == .SRCH) return null;
-    return p.metadata();
+    var out = p.metadata();
+    // The record is its owner's (the daemon); the server driving the
+    // engine names its browser in a file of its own beside it.
+    var label_buf: [MAX_PATH:0]u8 = undefined;
+    const label_path = std.fmt.bufPrintSentinel(&label_buf, "{s}/" ++ LABEL_FILE, .{dir}, 0) catch return out;
+    if (loadPresence(allocator, label_path)) |named| {
+        defer named.deinit();
+        out = named.value.metadata();
+    }
+    return out;
 }
 
 /// Bounded, single-line UTF-8 for labels; always NUL-terminated.
@@ -282,4 +296,37 @@ test "sessionlessEngine reports a live engine without a web session, in an insta
         try t.expectEqual(case.present, sessionlessEngine(t.allocator, mux) != null);
     }
     try t.expect(sessionlessEngine(t.allocator, "/tmp/sk-none-such-dir/mcp-x/mux.sock") == null);
+}
+
+test "a sessionless engine is named by the label file its driver writes" {
+    const t = std.testing;
+    var dir_buf: [MAX_PATH:0]u8 = undefined;
+    const dir = try std.fmt.bufPrintSentinel(&dir_buf, "/tmp/mcp-sk-label-{d}", .{c.getpid()}, 0);
+    _ = c.mkdir(dir.ptr, 0o700);
+    defer _ = c.rmdir(dir.ptr);
+    const files = [_]struct { name: []const u8, body_fmt: []const u8 }{
+        .{ .name = "web.json", .body_fmt = "{\"broker_pid\":1,\"helper_pid\":PID}\n" },
+        .{ .name = LABEL_FILE, .body_fmt = "{\"mcp_pid\":1,\"label\":\"Axus KYC\",\"domain\":\"axus.example\"}\n" },
+    };
+    var paths: [files.len][MAX_PATH:0]u8 = undefined;
+    defer for (&paths) |*p| {
+        _ = c.unlink(@ptrCast(p));
+    };
+    var mux_buf: [MAX_PATH]u8 = undefined;
+    const mux = try std.fmt.bufPrint(&mux_buf, "{s}/mux.sock", .{dir});
+    for (files, 0..) |file, i| {
+        const path = try std.fmt.bufPrintSentinel(&paths[i], "{s}/{s}", .{ dir, file.name }, 0);
+        var body_buf: [256]u8 = undefined;
+        var pid_buf: [24]u8 = undefined;
+        const pid = try std.fmt.bufPrint(&pid_buf, "{d}", .{c.getpid()});
+        const n = std.mem.replacementSize(u8, file.body_fmt, "PID", pid);
+        _ = std.mem.replace(u8, file.body_fmt, "PID", pid, &body_buf);
+        const f = c.fopen(path.ptr, "w") orelse return error.TestUnexpectedResult;
+        _ = c.fwrite(&body_buf, 1, n, f);
+        _ = c.fclose(f);
+        // Before the label file exists the row reads generically.
+        const meta = sessionlessEngine(t.allocator, mux) orelse return error.TestUnexpectedResult;
+        try t.expectEqualStrings(if (i == 0) "Assistant browser" else "Axus KYC", meta.title());
+        if (i == 1) try t.expectEqualStrings("axus.example", meta.subtitle());
+    }
 }
