@@ -15,12 +15,19 @@
 - Measured on the way (CEF 151): a windowless view's chooser never
   reaches `cef_dialog_handler_t`, and a trusted click on a file input
   without interception stalls the page (timers stop, eval and navigation
-  never answer). `web_act` still does that; its description now says to
-  use `web_upload`.
+  never answer). The MCP's views therefore keep the interception on for
+  their whole life (`upload_watch`, 0x7F, sent by `webdrive` at view
+  creation): a plain `web_act`/`web_key` on an upload control now leaves
+  the page running and reports `file_chooser: true`. A GUI never sends
+  it. The chooser event has its own hook on the DevTools session, so an
+  upload and `web_trace` do not contend.
 - smoke-mcp `webUploadStage` (in `SKETERM_SMOKE_MCP_WEB_ONLY`): one file,
   two files through a hidden multi input, two files refused by a
   single-file input, a control that opens no chooser, then an upload that
   still works.
+  It also clicks a file input with `web_act` and checks the page's timers
+  still run and a later upload works.
+- Version 0.2.4.
 
 ## 2026-11-24: named-instance browsers in the AI badge, session tab labels
 
