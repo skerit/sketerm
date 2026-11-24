@@ -621,7 +621,7 @@ fn agentTitle(self: *Switcher, buf: []u8, host: ?[]const u8, session: []const u8
     const watcher = self.win.assistants orelse return null;
     const row = watcher.findRow(host orelse return null, session) orelse return null;
     if (row.s.agent == null) return null;
-    return assistants.rowTitle(buf, row.a, row.s);
+    return assistants.rowTitle(&self.win.config, buf, row.a, row.s);
 }
 
 /// Sub-agent sessions on a daemon this overview does not list (an
@@ -636,7 +636,7 @@ fn populateAgentsElsewhere(self: *Switcher) void {
             if (listedHere(self, host, s.name)) continue;
             if (self.win.sessionPlacement(s.name, host) == .pane) continue;
             var title_buf: [320]u8 = undefined;
-            const title = assistants.rowTitle(&title_buf, a, s);
+            const title = assistants.rowTitle(&self.win.config, &title_buf, a, s);
             var subtitle_buf: [768:0]u8 = undefined;
             const subtitle = std.fmt.bufPrintSentinel(&subtitle_buf, "Sub-agent - assistant {s} - session {s} at {s}", .{ a.label(), s.name, host }, 0) catch "Sub-agent session";
             const entry = appendRow(self, .available, title, subtitle, null, std.mem.span(s.kind.icon()), false) orelse continue;

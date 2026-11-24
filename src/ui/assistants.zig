@@ -66,6 +66,8 @@ const webwatch = @import("webwatch.zig");
 const webpresence = @import("../web/webpresence.zig");
 const sockpath = @import("../mux/sockpath.zig");
 const strz = @import("../util/strz.zig");
+const Config = @import("../config.zig").Config;
+const sessname = @import("../mux/sessname.zig");
 const vocab = @import("../agent/vocab.zig");
 const glance = @import("../ipc/agentglance.zig");
 const agentbadge = @import("agentbadge.zig");
@@ -482,40 +484,46 @@ fn agentsFingerprint(src: ?[]const mcp_registry.Agent) u64 {
 pub const reportsRemote = glance.remotePerUser;
 
 /// The machine a host spec reaches, for people: `box`, `b via a`, or
-/// `this machine`; a route's instance is not a place.
-pub fn placeLabel(buf: []u8, spec: []const u8) []const u8 {
+/// `this machine`; a route's instance is not a place. With `cfg`, a
+/// host its user named with a `[domain.<name>]` reads by that name.
+pub fn placeLabel(cfg: ?*const Config, buf: []u8, spec: []const u8) []const u8 {
     if (std.mem.startsWith(u8, spec, "sock:")) return "this machine";
-    if (!sshroute.RouteSpec.isRoute(spec)) return sshroute.RemoteSpec.parse(spec).host;
+    if (!sshroute.RouteSpec.isRoute(spec)) return hostName(cfg, sshroute.RemoteSpec.parse(spec).host);
     const r = sshroute.RouteSpec.parse(spec) catch return spec;
     const hops = r.hops();
     var w: std.Io.Writer = .fixed(buf);
-    w.writeAll(hops[hops.len - 1]) catch return spec;
+    w.writeAll(hostName(cfg, hops[hops.len - 1])) catch return spec;
     if (hops.len > 1) {
         w.writeAll(" via ") catch return spec;
         for (hops[0 .. hops.len - 1], 0..) |hop, i| {
             if (i > 0) w.writeByte('/') catch return spec;
-            w.writeAll(hop) catch return spec;
+            w.writeAll(hostName(cfg, hop)) catch return spec;
         }
     }
     return w.buffered();
 }
 
+fn hostName(cfg: ?*const Config, host: []const u8) []const u8 {
+    const config = cfg orelse return host;
+    return if (config.domainForHost(host)) |d| d.name else host;
+}
+
 /// A sub-agent row's title: `claude-1 (claude)`, plus `on b via a` when
 /// its sessions live on another machine than its server's daemon.
-pub fn agentRowLabel(buf: []u8, id: []const u8, app: []const u8, elsewhere: ?[]const u8) []const u8 {
+pub fn agentRowLabel(cfg: ?*const Config, buf: []u8, id: []const u8, app: []const u8, elsewhere: ?[]const u8) []const u8 {
     var place_buf: [256]u8 = undefined;
     if (elsewhere) |spec| {
-        return std.fmt.bufPrint(buf, "{s} ({s}) on {s}", .{ id, app, placeLabel(&place_buf, spec) }) catch id;
+        return std.fmt.bufPrint(buf, "{s} ({s}) on {s}", .{ id, app, placeLabel(cfg, &place_buf, spec) }) catch id;
     }
     return std.fmt.bufPrint(buf, "{s} ({s})", .{ id, app }) catch id;
 }
 
 /// The title a roster row shows, shared by the popover and the Overview.
-pub fn rowTitle(buf: []u8, a: *const Assistant, s: *const Session) []const u8 {
+pub fn rowTitle(cfg: ?*const Config, buf: []u8, a: *const Assistant, s: *const Session) []const u8 {
     if (s.agent) |i| {
         if (i < a.agents.items.len) {
             const ag = a.agents.items[i];
-            return agentRowLabel(buf, ag.id, ag.app, s.host);
+            return agentRowLabel(cfg, buf, ag.id, ag.app, s.host);
         }
     }
     if (s.kind == .web) return s.browser.title();
@@ -527,7 +535,7 @@ pub fn rowTitle(buf: []u8, a: *const Assistant, s: *const Session) []const u8 {
 /// (busy ones wait for their worker). A server another host already
 /// reported, i.e. the same derived instance route, stays that host's.
 /// @return whether anything a surface shows changed.
-pub fn mergeReport(allocator: std.mem.Allocator, roster: *std.ArrayList(Assistant), host: []const u8, reports: []const mcp_registry.Report) bool {
+pub fn mergeReport(allocator: std.mem.Allocator, roster: *std.ArrayList(Assistant), cfg: ?*const Config, host: []const u8, reports: []const mcp_registry.Report) bool {
     var changed = false;
     for (roster.items) |*a| {
         if (a.reached) |r| if (std.mem.eql(u8, r, host)) {
@@ -541,10 +549,10 @@ pub fn mergeReport(allocator: std.mem.Allocator, roster: *std.ArrayList(Assistan
             const mine = if (a.reached) |r| std.mem.eql(u8, r, host) else false;
             if (!mine) continue;
             a.seen = true;
-            if (refreshRemote(allocator, a, host, rep)) changed = true;
+            if (refreshRemote(allocator, a, cfg, host, rep)) changed = true;
             continue;
         }
-        addRemote(allocator, roster, host, key, rep) catch continue;
+        addRemote(allocator, roster, cfg, host, key, rep) catch continue;
         changed = true;
     }
     var i: usize = 0;
@@ -567,13 +575,20 @@ fn findIn(items: []Assistant, host: []const u8) ?*Assistant {
     return null;
 }
 
-/// `<label> on <place>`; a server known only by its pid reads `mcp <pid>`,
-/// exactly as a local one does.
-fn remoteName(allocator: std.mem.Allocator, host: []const u8, rep: mcp_registry.Report) ![]u8 {
+/// `<name> on <place>`. The name is the server's label, except that an
+/// unnamed instance (`tmp-<pid>`) started in a session a person named
+/// reads by that session: a daemon that predates aliases still labels
+/// it by its working directory. A server known only by its pid reads
+/// `mcp <pid>`, exactly as a local one does.
+fn remoteName(allocator: std.mem.Allocator, cfg: ?*const Config, host: []const u8, rep: mcp_registry.Report) ![]u8 {
     var place_buf: [256]u8 = undefined;
     var pid_buf: [24]u8 = undefined;
     const pid_text = std.fmt.bufPrint(&pid_buf, "{d}", .{rep.pid}) catch "";
-    const place = placeLabel(&place_buf, host);
+    const place = placeLabel(cfg, &place_buf, host);
+    const unnamed = std.mem.startsWith(u8, rep.instance, "tmp-");
+    if (unnamed) if (rep.session) |s| {
+        if (s.len > 0 and !sessname.isMinted(s)) return std.fmt.allocPrint(allocator, "{s} on {s}", .{ s, place });
+    };
     if (rep.label.len == 0 or std.mem.eql(u8, rep.label, pid_text)) {
         return std.fmt.allocPrint(allocator, "mcp {d} on {s}", .{ rep.pid, place });
     }
@@ -584,12 +599,12 @@ fn modeOf(text: []const u8) mcp_registry.Mode {
     return std.meta.stringToEnum(mcp_registry.Mode, text) orelse .isolated;
 }
 
-fn refreshRemote(allocator: std.mem.Allocator, a: *Assistant, host: []const u8, rep: mcp_registry.Report) bool {
+fn refreshRemote(allocator: std.mem.Allocator, a: *Assistant, cfg: ?*const Config, host: []const u8, rep: mcp_registry.Report) bool {
     var changed = false;
     a.pid = rep.pid;
     a.mode = modeOf(rep.mode);
     if (a.setOrigin(allocator, rep.session, rep.session_socket)) changed = true;
-    if (remoteName(allocator, host, rep)) |name| {
+    if (remoteName(allocator, cfg, host, rep)) |name| {
         if (std.mem.eql(u8, name, a.name)) allocator.free(name) else {
             allocator.free(a.name);
             a.name = name;
@@ -603,8 +618,8 @@ fn refreshRemote(allocator: std.mem.Allocator, a: *Assistant, host: []const u8, 
     return changed;
 }
 
-fn addRemote(allocator: std.mem.Allocator, roster: *std.ArrayList(Assistant), host: []const u8, key: []const u8, rep: mcp_registry.Report) !void {
-    const name = try remoteName(allocator, host, rep);
+fn addRemote(allocator: std.mem.Allocator, roster: *std.ArrayList(Assistant), cfg: ?*const Config, host: []const u8, key: []const u8, rep: mcp_registry.Report) !void {
+    const name = try remoteName(allocator, cfg, host, rep);
     errdefer allocator.free(name);
     const detail = try allocator.dupe(u8, "");
     errdefer allocator.free(detail);
@@ -717,10 +732,10 @@ pub fn restSummary(buf: []u8, roster: []const Assistant) []const u8 {
 }
 
 /// An instance's tooltip: everything its one header line leaves out.
-pub fn instanceTip(buf: []u8, a: *const Assistant) []const u8 {
+pub fn instanceTip(cfg: ?*const Config, buf: []u8, a: *const Assistant) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     var place_buf: [256]u8 = undefined;
-    w.print("{s}\n{s} mode, pid {d}, on {s}", .{ a.label(), a.mode.text(), a.pid, placeLabel(&place_buf, a.reached orelse a.host) }) catch return w.buffered();
+    w.print("{s}\n{s} mode, pid {d}, on {s}", .{ a.label(), a.mode.text(), a.pid, placeLabel(cfg, &place_buf, a.reached orelse a.host) }) catch return w.buffered();
     if (a.detail.len > 0) w.print("\n{s}", .{a.detail}) catch return w.buffered();
     if (a.session) |session| w.print("\nstarted in session {s}", .{session}) catch return w.buffered();
     var why_buf: [224]u8 = undefined;
@@ -1173,7 +1188,7 @@ pub const Watcher = struct {
                 i += 1;
                 continue;
             }
-            _ = mergeReport(self.allocator, &self.roster, h.spec, &.{});
+            _ = mergeReport(self.allocator, &self.roster, &self.win.config, h.spec, &.{});
             self.allocator.free(h.spec);
             _ = self.hosts.swapRemove(i);
         }
@@ -1188,7 +1203,7 @@ pub const Watcher = struct {
             if (!term.remote.?.conn.caps.assistants) {
                 // An older daemon says nothing about assistants: none known.
                 h.next_ms = now + HOST_UNSUPPORTED_MS;
-                if (mergeReport(self.allocator, &self.roster, h.spec, &.{})) self.refreshChip();
+                if (mergeReport(self.allocator, &self.roster, &self.win.config, h.spec, &.{})) self.refreshChip();
                 continue;
             }
             if (term.requestHostList()) h.next_ms = now + HOST_POLL_MS;
@@ -1230,7 +1245,7 @@ pub const Watcher = struct {
         const spec = host orelse return;
         const h = self.findHost(spec) orelse return;
         h.next_ms = clock.nowMs() + HOST_POLL_MS;
-        if (mergeReport(self.allocator, &self.roster, spec, reports)) self.refreshChip();
+        if (mergeReport(self.allocator, &self.roster, &self.win.config, spec, reports)) self.refreshChip();
     }
 
     // ── surfaces ────────────────────────────────────────────────
@@ -1378,7 +1393,7 @@ pub const Watcher = struct {
         c.gtk_widget_set_size_request(glyph, 16, 16);
         var place_buf: [256]u8 = undefined;
         var title_buf: [400]u8 = undefined;
-        const title = std.fmt.bufPrint(&title_buf, "{s} on {s}", .{ ag.id, placeLabel(&place_buf, ag.watch) }) catch ag.id;
+        const title = std.fmt.bufPrint(&title_buf, "{s} on {s}", .{ ag.id, placeLabel(&self.win.config, &place_buf, ag.watch) }) catch ag.id;
         var status_buf: [64:0]u8 = undefined;
         const status = statusText(&status_buf, ag.attention);
         var first: ?*Session = null;
@@ -1566,7 +1581,7 @@ pub const Watcher = struct {
             };
             view.order = order;
             var title_buf: [320]u8 = undefined;
-            const title = rowTitle(&title_buf, a, s);
+            const title = rowTitle(&self.win.config, &title_buf, a, s);
             var tip_buf: [400]u8 = undefined;
             const tip = if (s.kind == .web)
                 s.browser.title()
@@ -1598,7 +1613,7 @@ pub const Watcher = struct {
         c.gtk_label_set_text(@ptrCast(h.facts), facts.ptr);
         var tip_buf: [1024]u8 = undefined;
         var tip_z: [1024:0]u8 = undefined;
-        c.gtk_widget_set_tooltip_text(h.line, strz.copyZ(&tip_z, instanceTip(&tip_buf, a)));
+        c.gtk_widget_set_tooltip_text(h.line, strz.copyZ(&tip_z, instanceTip(&self.win.config, &tip_buf, a)));
     }
 
     /// The instances without sessions (idle or unreachable), a name per
@@ -1617,7 +1632,7 @@ pub const Watcher = struct {
             c.gtk_widget_add_css_class(name, "caption");
             var tip_buf: [1024]u8 = undefined;
             var tip_z: [1024:0]u8 = undefined;
-            c.gtk_widget_set_tooltip_text(name, strz.copyZ(&tip_z, instanceTip(&tip_buf, a)));
+            c.gtk_widget_set_tooltip_text(name, strz.copyZ(&tip_z, instanceTip(&self.win.config, &tip_buf, a)));
             c.gtk_box_append(@ptrCast(inner), name);
         }
         return inner;
@@ -2374,7 +2389,12 @@ fn fetchThreadMain(op: *FetchOp) void {
     if (op.local) {
         op.engine = webpresence.sessionlessEngine(std.heap.c_allocator, op.key.?["sock:".len..]);
     } else if (op.parsed) |parsed| {
-        if (parsed.value.engine) op.engine = .{};
+        if (parsed.value.engine) {
+            var meta: webpresence.Metadata = .{};
+            webpresence.copyText(&meta.label, parsed.value.engine_label);
+            webpresence.copyText(&meta.domain, parsed.value.engine_domain);
+            op.engine = meta;
+        }
     }
     _ = c.g_idle_add(@ptrCast(&onFetchIdle), @ptrCast(op));
 }
@@ -2520,16 +2540,41 @@ test "show beside pane is a browser row's action alone, read-only for a new view
     try t.expectEqualStrings("Show beside pane", std.mem.span(AttachAction.beside.verb().text));
 }
 
+test "a host its user named with a domain reads by that name; a named session names its unnamed server" {
+    var cfg = try Config.loadFromBytes(t.allocator, "[domain.archdev]\nhost = skerit@10.47.1.70\ntransport = udp\n");
+    defer cfg.deinit();
+    var buf: [128]u8 = undefined;
+    try t.expectEqualStrings("archdev", placeLabel(&cfg, &buf, "skerit@10.47.1.70"));
+    try t.expectEqualStrings("archdev", placeLabel(&cfg, &buf, "udp:skerit@10.47.1.70"));
+    try t.expectEqualStrings("archdev", placeLabel(&cfg, &buf, "route:skerit@10.47.1.70#tmp-4"));
+    try t.expectEqualStrings("other", placeLabel(&cfg, &buf, "other"));
+    var rep = testReport("tmp-9", "zenit-workspace", null);
+    rep.session = "Mail";
+    const named = try remoteName(t.allocator, &cfg, "skerit@10.47.1.70", rep);
+    defer t.allocator.free(named);
+    try t.expectEqualStrings("Mail on archdev", named);
+    rep.session = "s7446-8";
+    const minted = try remoteName(t.allocator, &cfg, "skerit@10.47.1.70", rep);
+    defer t.allocator.free(minted);
+    try t.expectEqualStrings("zenit-workspace on archdev", minted);
+    // An instance somebody named keeps that name whatever session it runs in.
+    var explicit = testReport("hub", "hub", null);
+    explicit.session = "Mail";
+    const kept = try remoteName(t.allocator, null, "box", explicit);
+    defer t.allocator.free(kept);
+    try t.expectEqualStrings("hub on box", kept);
+}
+
 test "place labels name the machine, through its hops" {
     var buf: [128]u8 = undefined;
-    try t.expectEqualStrings("box", placeLabel(&buf, "box"));
-    try t.expectEqualStrings("box", placeLabel(&buf, "ssh:box"));
-    try t.expectEqualStrings("box", placeLabel(&buf, "route:box#tmp-4"));
-    try t.expectEqualStrings("b via a", placeLabel(&buf, "route:a/b"));
-    try t.expectEqualStrings("c via a/b", placeLabel(&buf, "route:tor:a/b/c#hub"));
-    try t.expectEqualStrings("this machine", placeLabel(&buf, "sock:/x/mux.sock"));
-    try t.expectEqualStrings("claude-1 (claude)", agentRowLabel(&buf, "claude-1", "claude", null));
-    try t.expectEqualStrings("claude-2 (claude) on hostb via hosta", agentRowLabel(&buf, "claude-2", "claude", "route:hosta/hostb"));
+    try t.expectEqualStrings("box", placeLabel(null, &buf, "box"));
+    try t.expectEqualStrings("box", placeLabel(null, &buf, "ssh:box"));
+    try t.expectEqualStrings("box", placeLabel(null, &buf, "route:box#tmp-4"));
+    try t.expectEqualStrings("b via a", placeLabel(null, &buf, "route:a/b"));
+    try t.expectEqualStrings("c via a/b", placeLabel(null, &buf, "route:tor:a/b/c#hub"));
+    try t.expectEqualStrings("this machine", placeLabel(null, &buf, "sock:/x/mux.sock"));
+    try t.expectEqualStrings("claude-1 (claude)", agentRowLabel(null, &buf, "claude-1", "claude", null));
+    try t.expectEqualStrings("claude-2 (claude) on hostb via hosta", agentRowLabel(null, &buf, "claude-2", "claude", "route:hosta/hostb"));
 }
 
 fn testReport(instance: []const u8, label: []const u8, agents: ?[]const mcp_registry.Agent) mcp_registry.Report {
@@ -2550,7 +2595,7 @@ test "a remote report lists its server with routes for each agent location" {
         .{ .id = "odd", .app = "claude", .sessions = &.{"agent-odd"}, .location = "moon" },
     };
     // An unnamed server's label is its pid: it reads like a local one.
-    try t.expect(mergeReport(t.allocator, &roster, "ssh:hosta", &.{testReport("tmp-9", "77", &agents)}));
+    try t.expect(mergeReport(t.allocator, &roster, null, "ssh:hosta", &.{testReport("tmp-9", "77", &agents)}));
     try t.expectEqual(@as(usize, 1), roster.items.len);
     const a = &roster.items[0];
     try t.expectEqualStrings("route:hosta#tmp-9", a.host);
@@ -2565,11 +2610,11 @@ test "a remote report lists its server with routes for each agent location" {
     const far = a.findSession("agent-claude-2").?;
     try t.expectEqualStrings("route:hosta/hostb", far.attachHost(a));
     var buf: [128]u8 = undefined;
-    try t.expectEqualStrings("claude-2 (claude) on hostb via hosta", rowTitle(&buf, a, far));
+    try t.expectEqualStrings("claude-2 (claude) on hostb via hosta", rowTitle(null, &buf, a, far));
     try t.expectEqual(@as(usize, 2), summarize(roster.items).terminal);
     // An unchanged report changes nothing; the server leaving drops it.
-    try t.expect(!mergeReport(t.allocator, &roster, "ssh:hosta", &.{testReport("tmp-9", "77", &agents)}));
-    try t.expect(mergeReport(t.allocator, &roster, "ssh:hosta", &.{}));
+    try t.expect(!mergeReport(t.allocator, &roster, null, "ssh:hosta", &.{testReport("tmp-9", "77", &agents)}));
+    try t.expect(mergeReport(t.allocator, &roster, null, "ssh:hosta", &.{}));
     try t.expectEqual(@as(usize, 0), roster.items.len);
 }
 
@@ -2577,13 +2622,13 @@ test "two specs reaching one machine report its server once" {
     var roster: std.ArrayList(Assistant) = .empty;
     defer freeTestRoster(&roster);
     const reps = [_]mcp_registry.Report{testReport("hub", "hub", null)};
-    try t.expect(mergeReport(t.allocator, &roster, "hosta", &reps));
-    try t.expect(!mergeReport(t.allocator, &roster, "ssh:hosta", &reps));
+    try t.expect(mergeReport(t.allocator, &roster, null, "hosta", &reps));
+    try t.expect(!mergeReport(t.allocator, &roster, null, "ssh:hosta", &reps));
     try t.expectEqual(@as(usize, 1), roster.items.len);
     try t.expectEqualStrings("hosta", roster.items[0].reached.?);
     try t.expectEqualStrings("hub on hosta", roster.items[0].label());
     // The second spec's empty report cannot drop the first one's server.
-    try t.expect(!mergeReport(t.allocator, &roster, "ssh:hosta", &.{}));
+    try t.expect(!mergeReport(t.allocator, &roster, null, "ssh:hosta", &.{}));
     try t.expectEqual(@as(usize, 1), roster.items.len);
     // agents: null (an older server) contributes the server, no rows.
     try t.expectEqual(@as(usize, 0), roster.items[0].sessions.items.len);
@@ -2596,7 +2641,7 @@ test "an instance listing is the truth on its own daemon, agents elsewhere are a
         .{ .id = "claude-1", .app = "claude", .sessions = &.{"agent-claude-1"}, .location = "instance" },
         .{ .id = "claude-2", .app = "claude", .sessions = &.{"agent-claude-2"}, .location = "host:hostb" },
     };
-    _ = mergeReport(t.allocator, &roster, "hosta", &.{testReport("tmp-9", "tmp-9", &agents)});
+    _ = mergeReport(t.allocator, &roster, null, "hosta", &.{testReport("tmp-9", "tmp-9", &agents)});
     const a = &roster.items[0];
     // A fresh listing without the instance agent's session (it ended)
     // and with a browser: the browser shows, the gone agent does not.
@@ -2656,7 +2701,7 @@ test "a sessionless engine is one browser row, by its kind and an empty name" {
     a.rebuildRows(t.allocator);
     try t.expectEqual(@as(usize, 1), a.sessions.items.len);
     try t.expectEqual(Kind.web, a.findSession("").?.kind);
-    try t.expectEqualStrings("Assistant browser", rowTitle(&.{}, &a, &a.sessions.items[0]));
+    try t.expectEqualStrings("Assistant browser", rowTitle(null, &.{}, &a, &a.sessions.items[0]));
     var counts: Counts = .{};
     for (a.sessions.items) |s| counts.add(s.kind);
     try t.expectEqual(@as(usize, 1), counts.web);
@@ -2719,7 +2764,7 @@ test "the tooltip carries the mode, the pid and why an instance is empty" {
     defer a.deinit(t.allocator);
     a.reach = .idle;
     var buf: [512]u8 = undefined;
-    const tip = instanceTip(&buf, &a);
+    const tip = instanceTip(null, &buf, &a);
     try t.expect(std.mem.indexOf(u8, tip, "isolated mode, pid 42, on this machine") != null);
     try t.expect(std.mem.indexOf(u8, tip, "idle:") != null);
 }

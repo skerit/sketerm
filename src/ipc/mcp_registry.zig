@@ -13,6 +13,7 @@ const readfile = @import("../util/readfile.zig");
 const sockpath = @import("../mux/sockpath.zig");
 const webpresence = @import("../web/webpresence.zig");
 const vocab = @import("../agent/vocab.zig");
+const sessname = @import("../mux/sessname.zig");
 const pathZ = pathz.pathZ;
 const unlinkPath = pathz.unlinkPath;
 
@@ -148,6 +149,9 @@ pub const Entry = struct {
     /// Null = not started from a pane session, or an older build.
     session: ?[]u8 = null,
     session_socket: ?[]u8 = null,
+    /// The alias its peer carries (its session's title, else its
+    /// working directory's name); null before the broker gave one.
+    alias: ?[]u8 = null,
 
     pub fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -158,13 +162,18 @@ pub const Entry = struct {
         allocator.free(self.agent_socket);
         if (self.session) |v| allocator.free(v);
         if (self.session_socket) |v| allocator.free(v);
+        if (self.alias) |v| allocator.free(v);
         if (self.agents) |owned| freeAgents(allocator, owned);
     }
 
-    /// Short operator-facing identity: explicit configuration, else the
-    /// working directory's name, else the log directory's; empty if none.
+    /// Short operator-facing identity: its explicit name, else what a
+    /// person called the session it runs in (the peer alias, or a
+    /// session name sketerm did not mint), else its other configuration,
+    /// its working directory's name, its log directory's; empty if none.
     pub fn displayName(self: Entry) []const u8 {
         if (self.name.len > 0) return self.name;
+        if (self.alias) |a| if (a.len > 0) return a;
+        if (self.session) |s| if (s.len > 0 and !sessname.isMinted(s)) return s;
         if (self.profile.len > 0) return self.profile;
         const cwd = lastComponent(self.cwd);
         if (cwd.len > 0) return cwd;
@@ -579,6 +588,8 @@ fn ownedEntry(allocator: std.mem.Allocator, record: Record, legacy: bool) !Entry
     const session = try dupeOpt(allocator, record.session);
     errdefer if (session) |v| allocator.free(v);
     const session_socket = try dupeOpt(allocator, record.session_socket);
+    errdefer if (session_socket) |v| allocator.free(v);
+    const alias = if (record.peer) |p| try dupeOpt(allocator, p.alias) else null;
     return .{
         .pid = record.pid,
         .mode = record.mode,
@@ -593,6 +604,7 @@ fn ownedEntry(allocator: std.mem.Allocator, record: Record, legacy: bool) !Entry
         .agent_socket = agent_socket,
         .session = session,
         .session_socket = session_socket,
+        .alias = alias,
     };
 }
 
@@ -931,6 +943,13 @@ test "display name: configuration, then the working directory, then the log dire
     try std.testing.expectEqualStrings("claudehere", entry.displayName());
     entry.log_dir = @constCast("");
     try std.testing.expectEqualStrings("", entry.displayName());
+    // What a person called the session outranks every derived name.
+    var in_session = Entry{ .pid = 1, .mode = .isolated, .name = &.{}, .profile = @constCast("prof"), .log_dir = &.{}, .cwd = @constCast("/x/project-x"), .mux_socket = &.{}, .session = @constCast("Mail") };
+    try std.testing.expectEqualStrings("Mail", in_session.displayName());
+    in_session.session = @constCast("s7446-8");
+    try std.testing.expectEqualStrings("prof", in_session.displayName());
+    in_session.alias = @constCast("Inbox");
+    try std.testing.expectEqualStrings("Inbox", in_session.displayName());
     try std.testing.expect(Mode.isolated.isDefault());
     try std.testing.expect(!Mode.durable.isDefault());
 }

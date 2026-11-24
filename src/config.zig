@@ -2033,6 +2033,14 @@ pub const Config = struct {
         for (self.domains.items) |*d| if (d.hasSpec(spec)) return d;
         return null;
     }
+
+    /// The first `[domain.<name>]` whose `host` is `host`, whatever its
+    /// transport: the name for a bare host or one hop of a route.
+    pub fn domainForHost(self: *const Config, host: []const u8) ?*const Domain {
+        if (host.len == 0) return null;
+        for (self.domains.items) |*d| if (std.mem.eql(u8, d.host, host)) return d;
+        return null;
+    }
 };
 
 /// Pure matcher behind Config.appWantsGpu (testable without a Config).
