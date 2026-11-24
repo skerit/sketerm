@@ -1857,7 +1857,7 @@ land — including for a download the client itself asked for.
   half (a url fetched to a caller's path, and a page-initiated download
   landing in the XDG download directory).
 
-## Uploads and file choosers (0x7D-0x7F, capability "upload")
+## Uploads and file choosers (0x7D-0x7F and 0xED-0xEE, capabilities "upload" and "upload-staging")
 
 `cefhost/upload.zig`. A client arms files for a view (`upload_arm`), clicks
 the page's upload control with trusted input, and gets `ev_upload` back.
@@ -1910,8 +1910,27 @@ view's DevTools session, never through `cef_dialog_handler_t`:
   never taken for the owner's; a controlling observer may send
   `upload_arm` (`observerAllows`), a view-only one may not. The GUI shows
   its picker for an OBSERVED page only while it holds control.
-- The helper reads the files on ITS machine: the GUI refuses, with a
-  toast, to pick for a page whose helper is remote.
+- **A folder input cannot be filled, and says so.** `DOM.setFileInputFiles`
+  on an `<input webkitdirectory>` answers SUCCESS and sets nothing
+  (measured on CEF 151: no change event, the field stays as it was).
+  Blink turns it into a directory enumeration that the embedder must
+  serve, and a windowless view serves none; a file dropped on one takes
+  the same road. So the helper describes the node first
+  (`DOM.describeNode`, phase `describing`) and answers
+  `upload_folder_input` for one, instead of reporting an upload that did
+  not happen. `web_upload` refuses a folder PATH before clicking.
+- **The helper reads the files on ITS machine, so a GUI on another host
+  delivers them first** (`ui/webface/upload.zig`). `upload_stage` asks
+  the helper for a private tree (`<staging>/sketerm-webup-XXXXXX/<i>/`,
+  one subdirectory per file so each keeps its name), the GUI's transfer
+  service copies every pick into it (`submitDelivery`, the road a staged
+  remote download takes in the other direction, visible and cancellable
+  in the transfers panel), and only then is the chooser answered with
+  the delivered paths. The helper removes the tree WITH THE VIEW, never
+  after the set: a page reads a file it was handed lazily. Without
+  "upload-staging" the GUI says the other machine needs an update.
+  smoke-e2e `webUploadPickerStage(remote)` covers delivery, the page
+  reading it, and the removal.
 
 ## ERR_NETWORK_CHANGED: retried once, reported as a retry (capability "load-retry")
 

@@ -1,5 +1,31 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-24: uploads into a browser on another machine, the overview's browser row, folder inputs
+
+- A pick in sketerm's file picker now reaches a page whose browser runs
+  on ANOTHER host (`on:` tabs, a watched remote assistant under control).
+  The helper hands out a private tree (`upload_stage` 0xED /
+  `ev_upload_staged` 0xEE, capability `upload-staging`), the transfer
+  service delivers each file into it, then the chooser is answered with
+  the delivered paths; the helper removes the tree with the view. The
+  picker is no longer local-only for such a page, so a file on a third
+  host can be picked too.
+- The Session Overview lists a named instance's sessionless browser
+  engine (the row the AI badge already had) by its `web_open` name, with
+  Watch / Take control / Show beside pane. It has no stop button: it is
+  no mux session.
+- Folder inputs: the engine answers success for an
+  `<input webkitdirectory>` and sets nothing (measured, CEF 151). The
+  helper now describes the input first and answers `upload_folder_input`;
+  `web_upload` refuses a folder path before clicking, and the GUI says
+  the field takes a folder. Filling one is not possible on this engine.
+- Host names by `[domain.<name>]` in the rest of the Session Overview
+  (attached, forwarded-app and sub-agent rows, daemon origins) and in
+  the upload/download toasts, through `assistants.placeLabel`.
+- smoke-e2e: the upload stage runs a second time against an `on:` tab
+  (delivery, page read, removal); the named-browser stage watches from
+  the Session Overview as well. smoke-mcp: folder path and folder input.
+
 ## 2026-11-24: the web_open name on the badge, session names for assistants, a file picker for people
 
 - A named instance's browser row carries the name given to `web_open` and
