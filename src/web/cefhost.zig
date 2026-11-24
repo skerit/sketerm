@@ -48,6 +48,7 @@ const host_obs = @import("cefhost/observe.zig");
 const host_us = @import("cefhost/usercontent.zig");
 const host_sec = @import("cefhost/security.zig");
 const host_dl = @import("cefhost/downloads.zig");
+const host_upload = @import("cefhost/upload.zig");
 const host_a11y = @import("cefhost/a11y.zig");
 const host_icpt = @import("cefhost/intercept.zig");
 const host_cap = @import("cefhost/capture.zig");
@@ -531,6 +532,8 @@ pub const View = struct {
     cert_cb: ?*cef.cef_callback_t = null,
     /// Permission prompts held for this view (see `PendingPerm`).
     perms: [max_pending_perms]PendingPerm = @splat(.{}),
+    /// Files a client armed for this view's next file chooser.
+    upload: host_upload.Armed = .{},
 
     /// Semantic-layer state: the shadow tree plus the requests waiting
     /// on a reply from the injected script.
@@ -2984,6 +2987,7 @@ pub const Host = struct {
         interceptUnregister(self.gpa, v.id);
         self.dropBrowser(v, close);
         self.motionDriftFree(v);
+        v.upload.clear(self.gpa);
         if (v.url.len != 0) self.gpa.free(v.url);
         if (v.title.len != 0) self.gpa.free(v.title);
         if (v.sel_text.len != 0) self.gpa.free(v.sel_text);
@@ -3178,6 +3182,7 @@ pub const Host = struct {
             mi += 1;
         }
         host_perf.pump(self, now_ms);
+        host_upload.pump(self);
         filterSubPump(self, now_ms);
         filterSubTick(self, now_ms);
         // A scroll that STOPPED left its resting position behind the
@@ -3249,6 +3254,7 @@ pub const Host = struct {
     pub const cancelDl = host_dl.cancelDl;
     pub const downloadCancel = host_dl.downloadCancel;
     pub const downloadStart = host_dl.downloadStart;
+    pub const uploadArm = host_upload.uploadArm;
     pub const dlPendingReq = host_dl.dlPendingReq;
     pub const expireDlPending = host_dl.expireDlPending;
 

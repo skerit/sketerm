@@ -1857,6 +1857,39 @@ land — including for a download the client itself asked for.
   half (a url fetched to a caller's path, and a page-initiated download
   landing in the XDG download directory).
 
+## Uploads (0x7D/0x7E, capability "upload")
+
+`cefhost/upload.zig`. A client arms files for a view (`upload_arm`), clicks
+the page's upload control with trusted input, and gets `ev_upload` back.
+The files are set through the view's DevTools session, never through
+`cef_dialog_handler_t`:
+
+- **A windowless view's file chooser never reaches `get_dialog_handler`**
+  (measured on CEF 151, headless and Wayland ozone alike: the getter is
+  not called at all). Do not build on `on_file_dialog`.
+- **An un-intercepted chooser stalls the page.** After a trusted click on
+  an `<input type=file>` the page's timers stop and neither an eval nor a
+  navigation is answered again; the helper itself stays responsive. That
+  is what a plain `web_act` click on an upload control still does, which
+  is why the tool text sends callers to `web_upload`.
+- The working sequence is `Page.enable`, then
+  `Page.setInterceptFileChooserDialog {enabled:true}`, the click,
+  `Page.fileChooserOpened` (it names the input's `backendNodeId` and
+  `selectSingle`/`selectMultiple`), then `DOM.setFileInputFiles` on that
+  node. The page sees trusted `input`/`change` events and is not stalled.
+  `Page.enable` is browser-side only; the ban on `Runtime.enable` and
+  `Debugger.enable` stands.
+- Interception is on ONLY while an upload is armed, and `disarm` turns it
+  off on every exit, so a view that never uploads attaches no agent for it.
+- The session has one `EventSink`. An arm while a trace holds it is
+  refused (`upload_failed`), and `disarm` removes only its own sink.
+- Nothing is sent from inside the event callback: the chooser is recorded
+  there and answered from `upload.pump` (the host watchdog), like tracing.
+- Several files armed for a single-file input set NOTHING
+  (`upload_too_many`); a later upload on the same input still works
+  (smoke-mcp `webUploadStage` pins that).
+- An untrusted helper withholds the capability and refuses `upload_arm`.
+
 ## ERR_NETWORK_CHANGED: retried once, reported as a retry (capability "load-retry")
 
 Chromium's Linux network-change notifier watches netlink and counts ANY

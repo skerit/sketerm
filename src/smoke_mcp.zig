@@ -3636,6 +3636,101 @@ fn webHandStage(m: *Mcp, rt: []const u8) void {
     say("smoke-mcp: hand-driven input (pointer, held keys, text, wheel) and the pulled frame stream ok");
 }
 
+/// The page's title once it contains `needle`, polled; false on timeout.
+fn waitTitleHas(m: *Mcp, needle: []const u8) bool {
+    var tries: usize = 0;
+    while (tries < 60) : (tries += 1) {
+        const got = m.callTool("web_eval", "{\"code\":\"document.title\"}");
+        if (std.mem.indexOf(u8, got, needle) != null) return true;
+        _ = c.usleep(50_000);
+    }
+    return false;
+}
+
+/// Local files into a page's upload field against the REAL helper: a
+/// trusted click opens the page's chooser, the engine intercepts it and
+/// sets the files, for an <input type=file> and for a button wired to a
+/// hidden one; the page reads the bytes; every refusal leaves nothing armed.
+fn webUploadStage(m: *Mcp, rt: []const u8) void {
+    const writeFileExact = @import("util/atomicwrite.zig").writeFileExact;
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/upload-fixture.html", .{rt}) catch unreachable;
+    const html =
+        "<!doctype html><html><head><title>up</title></head><body>" ++
+        "<input id=one type=file aria-label='Single file'>" ++
+        "<input id=many type=file multiple accept='image/*,.pdf' style='display:none'>" ++
+        "<button id=add onclick=\"document.getElementById('many').click()\">Add files</button>" ++
+        "<button id=plain>Plain</button><script>" ++
+        "for(const el of [document.getElementById('one'),document.getElementById('many')])" ++
+        "el.addEventListener('change',async e=>{const fs=[...e.target.files];" ++
+        "const ts=await Promise.all(fs.map(f=>f.text()));" ++
+        "document.title=e.target.id+':'+fs.map((f,i)=>f.name+'='+ts[i]).join('|')+(e.isTrusted?':trusted':'')});" ++
+        "</script></body></html>";
+    writeFileExact(path, html, 0o600) catch fail("cannot write upload fixture");
+    var a_buf: [512]u8 = undefined;
+    var b_buf: [512]u8 = undefined;
+    const file_a = std.fmt.bufPrint(&a_buf, "{s}/up-a.txt", .{rt}) catch unreachable;
+    const file_b = std.fmt.bufPrint(&b_buf, "{s}/up-b.txt", .{rt}) catch unreachable;
+    writeFileExact(file_a, "ALPHA", 0o600) catch fail("cannot write upload file a");
+    writeFileExact(file_b, "BETA", 0o600) catch fail("cannot write upload file b");
+
+    var args: [2048]u8 = undefined;
+    m.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"file://{s}\",\"ephemeral\":true,\"width\":800,\"height\":600}}", .{path}) catch unreachable);
+    const opened = m.recvLine(60_000);
+    if (std.mem.indexOf(u8, opened, "isError") != null) fail("upload fixture failed to open");
+    const view = viewHandleOf(opened);
+    const caps = m.callTool("capabilities", "{}");
+    if (std.mem.indexOf(u8, caps, "\"web_upload\":true") == null) fail("capabilities does not report web_upload:true with a running helper");
+
+    // 1. The file input itself, by id: one file, read by the page.
+    const one = m.callTool("web_eval", "{\"code\":\"document.getElementById('one')\"}");
+    const one_id = uintField(one, "semantic_id") orelse fail("web_eval named no semantic id for the file input");
+    const up1 = m.callTool("web_upload", std.fmt.bufPrint(&args, "{{\"id\":{d},\"files\":[\"{s}\"]}}", .{ one_id, file_a }) catch unreachable);
+    if (std.mem.indexOf(u8, up1, "isError") != null or std.mem.indexOf(u8, up1, "\"uploaded\":true") == null or
+        std.mem.indexOf(u8, up1, "\"multiple\":false") == null or std.mem.indexOf(u8, up1, "\"bytes\":5") == null)
+    {
+        say(up1[0..@min(up1.len, 900)]);
+        fail("web_upload did not report one file handed to the single-file input");
+    }
+    if (!waitTitleHas(m, "one:up-a.txt=ALPHA:trusted")) fail("the page did not read the uploaded file as a trusted selection");
+
+    // 2. A button wired to a HIDDEN multi-file input, by name: two files, in order.
+    const up2 = m.callTool("web_upload", std.fmt.bufPrint(&args, "{{\"name\":\"Add files\",\"role\":\"button\",\"files\":[\"{s}\",\"{s}\"]}}", .{ file_a, file_b }) catch unreachable);
+    if (std.mem.indexOf(u8, up2, "isError") != null or std.mem.indexOf(u8, up2, "\"multiple\":true") == null) {
+        say(up2[0..@min(up2.len, 900)]);
+        fail("web_upload did not report two files set on the multi-file input");
+    }
+    if (!waitTitleHas(m, "many:up-a.txt=ALPHA|up-b.txt=BETA:trusted")) fail("the page did not read both uploaded files in order");
+
+    // 3. Two files for a single-file chooser: refused whole, the field untouched.
+    const many_one = m.callTool("web_upload", std.fmt.bufPrint(&args, "{{\"id\":{d},\"files\":[\"{s}\",\"{s}\"]}}", .{ one_id, file_b, file_a }) catch unreachable);
+    if (std.mem.indexOf(u8, many_one, "\"code\":\"invalid_args\"") == null or std.mem.indexOf(u8, many_one, "ONE file") == null)
+        fail("two files for a single-file chooser were not refused");
+    const kept = m.callTool("web_eval", "{\"code\":\"document.getElementById('one').files[0].name\"}");
+    if (std.mem.indexOf(u8, kept, "up-a.txt") == null) fail("a refused upload changed the field");
+
+    // 4. A control that opens no chooser: an error, and nothing left armed:
+    //    the next upload sets ITS files, and the page still runs.
+    const none = m.callTool("web_upload", std.fmt.bufPrint(&args, "{{\"name\":\"Plain\",\"role\":\"button\",\"files\":[\"{s}\"]}}", .{file_b}) catch unreachable);
+    if (std.mem.indexOf(u8, none, "isError") == null or std.mem.indexOf(u8, none, "no file chooser") == null)
+        fail("a click that opens no chooser was not reported");
+    const again = m.callTool("web_upload", std.fmt.bufPrint(&args, "{{\"id\":{d},\"files\":[\"{s}\"]}}", .{ one_id, file_b }) catch unreachable);
+    if (std.mem.indexOf(u8, again, "isError") != null) {
+        say(again[0..@min(again.len, 900)]);
+        fail("an upload after two refused ones did not go through");
+    }
+    if (!waitTitleHas(m, "one:up-b.txt=BETA:trusted")) fail("the upload after the refusals did not reach the page");
+
+    // 5. Bad arguments are refused before anything is clicked.
+    const missing = m.callTool("web_upload", std.fmt.bufPrint(&args, "{{\"id\":{d},\"files\":[\"{s}/no-such-file\"]}}", .{ one_id, rt }) catch unreachable);
+    if (std.mem.indexOf(u8, missing, "\"code\":\"not_found\"") == null) fail("a missing upload file was not refused as not_found");
+    const relative = m.callTool("web_upload", std.fmt.bufPrint(&args, "{{\"id\":{d},\"files\":[\"up-a.txt\"]}}", .{one_id}) catch unreachable);
+    if (std.mem.indexOf(u8, relative, "\"code\":\"invalid_args\"") == null) fail("a relative upload path was not refused");
+
+    _ = m.callTool("web_close", std.fmt.bufPrint(&args, "{{\"pane\":{d}}}", .{view}) catch unreachable);
+    say("smoke-mcp: web_upload (file input, button-wired hidden input, refusals, nothing left armed) ok");
+}
+
 const StreamRig = struct {
     allocator: std.mem.Allocator,
     fd: c_int = -1,
@@ -5837,6 +5932,7 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
 
     webReviewStage(&m, rt);
     webHandStage(&m, rt);
+    webUploadStage(&m, rt);
     webStreamStage(allocator, exe, rt);
     if (@import("builtin").os.tag == .linux) webglPolicyStage(allocator, exe, rt);
     webScreenStage(allocator, exe, rt);

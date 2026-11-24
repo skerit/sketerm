@@ -500,6 +500,18 @@ pub const Download = struct {
     }
 };
 
+pub const UploadError = error{ Unavailable, Unsupported, NoView, OutOfMemory };
+
+/// How the helper answered the armed upload.
+pub const UploadOutcome = struct {
+    /// `proto.upload_*`.
+    outcome: u8,
+    /// The chooser takes several files.
+    multiple: bool,
+    /// Files set on the page's input.
+    count: u32,
+};
+
 pub const DownloadError = error{
     Unavailable,
     NoView,
@@ -1244,6 +1256,10 @@ pub const Engine = struct {
     /// Bounded by `DOWNLOAD_CAP`, drop-oldest-finished.
     downloads: std.ArrayList(Download) = .empty,
     next_download_req: u32 = 1,
+    /// The armed upload awaiting its chooser (`armUpload`); 0 = none.
+    upload_req: u32 = 0,
+    upload_view: u32 = 0,
+    upload_outcome: ?UploadOutcome = null,
     /// Prints asked for and not yet collected by `takePrint`.
     prints: std.ArrayList(Print) = .empty,
     /// Perf requests asked for and not yet collected by `takePerf`.
@@ -3912,6 +3928,49 @@ pub const Engine = struct {
         d.fail_reason = "canceled";
     }
 
+    /// Arm `view`'s next file chooser with `paths` (absolute, on this
+    /// machine): the helper hands them to the page when it opens one.
+    /// One upload is armed per engine at a time; a new arm replaces it.
+    /// @return the request to poll with `uploadOutcome` and release with `disarmUpload`.
+    pub fn armUpload(self: *Engine, view_id: u32, paths: []const []const u8) UploadError!u32 {
+        if (!self.ensure()) return error.Unavailable;
+        if (!self.has(.upload)) return error.Unsupported;
+        if (self.findView(view_id) == null) return error.NoView;
+        var joined: std.ArrayList(u8) = .empty;
+        defer joined.deinit(self.gpa);
+        for (paths, 0..) |p, i| {
+            if (i != 0) try joined.append(self.gpa, 0);
+            try joined.appendSlice(self.gpa, p);
+        }
+        const req = self.nextDownloadReq();
+        self.send(proto.UploadArm{ .view = view_id, .req = req, .paths = joined.items }) catch return error.Unavailable;
+        self.upload_req = req;
+        self.upload_view = view_id;
+        self.upload_outcome = null;
+        return req;
+    }
+
+    /// Null until the page opened the chooser `req` was armed for.
+    pub fn uploadOutcome(self: *const Engine, req: u32) ?UploadOutcome {
+        if (self.upload_req != req) return null;
+        return self.upload_outcome;
+    }
+
+    /// Forget `req`; while no chooser consumed it the helper is told to
+    /// drop the files, so a later unrelated chooser cannot receive them.
+    pub fn disarmUpload(self: *Engine, req: u32) void {
+        if (req == 0 or self.upload_req != req) return;
+        if (self.upload_outcome == null)
+            self.send(proto.UploadArm{ .view = self.upload_view, .req = req, .paths = "" }) catch {};
+        self.upload_req = 0;
+        self.upload_outcome = null;
+    }
+
+    fn onUpload(self: *Engine, ev: proto.EvUpload) void {
+        if (ev.req == 0 or ev.req != self.upload_req) return;
+        self.upload_outcome = .{ .outcome = ev.outcome, .multiple = ev.multiple != 0, .count = ev.count };
+    }
+
     /// Where a download with no caller-chosen path lands. The user's
     /// XDG download directory (`fsserve.downloadDir`), created if it is
     /// missing.
@@ -4817,6 +4876,10 @@ pub const Engine = struct {
             .ev_download_progress => {
                 const ev = proto.decode(proto.EvDownloadProgress, frame.payload) catch return;
                 self.onDownloadProgress(ev);
+            },
+            .ev_upload => {
+                const ev = proto.decode(proto.EvUpload, frame.payload) catch return;
+                self.onUpload(ev);
             },
             .ev_print_pdf_done => {
                 const ev = proto.decode(proto.EvPrintPdfDone, frame.payload) catch return;

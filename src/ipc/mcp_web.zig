@@ -872,6 +872,15 @@ pub fn downloadCapability() struct { supported: bool, started: bool } {
     return .{ .supported = e.has(.downloads) and e.has(.download_start), .started = true };
 }
 
+/// What `capabilities` reports about `web_upload`: headless only, and a
+/// code fact until a helper is running to say whether it answers choosers.
+pub fn uploadCapability() bool {
+    if (guiDrivesWeb()) return false;
+    const e = headlessEngine() orelse return false;
+    if (e.state != .ready) return true;
+    return e.has(.upload);
+}
+
 /// What `capabilities` reports about `web_print_pdf`: a code fact before
 /// the headless helper starts, negotiated afterwards for the engine that
 /// serves the current view (an untrusted one prints only staged). `css_page`
@@ -3513,6 +3522,103 @@ fn settleAndDelta(drv: Driver, arena: std.mem.Allocator, view: View, args: std.j
     return after;
 }
 
+/// How long `web_upload` waits for the page to open its file chooser
+/// after the click: it opens inside the click's own event handler.
+const CHOOSER_WAIT_MS: i64 = 5_000;
+/// Most files one `web_upload` takes.
+const UPLOAD_MAX_FILES = 32;
+
+const UploadFile = struct { path: []const u8, bytes: u64 };
+
+/// The files `web_upload` armed for the click that follows.
+const Upload = struct {
+    engine: *webdrive.Engine,
+    req: u32,
+    files: []const UploadFile,
+};
+
+const UploadArmed = union(enum) { armed: Upload, err: Fail };
+
+/// Validate `files` and arm them for `view`'s next file chooser.
+fn uploadArm(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) !UploadArmed {
+    const lc = @import("../c.zig").c;
+    const e = switch (drv) {
+        .gui => return .{ .err = fail(.unavailable, GUI_ONLY_HEADLESS) },
+        .headless => |e| e,
+    };
+    const list = mcp.argValue(args, "files") orelse
+        return .{ .err = fail(.invalid_args, "web_upload needs 'files': the absolute paths, on the machine running this MCP server, to put into the upload field") };
+    if (list != .array or list.array.items.len == 0)
+        return .{ .err = fail(.invalid_args, "'files' must be a non-empty array of absolute paths") };
+    if (list.array.items.len > UPLOAD_MAX_FILES)
+        return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "web_upload takes at most {d} files per call", .{UPLOAD_MAX_FILES})) };
+    const files = try arena.alloc(UploadFile, list.array.items.len);
+    const paths = try arena.alloc([]const u8, files.len);
+    for (list.array.items, 0..) |item, i| {
+        if (item != .string) return .{ .err = fail(.invalid_args, "'files' must be an array of path strings") };
+        const path = item.string;
+        if (path.len == 0 or path[0] != '/' or std.mem.indexOfScalar(u8, path, 0) != null)
+            return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "files[{d}] must be an ABSOLUTE path on the machine running this MCP server: {s}", .{ i, path })) };
+        const z = try arena.dupeSentinel(u8, path, 0);
+        var st: lc.struct_stat = undefined;
+        if (lc.stat(z.ptr, &st) != 0 or lc.access(z.ptr, lc.R_OK) != 0)
+            return .{ .err = fail(.not_found, try std.fmt.allocPrint(arena, "files[{d}] does not exist or cannot be read: {s}", .{ i, path })) };
+        if (st.st_mode & 0o170000 != 0o100000)
+            return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "files[{d}] is not a regular file: {s}", .{ i, path })) };
+        files[i] = .{ .path = path, .bytes = @intCast(@max(st.st_size, 0)) };
+        paths[i] = path;
+    }
+    const req = e.armUpload(view.pane, paths) catch |err| return .{ .err = switch (err) {
+        error.Unsupported => fail(.unavailable, "this browser helper cannot answer a file chooser (capability 'upload'); it predates web_upload, update sketerm-webengine"),
+        error.NoView => fail(.not_found, "that web view is gone"),
+        else => try headlessFail(arena, e, err),
+    } };
+    return .{ .armed = .{ .engine = e, .req = req, .files = files } };
+}
+
+const UploadAwait = union(enum) { outcome: webdrive.UploadOutcome, err: Fail };
+
+/// Wait for the chooser the click was meant to open, and read how the
+/// helper answered it.
+fn uploadAwait(drv: Driver, arena: std.mem.Allocator, u: Upload) !UploadAwait {
+    const deadline = drv.now() + CHOOSER_WAIT_MS;
+    const o = while (true) {
+        if (u.engine.uploadOutcome(u.req)) |o| break o;
+        if (drv.now() >= deadline or mcp.callerGone()) return .{ .err = fail(.failed, try std.fmt.allocPrint(
+            arena,
+            "the click opened no file chooser within {d} ms, so nothing was uploaded (the click itself happened). Target the control that opens the picker: the <input type=file> itself, or the visible button the page wires to it",
+            .{CHOOSER_WAIT_MS},
+        )) };
+        drv.sleep(40);
+    };
+    return switch (o.outcome) {
+        web_proto.upload_answered => .{ .outcome = o },
+        web_proto.upload_too_many => .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "the page's file chooser takes ONE file and {d} were given; nothing was uploaded. Pass one file per call", .{u.files.len})) },
+        else => .{ .err = fail(.io_failed, "the browser helper could not hand the files to the page's file chooser; nothing was uploaded") },
+    };
+}
+
+fn uploadResult(
+    arena: std.mem.Allocator,
+    mode: Mode,
+    v: View,
+    id: i64,
+    files: []const UploadFile,
+    o: webdrive.UploadOutcome,
+    after: ActAfter,
+) ![]const u8 {
+    var res = mcp.Res.init(arena);
+    try head(&res, arena, mode, v);
+    try res.fact("id", id);
+    try res.fact("uploaded", true);
+    try res.fact("files", files);
+    try res.fact("multiple", o.multiple);
+    try res.textf("uploaded {d} file(s) into the file input whose chooser clicking {d} opened; the page saw its input and change events as for a user's selection", .{ files.len, id });
+    for (files) |f| try res.textf("  {s} ({d} bytes)", .{ f.path, f.bytes });
+    try renderAfter(&res, arena, after);
+    return res.finish();
+}
+
 fn actResult(
     arena: std.mem.Allocator,
     mode: Mode,
@@ -5033,7 +5139,8 @@ fn webBody(
         }
     }
 
-    if (eql(u8, name, "web_act")) {
+    const uploading = eql(u8, name, "web_upload");
+    if (eql(u8, name, "web_act") or uploading) {
         if (try policyGate(arena, view)) |f| return failRes(arena, f);
         const follow = followUpArgs(args) orelse
             return mcp.errRes(arena, .invalid_args, FOLLOW_UP_REFUSAL);
@@ -5046,7 +5153,7 @@ fn webBody(
         // into one call, which also sidesteps acting on a stale id.
         if (id == null) {
             const want_name = mcp.argStr(args, "name") orelse
-                return mcp.errRes(arena, .invalid_args, "web_act needs 'id' (a node id from web_snapshot or web_read) or 'name' (the accessible name to act on, with optional 'role' and 'nth')");
+                return mcp.errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "{s} needs 'id' (a node id from web_snapshot or web_read) or 'name' (the accessible name to act on, with optional 'role' and 'nth')", .{name}));
             // The lookup reads the live tree. Right after a navigation
             // that tree can be an EARLY walk of a page still rendering
             // client-side, so a miss is retried ONCE after a fresh walk
@@ -5171,7 +5278,17 @@ fn webBody(
         // the name lookup read back out of the helper's own reply.
         const node = boundedU32(id_v) orelse
             return mcp.errRes(arena, .io_failed, "the name lookup named a node id outside the protocol's range");
-        const action = mcp.argStr(args, "action") orelse "click";
+        // An upload is a click: the trusted gesture a page needs before
+        // it may open its chooser.
+        const action = if (uploading) "click" else mcp.argStr(args, "action") orelse "click";
+        // Armed LAST, after every lookup that can fail, and released on
+        // every exit: files must never wait for some later chooser.
+        const upload: ?Upload = if (uploading) switch (try uploadArm(drv, arena, args, view)) {
+            .err => |f| return failRes(arena, f),
+            .armed => |u| u,
+        } else null;
+        defer if (upload) |u| u.engine.disarmUpload(u.req);
+
         const value = mcp.argStr(args, "value");
         // Only pointer and typing actions have motion; focus and
         // scroll_into_view are the same either way.
@@ -5199,6 +5316,14 @@ fn webBody(
                 else
                     "the page refused the action");
 
+                if (upload) |u| {
+                    const outcome = switch (try uploadAwait(drv, arena, u)) {
+                        .err => |f| return failRes(arena, f),
+                        .outcome => |o| o,
+                    };
+                    const after = try settleAndDelta(drv, arena, view, args, follow);
+                    return uploadResult(arena, drv.mode(), view, id_v, u.files, outcome, after);
+                }
                 const after = try settleAndDelta(drv, arena, view, args, follow);
                 return actResult(arena, drv.mode(), view, id_v, action, r.payload, r.motion_ms, after);
             },

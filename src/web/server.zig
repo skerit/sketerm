@@ -133,6 +133,7 @@ const unconditional_caps = [_]proto.Cap{
     .download_start,
     .download_staging,
     .download_errors,
+    .upload,
     .a11y,
     .a11y_caret,
     .contexts,
@@ -1046,6 +1047,7 @@ pub const Server = struct {
             .download_decide => self.host.downloadDecide(try self.dec(cn, proto.DownloadDecide, frame.payload)),
             .download_cancel => self.host.downloadCancel(try self.dec(cn, proto.DownloadCancel, frame.payload)),
             .download_start => self.host.downloadStart(try self.dec(cn, proto.DownloadStart, frame.payload)),
+            .upload_arm => self.host.uploadArm(try self.dec(cn, proto.UploadArm, frame.payload)),
             .a11y_enable => self.host.a11yEnable(try self.dec(cn, proto.A11yEnable, frame.payload)),
             .us_script_set => {
                 // Process-global, last-writer-wins: see .intercept_lists.
@@ -1183,6 +1185,10 @@ pub const Server = struct {
             .download_start => {
                 const req = try proto.decode(proto.DownloadStart, frame.payload);
                 try cn.out.post(proto.EvDownloadProgress{ .view = req.view, .id = 0, .received = 0, .total = 0, .done = 0, .failed = 1, .req = req.req }, null);
+            },
+            .upload_arm => {
+                const req = try proto.decode(proto.UploadArm, frame.payload);
+                try cn.out.post(proto.EvUpload{ .view = req.view, .req = req.req, .outcome = proto.upload_failed, .multiple = 0, .count = 0 }, null);
             },
             else => {},
         }

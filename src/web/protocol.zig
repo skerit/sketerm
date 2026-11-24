@@ -175,6 +175,11 @@ pub const CAP_DOWNLOAD_START = "download-start";
 /// Helper-owned staging for downloads whose destination is on another host.
 pub const CAP_DOWNLOAD_STAGING = "download-staging";
 pub const CAP_DOWNLOAD_ERRORS = "download-errors";
+/// The helper puts files a client armed (`upload_arm`) into the file
+/// input whose chooser the page opens next, and reports the outcome as
+/// `ev_upload`. Without it a client cannot upload a local file at all:
+/// nobody can operate the engine's own chooser in a windowless view.
+pub const CAP_UPLOAD = "upload";
 /// The helper accepts `a11y_enable` and, for a view it was enabled on,
 /// streams the engine's accessibility tree as `ev_a11y_tree` /
 /// `ev_a11y_loc` / `ev_a11y_event` frames (the 0x70 block). Nothing is
@@ -602,6 +607,7 @@ pub const Cap = enum {
     drag_drop,
     web_perf,
     web_trace,
+    upload,
 
     /// The wire name `hello_ack` carries.
     pub fn name(self: Cap) []const u8 {
@@ -849,6 +855,9 @@ pub const Tag = enum(u8) {
     ev_download_progress = 0x7A,
     download_cancel = 0x7B,
     download_start = 0x7C,
+    // Capability "upload" (see CAP_UPLOAD): the rest of the downloads block.
+    upload_arm = 0x7D,
+    ev_upload = 0x7E,
     intercept_set = 0x80,
     intercept_lists = 0x81,
     intercept_status_req = 0x82,
@@ -2371,6 +2380,40 @@ pub const DownloadCancel = struct {
     pub const tag: Tag = .download_cancel;
     view: u32,
     id: u32,
+};
+
+/// Arm `view` with files for the NEXT file chooser its page opens: the
+/// helper sets them on that chooser's file input and reports the outcome
+/// as `ev_upload` echoing `req`. One arm answers one chooser. Empty
+/// `paths` disarms, and a client whose chooser never opened must disarm.
+///
+/// `paths` is the absolute paths joined by NUL (a path can hold any
+/// other byte), on the helper's machine. `req` is client-minted, non-zero.
+pub const UploadArm = struct {
+    pub const tag: Tag = .upload_arm;
+    view: u32,
+    req: u32,
+    paths: []const u8,
+};
+
+/// `EvUpload.outcome`: the files were set on the page's file input.
+pub const upload_answered: u8 = 1;
+/// Nothing set: several files were armed for an input that takes one.
+pub const upload_too_many: u8 = 2;
+/// Nothing set: the helper could not arm or answer (no DevTools session,
+/// a trace holding its events, the engine refusing the files).
+pub const upload_failed: u8 = 3;
+
+/// The outcome of the `upload_arm` whose `req` this echoes.
+pub const EvUpload = struct {
+    pub const tag: Tag = .ev_upload;
+    view: u32,
+    req: u32,
+    outcome: u8,
+    /// The chooser takes several files.
+    multiple: u8,
+    /// Files set; 0 unless `outcome` is answered.
+    count: u32,
 };
 
 // -- accessibility (0x70 block, capability "a11y") --------------------
@@ -4400,7 +4443,7 @@ pub const EvRequestRefused = struct {
 /// Capabilities an untrusted helper leaves out of `hello_ack`; `untrustedWithheld` refuses their frames.
 pub fn untrustedWithholdsCap(cap: Cap) bool {
     return switch (cap) {
-        .devtools, .clipboard, .popup_open, .downloads, .download_start, .download_staging, .download_errors, .userscripts, .userscripts_gm, .webext, .webext_tabs, .webext_action, .webext_events, .webext_transaction, .filter_subscribe, .cookie_sync, .observe, .observe_notify, .drag_drop => true,
+        .devtools, .clipboard, .popup_open, .downloads, .download_start, .download_staging, .download_errors, .upload, .userscripts, .userscripts_gm, .webext, .webext_tabs, .webext_action, .webext_events, .webext_transaction, .filter_subscribe, .cookie_sync, .observe, .observe_notify, .drag_drop => true,
         else => false,
     };
 }
@@ -4423,6 +4466,7 @@ pub fn untrustedWithheld(tag: Tag) bool {
         .download_decide,
         .download_cancel,
         .download_start,
+        .upload_arm,
         .us_script_set,
         .us_style_set,
         .webext_set,
@@ -6006,6 +6050,10 @@ test "round-trip: download frames" {
     try roundTrip(EvDownloadOffer, .{ .view = 7, .id = 42, .total = 0, .url = "data:,x", .name = "x", .mime = "" });
     try roundTrip(DownloadDecide, .{ .view = 7, .id = 41, .path = "/home/x/Downloads/big.iso" });
     try roundTrip(DownloadDecide, .{ .view = 7, .id = 41, .path = "" });
+    try roundTrip(UploadArm, .{ .view = 7, .req = 3, .paths = "/home/x/id front.png\x00/home/x/id-back.png" });
+    try roundTrip(UploadArm, .{ .view = 7, .req = 4, .paths = "" });
+    try roundTrip(EvUpload, .{ .view = 7, .req = 3, .outcome = upload_answered, .multiple = 1, .count = 2 });
+    try roundTrip(EvUpload, .{ .view = 7, .req = 4, .outcome = upload_failed, .multiple = 0, .count = 0 });
     try roundTrip(EvDownloadProgress, .{
         .view = 7,
         .id = 41,

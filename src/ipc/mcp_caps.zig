@@ -454,6 +454,9 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         // pixels. A remote-control viewer preflights both here.
         try res.fact("web_input", web_ok and !gui_web);
         try res.fact("web_frames", web_ok and !gui_web);
+        // Putting local files into a page's upload field: the helper
+        // answers the page's own file chooser, headless only.
+        try res.fact("web_upload", @import("mcp_web.zig").uploadCapability());
         try verdicts.add(arena, if (gui_web) "input/frames (headless only)" else "input/frames", web_ok and !gui_web);
         try verdicts.add(arena, "untrusted views", @import("mcp_web.zig").restrictedCapability(.untrusted_web));
         try verdicts.add(arena, "policy acks", @import("mcp_web.zig").restrictedCapability(.net_policy_ack));
