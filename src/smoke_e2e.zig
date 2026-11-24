@@ -562,6 +562,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (mux_pid < 0) return fail("mux fork");
     if (mux_pid == 0) {
         platform.dieWithParent();
+        // The daemon dials hosts itself for a transfer (cross_copy): it
+        // must reach the fake remote written below, never the machine's
+        // real sshd, which `localhost` would otherwise be.
+        var dssh_buf: [300:0]u8 = undefined;
+        if (std.fmt.bufPrintSentinel(&dssh_buf, "{s}/fake-ssh", .{rt}, 0)) |p| {
+            _ = c.setenv("SKETERM_SSH", p.ptr, 1);
+        } else |_| {}
         const argv = [_:null]?[*:0]const u8{ bindir.path(.@"sketerm-mux"), "--broker", null };
         _ = c.execv(bindir.path(.@"sketerm-mux"), @ptrCast(@constCast(&argv)));
         c._exit(127);
@@ -651,6 +658,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             const link = remotePanelAssetFile(&link_buf, name) orelse return fail("remote panel asset link path");
             if (c.link(asset.ptr, link.ptr) != 0) return fail("remote panel asset link");
         }
+        // The remote daemon runs out of the dev bin dir and another cwd,
+        // so it would find no browser helper for an `on:` tab: pin it.
+        var rweb_buf: [4096]u8 = undefined;
+        const rweb = c.realpath("zig-out/bin/sketerm-webengine", &rweb_buf);
         const rmt_pid = c.fork();
         if (rmt_pid < 0) return fail("remote mux fork");
         if (rmt_pid == 0) {
@@ -662,6 +673,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             // Its own data home, so ITS trash is not the local one
             // (FILES_REMOTE_TRASH tells them apart).
             _ = c.setenv("XDG_DATA_HOME", rrt.ptr, 1);
+            if (rweb) |p| _ = c.setenv("SKETERM_WEB_BIN", p, 1);
             const argv = [_:null]?[*:0]const u8{ bindir.path(.@"sketerm-mux"), null };
             _ = c.execv(bindir.path(.@"sketerm-mux"), @ptrCast(@constCast(&argv)));
             c._exit(127);
@@ -1227,8 +1239,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (!have_web_action) return fail("focused web upload smoke needs zig-out/bin/sketerm-webengine (run `zig build web` first)");
         if (app.windows.items.len == 0) return fail("focused web upload smoke lost its window");
         app.focusWindow(mainWin(app).id) catch return fail("focused web upload smoke could not focus the window");
-        if (webUploadPickerStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        if (webUploadPickerStage(allocator, app, sock_path, rt, false)) |why| return failMsg(why);
         say("web upload: a page's file chooser opened the file picker and the pick reached the page");
+        if (webUploadPickerStage(allocator, app, sock_path, rt, true)) |why| return failMsg(why);
+        say("remote web upload: a pick on this machine was delivered to the on: tab's helper, reached its page, and was removed with the view");
         teardown();
         return 0;
     }
@@ -4593,13 +4607,58 @@ fn assistantNamedWebStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
 
     const chip = waitAssistantChip(app, win_id, true, 30_000) orelse
         return "no assistant chip appeared for the named MCP";
-    // Let a poll find the engine (3 s tick) before the popover is built.
+    // Let a poll find the engine (3 s tick) before a list is built.
     pumpFor(app, 4_000);
+
+    // The Session Overview lists it too, and its Watch opens the same tab.
+    {
+        var before: [32]u32 = undefined;
+        var before_n: usize = 0;
+        for (app.windows.items) |w| if (before_n < before.len) {
+            before[before_n] = w.id;
+            before_n += 1;
+        };
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"app_windows\"}\n") orelse return "opening the Session Overview failed";
+        allocator.free(r);
+        var ov_id: ?u32 = null;
+        var ov_waited: u32 = 0;
+        while (ov_waited < 10_000 and ov_id == null) : (ov_waited += 200) {
+            pumpFor(app, 200);
+            for (app.windows.items) |w| {
+                if (w.popup or w.frames == 0 or contains(before[0..before_n], w.id)) continue;
+                ov_id = w.id;
+            }
+        }
+        const ov = ov_id orelse return "the Session Overview opened no window";
+        app.resizeWindow(ov, 900, 1400) catch {};
+        _ = app.waitVisualSettle(ov, 400, 5_000, 0.1, null);
+        if (pressNamed(allocator, app, "Watch Named review", ov, "zig-out/smoke-e2e-namedweb-overview.png", 30_000)) |why| return why;
+        if (namedPageShown(allocator, app, sock_path, win_id)) |why| return why;
+        closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
+        _ = app.waitIdle(300, 5_000);
+        say("assistant named browser: the Session Overview listed it by its web_open name and Watch opened its page");
+    }
+
     if (openPopup(app) != null) return "a popup surface was already open before the chip was clicked";
     app.click(win_id, chip.x + chip.w / 2, chip.y + chip.h / 2, 1) catch return "clicking the assistant chip failed";
     const pop_id = waitPopup(app, true, 10_000) orelse return "the assistant chip opened no popover surface";
     if (pressNamed(allocator, app, "Watch Named review", pop_id, "zig-out/smoke-e2e-namedweb-popover.png", 15_000)) |why| return why;
+    if (namedPageShown(allocator, app, sock_path, win_id)) |why| return why;
+    shotTo(allocator, app, win_id, "zig-out/smoke-e2e-namedweb-tab.png");
 
+    closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
+    _ = app.waitIdle(300, 5_000);
+    m.close();
+    m_open = false;
+    const retired = waitAssistantChip(app, win_id, false, 30_000) != null;
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
+    _ = app.waitIdle(200, 4_000);
+    if (!retired) return "the assistant chip survived the named assistant exiting";
+    return null;
+}
+
+/// Whether a web tab shows the named assistant's (red) page.
+fn namedPageShown(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, win_id: u32) ?[]const u8 {
     var waited: u32 = 0;
     var shown = false;
     while (waited < 30_000 and !shown) : (waited += 250) {
@@ -4616,16 +4675,6 @@ fn assistantNamedWebStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
         shotTo(allocator, app, win_id, "zig-out/smoke-e2e-namedweb-noframe.png");
         return "the named assistant's page never painted into the web tab (see zig-out/smoke-e2e-namedweb-noframe.png)";
     }
-    shotTo(allocator, app, win_id, "zig-out/smoke-e2e-namedweb-tab.png");
-
-    closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
-    _ = app.waitIdle(300, 5_000);
-    m.close();
-    m_open = false;
-    const retired = waitAssistantChip(app, win_id, false, 30_000) != null;
-    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
-    _ = app.waitIdle(200, 4_000);
-    if (!retired) return "the assistant chip survived the named assistant exiting";
     return null;
 }
 
@@ -5727,7 +5776,7 @@ fn siteInfoAnswersStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: 
 /// The browser stages after the route stage, in the order the full rig
 /// and `SKETERM_SMOKE_E2E_WEB_PAGES_ONLY` both run them.
 fn webPagesStages(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, rt: [:0]const u8) ?[]const u8 {
-    if (webUploadPickerStage(allocator, app, sock, rt)) |why| return why;
+    if (webUploadPickerStage(allocator, app, sock, rt, false)) |why| return why;
     say("web upload: a page's file chooser opened the file picker and the pick reached the page");
     if (webPrivateStage(allocator, app, sock, rt)) |why| return why;
     say("private browsing: an incognito tab's page stayed out of the history journal that an ordinary tab's page reached");
@@ -5737,6 +5786,8 @@ fn webPagesStages(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]co
     say("via: route: the tab's instance ran behind the loopback SOCKS5 bridge and its page arrived through the fake-SSH host");
     if (webRemotePrintStage(allocator, app, sock, rt)) |why| return why;
     say("remote print: Print to PDF on an on: tab staged the PDF on the remote host and delivered it to the local path picked");
+    if (webUploadPickerStage(allocator, app, sock, rt, true)) |why| return why;
+    say("remote web upload: a pick on this machine was delivered to the on: tab's helper, reached its page, and was removed with the view");
     return null;
 }
 
@@ -5745,26 +5796,56 @@ fn windowHeightOrWidth(app: *appdrive.App, id: u32, comptime which: enum { w, h 
     return 0;
 }
 
+const e2e_upload_page = "<html><head><title>pick:none</title><style>html,body{margin:0;min-height:100vh;background:red}</style></head>" ++
+    "<body onclick=\"document.getElementById('f').click()\"><input id=f type=file style='display:none'><script>" ++
+    "document.getElementById('f').onchange=async e=>{const x=e.target.files[0];document.body.style.background='lime';document.title='pick:'+x.name+'='+await x.text()}" ++
+    "</script></body></html>";
+
+/// Whether a helper's upload staging tree under /tmp holds `name` as its first file.
+fn stagedUploadExists(name: []const u8) bool {
+    const dir = c.opendir("/tmp") orelse return false;
+    defer _ = c.closedir(dir);
+    while (c.readdir(dir)) |ent| {
+        const entry = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (!std.mem.startsWith(u8, entry, "sketerm-webup-")) continue;
+        var buf: [512:0]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&buf, "/tmp/{s}/0/{s}", .{ entry, name }, 0) catch continue;
+        if (c.access(path.ptr, c.F_OK) == 0) return true;
+    }
+    return false;
+}
+
 /// A person's upload in a browser pane: a click on the page makes it
 /// open its file chooser, the GUI shows its own file picker for it, and
-/// the file picked there is the one the page reads.
-fn webUploadPickerStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, rt: [:0]const u8) ?[]const u8 {
+/// the file picked there is the one the page reads. With `remote` the
+/// tab's browser runs on another host (`on:`), so the pick is first
+/// delivered into a tree that host's helper hands out and removes.
+fn webUploadPickerStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, rt: [:0]const u8, remote: bool) ?[]const u8 {
     var page_buf: [512:0]u8 = undefined;
     const page = std.fmt.bufPrintSentinel(&page_buf, "{s}/e2e-upload.html", .{rt}, 0) catch return "upload page path";
-    if (!writeFile(page, "<html><head><title>pick:none</title><style>html,body{margin:0;min-height:100vh;background:red}</style></head>" ++
-        "<body onclick=\"document.getElementById('f').click()\"><input id=f type=file style='display:none'><script>" ++
-        "document.getElementById('f').onchange=async e=>{const x=e.target.files[0];document.body.style.background='lime';document.title='pick:'+x.name+'='+await x.text()}" ++
-        "</script></body></html>")) return "could not write the upload page";
+    if (!writeFile(page, e2e_upload_page)) return "could not write the upload page";
+    const leaf = if (remote) "e2e-upload-remote.txt" else "e2e-upload.txt";
     var file_buf: [512:0]u8 = undefined;
-    const file = std.fmt.bufPrintSentinel(&file_buf, "{s}/e2e-upload.txt", .{rt}, 0) catch return "upload file path";
+    const file = std.fmt.bufPrintSentinel(&file_buf, "{s}/{s}", .{ rt, leaf }, 0) catch return "upload file path";
     if (!writeFile(file, "PICKED")) return "could not write the file to upload";
+    var doc = HttpDoc{ .body = e2e_upload_page };
+    if (remote and !doc.start()) return "the remote-upload document server did not start";
+    defer if (remote) doc.stop();
 
     var req_buf: [768]u8 = undefined;
-    const open_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-open\",\"target\":\"tab\",\"data\":\"file://{s}\"}}\n", .{page}) catch return "web-open request";
+    const open_req = if (remote)
+        std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-open\",\"target\":\"tab\",\"route\":\"on:localhost\",\"data\":\"http://127.0.0.1:{d}/e2e-upload\"}}\n", .{doc.lis.port}) catch return "web-open request"
+    else
+        std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-open\",\"target\":\"tab\",\"data\":\"file://{s}\"}}\n", .{page}) catch return "web-open request";
     const opened = roundtrip(allocator, sock, open_req) orelse return "opening the upload page failed";
     defer allocator.free(opened);
     const pane = parseNumAfter(opened, "\"pane\":") orelse return "the upload page reply named no pane";
-    if (!waitWebPaneTitled(allocator, sock, app, pane, "pick:none", 60_000)) return "the upload page never loaded";
+    if (!waitWebPaneTitled(allocator, sock, app, pane, "pick:none", 90_000)) {
+        dumpWebList(allocator, sock);
+        shotTo(allocator, app, mainWin(app).id, "zig-out/smoke-e2e-upload-noload.png");
+        return "the upload page never loaded (see zig-out/smoke-e2e-upload-noload.png)";
+    }
+    if (remote and !webPaneTitled(allocator, sock, pane, "\"route\":\"on:localhost\"")) return "the upload tab does not report route on:localhost";
     const win_id = mainWin(app).id;
     const focus_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{pane}) catch return "focus request";
     if (roundtrip(allocator, sock, focus_req)) |r| allocator.free(r) else return "focusing the upload tab failed";
@@ -5798,12 +5879,21 @@ fn webUploadPickerStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: 
         shotTo(allocator, app, picker, "zig-out/smoke-e2e-upload-picker-stuck.png");
         return "the file picker stayed open after Enter (see zig-out/smoke-e2e-upload-picker-stuck.png)";
     }
-    if (!waitWebPaneTitled(allocator, sock, app, pane, "pick:e2e-upload.txt=PICKED", 20_000)) {
+    var want_buf: [96]u8 = undefined;
+    const want = std.fmt.bufPrint(&want_buf, "pick:{s}=PICKED", .{leaf}) catch return "expected title";
+    if (!waitWebPaneTitled(allocator, sock, app, pane, want, 60_000)) {
         dumpWebList(allocator, sock);
+        shotTo(allocator, app, win_id, "zig-out/smoke-e2e-upload-notaken.png");
         return "the picked file never reached the page";
     }
-    const close_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{pane}) catch return "close request";
-    if (roundtrip(allocator, sock, close_req)) |r| allocator.free(r);
+    if (remote and !stagedUploadExists(leaf)) return "the remote helper's page read the file, but not from a staging tree of its helper";
+    if (!closePaneGone(allocator, sock, pane)) return "the upload tab survived close-pane";
+    if (remote) {
+        const deadline = clock.nowMs() + 10_000;
+        while (stagedUploadExists(leaf) and clock.nowMs() < deadline) pumpFor(app, 200);
+        if (stagedUploadExists(leaf)) return "the delivered upload outlived its view on the helper's machine";
+    }
+    if (roundtrip(allocator, sock, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
     _ = app.waitIdle(200, 4_000);
     return null;
 }
