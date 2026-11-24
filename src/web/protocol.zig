@@ -858,6 +858,7 @@ pub const Tag = enum(u8) {
     // Capability "upload" (see CAP_UPLOAD): the rest of the downloads block.
     upload_arm = 0x7D,
     ev_upload = 0x7E,
+    upload_watch = 0x7F,
     intercept_set = 0x80,
     intercept_lists = 0x81,
     intercept_status_req = 0x82,
@@ -2396,7 +2397,11 @@ pub const UploadArm = struct {
     paths: []const u8,
 };
 
-/// `EvUpload.outcome`: the files were set on the page's file input.
+/// `EvUpload.outcome`: a chooser opened with nothing armed (`req` 0);
+/// only a view under `upload_watch` reports these. It was intercepted,
+/// so the page goes on, with no files.
+pub const upload_unanswered: u8 = 0;
+/// The files were set on the page's file input.
 pub const upload_answered: u8 = 1;
 /// Nothing set: several files were armed for an input that takes one.
 pub const upload_too_many: u8 = 2;
@@ -2404,7 +2409,8 @@ pub const upload_too_many: u8 = 2;
 /// a trace holding its events, the engine refusing the files).
 pub const upload_failed: u8 = 3;
 
-/// The outcome of the `upload_arm` whose `req` this echoes.
+/// The outcome of the `upload_arm` whose `req` this echoes, or (`req` 0)
+/// a chooser nobody armed.
 pub const EvUpload = struct {
     pub const tag: Tag = .ev_upload;
     view: u32,
@@ -2414,6 +2420,17 @@ pub const EvUpload = struct {
     multiple: u8,
     /// Files set; 0 unless `outcome` is answered.
     count: u32,
+};
+
+/// Keep every file chooser of `view` intercepted (`enabled` != 0) and
+/// reported as `ev_upload`, armed or not, or stop. For a client driving
+/// pages nobody else operates: an un-intercepted chooser in a windowless
+/// view can never be answered and stalls its page. A client whose user
+/// answers the engine's own dialog never sends this.
+pub const UploadWatch = struct {
+    pub const tag: Tag = .upload_watch;
+    view: u32,
+    enabled: u8,
 };
 
 // -- accessibility (0x70 block, capability "a11y") --------------------
@@ -4467,6 +4484,7 @@ pub fn untrustedWithheld(tag: Tag) bool {
         .download_cancel,
         .download_start,
         .upload_arm,
+        .upload_watch,
         .us_script_set,
         .us_style_set,
         .webext_set,
@@ -6054,6 +6072,8 @@ test "round-trip: download frames" {
     try roundTrip(UploadArm, .{ .view = 7, .req = 4, .paths = "" });
     try roundTrip(EvUpload, .{ .view = 7, .req = 3, .outcome = upload_answered, .multiple = 1, .count = 2 });
     try roundTrip(EvUpload, .{ .view = 7, .req = 4, .outcome = upload_failed, .multiple = 0, .count = 0 });
+    try roundTrip(EvUpload, .{ .view = 7, .req = 0, .outcome = upload_unanswered, .multiple = 1, .count = 0 });
+    try roundTrip(UploadWatch, .{ .view = 7, .enabled = 1 });
     try roundTrip(EvDownloadProgress, .{
         .view = 7,
         .id = 41,

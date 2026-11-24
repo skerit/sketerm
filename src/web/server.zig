@@ -1048,6 +1048,7 @@ pub const Server = struct {
             .download_cancel => self.host.downloadCancel(try self.dec(cn, proto.DownloadCancel, frame.payload)),
             .download_start => self.host.downloadStart(try self.dec(cn, proto.DownloadStart, frame.payload)),
             .upload_arm => self.host.uploadArm(try self.dec(cn, proto.UploadArm, frame.payload)),
+            .upload_watch => self.host.uploadWatch(try self.dec(cn, proto.UploadWatch, frame.payload)),
             .a11y_enable => self.host.a11yEnable(try self.dec(cn, proto.A11yEnable, frame.payload)),
             .us_script_set => {
                 // Process-global, last-writer-wins: see .intercept_lists.

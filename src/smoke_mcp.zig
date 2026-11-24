@@ -3727,6 +3727,23 @@ fn webUploadStage(m: *Mcp, rt: []const u8) void {
     const relative = m.callTool("web_upload", std.fmt.bufPrint(&args, "{{\"id\":{d},\"files\":[\"up-a.txt\"]}}", .{one_id}) catch unreachable);
     if (std.mem.indexOf(u8, relative, "\"code\":\"invalid_args\"") == null) fail("a relative upload path was not refused");
 
+    // 6. A plain click on an upload control: the chooser is intercepted, the
+    //    reply says so, and the page keeps running (it used to stall for good).
+    _ = m.callTool("web_eval", "{\"code\":\"(document.title='reset')\"}");
+    const plain = m.callTool("web_act", std.fmt.bufPrint(&args, "{{\"id\":{d}}}", .{one_id}) catch unreachable);
+    if (std.mem.indexOf(u8, plain, "isError") != null or std.mem.indexOf(u8, plain, "\"file_chooser\":true") == null) {
+        say(plain[0..@min(plain.len, 900)]);
+        fail("web_act did not report the file chooser its click opened");
+    }
+    const alive = m.callTool("web_eval", "{\"code\":\"new Promise(r=>setTimeout(()=>r('TIMER-RAN:'+document.title),300))\",\"timeout_ms\":4000}");
+    if (std.mem.indexOf(u8, alive, "TIMER-RAN:reset") == null) {
+        say(alive[0..@min(alive.len, 600)]);
+        fail("the page stalled, or received files, after a plain click on a file input");
+    }
+    const after_plain = m.callTool("web_upload", std.fmt.bufPrint(&args, "{{\"name\":\"Add files\",\"role\":\"button\",\"files\":[\"{s}\"]}}", .{file_a}) catch unreachable);
+    if (std.mem.indexOf(u8, after_plain, "isError") != null or !waitTitleHas(m, "many:up-a.txt=ALPHA:trusted"))
+        fail("an upload after an unanswered chooser did not go through");
+
     _ = m.callTool("web_close", std.fmt.bufPrint(&args, "{{\"pane\":{d}}}", .{view}) catch unreachable);
     say("smoke-mcp: web_upload (file input, button-wired hidden input, refusals, nothing left armed) ok");
 }

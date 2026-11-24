@@ -68,6 +68,9 @@ pub const Session = struct {
     detaches: u32 = 0,
     requests: std.ArrayList(Request) = .empty,
     events: ?EventSink = null,
+    /// Receives `Page.fileChooserOpened` alone (`upload.zig`), apart from
+    /// `events` so an upload and a trace never contend for the one sink.
+    chooser: ?EventSink = null,
     /// Events received, for diagnostics.
     event_count: u32 = 0,
 
@@ -163,6 +166,7 @@ pub const Session = struct {
     pub fn stop(self: *Session) void {
         self.active = false;
         self.events = null;
+        self.chooser = null;
         if (self.registration) |r| {
             self.registration = null;
             host_mod.release(&r.base);
@@ -266,6 +270,10 @@ pub const Session = struct {
         if (std.mem.eql(u8, name.slice(), "Inspector.targetCrashed")) {
             for (self.requests.items) |*r| if (r.state == .pending) self.fail(r, "the page's renderer crashed");
         }
+        if (self.chooser) |hook| if (std.mem.eql(u8, name.slice(), "Page.fileChooserOpened")) {
+            const body: []const u8 = if (params) |p| @as([*]const u8, @ptrCast(p))[0..size] else "";
+            hook.on_event(hook.ctx, name.slice(), body);
+        };
         const sink = self.events orelse return;
         const bytes: []const u8 = if (params) |p| @as([*]const u8, @ptrCast(p))[0..size] else "";
         sink.on_event(sink.ctx, name.slice(), bytes);

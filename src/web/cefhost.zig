@@ -533,7 +533,7 @@ pub const View = struct {
     /// Permission prompts held for this view (see `PendingPerm`).
     perms: [max_pending_perms]PendingPerm = @splat(.{}),
     /// Files a client armed for this view's next file chooser.
-    upload: host_upload.Armed = .{},
+    upload: host_upload.State = .{},
 
     /// Semantic-layer state: the shadow tree plus the requests waiting
     /// on a reply from the injected script.
@@ -2914,6 +2914,7 @@ pub const Host = struct {
         var browser_closed = false;
         v.media_ack = null;
         host_perf.browserGone(self, v);
+        host_upload.browserGone(self, v);
         if (v.devtools) |session| {
             v.devtools = null;
             browser_closed = session.browser_closed;
@@ -3255,6 +3256,7 @@ pub const Host = struct {
     pub const downloadCancel = host_dl.downloadCancel;
     pub const downloadStart = host_dl.downloadStart;
     pub const uploadArm = host_upload.uploadArm;
+    pub const uploadWatch = host_upload.uploadWatch;
     pub const dlPendingReq = host_dl.dlPendingReq;
     pub const expireDlPending = host_dl.expireDlPending;
 

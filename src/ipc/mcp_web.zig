@@ -3376,6 +3376,8 @@ const ActAfter = struct {
     /// What became of that subtree's root, read off the helper's scope
     /// line; null with no scope or a helper that writes none.
     scope_line: ?semantic.ScopeLine = null,
+    /// The input made the page open a file chooser nobody had armed.
+    file_chooser: bool = false,
     follow: FollowUp = .{},
 };
 
@@ -3519,6 +3521,10 @@ fn settleAndDelta(drv: Driver, arena: std.mem.Allocator, view: View, args: std.j
             after.loading_after = a.loading;
         }
     }
+    after.file_chooser = switch (drv) {
+        .gui => false,
+        .headless => |e| e.takeUnarmedChooser(),
+    };
     return after;
 }
 
@@ -3666,6 +3672,10 @@ fn renderAfter(res: *mcp.Res, arena: std.mem.Allocator, after: ActAfter) !void {
     if (after.loading_after) |l| {
         try res.fact("loading_after", l);
         if (l) try res.text("the page was still loading after the act");
+    }
+    if (after.file_chooser) {
+        try res.fact("file_chooser", true);
+        try res.text("the page opened a FILE CHOOSER and got no files (nobody can operate one here; the page goes on as if it was cancelled). To upload, repeat this as web_upload with the same target and 'files'");
     }
     // Text lane only: a caveat is prose, not a machine fact.
     if (after.note) |n| try res.textf("note: {s}", .{n});

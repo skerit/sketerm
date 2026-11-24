@@ -1260,6 +1260,10 @@ pub const Engine = struct {
     upload_req: u32 = 0,
     upload_view: u32 = 0,
     upload_outcome: ?UploadOutcome = null,
+    /// Choosers pages opened with nothing armed (every view is watched),
+    /// and how many of them a caller was told about (`takeUnarmedChooser`).
+    unarmed_choosers: u32 = 0,
+    unarmed_reported: u32 = 0,
     /// Prints asked for and not yet collected by `takePrint`.
     prints: std.ArrayList(Print) = .empty,
     /// Perf requests asked for and not yet collected by `takePerf`.
@@ -2697,6 +2701,9 @@ pub const Engine = struct {
                 .max_fps = v.max_fps orelse 0,
             }) catch return error.Unavailable;
         }
+        // Nobody operates these pages but this client: a chooser the
+        // engine showed could never be answered and would stall the page.
+        if (self.has(.upload)) self.send(proto.UploadWatch{ .view = v.id, .enabled = 1 }) catch return error.Unavailable;
         // Nobody waits on it (req 0): every perf result reports the throttle that is really active.
         if (emulation.cpu_throttle) |r| if (r != 1) self.send(proto.PerfReq{
             .view = v.id,
@@ -3966,8 +3973,19 @@ pub const Engine = struct {
         self.upload_outcome = null;
     }
 
+    /// Whether a page opened a file chooser nobody armed since the last call.
+    pub fn takeUnarmedChooser(self: *Engine) bool {
+        const opened = self.unarmed_choosers != self.unarmed_reported;
+        self.unarmed_reported = self.unarmed_choosers;
+        return opened;
+    }
+
     fn onUpload(self: *Engine, ev: proto.EvUpload) void {
-        if (ev.req == 0 or ev.req != self.upload_req) return;
+        if (ev.req == 0) {
+            if (ev.outcome == proto.upload_unanswered) self.unarmed_choosers +%= 1;
+            return;
+        }
+        if (ev.req != self.upload_req) return;
         self.upload_outcome = .{ .outcome = ev.outcome, .multiple = ev.multiple != 0, .count = ev.count };
     }
 

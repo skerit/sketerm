@@ -1857,38 +1857,48 @@ land — including for a download the client itself asked for.
   half (a url fetched to a caller's path, and a page-initiated download
   landing in the XDG download directory).
 
-## Uploads (0x7D/0x7E, capability "upload")
+## Uploads and file choosers (0x7D-0x7F, capability "upload")
 
 `cefhost/upload.zig`. A client arms files for a view (`upload_arm`), clicks
 the page's upload control with trusted input, and gets `ev_upload` back.
-The files are set through the view's DevTools session, never through
-`cef_dialog_handler_t`:
+A client driving pages nobody else operates also sends `upload_watch`,
+which keeps every chooser of the view intercepted and reports the ones
+nobody armed (`ev_upload` with `req` 0). Everything goes through the
+view's DevTools session, never through `cef_dialog_handler_t`:
 
 - **A windowless view's file chooser never reaches `get_dialog_handler`**
   (measured on CEF 151, headless and Wayland ozone alike: the getter is
   not called at all). Do not build on `on_file_dialog`.
 - **An un-intercepted chooser stalls the page.** After a trusted click on
   an `<input type=file>` the page's timers stop and neither an eval nor a
-  navigation is answered again; the helper itself stays responsive. That
-  is what a plain `web_act` click on an upload control still does, which
-  is why the tool text sends callers to `web_upload`.
+  navigation is answered again; the helper itself stays responsive. This
+  is why `webdrive` sends `upload_watch` for every view it creates: an
+  intercepted chooser that gets no files leaves the page running, and
+  `web_act`/`web_key` then report `file_chooser`. A GUI never sends it,
+  so its panes keep the engine's own handling.
 - The working sequence is `Page.enable`, then
   `Page.setInterceptFileChooserDialog {enabled:true}`, the click,
   `Page.fileChooserOpened` (it names the input's `backendNodeId` and
   `selectSingle`/`selectMultiple`), then `DOM.setFileInputFiles` on that
   node. The page sees trusted `input`/`change` events and is not stalled.
   `Page.enable` is browser-side only; the ban on `Runtime.enable` and
-  `Debugger.enable` stands.
-- Interception is on ONLY while an upload is armed, and `disarm` turns it
-  off on every exit, so a view that never uploads attaches no agent for it.
-- The session has one `EventSink`. An arm while a trace holds it is
-  refused (`upload_failed`), and `disarm` removes only its own sink.
-- Nothing is sent from inside the event callback: the chooser is recorded
-  there and answered from `upload.pump` (the host watchdog), like tracing.
+  `Debugger.enable` stands, and the HELPER still attaches nothing by
+  default (smoke-web's dt stage): the agent comes with a client's watch
+  or arm.
+- `upload.sync` is the one place the interception is turned on or off:
+  on while a watch or an armed upload wants it, re-sent when the session
+  is new (a revived browser) or its agent detached, off otherwise.
+- The chooser event has its OWN hook on the session (`Session.chooser`),
+  apart from the single `events` sink, so an upload and a trace never
+  contend.
+- No DevTools method is sent from inside the event callback: an armed
+  chooser is recorded there and answered from `upload.pump` (the host
+  watchdog); an unarmed one is only posted, at once, so the client sees
+  it while the act that opened it is still settling.
 - Several files armed for a single-file input set NOTHING
   (`upload_too_many`); a later upload on the same input still works
-  (smoke-mcp `webUploadStage` pins that).
-- An untrusted helper withholds the capability and refuses `upload_arm`.
+  (smoke-mcp `webUploadStage` pins that, and the unarmed click).
+- An untrusted helper withholds the capability and refuses both frames.
 
 ## ERR_NETWORK_CHANGED: retried once, reported as a retry (capability "load-retry")
 
