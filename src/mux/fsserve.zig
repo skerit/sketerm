@@ -171,7 +171,7 @@ fn btimeMsOf(st: *const c.struct_stat, full: [*:0]const u8) i64 {
     if (comptime @hasField(c.struct_stat, "st_birthtimespec")) {
         const ts = st.st_birthtimespec;
         if (ts.tv_sec == 0 and ts.tv_nsec == 0) return 0;
-        return @as(i64, @intCast(ts.tv_sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
+        return msSaturating(@intCast(ts.tv_sec), @intCast(ts.tv_nsec));
     } else if (comptime is_linux) {
         const linux = std.os.linux;
         var stx: linux.Statx = undefined;
@@ -185,9 +185,21 @@ fn btimeMsOf(st: *const c.struct_stat, full: [*:0]const u8) i64 {
         // Raw syscall: 0 is success, anything else is -errno.
         if (rc != 0) return 0;
         if (!stx.mask.BTIME) return 0;
-        return @as(i64, stx.btime.sec) * 1000 + @as(i64, stx.btime.nsec / 1_000_000);
+        return msSaturating(stx.btime.sec, stx.btime.nsec);
     }
     return 0;
+}
+
+/// Milliseconds of a timestamp, saturating: a filesystem can hand back a
+/// birth time far outside any real date, and a listing must survive it.
+fn msSaturating(sec: i64, nsec: i64) i64 {
+    return sec *| 1000 +| @divTrunc(nsec, 1_000_000);
+}
+
+test "a birth time outside any real date saturates instead of overflowing" {
+    try std.testing.expectEqual(@as(i64, 1_500), msSaturating(1, 500_000_000));
+    try std.testing.expectEqual(std.math.maxInt(i64), msSaturating(std.math.maxInt(i64) - 1, 999_999_999));
+    try std.testing.expectEqual(std.math.minInt(i64), msSaturating(std.math.minInt(i64) + 1, 0));
 }
 
 fn timespecNs(ts: c.struct_timespec) i64 {
