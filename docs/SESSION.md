@@ -1,5 +1,29 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-11-24: an idle MCP server is back on a restarted daemon by itself
+
+- A peer message to an open, idle session was queued as if the session
+  were gone. The session's MCP server lost its link when the per-user
+  daemon restarted (a broker handover) and dialed again only with its next
+  peer tool call, or for kept acks; a session waiting at its prompt makes
+  none, so the new daemon had no server registered for it until its
+  assistant happened to call a peer tool. The server loop now dials
+  whenever the link is not up (`mcp_peer.service`, backoff 1 s to 60 s).
+- That retry reaches only a daemon that runs already
+  (`Conn.connectLocalExisting`, `mcp_peer.Dial.existing`): an idle
+  session never starts one. Startup and tool calls autostart as before.
+  A failed retry is silent; the loss itself is logged once.
+- The sender of mail queued for an address without a live server reads
+  what is known and what happens next instead of `it is gone`
+  (`peer_cli.sentLine`); the recipient reads `while this session's sketerm
+  server was not connected` instead of `while you were offline`
+  (`agentpush.QUEUED_CLAUSE`).
+- `peer_list`'s `you:` line says how the daemon lists the reader
+  (`seen as idle`, `polls`, pending, or no live server).
+- smoke-mux / smoke-broker: federation stage f11 restarts the member's
+  daemon under an idle server and expects `delivered` from the other host
+  with no tool call on the recipient in between.
+
 ## 2026-11-24: uploads into a browser on another machine, the overview's browser row, folder inputs
 
 - A pick in sketerm's file picker now reaches a page whose browser runs
