@@ -209,6 +209,7 @@
 
 const std = @import("std");
 const wf_print = @import("webface/print.zig");
+const wf_upload = @import("webface/upload.zig");
 const wf_pw = @import("webface/password.zig");
 const wf_page = @import("webface/pageview.zig");
 const wf_auto = @import("webface/automation.zig");
@@ -1046,6 +1047,10 @@ pub const WebFace = struct {
     /// Whether this GUI holds control of the observed page (the
     /// helper's answer, not the request).
     obs_control: bool = false,
+    /// The helper was asked to intercept this view's file choosers.
+    upload_watched: bool = false,
+    /// The `upload_arm.req` of the pick awaiting its outcome; 0 = none.
+    upload_req: u32 = 0,
     obs_fit: watchgeom.Fit = .{ .x = 0, .y = 0, .w = 0, .h = 0, .scale = 1 },
     /// The `webwatch.Watch` this page belongs to; told on deinit.
     watch: ?*anyopaque = null,
@@ -2918,6 +2923,8 @@ pub const WebFace = struct {
         // until it asks again (which waits for `hello_ack`).
         self.enc_on = false;
         self.syncFrameEncode();
+        self.upload_watched = false;
+        self.syncUploadWatch();
         // A fresh helper connection knows no cap; force the send.
         self.sent_max_fps = 0xffff;
         self.syncMaxFps();
@@ -2969,6 +2976,8 @@ pub const WebFace = struct {
     pub const onInline = wf_frames.onInline;
     pub const onEncoded = wf_frames.onEncoded;
     pub const syncFrameEncode = wf_frames.syncFrameEncode;
+    pub const syncUploadWatch = wf_upload.syncUploadWatch;
+    pub const onUpload = wf_upload.onUpload;
     pub const onDamage = wf_frames.onDamage;
     pub fn onTitle(self: *WebFace, title: []const u8) void {
         if (self.title) |t| self.allocator.free(t);

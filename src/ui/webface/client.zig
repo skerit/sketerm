@@ -939,6 +939,8 @@ pub const Client = struct {
                 // Views minted before the ack learn only now that their
                 // pixels may travel encoded.
                 for (self.faces.items) |face| face.syncFrameEncode();
+                // Nor, until now, that their file choosers can be intercepted.
+                for (self.faces.items) |face| face.syncUploadWatch();
             },
             .ev_webext_state => {
                 const st = proto.decode(proto.EvWebextState, frame.payload) catch return;
@@ -1176,6 +1178,10 @@ pub const Client = struct {
                     // that would ask is gone.
                     self.post(proto.DownloadDecide{ .view = ev.view, .id = ev.id, .path = "" });
                 }
+            },
+            .ev_upload => {
+                const ev = proto.decode(proto.EvUpload, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onUpload(ev);
             },
             .ev_cookie_change => {
                 const ev = proto.EvCookieChange.decodeFrom(frame.payload) catch return;

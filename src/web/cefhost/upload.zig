@@ -60,6 +60,12 @@ pub const State = struct {
     detaches_seen: u32 = 0,
     /// The enabling methods, kept only to be forgotten.
     on_ids: [2]c_int = .{ 0, 0 },
+    /// The last chooser that opened unarmed, kept so a client can answer
+    /// it after the fact (`upload_arm.chooser`); `pending_id` 0 = none.
+    pending_id: u32 = 0,
+    pending_node: i64 = 0,
+    pending_multiple: bool = false,
+    next_chooser: u32 = 0,
 
     fn count(self: State) u32 {
         var n: u32 = 0;
@@ -156,6 +162,16 @@ pub fn uploadArm(self: *Host, req: proto.UploadArm) void {
     const owned = self.gpa.dupe(u8, req.paths) catch return post(self, v, req.req, proto.upload_failed, 0);
     v.upload.req = req.req;
     v.upload.paths = owned;
+    if (req.chooser != 0) {
+        // The chooser already opened: its input is known, so the answer
+        // goes out with the next pump.
+        if (v.upload.pending_id != req.chooser or v.upload.pending_node == 0) return finish(self, v, proto.upload_failed);
+        v.upload.node = v.upload.pending_node;
+        v.upload.multiple = v.upload.pending_multiple;
+        v.upload.pending_id = 0;
+        v.upload.phase = .opened;
+        return;
+    }
     v.upload.phase = .armed;
     if (!sync(self, v)) finish(self, v, proto.upload_failed);
 }
@@ -165,6 +181,7 @@ pub fn uploadArm(self: *Host, req: proto.UploadArm) void {
 pub fn browserGone(host: *Host, v: *View) void {
     v.upload.on = null;
     v.upload.on_ids = .{ 0, 0 };
+    v.upload.pending_id = 0;
     if (v.upload.phase != .idle) {
         v.upload.set_id = 0;
         finish(host, v, proto.upload_failed);
@@ -187,13 +204,22 @@ fn onChooser(ctx: *anyopaque, _: []const u8, params: []const u8) void {
             v.upload.multiple = multiple;
             v.upload.phase = .opened;
         },
-        .idle => host.post(proto.EvUpload{
-            .view = v.id,
-            .req = 0,
-            .outcome = proto.upload_unanswered,
-            .multiple = @intFromBool(multiple),
-            .count = 0,
-        }),
+        .idle => {
+            const st = &v.upload;
+            st.next_chooser +%= 1;
+            if (st.next_chooser == 0) st.next_chooser = 1;
+            st.pending_id = st.next_chooser;
+            st.pending_node = if (parsed) |p| p.value.backendNodeId else 0;
+            st.pending_multiple = multiple;
+            host.post(proto.EvUpload{
+                .view = v.id,
+                .req = 0,
+                .outcome = proto.upload_unanswered,
+                .multiple = @intFromBool(multiple),
+                .count = 0,
+                .chooser = st.pending_id,
+            });
+        },
         // A second chooser while the first is being answered: the page's own queue.
         .opened, .setting => {},
     }

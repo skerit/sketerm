@@ -1010,6 +1010,8 @@ pub fn observerAllows(tag: Tag, control: bool) bool {
         .input_paste,
         .input_focus,
         .clipboard_read,
+        // Answering the file chooser its own click opened.
+        .upload_arm,
         .navigate,
         .nav_action,
         .find,
@@ -2390,12 +2392,26 @@ pub const DownloadCancel = struct {
 ///
 /// `paths` is the absolute paths joined by NUL (a path can hold any
 /// other byte), on the helper's machine. `req` is client-minted, non-zero.
+///
+/// `chooser` is the OPTIONAL TRAILING field: non-zero answers a chooser
+/// that ALREADY opened unarmed (the `EvUpload.chooser` of its report)
+/// instead of arming, which is how a person's pick reaches the page. A
+/// stale one answers `upload_failed`.
+///
+/// A controlling observer may send it. Its `req` must carry
+/// `upload_req_observer`, so its outcome can never be taken for the
+/// answer to an arm of the view's owner, who sees the same `ev_upload`.
 pub const UploadArm = struct {
     pub const tag: Tag = .upload_arm;
+    pub const optional_from = "chooser";
     view: u32,
     req: u32,
     paths: []const u8,
+    chooser: u32 = 0,
 };
+
+/// The `UploadArm.req` bit an observer's requests carry.
+pub const upload_req_observer: u32 = 0x8000_0000;
 
 /// `EvUpload.outcome`: a chooser opened with nothing armed (`req` 0);
 /// only a view under `upload_watch` reports these. It was intercepted,
@@ -2413,6 +2429,7 @@ pub const upload_failed: u8 = 3;
 /// a chooser nobody armed.
 pub const EvUpload = struct {
     pub const tag: Tag = .ev_upload;
+    pub const optional_from = "chooser";
     view: u32,
     req: u32,
     outcome: u8,
@@ -2420,6 +2437,9 @@ pub const EvUpload = struct {
     multiple: u8,
     /// Files set; 0 unless `outcome` is answered.
     count: u32,
+    /// With `upload_unanswered`: what an `upload_arm.chooser` names to
+    /// answer this chooser after the fact. The OPTIONAL TRAILING field.
+    chooser: u32 = 0,
 };
 
 /// Keep every file chooser of `view` intercepted (`enabled` != 0) and
@@ -6074,6 +6094,8 @@ test "round-trip: download frames" {
     try roundTrip(EvUpload, .{ .view = 7, .req = 4, .outcome = upload_failed, .multiple = 0, .count = 0 });
     try roundTrip(EvUpload, .{ .view = 7, .req = 0, .outcome = upload_unanswered, .multiple = 1, .count = 0 });
     try roundTrip(UploadWatch, .{ .view = 7, .enabled = 1 });
+    try roundTrip(UploadArm, .{ .view = 7, .req = upload_req_observer | 2, .paths = "/home/x/a.png", .chooser = 5 });
+    try roundTrip(EvUpload, .{ .view = 7, .req = 0, .outcome = upload_unanswered, .multiple = 0, .count = 0, .chooser = 5 });
     try roundTrip(EvDownloadProgress, .{
         .view = 7,
         .id = 41,

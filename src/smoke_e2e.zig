@@ -1222,6 +1222,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_WEB_UPLOAD_ONLY") != null) {
+        const app = drive orelse return fail("focused web upload smoke has no display driver");
+        if (!have_web_action) return fail("focused web upload smoke needs zig-out/bin/sketerm-webengine (run `zig build web` first)");
+        if (app.windows.items.len == 0) return fail("focused web upload smoke lost its window");
+        app.focusWindow(mainWin(app).id) catch return fail("focused web upload smoke could not focus the window");
+        if (webUploadPickerStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("web upload: a page's file chooser opened the file picker and the pick reached the page");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_DOWNLOAD_ONLY") != null) {
         const app = drive orelse return fail("focused Download File smoke has no display driver");
         if (remoteDownloadStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
@@ -4571,7 +4581,7 @@ fn assistantNamedWebStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
     defer if (m_open) m.close();
     if (!m.initialize()) return "the named MCP server never answered initialize";
     var args: [1024]u8 = undefined;
-    const open_args = std.fmt.bufPrint(&args, "{{\"url\":\"file://{s}\",\"timeout_ms\":45000,\"snapshot\":\"none\"}}", .{page}) catch
+    const open_args = std.fmt.bufPrint(&args, "{{\"name\":\"Named review\",\"url\":\"file://{s}\",\"timeout_ms\":45000,\"snapshot\":\"none\"}}", .{page}) catch
         return "web_open arguments did not fit";
     const opened = m.call("web_open", open_args, 90_000) orelse return "web_open on the named MCP timed out";
     if (mcpHas(opened, "isError"))
@@ -4588,7 +4598,7 @@ fn assistantNamedWebStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
     if (openPopup(app) != null) return "a popup surface was already open before the chip was clicked";
     app.click(win_id, chip.x + chip.w / 2, chip.y + chip.h / 2, 1) catch return "clicking the assistant chip failed";
     const pop_id = waitPopup(app, true, 10_000) orelse return "the assistant chip opened no popover surface";
-    if (pressNamed(allocator, app, "Watch Assistant browser", pop_id, "zig-out/smoke-e2e-namedweb-popover.png", 15_000)) |why| return why;
+    if (pressNamed(allocator, app, "Watch Named review", pop_id, "zig-out/smoke-e2e-namedweb-popover.png", 15_000)) |why| return why;
 
     var waited: u32 = 0;
     var shown = false;
@@ -5717,6 +5727,8 @@ fn siteInfoAnswersStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: 
 /// The browser stages after the route stage, in the order the full rig
 /// and `SKETERM_SMOKE_E2E_WEB_PAGES_ONLY` both run them.
 fn webPagesStages(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, rt: [:0]const u8) ?[]const u8 {
+    if (webUploadPickerStage(allocator, app, sock, rt)) |why| return why;
+    say("web upload: a page's file chooser opened the file picker and the pick reached the page");
     if (webPrivateStage(allocator, app, sock, rt)) |why| return why;
     say("private browsing: an incognito tab's page stayed out of the history journal that an ordinary tab's page reached");
     if (webClosePageStage(allocator, app, sock)) |why| return why;
@@ -5725,6 +5737,74 @@ fn webPagesStages(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]co
     say("via: route: the tab's instance ran behind the loopback SOCKS5 bridge and its page arrived through the fake-SSH host");
     if (webRemotePrintStage(allocator, app, sock, rt)) |why| return why;
     say("remote print: Print to PDF on an on: tab staged the PDF on the remote host and delivered it to the local path picked");
+    return null;
+}
+
+fn windowHeightOrWidth(app: *appdrive.App, id: u32, comptime which: enum { w, h }) i32 {
+    for (app.windows.items) |w| if (w.id == id) return if (which == .w) w.w else w.h;
+    return 0;
+}
+
+/// A person's upload in a browser pane: a click on the page makes it
+/// open its file chooser, the GUI shows its own file picker for it, and
+/// the file picked there is the one the page reads.
+fn webUploadPickerStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, rt: [:0]const u8) ?[]const u8 {
+    var page_buf: [512:0]u8 = undefined;
+    const page = std.fmt.bufPrintSentinel(&page_buf, "{s}/e2e-upload.html", .{rt}, 0) catch return "upload page path";
+    if (!writeFile(page, "<html><head><title>pick:none</title><style>html,body{margin:0;min-height:100vh;background:red}</style></head>" ++
+        "<body onclick=\"document.getElementById('f').click()\"><input id=f type=file style='display:none'><script>" ++
+        "document.getElementById('f').onchange=async e=>{const x=e.target.files[0];document.body.style.background='lime';document.title='pick:'+x.name+'='+await x.text()}" ++
+        "</script></body></html>")) return "could not write the upload page";
+    var file_buf: [512:0]u8 = undefined;
+    const file = std.fmt.bufPrintSentinel(&file_buf, "{s}/e2e-upload.txt", .{rt}, 0) catch return "upload file path";
+    if (!writeFile(file, "PICKED")) return "could not write the file to upload";
+
+    var req_buf: [768]u8 = undefined;
+    const open_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-open\",\"target\":\"tab\",\"data\":\"file://{s}\"}}\n", .{page}) catch return "web-open request";
+    const opened = roundtrip(allocator, sock, open_req) orelse return "opening the upload page failed";
+    defer allocator.free(opened);
+    const pane = parseNumAfter(opened, "\"pane\":") orelse return "the upload page reply named no pane";
+    if (!waitWebPaneTitled(allocator, sock, app, pane, "pick:none", 60_000)) return "the upload page never loaded";
+    const win_id = mainWin(app).id;
+    const focus_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{pane}) catch return "focus request";
+    if (roundtrip(allocator, sock, focus_req)) |r| allocator.free(r) else return "focusing the upload tab failed";
+    _ = app.waitIdle(200, 4_000);
+    // A GUI-owned page's pixels are a GPU texture this display session does
+    // not read back, so the click is aimed by geometry: the page fills the
+    // pane under the toolbar, and its whole body is the click target.
+    const geo = app.windowGeometry(win_id) orelse return "the upload window has no size";
+    var known_buf: [16]u32 = undefined;
+    const known = known_buf[0..knownToplevels(app, &known_buf)];
+    app.click(win_id, @as(f64, @floatFromInt(geo.w)) / 2, @as(f64, @floatFromInt(geo.h)) * 0.6, 1) catch return "clicking the upload page failed";
+    const picker = waitNewToplevel(app, known, 15_000) orelse {
+        shotTo(allocator, app, win_id, "zig-out/smoke-e2e-upload-nopicker.png");
+        return "the page's file chooser opened no file picker (see zig-out/smoke-e2e-upload-nopicker.png)";
+    };
+    _ = app.waitIdle(300, 5_000);
+    shotTo(allocator, app, picker, "zig-out/smoke-e2e-upload-picker.png");
+    // An absolute path typed into the picker's name entry is the pick. In
+    // open mode the listing has the focus, so the entry (the bottom row,
+    // left of the buttons) is clicked first.
+    // Surface pixels (the client-side decoration included), as clicks are.
+    const pw: f64 = @floatFromInt(windowHeightOrWidth(app, picker, .w));
+    const ph: f64 = @floatFromInt(windowHeightOrWidth(app, picker, .h));
+    if (pw <= 0 or ph <= 0) return "the file picker has no size";
+    app.click(picker, pw * 0.43, ph * 0.929, 1) catch return "clicking the picker's name entry failed";
+    _ = app.waitIdle(200, 3_000);
+    app.pressKey(picker, "ctrl+a") catch return "select-all in the file picker failed";
+    app.typeText(picker, file) catch return "typing the upload path failed";
+    app.pressKey(picker, "Enter") catch return "confirming the file picker failed";
+    if (!waitToplevelGone(app, picker, 10_000)) {
+        shotTo(allocator, app, picker, "zig-out/smoke-e2e-upload-picker-stuck.png");
+        return "the file picker stayed open after Enter (see zig-out/smoke-e2e-upload-picker-stuck.png)";
+    }
+    if (!waitWebPaneTitled(allocator, sock, app, pane, "pick:e2e-upload.txt=PICKED", 20_000)) {
+        dumpWebList(allocator, sock);
+        return "the picked file never reached the page";
+    }
+    const close_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{pane}) catch return "close request";
+    if (roundtrip(allocator, sock, close_req)) |r| allocator.free(r);
+    _ = app.waitIdle(200, 4_000);
     return null;
 }
 

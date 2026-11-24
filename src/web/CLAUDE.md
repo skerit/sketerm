@@ -1874,8 +1874,9 @@ view's DevTools session, never through `cef_dialog_handler_t`:
   navigation is answered again; the helper itself stays responsive. This
   is why `webdrive` sends `upload_watch` for every view it creates: an
   intercepted chooser that gets no files leaves the page running, and
-  `web_act`/`web_key` then report `file_chooser`. A GUI never sends it,
-  so its panes keep the engine's own handling.
+  `web_act`/`web_key` then report `file_chooser`. The GUI sends it too
+  (`ui/webface/upload.zig`, once `hello_ack` names the capability) and
+  answers each report with sketerm's own file picker.
 - The working sequence is `Page.enable`, then
   `Page.setInterceptFileChooserDialog {enabled:true}`, the click,
   `Page.fileChooserOpened` (it names the input's `backendNodeId` and
@@ -1899,6 +1900,18 @@ view's DevTools session, never through `cef_dialog_handler_t`:
   (`upload_too_many`); a later upload on the same input still works
   (smoke-mcp `webUploadStage` pins that, and the unarmed click).
 - An untrusted helper withholds the capability and refuses both frames.
+- **A chooser can be answered after the fact.** An unarmed report carries
+  `EvUpload.chooser`; `upload_arm` naming it sets the files on that
+  chooser's remembered input instead of arming. That is the person's
+  path: the GUI cannot know a chooser is coming, so it picks afterwards.
+  A stale id answers `upload_failed`.
+- **Every client of a view sees every `ev_upload`.** An observer's
+  requests carry `upload_req_observer` (the top bit) so its outcome is
+  never taken for the owner's; a controlling observer may send
+  `upload_arm` (`observerAllows`), a view-only one may not. The GUI shows
+  its picker for an OBSERVED page only while it holds control.
+- The helper reads the files on ITS machine: the GUI refuses, with a
+  toast, to pick for a page whose helper is remote.
 
 ## ERR_NETWORK_CHANGED: retried once, reported as a retry (capability "load-retry")
 
