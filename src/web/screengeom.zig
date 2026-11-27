@@ -53,22 +53,25 @@ pub fn engine(lever: ScaleLever, w: u16, h: u16, scale_x1000: u16, report: ?prot
     };
 }
 
-pub const FrameSize = struct { w: u16, h: u16 };
-
-/// The size CEF's `on_accelerated_paint` delivers for a view of `pw`x`ph`
-/// physical pixels: each axis evened down (measured on CEF 156 under
-/// Wayland ozone, 575x751 -> 574x750). `on_paint` keeps the exact size.
-pub fn acceleratedFrameSize(pw: u16, ph: u16) FrameSize {
-    return .{ .w = pw & ~@as(u16, 1), .h = ph & ~@as(u16, 1) };
+/// Whether a GPU frame of `coded_w`x`coded_h` belongs to a view of
+/// `pw`x`ph` physical pixels. The engine's rounding of an odd side is not
+/// stable across builds and drivers (evened down on CEF 156 under Wayland
+/// ozone: 575x751 -> 574x750; exact on CEF 151 with a real GPU: 1000x577
+/// stayed 1000x577), so each axis may differ by one pixel. A stale frame
+/// from before a resize differs by more than that.
+pub fn acceleratedFrameFits(pw: u16, ph: u16, coded_w: i32, coded_h: i32) bool {
+    return @abs(coded_w - @as(i32, pw)) <= 1 and @abs(coded_h - @as(i32, ph)) <= 1;
 }
 
-test "a GPU frame is the view evened down on each axis" {
-    // Measured pairs (view -> coded_size), CEF 156 on a 1.3 scale display.
-    try std.testing.expectEqual(FrameSize{ .w = 1300, .h = 750 }, acceleratedFrameSize(1300, 751));
-    try std.testing.expectEqual(FrameSize{ .w = 574, .h = 750 }, acceleratedFrameSize(575, 751));
-    try std.testing.expectEqual(FrameSize{ .w = 644, .h = 750 }, acceleratedFrameSize(645, 751));
-    try std.testing.expectEqual(FrameSize{ .w = 650, .h = 750 }, acceleratedFrameSize(650, 751));
-    try std.testing.expectEqual(FrameSize{ .w = 1280, .h = 800 }, acceleratedFrameSize(1280, 800));
+test "a GPU frame fits its view within one pixel on each axis" {
+    // Evened down (CEF 156, 1.3 scale display) and exact (CEF 151).
+    try std.testing.expect(acceleratedFrameFits(1300, 751, 1300, 750));
+    try std.testing.expect(acceleratedFrameFits(575, 751, 574, 750));
+    try std.testing.expect(acceleratedFrameFits(1000, 577, 1000, 577));
+    try std.testing.expect(acceleratedFrameFits(1280, 800, 1280, 800));
+    // A frame from before a resize is not this view's.
+    try std.testing.expect(!acceleratedFrameFits(1100, 637, 1000, 577));
+    try std.testing.expect(!acceleratedFrameFits(1280, 800, 1280, 798));
 }
 
 pub const Point = struct { x: i32, y: i32 };
