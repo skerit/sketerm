@@ -5673,6 +5673,7 @@ fn webRouteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]con
     if (ocr.available()) {
         if (waitOcrWordCenter(allocator, app, gui_win, "Tor", 15_000) == null) return "the toolbar's route button does not read \"Tor\" after the switch";
     }
+    if (routeHostTypingStage(allocator, app, sock, pane)) |why| return why;
     if (siteInfoAnswersStage(allocator, app, sock, pane)) |why| return why;
 
     // Palette actions move it back and forth over IPC.
@@ -5770,6 +5771,45 @@ fn siteInfoAnswersStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: 
     } else |_| {}
     app.pressKey(pop, "Escape") catch return "injecting Escape into the site-info popover failed";
     if (waitPopup(app, false, 10_000) == null) return "the site-info popover did not close on Escape";
+    return null;
+}
+
+/// The host entry of "Via server..." takes typed keys. The route menu's
+/// row opens the site popover pre-set to that route; the popover hangs
+/// off a toolbar button that is `can_focus = false`, which once denied
+/// every descendant the keyboard, so keystrokes went to the page and the
+/// entry stayed empty (paste still worked, being pointer-driven). The
+/// typed word is read back off the popover by OCR.
+fn routeHostTypingStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, pane: u32) ?[]const u8 {
+    var focus_buf: [96]u8 = undefined;
+    const focus_req = std.fmt.bufPrint(&focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{pane}) catch return "focus request";
+    if (roundtrip(allocator, sock, focus_req)) |r| allocator.free(r) else return "focusing the tab for the host entry failed";
+    _ = app.waitIdle(200, 4_000);
+    const ocr = @import("util/ocr.zig");
+    if (!ocr.available()) {
+        say("route: tesseract unavailable; the host entry's typing was not read back");
+        return null;
+    }
+    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"web_route_menu\"}\n")) |r| allocator.free(r) else return "web_route_menu roundtrip failed";
+    const menu = waitPopup(app, true, 10_000) orelse return "web_route_menu opened no menu";
+    _ = app.waitIdle(200, 3_000);
+    const via_row = waitOcrWordCenter(allocator, app, menu, "Via", 15_000) orelse
+        return "the route menu shows no \"Via server...\" row";
+    app.clickEx(menu, via_row.x, via_row.y, 1, 100, 1) catch return "clicking the Via server row failed";
+    _ = app.waitIdle(300, 5_000);
+    const pop = waitPopup(app, true, 10_000) orelse return "the Via server row opened no popover";
+    if (!viewerWaitOcr(allocator, app, pop, "Permissions", 20_000)) return "the Via server row did not open the site popover";
+    app.typeText(pop, "typeprobe") catch return "typing into the host entry failed";
+    _ = app.waitIdle(300, 5_000);
+    if (!viewerWaitOcr(allocator, app, pop, "typeprobe", 20_000)) {
+        if (app.screenshotPng(pop, 1024, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("/tmp/sketerm-e2e-route-hosttyping-fail.png", shot.png);
+        } else |_| {}
+        return "the host entry of the Via server route did not take typed text";
+    }
+    app.pressKey(pop, "Escape") catch return "injecting Escape into the host popover failed";
+    if (waitPopup(app, false, 10_000) == null) return "the host popover did not close on Escape";
     return null;
 }
 

@@ -131,8 +131,12 @@ pub const SiteInfo = struct {
     /// The face this belongs to, by id (see the header).
     view: u32,
     popover: *c.GtkWidget,
-    /// The toolbar button the popover hangs off; the parent that must
-    /// be told to let go before the widget tree dies.
+    /// The toolbar button the popover points at. It is NOT the popover's
+    /// parent: toolbar buttons are `can_focus = false` (`toolbtn.flatten`),
+    /// and GTK refuses keyboard focus to every descendant of such a
+    /// widget, so a popover parented to the button could never focus its
+    /// host entry (typing went to the page). The parent is the button's
+    /// container, and `pointAtAnchor` aims the popover at the button.
     anchor: *c.GtkWidget,
     parented: bool = false,
 
@@ -318,7 +322,7 @@ pub const SiteInfo = struct {
         _ = c.g_signal_connect_data(route_host, "activate", @ptrCast(&onRouteApply), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(route_apply, "clicked", @ptrCast(&onRouteApply), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
 
-        c.gtk_widget_set_parent(pop, anchor);
+        c.gtk_widget_set_parent(pop, c.gtk_widget_get_parent(anchor) orelse anchor);
         self.parented = true;
         return self;
     }
@@ -387,7 +391,25 @@ pub const SiteInfo = struct {
             c.gtk_label_set_text(@ptrCast(self.cookie_status), "Counting cookies…");
         }
 
-        if (open) c.gtk_popover_popup(@ptrCast(self.popover));
+        if (open) {
+            self.pointAtAnchor();
+            c.gtk_popover_popup(@ptrCast(self.popover));
+        }
+    }
+
+    /// Aim the popover at `anchor` from its (focusable) parent container.
+    fn pointAtAnchor(self: *SiteInfo) void {
+        const parent = c.gtk_widget_get_parent(self.popover) orelse return;
+        if (parent == self.anchor) return;
+        var b: c.graphene_rect_t = undefined;
+        if (c.gtk_widget_compute_bounds(self.anchor, parent, &b) == 0) return;
+        const rect = c.GdkRectangle{
+            .x = @intFromFloat(b.origin.x),
+            .y = @intFromFloat(b.origin.y),
+            .width = @intFromFloat(@ceil(b.size.width)),
+            .height = @intFromFloat(@ceil(b.size.height)),
+        };
+        c.gtk_popover_set_pointing_to(@ptrCast(self.popover), &rect);
     }
 
     /// Pre-select a host-bound route and put the caret in the host
@@ -405,7 +427,12 @@ pub const SiteInfo = struct {
             self.route_shows_proxy = false;
         }
         c.gtk_widget_set_sensitive(self.route_host, if (choice.needsHost()) 1 else 0);
-        if (choice.needsHost()) _ = c.gtk_widget_grab_focus(self.route_host);
+        if (choice.needsHost()) {
+            _ = c.gtk_widget_grab_focus(self.route_host);
+            // The popover focuses its first focusable child (the selectable
+            // origin label) when it opens; drop the selection it carries.
+            c.gtk_label_select_region(@ptrCast(self.origin_label), 0, 0);
+        }
     }
 
     fn fillPerms(self: *SiteInfo, st: State) void {
