@@ -1098,6 +1098,19 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     // search path); for `zig build run` the CWD is the repo root, so add
     // data/icons too. A non-existent path is harmless.
     if (c.gdk_display_get_default()) |display| {
+        // GtkGLArea supplies GL textures. Compositing them with Vulkan can
+        // download pane pixels on the UI thread and upload them again. Set
+        // GSK's per-display preference before the first window is realized;
+        // unlike setting GSK_RENDERER, this won't affect apps run in a pane.
+        const obj: *c.GObject = @ptrCast(@alignCast(display));
+        if (builtin.os.tag == .linux and (g_app.mode == .terminal or g_app.mode == .editor) and
+            c.getenv("GSK_RENDERER") == null and c.g_object_get_data(obj, "gsk-renderer") == null)
+        {
+            // GTK 4.14 called its modern OpenGL renderer "ngl".
+            const renderer: [*:0]const u8 = if (c.gtk_get_minor_version() < 18) "ngl" else "gl";
+            c.g_object_set_data(obj, "gsk-renderer", @ptrCast(@constCast(renderer)));
+        }
+
         const theme = c.gtk_icon_theme_get_for_display(display);
         c.gtk_icon_theme_add_search_path(theme, "data/icons");
     }
